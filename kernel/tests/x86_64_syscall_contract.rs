@@ -1198,11 +1198,13 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
+    // D1 commit 5 adds the family-A preparation hold, which services CPU0's
+    // timer expiries exactly like the ordinary syscall hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        4
+        5
     );
     let shared_carrier = runtime
         .split_once(
@@ -2281,4 +2283,41 @@ fn f9_zero_count_wake_still_validates_address_key_and_output_before_dispatch() {
         runtime.contains("crate::syscall::atomic_wake_with("),
         "F9 target runtime must use the host-tested atomic wake transaction"
     );
+}
+
+/// Text test (D1 commit 5, design §11.2.3 family A): `AbiGetInfo` and
+/// `ClockGet` are served by the facade with their usercopy outside every
+/// runtime-authority hold. P is taken alone through a `GuardFree`, from a
+/// copied root identity that is revalidated before the walk. The facade is
+/// target-only, so its routing is pinned here; the type facts are UI cases.
+#[test]
+fn family_a_usercopy_runs_guard_free() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_guard_free_usercopy(")
+        .expect("family-A facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("family-A facade helper extent")
+        .0;
+    assert!(helper.contains(
+        "NativeSyscallRequest::AbiGetInfo { .. } | NativeSyscallRequest::ClockGet { .. }"
+    ));
+    let prepare = helper
+        .find("runtime.prepare_guard_free_usercopy()")
+        .expect("guarded preparation");
+    let copy = helper
+        .find("self.paging.guard_free_access(self.runtime.guard_free())")
+        .expect("guard-free P access");
+    let walk = helper
+        .find("paging.usercopy_process_address_space(root, process)")
+        .expect("revalidated copied root");
+    let commit = helper
+        .find("runtime.commit_runtime_phase(phase);")
+        .expect("phase commit");
+    assert!(prepare < copy && copy < walk && walk < commit);
+    assert!(primordial.contains("match self.handle_guard_free_usercopy(request) {"));
+    assert!(primordial.contains(
+        "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
+    ));
 }

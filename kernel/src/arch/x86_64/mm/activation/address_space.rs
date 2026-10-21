@@ -10,7 +10,7 @@ use super::super::super::{FrameAddress, HUGE, PageTableRoot, USER, decode_interm
 use crate::arch::x86_64::mm::journal::{AtomicPageTableTarget, JournalWrite};
 use crate::cpu::CpuIndex;
 use crate::memory::address_region::{
-    AddressSpaceCoherency, AddressSpaceCoherencyError, AddressSpaceKey, Residency,
+    AddressSpaceCoherency, AddressSpaceCoherencyError, AddressSpaceKey, Residency, ResidencyWitness,
 };
 use crate::memory::frame_roles::{
     EmptyTableHierarchyCandidate, FrameRoleError, FrameRoleManager, TableIdentity, TableLevel,
@@ -507,6 +507,25 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         observed_root: u64,
         process: ProcessKey,
     ) -> Result<(&'a PageTableRoot, TableIdentity, AddressSpaceKey), RootBindingError> {
+        self.usercopy_root_for_process(
+            primordial,
+            active.usercopy_root(),
+            observed_cpu,
+            observed_root,
+            process,
+        )
+    }
+
+    /// As `active_root_for_process`, from a copied selection identity: every
+    /// field is revalidated against the live binding, CPU, CR3 and residency.
+    pub(crate) fn usercopy_root_for_process<'a>(
+        &'a self,
+        primordial: &'a PageTableRoot,
+        active: UserCopyRoot,
+        observed_cpu: CpuIndex,
+        observed_root: u64,
+        process: ProcessKey,
+    ) -> Result<(&'a PageTableRoot, TableIdentity, AddressSpaceKey), RootBindingError> {
         if active.process != process
             || active.residency.cpu() != observed_cpu
             || active.root != observed_root
@@ -520,9 +539,7 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         {
             return Err(RootBindingError::RootMismatch);
         }
-        binding
-            .coherency
-            .preflight_leave_after_local_flush(&active.residency)?;
+        binding.coherency.validate_residency(active.residency)?;
         let root = match &binding.storage {
             RootStorage::Primordial => primordial,
             RootStorage::Owned(root) => root,
@@ -1198,6 +1215,26 @@ pub(crate) struct ActiveRootSelection {
     binding_generation: u64,
 }
 
+/// A copy of an `ActiveRootSelection`'s identity, so usercopy can run where
+/// the selection itself, which lives in the runtime-authority-guarded CPU slot,
+/// cannot be borrowed (D1 commit 5, design §11.2.3 family A).
+///
+/// It proves nothing on its own. `AddressSpaceRootBindings::active_root_for_process`
+/// revalidates every field against the live binding, the observed CPU and
+/// CR3, and the live residency epoch before any walk. A copy taken during
+/// this CPU's own syscall stays exact, because only this CPU's own carrier
+/// replaces its selection (owner-only mutation, design §11.1), and it does so
+/// only at a root switch, which no syscall body crosses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserCopyRoot {
+    process: ProcessKey,
+    address_space: AddressSpaceKey,
+    root: u64,
+    identity: TableIdentity,
+    residency: ResidencyWitness,
+    binding_generation: u64,
+}
+
 /// CPU-private token proving that this CPU is executing its retained kernel
 /// execution root. It has no portable address-space identity or residency.
 #[must_use = "kernel execution-root selection must be carried into the next switch"]
@@ -1256,6 +1293,18 @@ impl KernelRootSelectionFailure {
 impl ActiveRootSelection {
     pub(crate) const fn process(&self) -> ProcessKey {
         self.process
+    }
+
+    /// This selection's identity, copied for a usercopy that cannot borrow it.
+    pub(crate) const fn usercopy_root(&self) -> UserCopyRoot {
+        UserCopyRoot {
+            process: self.process,
+            address_space: self.address_space,
+            root: self.root,
+            identity: self.identity,
+            residency: self.residency.witness(),
+            binding_generation: self.binding_generation,
+        }
     }
 
     pub(crate) const fn address_space(&self) -> AddressSpaceKey {

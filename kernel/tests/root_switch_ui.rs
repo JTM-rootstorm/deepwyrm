@@ -155,6 +155,18 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
             fixture: "paging_without_guard.rs",
             expected_error: Some("error[E0624]: method `acquire` is private"),
         },
+        // D1 commit 5: P taken alone for a guard-free usercopy keeps the
+        // handle borrowed, so T is never taken after P.
+        UiCase {
+            fixture: "paging_guard_free_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "paging_guard_free_then_lock.rs",
+            expected_error: Some(
+                "error[E0499]: cannot borrow `handle` as mutable more than once at a time",
+            ),
+        },
     ] {
         run_case(&rustc, &manifest_dir, &output_dir, &case);
     }

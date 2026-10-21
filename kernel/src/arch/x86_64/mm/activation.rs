@@ -150,7 +150,7 @@ pub(crate) use address_space::{
     ExecutedProcessRootSwitch, KernelExecutionRoot, KernelExecutionRoots, KernelHalfBinding,
     KernelRootSelectionFailure, PreparedKernelExecutionRootSwitch, PreparedKernelRootEntry,
     PreparedKernelToProcessRootSwitch, PreparedProcessRootSwitch, PreparedRootSelection,
-    RootBindingError, RootSelectionFailure, RootSwitchTarget,
+    RootBindingError, RootSelectionFailure, RootSwitchTarget, UserCopyRoot,
 };
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1879,13 +1879,24 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .with_temporary_mmio_frame(frame, operation)
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "the CPU-owned active-root token is checked against current CPU identity and CR3 before raw-VA usercopy"
-    )]
     pub(crate) fn current_process_address_space(
         &mut self,
         active_root: &ActiveRootSelection,
+        process: crate::task::ProcessKey,
+    ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+        self.usercopy_process_address_space(active_root.usercopy_root(), process)
+    }
+
+    /// As `current_process_address_space`, from a copied selection identity
+    /// (D1 commit 5). The copy is revalidated against the live binding, this
+    /// CPU, CR3 and the residency epoch before the session exists.
+    #[allow(
+        unsafe_code,
+        reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
+    )]
+    pub(crate) fn usercopy_process_address_space(
+        &mut self,
+        active_root: address_space::UserCopyRoot,
         process: crate::task::ProcessKey,
     ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
         let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
@@ -1901,7 +1912,7 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let (root, identity, address_space) = self
             .root_bindings
-            .active_root_for_process(&self.root, active_root, cpu, observed_root, process)
+            .usercopy_root_for_process(&self.root, active_root, cpu, observed_root, process)
             .unwrap_or_else(|error| {
                 panic!("process usercopy root is not current on this CPU: {error:?}")
             });

@@ -1742,6 +1742,9 @@ struct RuntimeCarrierFacade<
         PrimordialRuntimeState<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
     >,
     shared: &'static PrimordialRuntimeShared,
+    /// The paging lock P, which this CPU takes alone only for a guard-free
+    /// usercopy (D1 commit 5); a carrier reaches it beneath its guard.
+    paging: &'runtime PagingLock<RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     /// This CPU's owner-local runtime facts, lent to its carrier for each
     /// guard hold (S2K-6, design §11.1).
     owned: CpuOwnedState,
@@ -1937,6 +1940,64 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
             crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
         )
+    }
+
+    /// Family A (design §11.2.3, D1 commit 5): a syscall that needs no
+    /// runtime authority, only its usercopy. The safe-point synchronization
+    /// and one short guard hold run as for every syscall. That hold checks
+    /// the running Thread, reserves the phase, and copies the CPU's root
+    /// identity. The usercopy then runs with neither T nor P beneath it,
+    /// taking P alone through a `GuardFree`, so H0 §12.8 holds by
+    /// construction. A last hold commits the phase and leaves through
+    /// `ready_to_return`. `None` for every other request.
+    fn handle_guard_free_usercopy(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        if !matches!(
+            request,
+            NativeSyscallRequest::AbiGetInfo { .. } | NativeSyscallRequest::ClockGet { .. }
+        ) {
+            return None;
+        }
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let result = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            NativeSyscallResult::returning(match request {
+                NativeSyscallRequest::AbiGetInfo {
+                    out_info,
+                    out_size,
+                    out_required_size,
+                } => crate::syscall::abi_get_info_with_features(
+                    &mut user,
+                    out_info,
+                    out_size,
+                    out_required_size,
+                    deepwyrm_abi::DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT,
+                ),
+                NativeSyscallRequest::ClockGet {
+                    clock_id,
+                    out_nanoseconds,
+                } => crate::syscall::clock_get_with(&mut user, clock_id, out_nanoseconds, || {
+                    crate::time::monotonic_now().map_err(|_| deepwyrm_abi::DW_STATUS_BAD_STATE)
+                }),
+                _ => unreachable!("guard-free usercopy classification drifted"),
+            })
+        };
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        runtime.commit_runtime_phase(phase);
+        Some(Ok(runtime.ready_to_return(result)))
     }
 
     /// Runs one scheduler-current transaction under the same runtime guard as
@@ -8362,13 +8423,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     break 'handled crate::syscall::native::ReturnReady::complete_remote_stop();
                 }
             }
-            let cpu = self.cpu;
-            let ready = match self.with_synchronized_runtime_at_safe_point(|runtime| {
-                if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                    runtime.service_pending_timer_expiries_on_bootstrap();
+            let handled = match self.handle_guard_free_usercopy(request) {
+                Some(handled) => handled,
+                None => {
+                    let cpu = self.cpu;
+                    self.with_synchronized_runtime_at_safe_point(|runtime| {
+                        if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                            runtime.service_pending_timer_expiries_on_bootstrap();
+                        }
+                        runtime.handle(request)
+                    })
                 }
-                runtime.handle(request)
-            }) {
+            };
+            let ready = match handled {
                 Ok(ready) => ready,
                 Err(()) => {
                     break 'handled crate::syscall::native::ReturnReady::service_rendezvous();
@@ -9908,6 +9975,7 @@ pub(super) fn enter(
             }
             .unwrap_or_else(|| panic!("no runtime authority handle for CPU {cpu_index}")),
             shared,
+            paging,
             owned: owned[cpu_index]
                 .take()
                 .unwrap_or_else(|| panic!("no owner-local state for CPU {cpu_index}")),
@@ -10174,6 +10242,46 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.ready_to_return(result)
     }
 
+    /// The guarded half of a family-A syscall's preparation (D1 commit 5):
+    /// the same running-Thread check and I1 observation as `handle`, the
+    /// phase reservation, and a copy of this CPU's root identity for the
+    /// usercopy that follows guard-free.
+    fn prepare_guard_free_usercopy(
+        &mut self,
+    ) -> (
+        crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        super::UserCopyRoot,
+        ProcessKey,
+    ) {
+        if self
+            .core
+            .shared
+            .execution
+            .scheduler_state(self.own.scheduled().thread)
+            != Some(SchedulerThreadState::Running)
+        {
+            panic!("primordial syscall arrived without its running Thread");
+        }
+        #[cfg(deepwyrm_i1_evidence)]
+        {
+            let claim = self
+                .core
+                .shared
+                .execution
+                .running_claim_on(self.cpu())
+                .unwrap_or_else(|| panic!("I1 syscall has no running execution claim"));
+            crate::test_support::observe_i1_cpl3_syscall(self.cpu(), claim.generation(), 1);
+        }
+        let phase = self.reserve_runtime_phase();
+        let root = self
+            .own
+            .active_root
+            .as_ref()
+            .expect("active root")
+            .usercopy_root();
+        (phase, root, self.own.scheduled().process)
+    }
+
     /// The only way a syscall result leaves the runtime guard for its
     /// dispatcher. A syscall return is the publication boundary for final
     /// handle releases: a result that returns to the caller first drains the
@@ -10313,23 +10421,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
         match request {
-            NativeSyscallRequest::AbiGetInfo {
-                out_info,
-                out_size,
-                out_required_size,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::abi_get_info_with_features(
-                    &mut user,
-                    out_info,
-                    out_size,
-                    out_required_size,
-                    deepwyrm_abi::DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT,
-                ))
+            NativeSyscallRequest::AbiGetInfo { .. } => {
+                unreachable!("AbiGetInfo must be served guard-free by the CPU-local facade")
             }
             NativeSyscallRequest::HandleClose { handle } => {
                 #[cfg(deepwyrm_i1_evidence)]

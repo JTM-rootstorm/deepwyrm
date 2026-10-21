@@ -1204,3 +1204,28 @@ fn address_space_identity_release_refuses_live_region_records() {
         Err(AddressRegionError::OutsideRegion)
     );
 }
+
+/// D1 commit 5: a copied residency witness is revalidated against the live
+/// residency, so a copy outlives neither the residency it names nor a later
+/// entry by the same CPU.
+#[test]
+fn a_residency_witness_is_valid_only_for_its_live_epoch() {
+    let coherency = AddressSpaceCoherency::<2>::new(AddressSpaceKey::for_test(21, 23));
+    let cpu = CpuIndex::new(1).unwrap();
+    let residency = coherency.enter(cpu).unwrap();
+    let witness = residency.witness();
+    assert_eq!(witness.cpu(), cpu);
+    assert_eq!(coherency.validate_residency(witness), Ok(()));
+    coherency.leave_after_local_flush(residency).unwrap();
+    assert_eq!(
+        coherency.validate_residency(witness),
+        Err(AddressSpaceCoherencyError::NotResident)
+    );
+    let again = coherency.enter(cpu).unwrap();
+    assert_eq!(
+        coherency.validate_residency(witness),
+        Err(AddressSpaceCoherencyError::StaleResidency)
+    );
+    assert_eq!(coherency.validate_residency(again.witness()), Ok(()));
+    coherency.leave_after_local_flush(again).unwrap();
+}

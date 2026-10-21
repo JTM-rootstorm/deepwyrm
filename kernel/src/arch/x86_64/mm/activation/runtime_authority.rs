@@ -232,13 +232,15 @@ impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
 ///
 /// P is a component lock beneath the runtime authority, T, in the order
 /// DW0-H §12.5 permits: always T, then P, and never P before T. The order
-/// is a type fact. The only way to reach P is a [`PagingAccess`], which only
-/// [`RuntimeAuthorityGuard::with_paging`] mints, and which mutably borrows
-/// that T guard for its whole life. So:
-/// - a P guard cannot outlive the T guard beneath which it was taken;
-/// - no code holds P without holding T, so none can take T after P;
-/// - the CPU's handle stays borrowed by its T guard, so T cannot be taken
-///   twice either.
+/// is a type fact. The only way to reach P is a [`PagingAccess`]. Two
+/// functions mint one, and each keeps the CPU's handle mutably borrowed for
+/// the access's whole life:
+/// - [`RuntimeAuthorityGuard::with_paging`] borrows a T guard, so a P guard
+///   cannot outlive the T guard beneath which it was taken;
+/// - [`PagingLock::guard_free_access`] consumes a `GuardFree` (D1 commit 5),
+///   so no T guard exists, and none can be taken, while that access lives.
+///
+/// So no code takes T after P.
 ///
 /// It lives outside T's value, so a later D1 step can give usercopy its own
 /// way in without reaching into T's cell.
@@ -277,6 +279,23 @@ impl<P> PagingLock<P> {
     }
 }
 
+impl<P> PagingLock<P> {
+    /// Access to P with no T guard beneath it, for a usercopy (D1 commit 5,
+    /// design §11.2.3 family A). The `GuardFree` token mutably borrows the
+    /// CPU's handle for `'a`, and so does the access. So no T guard is alive
+    /// while the access is, and none can be taken while it lives: P is never
+    /// held before T.
+    pub(super) fn guard_free_access<'a>(
+        &'a self,
+        _guard_free: GuardFree<'a>,
+    ) -> PagingAccess<'a, P> {
+        PagingAccess {
+            lock: self,
+            _beneath_runtime_guard: PhantomData,
+        }
+    }
+}
+
 impl<'g, T> RuntimeAuthorityGuard<'g, T> {
     /// Splits this T guard into its value and access to `paging` beneath it.
     /// The access mutably borrows the guard, so P is reached only while T is
@@ -293,8 +312,9 @@ impl<'g, T> RuntimeAuthorityGuard<'g, T> {
     }
 }
 
-/// The right to take P during one T hold. Neither `Clone` nor `Copy`, and
-/// constructible only by [`RuntimeAuthorityGuard::with_paging`].
+/// The right to take P during one T hold, or during one guard-free usercopy.
+/// Neither `Clone` nor `Copy`, and constructible only by
+/// [`RuntimeAuthorityGuard::with_paging`] and [`PagingLock::guard_free_access`].
 pub(super) struct PagingAccess<'a, P> {
     lock: &'a PagingLock<P>,
     _beneath_runtime_guard: PhantomData<&'a mut ()>,

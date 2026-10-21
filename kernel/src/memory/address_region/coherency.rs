@@ -156,6 +156,31 @@ impl Residency {
     pub(crate) const fn observed_shootdown_generation(&self) -> u64 {
         self.observed_shootdown_generation
     }
+
+    /// A copy of this residency's identity, for revalidation where the token
+    /// itself cannot be borrowed (D1 commit 5: a guard-free usercopy). It
+    /// proves nothing on its own; `validate_residency` checks it against the
+    /// live residency state.
+    pub(crate) const fn witness(&self) -> ResidencyWitness {
+        ResidencyWitness {
+            cpu: self.cpu,
+            epoch: self.epoch,
+        }
+    }
+}
+
+/// The identity of one CPU's residency in one address space, as of when it
+/// was copied: its CPU and residency epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResidencyWitness {
+    cpu: CpuIndex,
+    epoch: u64,
+}
+
+impl ResidencyWitness {
+    pub(crate) const fn cpu(self) -> CpuIndex {
+        self.cpu
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -443,6 +468,15 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
     pub(crate) fn preflight_leave_after_local_flush(
         &self,
         residency: &Residency,
+    ) -> Result<(), AddressSpaceCoherencyError> {
+        self.validate_residency(residency.witness())
+    }
+
+    /// Whether the witnessed residency is still this address space's live
+    /// residency for its CPU: resident, at the same epoch.
+    pub(crate) fn validate_residency(
+        &self,
+        residency: ResidencyWitness,
     ) -> Result<(), AddressSpaceCoherencyError> {
         let index = self.checked_cpu(residency.cpu)?;
         let state = self.state.lock();
