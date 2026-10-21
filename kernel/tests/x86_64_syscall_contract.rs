@@ -2350,6 +2350,8 @@ fn family_b_outputs_are_pinned_before_and_written_after_the_hold() {
         // D1 commit 6b: a two-output creator and the atomic wake.
         "NativeSyscallRequest::ChannelCreate {",
         "NativeSyscallRequest::AtomicWake { out_woken, .. }",
+        // D1 commit 6c: the creator whose backing is allocated under P alone.
+        "NativeSyscallRequest::MemoryObjectCreate { out_handle, .. }",
     ] {
         assert!(helper.contains(request), "family B omits {request}");
     }
@@ -2374,6 +2376,15 @@ fn family_b_outputs_are_pinned_before_and_written_after_the_hold() {
         .find("FAtomicUserAccess::release_atomic_u32(&mut user, pin);")
         .expect("guard-free atomic pin release");
     assert!(run < release && release < copy);
+    // MemoryObjectCreate's backing is allocated, and an unused or rolled-back
+    // one returned, with P alone on either side of the hold.
+    let allocate = helper
+        .find("MemoryObjectBackingAccess::allocate_zeroed_backing(")
+        .expect("early backing allocation");
+    let rollback = helper
+        .find("MemoryObjectBackingAccess::rollback_object_backing(")
+        .expect("guard-free backing rollback");
+    assert!(pin < allocate && allocate < run && run < rollback && rollback < copy);
     // Each owned output receives the bytes recorded at its own index.
     assert!(helper.contains("match deferred.written_at(index) {"));
     assert_eq!(

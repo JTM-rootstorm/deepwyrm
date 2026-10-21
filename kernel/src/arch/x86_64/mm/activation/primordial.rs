@@ -2064,7 +2064,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             NativeSyscallRequest::AtomicWake { out_woken, .. } => {
                 [Some((out_woken, 4, 4)), None, None]
             }
+            NativeSyscallRequest::MemoryObjectCreate { out_handle, .. } => handle(out_handle),
             _ => return None,
+        };
+        // MemoryObjectCreate's backing, allocated with P alone before the
+        // hold, when its size is one the adapter can reach its allocation
+        // with (D1 commit 6c).
+        let backing_pages = match request {
+            NativeSyscallRequest::MemoryObjectCreate { byte_len, .. }
+                if byte_len != 0
+                    && byte_len.is_multiple_of(u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE)) =>
+            {
+                Some(byte_len / u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE))
+            }
+            _ => None,
         };
         let cpu = self.cpu;
         let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
@@ -2087,7 +2100,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             }
         }
-        let (atomic_pin, pinned) = {
+        let (atomic_pin, pinned, backing) = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut user = paging.usercopy_process_address_space(root, process);
@@ -2124,15 +2137,39 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     Some(owned)
                 }
             };
-            (atomic_pin, pinned)
+            let backing = match (backing_pages, &pinned) {
+                (Some(page_count), Some(_)) => Some(
+                    crate::syscall::MemoryObjectBackingAccess::allocate_zeroed_backing(
+                        &mut user, page_count,
+                    ),
+                ),
+                _ => None,
+            };
+            (atomic_pin, pinned, backing)
         };
         let pin_taken = matches!(atomic_pin, Some(Ok(_)));
         let mut deferred =
             crate::memory::usercopy::DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));
+        let mut rollback = None;
         let (ready, released_pin) = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
             let (status, released_pin) = match (request, atomic_pin) {
+                (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
+                    let mut access = crate::syscall::DeferredMemoryObjectAccess::new(
+                        core::mem::replace(
+                            &mut deferred,
+                            crate::memory::usercopy::DeferredUserOutput::batch(None),
+                        ),
+                        backing_pages.unwrap_or(0),
+                        backing,
+                    );
+                    let status = runtime.run_deferred_output_with(request, &mut access);
+                    let (output, unused) = access.into_parts();
+                    deferred = output;
+                    rollback = unused;
+                    (status, None)
+                }
                 (
                     NativeSyscallRequest::AtomicWake {
                         address,
@@ -2161,10 +2198,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin_taken,
             "a deferred atomic pin was not returned for release"
         );
-        if released_pin.is_some() || pinned.is_some() {
+        if released_pin.is_some() || pinned.is_some() || rollback.is_some() {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut user = paging.usercopy_process_address_space(root, process);
+            if let Some(grant) = rollback {
+                crate::syscall::MemoryObjectBackingAccess::rollback_object_backing(
+                    &mut user, grant,
+                );
+            }
             if let Some(pin) = released_pin {
                 crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
             }
@@ -10585,6 +10627,38 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// The guarded half of a deferred `MemoryObjectCreate` (D1 commit 6c):
+    /// the ordinary adapter call, with the early backing and output standing
+    /// in for the user session.
+    fn run_deferred_output_with(
+        &mut self,
+        request: NativeSyscallRequest,
+        access: &mut crate::syscall::DeferredMemoryObjectAccess,
+    ) -> deepwyrm_abi::DwStatus {
+        let NativeSyscallRequest::MemoryObjectCreate {
+            byte_len,
+            flags,
+            requested_rights,
+            out_handle,
+        } = request
+        else {
+            unreachable!("deferred MemoryObject classification drifted")
+        };
+        let process = self.own.scheduled().process;
+        crate::syscall::memory_object_create_owned(
+            access,
+            &mut self.core.registry,
+            &mut self.core.memory,
+            &mut self.core.tasks,
+            process,
+            byte_len,
+            flags,
+            requested_rights,
+            out_handle,
+            &mut self.core.cleanup,
+        )
+    }
+
     /// The guarded half of a deferred `AtomicWake` (D1 commit 6b). The early
     /// atomic pin comes back for release after the hold.
     fn run_deferred_atomic_wake(
@@ -10800,7 +10874,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | NativeSyscallRequest::ThreadCreate { .. }
             | NativeSyscallRequest::DeviceResourceClaim { .. }
             | NativeSyscallRequest::DevicePioRead { .. }
-            | NativeSyscallRequest::InterruptCreate { .. } => {
+            | NativeSyscallRequest::InterruptCreate { .. }
+            | NativeSyscallRequest::MemoryObjectCreate { .. } => {
                 unreachable!(
                     "family-B requests are served by the CPU-local facade's deferred output"
                 )
@@ -10926,30 +11001,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 reason,
                 code,
             } => self.terminate_thread_handle(thread, reason, code),
-            NativeSyscallRequest::MemoryObjectCreate {
-                byte_len,
-                flags,
-                requested_rights,
-                out_handle,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::memory_object_create_owned(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.memory,
-                    &mut self.core.tasks,
-                    self.own.scheduled().process,
-                    byte_len,
-                    flags,
-                    requested_rights,
-                    out_handle,
-                    &mut self.core.cleanup,
-                ))
-            }
             NativeSyscallRequest::AddressRegionMap {
                 address_region,
                 memory_object,

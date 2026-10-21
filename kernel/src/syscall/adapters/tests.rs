@@ -11406,3 +11406,124 @@ fn a_pinned_range_conflict_fails_unmap_and_protect_with_bad_state() {
     let coherent = crate::memory::address_region::CoherentPublishError::Publish(journal);
     assert_eq!(coherent.syscall_status(), DW_STATUS_BAD_STATE);
 }
+
+/// D1 commit 6c: MemoryObjectCreate against a backing allocated, and an
+/// output pinned, before the runtime authority keeps its statuses. It
+/// consumes the early backing on success, and returns it for rollback when
+/// the adapter never reaches its allocation.
+#[test]
+fn a_deferred_memory_object_create_consumes_or_returns_its_early_backing() {
+    use deepwyrm_abi::{DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let mut backing = TestBacking::new();
+    // One object slot, so a second creation fails at its binding.
+    let mut memory = MemoryObjectAuthority::<1, 4>::new();
+    let rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0);
+    let mut cleanup = CleanupQueue::<16>::new();
+    let out = DwUserAddress(BASE + 0x100);
+    let range = output_range(out, 8, 8).unwrap();
+    let deferred = || crate::memory::usercopy::DeferredUserOutput::new(Some(range));
+    let mut create = |access: &mut DeferredMemoryObjectAccess,
+                      registry: &mut ObjectRegistry<16>,
+                      memory: &mut MemoryObjectAuthority<1, 4>,
+                      tasks: &mut _,
+                      flags: u32| {
+        memory_object_create_owned(
+            access,
+            registry,
+            memory,
+            tasks,
+            process,
+            4096,
+            flags,
+            rights,
+            out,
+            &mut cleanup,
+        )
+    };
+
+    // Success consumes the early backing and records the handle.
+    let early = backing.allocate_zeroed_backing(1);
+    let mut access = DeferredMemoryObjectAccess::new(deferred(), 1, Some(early));
+    assert_eq!(
+        create(&mut access, &mut registry, &mut memory, &mut tasks, 0),
+        DW_STATUS_SUCCESS
+    );
+    let (output, unused) = access.into_parts();
+    assert!(unused.is_none());
+    let memory_handle = DwHandle(u64::from_le_bytes(
+        output
+            .written()
+            .expect("handle written")
+            .try_into()
+            .unwrap(),
+    ));
+
+    // A binding failure: the adapter rolls the backing back, and the deferred
+    // access keeps it for the caller's rollback.
+    let early = backing.allocate_zeroed_backing(1);
+    let mut access = DeferredMemoryObjectAccess::new(deferred(), 1, Some(early));
+    assert_eq!(
+        create(&mut access, &mut registry, &mut memory, &mut tasks, 0),
+        DW_STATUS_NO_RESOURCES
+    );
+    let (output, rolled_back) = access.into_parts();
+    assert_eq!(output.written(), None);
+    backing.rollback_object_backing(rolled_back.expect("rolled-back backing kept"));
+
+    // Invalid flags fail before the allocation: the early backing returns.
+    let early = backing.allocate_zeroed_backing(1);
+    let mut access = DeferredMemoryObjectAccess::new(deferred(), 1, Some(early));
+    assert_eq!(
+        create(&mut access, &mut registry, &mut memory, &mut tasks, 1),
+        DW_STATUS_INVALID_ARGUMENT
+    );
+    let (output, unused) = access.into_parts();
+    assert_eq!(output.written(), None);
+    backing.rollback_object_backing(unused.expect("unused early backing returned"));
+
+    // An early allocation failure is the adapter's allocation status.
+    let mut access = DeferredMemoryObjectAccess::new(
+        deferred(),
+        1,
+        Some(Err(deepwyrm_abi::DW_STATUS_NO_MEMORY)),
+    );
+    assert_eq!(
+        create(&mut access, &mut registry, &mut memory, &mut tasks, 0),
+        deepwyrm_abi::DW_STATUS_NO_MEMORY
+    );
+    let (output, unused) = access.into_parts();
+    assert!(unused.is_none());
+    assert_eq!(output.written(), None);
+
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            memory_handle,
+            &mut cleanup
+        ),
+        DW_STATUS_SUCCESS
+    );
+    while let Some(release) = cleanup.pop() {
+        let finalization = memory.take_finalization(release).unwrap();
+        crate::memory::object::complete_memory_finalization(
+            &mut registry,
+            &mut backing.roles,
+            finalization,
+        );
+    }
+    let mut final_cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            process_handle,
+            &mut final_cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+}

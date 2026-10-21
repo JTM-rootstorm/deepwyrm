@@ -87,9 +87,9 @@ pub(crate) use adapters::process_terminate;
     reason = "the integrated F12 target probe consumes the synchronous compatibility adapter only when test support is selected"
 )]
 pub(crate) use adapters::{
-    MemoryObjectBackingAccess, ProcessRootReservation, ThreadStartMappingAccess,
-    memory_object_create_owned, process_create_with_root, process_terminate, thread_create,
-    thread_start_with_access, thread_terminate,
+    DeferredMemoryObjectAccess, MemoryObjectBackingAccess, ProcessRootReservation,
+    ThreadStartMappingAccess, memory_object_create_owned, process_create_with_root,
+    process_terminate, thread_create, thread_start_with_access, thread_terminate,
 };
 #[cfg(deepwyrm_e7_guest)]
 pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};

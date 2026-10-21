@@ -6803,6 +6803,126 @@ pub(crate) trait MemoryObjectBackingAccess {
     fn rollback_object_backing(&mut self, backing: crate::memory::frame_roles::ObjectBackingGrant);
 }
 
+/// `memory_object_create_owned`'s access with its zeroed backing allocated,
+/// and its output pinned, before the runtime authority (D1 commit 6c, design
+/// §11.2.3 family B).
+///
+/// Allocating and zeroing the backing needs the paging authority's frame
+/// roles and scratch window, not the object authorities. So the caller
+/// allocates it with the paging lock alone, before the runtime authority.
+/// The adapter then runs under the runtime authority with this value as its
+/// access and keeps its own order:
+/// - `allocate_zeroed_backing` hands over the early allocation, or its early
+///   failure;
+/// - `rollback_object_backing` keeps the grant;
+/// - output preflight and commit go to the `DeferredUserOutput`.
+///
+/// Afterwards `into_parts` returns the output, and any grant to roll back:
+/// the early allocation if the adapter never took it, or the one it rolled
+/// back. The caller rolls that back with the paging lock alone.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime allocates backing early")
+)]
+pub(crate) struct DeferredMemoryObjectAccess {
+    output: crate::memory::usercopy::DeferredUserOutput,
+    page_count: u64,
+    backing: Option<Result<crate::memory::frame_roles::ObjectBackingGrant, DwStatus>>,
+    returned: Option<crate::memory::frame_roles::ObjectBackingGrant>,
+}
+
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime allocates backing early")
+)]
+impl DeferredMemoryObjectAccess {
+    /// `backing` is the early allocation of `page_count` pages, or `None` if
+    /// none was attempted because the adapter cannot reach its allocation.
+    pub(crate) fn new(
+        output: crate::memory::usercopy::DeferredUserOutput,
+        page_count: u64,
+        backing: Option<Result<crate::memory::frame_roles::ObjectBackingGrant, DwStatus>>,
+    ) -> Self {
+        Self {
+            output,
+            page_count,
+            backing,
+            returned: None,
+        }
+    }
+
+    /// The output, and the grant the caller must roll back, if any.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::memory::usercopy::DeferredUserOutput,
+        Option<crate::memory::frame_roles::ObjectBackingGrant>,
+    ) {
+        let unused = match self.backing {
+            Some(Ok(grant)) => Some(grant),
+            Some(Err(_)) | None => None,
+        };
+        assert!(
+            unused.is_none() || self.returned.is_none(),
+            "an early backing was both unused and rolled back"
+        );
+        (self.output, self.returned.or(unused))
+    }
+}
+
+impl UserPageAccess for DeferredMemoryObjectAccess {
+    type Error = crate::memory::usercopy::DeferredOutputUnavailable;
+    type Pinned<'a>
+        = crate::memory::usercopy::DeferredOutputPin<'a>
+    where
+        Self: 'a;
+
+    fn pin(&mut self, range: UserRange) -> Result<Self::Pinned<'_>, Self::Error> {
+        self.output.pin(range)
+    }
+}
+
+impl OwnedUserOutputAccess for DeferredMemoryObjectAccess {
+    type OwnedOutput = crate::memory::usercopy::DeferredOwnedOutput;
+
+    fn preflight_owned_output(
+        &mut self,
+        range: UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        self.output.preflight_owned_output(range)
+    }
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]) {
+        self.output.commit_owned_output(output, source);
+    }
+
+    fn discard_owned_output(&mut self, output: Self::OwnedOutput) {
+        self.output.discard_owned_output(output);
+    }
+}
+
+impl MemoryObjectBackingAccess for DeferredMemoryObjectAccess {
+    fn allocate_zeroed_backing(
+        &mut self,
+        page_count: u64,
+    ) -> Result<crate::memory::frame_roles::ObjectBackingGrant, DwStatus> {
+        assert_eq!(
+            page_count, self.page_count,
+            "deferred MemoryObject backing size drifted from its early allocation"
+        );
+        self.backing
+            .take()
+            .expect("deferred MemoryObject backing was not allocated early")
+    }
+
+    fn rollback_object_backing(&mut self, backing: crate::memory::frame_roles::ObjectBackingGrant) {
+        assert!(
+            self.returned.replace(backing).is_none(),
+            "deferred MemoryObject backing rolled back twice"
+        );
+    }
+}
+
 fn memory_object_status(error: crate::memory::object::MemoryObjectError) -> DwStatus {
     use crate::memory::object::MemoryObjectError;
     match error {
