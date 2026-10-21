@@ -553,17 +553,29 @@ impl RendezvousMailbox {
     }
 
     /// Acquires the published request before returning it to the target CPU.
+    ///
+    /// The state and the request it names are read under one hold of the
+    /// request lock. The target polls here after it has acknowledged Safe
+    /// (`HoldSafe`), while the initiator may concurrently retire that Safe in
+    /// `complete_reclaim`, which takes the request under the same lock. Read
+    /// apart, a poll could load Safe and then find the request already taken.
+    /// Under the lock, Requested and Safe always name a present request:
+    /// `publish_stop` installs the request before it publishes Requested,
+    /// Safe is reached only from Requested, and `complete_reclaim` leaves Safe
+    /// before it takes the request.
     pub(crate) fn take_notification(&self) -> MailboxNotification {
+        let request = self.request.lock();
+        let published = || request.expect("published rendezvous state has a request");
         match self.state.load(Ordering::Acquire) {
-            MAILBOX_STOP_REQUESTED => MailboxNotification::Stop(self.current_request()),
-            MAILBOX_STOP_SAFE => MailboxNotification::HoldSafe(self.current_request()),
+            MAILBOX_STOP_REQUESTED => MailboxNotification::Stop(published()),
+            MAILBOX_STOP_SAFE => MailboxNotification::HoldSafe(published()),
             MAILBOX_IDLE => {
                 if !self.wake_pending.swap(false, Ordering::AcqRel) {
                     return MailboxNotification::None;
                 }
                 match self.state.load(Ordering::Acquire) {
-                    MAILBOX_STOP_REQUESTED => MailboxNotification::Stop(self.current_request()),
-                    MAILBOX_STOP_SAFE => MailboxNotification::HoldSafe(self.current_request()),
+                    MAILBOX_STOP_REQUESTED => MailboxNotification::Stop(published()),
+                    MAILBOX_STOP_SAFE => MailboxNotification::HoldSafe(published()),
                     MAILBOX_IDLE => MailboxNotification::Wake,
                     _ => {
                         self.wake_pending.store(true, Ordering::Release);
@@ -575,6 +587,10 @@ impl RendezvousMailbox {
         }
     }
 
+    /// The published request, for callers that read Requested or Safe from a
+    /// state no other CPU can retire meanwhile: the target before it
+    /// acknowledges (only it moves Requested to Safe), and the initiator that
+    /// owns the reclaim.
     fn current_request(&self) -> StopRequest {
         self.request
             .lock()
@@ -1038,6 +1054,66 @@ mod tests {
         start.wait();
         target.join().unwrap();
         assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 99);
+    }
+
+    /// The stopped CPU keeps polling its mailbox at safe points after it has
+    /// acknowledged Safe (a HoldSafe), while the initiator reclaims as soon
+    /// as it observes Safe. A poll racing the reclaim must see either the
+    /// held request or the retired mailbox, never Safe without its request
+    /// (the SMP panic "published rendezvous state has a request").
+    #[test]
+    fn target_polls_racing_initiator_reclaim_never_see_safe_without_its_request() {
+        use std::sync::atomic::AtomicBool;
+
+        const ROUNDS: u32 = 20_000;
+        let mut objects = ObjectRegistry::<8>::new();
+        let stop_identity = identity(thread_key(&mut objects));
+        let mailbox = Arc::new(RendezvousMailbox::new(2).unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let target_mailbox = Arc::clone(&mailbox);
+        let target_done = Arc::clone(&done);
+        let target = thread::spawn(move || {
+            let mut acknowledged = 0_u32;
+            while !target_done.load(Ordering::Acquire) {
+                match target_mailbox.take_notification() {
+                    MailboxNotification::Stop(request) => {
+                        let mut model = SafePointModel::new(stop_identity);
+                        target_mailbox
+                            .complete_stop_at_safe_point(request, &mut model)
+                            .unwrap();
+                        acknowledged += 1;
+                    }
+                    MailboxNotification::HoldSafe(request) => {
+                        assert_eq!(request.identity(), stop_identity);
+                    }
+                    MailboxNotification::None | MailboxNotification::Wake => {}
+                }
+            }
+            acknowledged
+        });
+
+        for round in 0..ROUNDS {
+            let mut deferred = mailbox.publish_stop(stop_identity, round).unwrap();
+            let reclaimed = loop {
+                match mailbox.complete_reclaim(deferred) {
+                    Ok(resource) => break resource,
+                    Err(failure) => {
+                        assert_eq!(failure.error(), ReclaimError::AwaitingAcknowledgement);
+                        deferred = failure.into_deferred();
+                        // A target that panicked never acknowledges: surface its panic.
+                        if target.is_finished() {
+                            done.store(true, Ordering::Release);
+                            let outcome = target.join();
+                            panic!("target stopped polling in round {round}: {outcome:?}");
+                        }
+                        core::hint::spin_loop();
+                    }
+                }
+            };
+            assert_eq!(reclaimed, round);
+        }
+        done.store(true, Ordering::Release);
+        assert_eq!(target.join().unwrap(), ROUNDS);
     }
 
     #[test]
