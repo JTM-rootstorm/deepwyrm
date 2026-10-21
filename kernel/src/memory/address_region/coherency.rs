@@ -705,6 +705,10 @@ pub(crate) struct CoherentAddressSpacePublisher<
     coherency: &'a AddressSpaceCoherency<CPUS>,
     driver: &'a mut D,
     completed: Option<ReclaimPermit>,
+    /// D1 option B3: a deferred publisher returns after notifying its
+    /// targets, and its caller waits for the acknowledgements.
+    deferred: bool,
+    pending: Option<(ShootdownRequest, CpuSet<CPUS>)>,
 }
 
 impl<'a, P, D, const CPUS: usize, const WAIT_STEPS: usize>
@@ -720,11 +724,65 @@ impl<'a, P, D, const CPUS: usize, const WAIT_STEPS: usize>
             coherency,
             driver,
             completed: None,
+            deferred: false,
+            pending: None,
         }
     }
 
+    /// A publisher that does not wait (D1 option B3, design §11.2.9). It
+    /// publishes the page tables, the request and the target notifications,
+    /// then returns. [`Self::finish_deferred`] hands back the published
+    /// request as a [`PendingShootdown`], which its caller awaits after
+    /// releasing the locks it published under.
+    ///
+    /// # Safety
+    ///
+    /// `coherency` must stay alive, at the same address, until every
+    /// `PendingShootdown` this publisher returns has completed. The live
+    /// coherency domains sit in their root bindings in stationary paging
+    /// storage, and a binding is removed only by a teardown that first
+    /// prepares one on the domain, which a published mutation refuses.
+    #[allow(
+        unsafe_code,
+        reason = "the caller promises the coherency domain outlives the shootdown it hands back"
+    )]
+    pub(crate) const unsafe fn new_deferred(
+        publisher: &'a mut P,
+        coherency: &'a AddressSpaceCoherency<CPUS>,
+        driver: &'a mut D,
+    ) -> Self {
+        let mut publisher = Self::new(publisher, coherency, driver);
+        publisher.deferred = true;
+        publisher
+    }
+
     /// The settlement of the shootdown this publisher published, if any.
+    /// A waiting publisher's only finish.
     pub(crate) fn finish(self) -> ShootdownOutcome {
+        assert!(
+            self.pending.is_none(),
+            "a deferred coherent publisher finished without its pending shootdown"
+        );
+        self.settled()
+    }
+
+    /// A deferred publisher's finish: the shootdown still to be acknowledged,
+    /// or, if it published none or its targets were all acknowledged at
+    /// once, its settlement.
+    pub(crate) fn finish_deferred(self) -> PublishedShootdown<CPUS> {
+        match self.pending {
+            Some((request, targets)) => PublishedShootdown::Pending(PendingShootdown {
+                parts: Some(PendingShootdownParts {
+                    coherency: core::ptr::NonNull::from(self.coherency),
+                    request,
+                    targets,
+                }),
+            }),
+            None => PublishedShootdown::Settled(self.settled()),
+        }
+    }
+
+    fn settled(self) -> ShootdownOutcome {
         match self.completed {
             Some(permit) => ShootdownOutcome::Completed(permit),
             None => ShootdownOutcome::NothingPublished(NothingPublished { _private: () }),
@@ -733,9 +791,126 @@ impl<'a, P, D, const CPUS: usize, const WAIT_STEPS: usize>
 
     fn record_completion(&mut self, permit: ReclaimPermit) {
         assert!(
-            self.completed.replace(permit).is_none(),
+            self.completed.is_none() && self.pending.is_none(),
             "one coherent publisher published two shootdowns"
         );
+        self.completed = Some(permit);
+    }
+
+    fn record_pending(&mut self, barrier: ShootdownBarrier<'_, CPUS>) {
+        assert!(
+            self.completed.is_none() && self.pending.is_none(),
+            "one coherent publisher published two shootdowns"
+        );
+        self.pending = Some((barrier.request, barrier.targets));
+    }
+}
+
+/// What a deferred coherent publisher hands back (D1 option B3).
+#[must_use = "a published shootdown must be awaited, or its settlement consumed"]
+pub(crate) enum PublishedShootdown<const CPUS: usize> {
+    /// Nothing is left to acknowledge.
+    Settled(ShootdownOutcome),
+    /// The request is published and its targets notified.
+    Pending(PendingShootdown<CPUS>),
+}
+
+/// One published shootdown whose acknowledgements are still awaited, detached
+/// from the locks it was published under (D1 option B3, design §11.2.9).
+/// Only [`CoherentAddressSpacePublisher::finish_deferred`] makes one, under
+/// [`CoherentAddressSpacePublisher::new_deferred`]'s contract that its
+/// coherency domain outlives it. Its completion mints the [`ReclaimPermit`].
+/// Dropping one before it completes is a kernel bug and panics.
+#[must_use = "a pending shootdown must be awaited for its permit"]
+pub(crate) struct PendingShootdown<const CPUS: usize> {
+    parts: Option<PendingShootdownParts<CPUS>>,
+}
+
+struct PendingShootdownParts<const CPUS: usize> {
+    coherency: core::ptr::NonNull<AddressSpaceCoherency<CPUS>>,
+    request: ShootdownRequest,
+    targets: CpuSet<CPUS>,
+}
+
+impl<const CPUS: usize> PendingShootdown<CPUS> {
+    pub(crate) fn request(&self) -> ShootdownRequest {
+        self.parts
+            .as_ref()
+            .expect("a pending shootdown keeps its request until it completes")
+            .request
+    }
+
+    /// Mints the permit once every target has acknowledged.
+    #[allow(
+        unsafe_code,
+        reason = "the deferred publisher's contract keeps the coherency domain alive until completion"
+    )]
+    pub(crate) fn try_complete(mut self) -> Result<ReclaimPermit, Self> {
+        let parts = self
+            .parts
+            .take()
+            .expect("a pending shootdown completes once");
+        // SAFETY: `CoherentAddressSpacePublisher::new_deferred`'s contract keeps this coherency
+        // domain alive, at this address, until this shootdown completes, which is not before this
+        // call returns a permit.
+        let coherency = unsafe { parts.coherency.as_ref() };
+        let barrier = ShootdownBarrier {
+            coherency,
+            request: parts.request,
+            targets: parts.targets,
+        };
+        match barrier.try_complete() {
+            Ok(permit) => Ok(permit),
+            Err(barrier) => {
+                self.parts = Some(PendingShootdownParts {
+                    coherency: parts.coherency,
+                    request: barrier.request,
+                    targets: barrier.targets,
+                });
+                Err(self)
+            }
+        }
+    }
+
+    /// Waits for every acknowledgement, driving `driver` between attempts,
+    /// and mints the permit. Panics after `WAIT_STEPS` steps.
+    #[allow(
+        unsafe_code,
+        reason = "the deferred publisher's contract keeps the coherency domain alive until completion"
+    )]
+    pub(crate) fn await_permit<D: ShootdownDriver<CPUS>, const WAIT_STEPS: usize>(
+        mut self,
+        driver: &mut D,
+    ) -> ReclaimPermit {
+        for _ in 0..WAIT_STEPS {
+            match self.try_complete() {
+                Ok(permit) => return permit,
+                Err(pending) => self = pending,
+            }
+            let coherency = self
+                .parts
+                .as_ref()
+                .expect("a pending shootdown keeps its domain until it completes")
+                .coherency;
+            // SAFETY: as in `try_complete`: the domain outlives this uncompleted shootdown.
+            driver.wait_step(unsafe { coherency.as_ref() });
+        }
+        match self.try_complete() {
+            Ok(permit) => permit,
+            Err(pending) => {
+                // Leaked, not dropped: its own drop would turn this report into a double panic.
+                core::mem::forget(pending);
+                panic!("address-space shootdown acknowledgement timeout");
+            }
+        }
+    }
+}
+
+impl<const CPUS: usize> Drop for PendingShootdown<CPUS> {
+    fn drop(&mut self) {
+        if self.parts.take().is_some() {
+            panic!("a published shootdown was dropped before its acknowledgement");
+        }
     }
 }
 
@@ -815,6 +990,10 @@ where
         match barrier.try_complete() {
             Ok(permit) => {
                 self.record_completion(permit);
+                return Ok(());
+            }
+            Err(pending) if self.deferred => {
+                self.record_pending(pending);
                 return Ok(());
             }
             Err(pending) => barrier = pending,

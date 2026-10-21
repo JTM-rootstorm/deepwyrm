@@ -32,7 +32,7 @@ use super::GuardFree;
 use super::cpu_slots::{CpuOwner, CpuSlots, OtherCpus, RemotelyStaged};
 use super::runtime_authority::{
     PagingAccess, PagingLock, RuntimeAuthorityGuard, RuntimeAuthorityHandle, RuntimeAuthorityLock,
-    ShootdownInitiatorLock,
+    ShootdownInitiatorGuard, ShootdownInitiatorLock,
 };
 use crate::one_shot::init_fields;
 use core::cell::UnsafeCell;
@@ -1799,6 +1799,30 @@ struct QuantumExpiryPublisher {
     shared: &'static PrimordialRuntimeShared,
 }
 
+/// A family-G shootdown published in its syscall's first hold and awaited
+/// after it, with neither T nor P held (D1 option B3, design §11.2.9): the
+/// pending request, the driver that notified its targets, and S, released
+/// only on its permit.
+struct FamilyGShootdown {
+    pending: crate::memory::address_region::PendingShootdown<{ crate::cpu::CPU_CAPACITY }>,
+    driver: user_access::LiveTlbShootdownDriver,
+    initiator: ShootdownInitiatorGuard<'static>,
+}
+
+/// The first hold of a family-G syscall (D1 option B3).
+#[must_use = "a family-G syscall leaves through ready_to_return, now or after its acknowledgement"]
+enum FamilyGBegun {
+    /// Settled in the first hold, and left through `ready_to_return`.
+    Returned(crate::syscall::native::ReturnReady),
+    /// Published: the facade awaits the acknowledgement, releases S, and
+    /// finishes in a last hold.
+    Published {
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        status: deepwyrm_abi::DwStatus,
+        shootdown: FamilyGShootdown,
+    },
+}
+
 /// A resumed F operation's user effects, recorded under the runtime
 /// authority and applied with P alone after it (D1 commit 8, design §11.2.3
 /// family E). The output and the atomic word were pinned before the
@@ -2835,6 +2859,69 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
         }
         Some(Ok(ready))
+    }
+
+    /// `AddressRegionMap`, `AddressRegionUnmap` and `AddressRegionProtect`
+    /// (design §11.2.3 family G and §11.2.9, D1 option B3).
+    /// 1. A first hold, under T and then P: prepare, take S, publish the page
+    ///    tables, commit the model and notify the targets, with every final
+    ///    release held in the frame's `HeldReleases`. A mutation that leaves
+    ///    nothing to acknowledge finishes here.
+    /// 2. With neither T nor P held (`GuardFree`), wait for every
+    ///    acknowledgement, servicing this CPU's mailbox, and mint the permit.
+    /// 3. Release S on the permit.
+    /// 4. A last hold merges the held releases on the permit, revalidates and
+    ///    commits the phase, and leaves through `ready_to_return`, whose drain
+    ///    therefore runs after the acknowledgement.
+    /// `None` for every other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_address_region_mutation(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        if !matches!(
+            request,
+            NativeSyscallRequest::AddressRegionMap { .. }
+                | NativeSyscallRequest::AddressRegionUnmap { .. }
+                | NativeSyscallRequest::AddressRegionProtect { .. }
+        ) {
+            return None;
+        }
+        let cpu = self.cpu;
+        let mut held = crate::syscall::HeldReleases::new();
+        let Ok(begun) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.begin_address_region_mutation(request, &mut held)
+        }) else {
+            return Some(Err(()));
+        };
+        let (phase, status, shootdown) = match begun {
+            FamilyGBegun::Returned(ready) => return Some(Ok(ready)),
+            FamilyGBegun::Published {
+                phase,
+                status,
+                shootdown,
+            } => (phase, status, shootdown),
+        };
+        let FamilyGShootdown {
+            pending,
+            mut driver,
+            initiator,
+        } = shootdown;
+        let permit = user_access::await_shootdown(self.runtime.guard_free(), pending, &mut driver);
+        drop(driver);
+        let settlement = initiator.release(
+            crate::memory::address_region::ShootdownOutcome::Completed(permit),
+        );
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        Some(Ok(runtime.finish_address_region_mutation(
+            &mut held, settlement, phase, status,
+        )))
     }
 
     /// Applies a resumed F operation's recorded user effects with P alone,
@@ -9340,6 +9427,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_process_create(request))
                 .or_else(|| self.handle_wait(request))
                 .or_else(|| self.handle_atomic_wait(request))
+                .or_else(|| self.handle_address_region_mutation(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -11858,37 +11946,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 reason,
                 code,
             } => self.terminate_thread_handle(thread, reason, code),
-            NativeSyscallRequest::AddressRegionMap {
-                address_region,
-                memory_object,
-                args,
-                args_size,
-                out_address,
-            } => NativeSyscallResult::returning(self.map_memory(
-                address_region,
-                memory_object,
-                args,
-                args_size,
-                out_address,
-            )),
-            NativeSyscallRequest::AddressRegionUnmap {
-                address_region,
-                address,
-                byte_len,
-            } => {
-                NativeSyscallResult::returning(self.unmap_memory(address_region, address, byte_len))
+            NativeSyscallRequest::AddressRegionMap { .. }
+            | NativeSyscallRequest::AddressRegionUnmap { .. }
+            | NativeSyscallRequest::AddressRegionProtect { .. } => {
+                unreachable!("family-G requests are served by the CPU-local facade (D1 option B3)")
             }
-            NativeSyscallRequest::AddressRegionProtect {
-                address_region,
-                address,
-                byte_len,
-                protections,
-            } => NativeSyscallResult::returning(self.protect_memory(
-                address_region,
-                address,
-                byte_len,
-                protections,
-            )),
             NativeSyscallRequest::ProcessExit { exit_code } => self.exit_process(exit_code),
             NativeSyscallRequest::DevicePioWrite {
                 resource,
@@ -11959,6 +12021,124 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// The first hold of a family-G syscall (D1 option B3, design §11.2.9):
+    /// the phase reservation and the running-Thread check of `handle`, then
+    /// map, unmap or protect. A mutation whose shootdown is settled in this
+    /// hold (nothing published, or no target left to acknowledge) has its
+    /// releases merged, commits the phase and leaves through
+    /// `ready_to_return`. A published one hands its pending shootdown, the
+    /// held S and the phase to the facade, which waits with neither T nor P
+    /// held.
+    fn begin_address_region_mutation(
+        &mut self,
+        request: NativeSyscallRequest,
+        held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+    ) -> FamilyGBegun {
+        let (phase, _, _) = self.prepare_guard_free_usercopy();
+        let (status, shootdown) = match request {
+            NativeSyscallRequest::AddressRegionMap {
+                address_region,
+                memory_object,
+                args,
+                args_size,
+                out_address,
+            } => self.map_memory(
+                address_region,
+                memory_object,
+                args,
+                args_size,
+                out_address,
+                held,
+            ),
+            NativeSyscallRequest::AddressRegionUnmap {
+                address_region,
+                address,
+                byte_len,
+            } => self.unmap_memory(address_region, address, byte_len, held),
+            NativeSyscallRequest::AddressRegionProtect {
+                address_region,
+                address,
+                byte_len,
+                protections,
+            } => self.protect_memory(address_region, address, byte_len, protections, held),
+            _ => unreachable!("family-G classification drifted"),
+        };
+        match shootdown {
+            None => {
+                self.commit_runtime_phase(phase);
+                FamilyGBegun::Returned(self.ready_to_return(NativeSyscallResult::returning(status)))
+            }
+            Some(shootdown) => FamilyGBegun::Published {
+                phase,
+                status,
+                shootdown,
+            },
+        }
+    }
+
+    /// The last hold of a published family-G syscall (D1 option B3): its
+    /// held releases merge on the permit, after every acknowledgement, so
+    /// `ready_to_return`'s drain reclaims them only then; the phase is
+    /// revalidated and committed.
+    fn finish_address_region_mutation(
+        &mut self,
+        held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+        settlement: crate::memory::address_region::ShootdownOutcome,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        status: deepwyrm_abi::DwStatus,
+    ) -> crate::syscall::native::ReturnReady {
+        held.merge(settlement, &mut self.core.cleanup);
+        self.commit_runtime_phase(phase);
+        self.ready_to_return(NativeSyscallResult::returning(status))
+    }
+
+    /// Settles a family-G shootdown in its first hold when nothing is left to
+    /// acknowledge, or hands it on (D1 option B3).
+    fn settle_or_defer_shootdown<const CLEANUP: usize>(
+        published: crate::memory::address_region::PublishedShootdown<{ crate::cpu::CPU_CAPACITY }>,
+        initiator: ShootdownInitiatorGuard<'static>,
+        driver: user_access::LiveTlbShootdownDriver,
+        held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+        cleanup: &mut crate::syscall::CleanupQueue<CLEANUP>,
+    ) -> Option<FamilyGShootdown> {
+        match published {
+            crate::memory::address_region::PublishedShootdown::Settled(settlement) => {
+                let settlement = initiator.release(settlement);
+                held.merge(settlement, cleanup);
+                None
+            }
+            crate::memory::address_region::PublishedShootdown::Pending(pending) => {
+                Some(FamilyGShootdown {
+                    pending,
+                    driver,
+                    initiator,
+                })
+            }
+        }
+    }
+
+    /// Commits or discards `AddressRegionMap`'s pinned output on the caller's
+    /// usercopy session (commit 9 moves this out of the hold).
+    fn settle_map_output(
+        &mut self,
+        output: user_access::OwnedLiveUserOutput,
+        address: Option<u64>,
+    ) {
+        let mut paging = self.paging.lock();
+        let mut user = paging.current_process_address_space(
+            self.own.active_root.as_ref().expect("active root"),
+            self.own.scheduled().process,
+        );
+        match address {
+            Some(address) => user
+                .commit_owned_output(output, &address.to_le_bytes())
+                .unwrap_or_else(|_| panic!("primordial map output pin drifted")),
+            None => user
+                .discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("primordial map output pin drifted")),
+        }
+    }
+
     // Out of line (D1 option B2): its held releases stay out of the
     // ordinary handler's measured frame.
     #[inline(never)]
@@ -11969,40 +12149,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         args_address: deepwyrm_abi::DwUserAddress,
         args_size: u64,
         out_address: deepwyrm_abi::DwUserAddress,
-    ) -> deepwyrm_abi::DwStatus {
-        let phase = self.reserve_runtime_phase();
+        held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+    ) -> (deepwyrm_abi::DwStatus, Option<FamilyGShootdown>) {
+        let mut shootdown = None;
         let status = (|| {
-            let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
-                self.own.active_root.as_ref().expect("active root"),
-                self.own.scheduled().process,
-            );
-            let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size) {
-                Ok(args) => args,
-                Err(status) => return status,
-            };
-            let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
-                Ok(protection) => protection,
-                Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
-                    return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
-                }
-                Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
-            };
-            let output_range = match UserRange::new(
-                UserAddressSpace::x86_64_four_level(PAGE_SIZE)
-                    .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
-                out_address.0,
-                8,
-                8,
-                UserAccess::WRITE,
-                EmptyAddressRule::Reject,
-            ) {
-                Ok(range) => range,
-                Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
-            };
-            let output = match user.preflight_owned_output(output_range) {
-                Ok(output) => output,
-                Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+            // The arguments and the output pin, on the caller's usercopy
+            // session (commit 9 moves them out of the hold).
+            let (args, protection, output) = {
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
+                    self.own.active_root.as_ref().expect("active root"),
+                    self.own.scheduled().process,
+                );
+                let args = match crate::syscall::decode_map_args(&mut user, args_address, args_size)
+                {
+                    Ok(args) => args,
+                    Err(status) => return status,
+                };
+                let protection = match MemoryProtection::mapping(args.protections.0 as u8) {
+                    Ok(protection) => protection,
+                    Err(crate::memory::object::MemoryObjectError::UnsupportedProtection) => {
+                        return deepwyrm_abi::DW_STATUS_NOT_SUPPORTED;
+                    }
+                    Err(_) => return deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT,
+                };
+                let output_range = match UserRange::new(
+                    UserAddressSpace::x86_64_four_level(PAGE_SIZE)
+                        .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
+                    out_address.0,
+                    8,
+                    8,
+                    UserAccess::WRITE,
+                    EmptyAddressRule::Reject,
+                ) {
+                    Ok(range) => range,
+                    Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+                };
+                let output = match user.preflight_owned_output(output_range) {
+                    Ok(output) => output,
+                    Err(_) => return deepwyrm_abi::DW_STATUS_BAD_ADDRESS,
+                };
+                (args, protection, output)
             };
             let prepared = match crate::syscall::prepare_address_region_mutation(
                 &mut self.core.registry,
@@ -12017,111 +12204,133 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             ) {
                 Ok(target) => target,
                 Err(status) => {
-                    user.discard_owned_output(output)
-                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    self.settle_map_output(output, None);
                     return status;
                 }
             };
             let target = prepared.target();
             let caller_process = self.own.scheduled().process;
-            if user
-                .select_process_for_return_validation(target.process)
-                .is_err()
-            {
-                user.discard_owned_output(output)
-                    .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
-                return DW_STATUS_BAD_STATE;
-            }
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-            let result = (|| {
-                candidates[0] = Some(
-                    user.prepare_table_candidate(TableLevel::Pdpt)
-                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                );
-                candidates[1] = Some(
-                    user.prepare_table_candidate(TableLevel::Pd)
-                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                );
-                candidates[2] = Some(
-                    user.prepare_table_candidate(TableLevel::Pt)
-                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                );
-                candidates[3] = Some(
-                    user.prepare_table_candidate(TableLevel::Pdpt)
-                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                );
-                candidates[4] = Some(
-                    user.prepare_table_candidate(TableLevel::Pd)
-                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                );
-                candidates[5] = Some(
-                    user.prepare_table_candidate(TableLevel::Pt)
-                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                );
-                let mut shootdown = user_access::LiveTlbShootdownDriver::current();
-                // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
-                let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&user);
-                let (mut publisher, coherency) = match user
-                    .publisher_with_coherency::<
-                        PRIMORDIAL_TABLE_CANDIDATES,
-                        PRIMORDIAL_JOURNAL_ENTRIES,
-                        PRIMORDIAL_INVALIDATIONS,
-                    >(target.address_space, target.region_key, &mut candidates)
-                {
-                    Ok(parts) => parts,
-                    Err(_) => {
-                        initiator.release_unused();
-                        return Err(DW_STATUS_BAD_STATE);
-                    }
-                };
-                let mut publisher =
-                    crate::memory::address_region::CoherentAddressSpacePublisher::<
-                        _,
-                        _,
-                        { crate::cpu::CPU_CAPACITY },
-                        1_000_000,
-                    >::new(&mut publisher, coherency, &mut shootdown);
-                let mut held = crate::syscall::HeldReleases::new();
-                let result = crate::syscall::address_region_map_prepared_model(
-                    prepared,
-                    &mut publisher,
-                    &mut self.core.registry,
-                    &mut self.core.memory,
-                    &mut self.core.tasks,
-                    &mut self.core.regions,
+            let result = {
+                let mut paging = self.paging.lock();
+                let mut session = paging.page_table_mutation_session(
+                    self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
-                    address_region,
-                    memory_object,
-                    args,
-                    protection,
-                    &mut held,
                 );
-                let settled = initiator.release(publisher.finish());
-                held.merge(settled, &mut self.core.cleanup);
-                result
-            })();
-            for candidate in candidates.into_iter().flatten() {
-                user.recycle_table_candidate(candidate);
-            }
-            user.select_process_for_return_validation(caller_process)
-                .unwrap_or_else(|error| {
-                    panic!("primordial map caller-root restoration failed: {error:?}")
-                });
+                if session
+                    .select_process_for_return_validation(target.process)
+                    .is_err()
+                {
+                    Err(DW_STATUS_BAD_STATE)
+                } else {
+                    let result = (|| {
+                        candidates[0] = Some(
+                            session
+                                .prepare_table_candidate(TableLevel::Pdpt)
+                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                        );
+                        candidates[1] = Some(
+                            session
+                                .prepare_table_candidate(TableLevel::Pd)
+                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                        );
+                        candidates[2] = Some(
+                            session
+                                .prepare_table_candidate(TableLevel::Pt)
+                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                        );
+                        candidates[3] = Some(
+                            session
+                                .prepare_table_candidate(TableLevel::Pdpt)
+                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                        );
+                        candidates[4] = Some(
+                            session
+                                .prepare_table_candidate(TableLevel::Pd)
+                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                        );
+                        candidates[5] = Some(
+                            session
+                                .prepare_table_candidate(TableLevel::Pt)
+                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                        );
+                        let mut driver = user_access::LiveTlbShootdownDriver::current();
+                        // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
+                        let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);
+                        let (mut publisher, coherency) = match session
+                            .publisher_with_coherency::<
+                                PRIMORDIAL_TABLE_CANDIDATES,
+                                PRIMORDIAL_JOURNAL_ENTRIES,
+                                PRIMORDIAL_INVALIDATIONS,
+                            >(target.address_space, target.region_key, &mut candidates)
+                        {
+                            Ok(parts) => parts,
+                            Err(_) => {
+                                initiator.release_unused();
+                                return Err(DW_STATUS_BAD_STATE);
+                            }
+                        };
+                        // SAFETY: the coherency domain lives in its root binding in the stationary
+                        // primordial paging storage. A binding is removed only by a teardown,
+                        // which takes S first (D1 option B4) and prepares one on the domain, which
+                        // a published mutation refuses; S stays held until this shootdown's permit.
+                        let mut publisher = unsafe {
+                            crate::memory::address_region::CoherentAddressSpacePublisher::<
+                                _,
+                                _,
+                                { crate::cpu::CPU_CAPACITY },
+                                { user_access::LIVE_SHOOTDOWN_WAIT_STEPS },
+                            >::new_deferred(
+                                &mut publisher, coherency, &mut driver
+                            )
+                        };
+                        let result = crate::syscall::address_region_map_prepared_model(
+                            prepared,
+                            &mut publisher,
+                            &mut self.core.registry,
+                            &mut self.core.memory,
+                            &mut self.core.tasks,
+                            &mut self.core.regions,
+                            self.own.scheduled().process,
+                            address_region,
+                            memory_object,
+                            args,
+                            protection,
+                            held,
+                        );
+                        let published = publisher.finish_deferred();
+                        shootdown = Self::settle_or_defer_shootdown(
+                            published,
+                            initiator,
+                            driver,
+                            held,
+                            &mut self.core.cleanup,
+                        );
+                        result
+                    })();
+                    for candidate in candidates.into_iter().flatten() {
+                        session.recycle_table_candidate(candidate);
+                    }
+                    session
+                        .select_process_for_return_validation(caller_process)
+                        .unwrap_or_else(|error| {
+                            panic!("primordial map caller-root restoration failed: {error:?}")
+                        });
+                    result
+                }
+            };
             match result {
                 Ok(address) => {
-                    user.commit_owned_output(output, &address.to_le_bytes())
-                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    self.settle_map_output(output, Some(address));
                     DW_STATUS_SUCCESS
                 }
                 Err(status) => {
-                    user.discard_owned_output(output)
-                        .unwrap_or_else(|_| panic!("primordial map output pin drifted"));
+                    self.settle_map_output(output, None);
                     status
                 }
             }
         })();
-        self.commit_runtime_phase(phase);
-        status
+        (status, shootdown)
     }
 
     // Out of line (D1 option B2): its held releases stay out of the
@@ -12132,82 +12341,87 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address_region: deepwyrm_abi::DwHandle,
         address: deepwyrm_abi::DwUserAddress,
         byte_len: u64,
-    ) -> deepwyrm_abi::DwStatus {
-        let phase = self.reserve_runtime_phase();
-        let status = (|| {
-            let prepared = match crate::syscall::prepare_address_region_mutation(
-                &mut self.core.registry,
-                &self.core.tasks,
-                &self.core.regions,
-                self.own.scheduled().process,
-                address_region,
-                deepwyrm_abi::DW_RIGHT_MODIFY,
-                &mut self.core.cleanup,
-            ) {
-                Ok(target) => target,
-                Err(status) => return status,
-            };
-            let target = prepared.target();
-            let caller_process = self.own.scheduled().process;
-            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-            let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
-                self.own.active_root.as_ref().expect("active root"),
-                self.own.scheduled().process,
-            );
-            if user
-                .select_process_for_return_validation(target.process)
-                .is_err()
-            {
-                return DW_STATUS_BAD_STATE;
-            }
-            let status = {
-                let mut shootdown = user_access::LiveTlbShootdownDriver::current();
-                // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
-                let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&user);
-                let (mut publisher, coherency) = user
+        held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+    ) -> (deepwyrm_abi::DwStatus, Option<FamilyGShootdown>) {
+        let prepared = match crate::syscall::prepare_address_region_mutation(
+            &mut self.core.registry,
+            &self.core.tasks,
+            &self.core.regions,
+            self.own.scheduled().process,
+            address_region,
+            deepwyrm_abi::DW_RIGHT_MODIFY,
+            &mut self.core.cleanup,
+        ) {
+            Ok(target) => target,
+            Err(status) => return (status, None),
+        };
+        let target = prepared.target();
+        let caller_process = self.own.scheduled().process;
+        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+        let mut paging = self.paging.lock();
+        let mut session = paging.page_table_mutation_session(
+            self.own.active_root.as_ref().expect("active root"),
+            self.own.scheduled().process,
+        );
+        if session
+            .select_process_for_return_validation(target.process)
+            .is_err()
+        {
+            return (DW_STATUS_BAD_STATE, None);
+        }
+        let (status, shootdown) = {
+            let mut driver = user_access::LiveTlbShootdownDriver::current();
+            // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
+            let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);
+            let (mut publisher, coherency) = session
                 .publisher_with_coherency::<
                     PRIMORDIAL_TABLE_CANDIDATES,
                     PRIMORDIAL_JOURNAL_ENTRIES,
                     PRIMORDIAL_INVALIDATIONS,
                 >(target.address_space, target.region_key, &mut candidates)
                 .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
-                let mut publisher =
-                    crate::memory::address_region::CoherentAddressSpacePublisher::<
-                        _,
-                        _,
-                        { crate::cpu::CPU_CAPACITY },
-                        1_000_000,
-                    >::new(&mut publisher, coherency, &mut shootdown);
-                let mut held = crate::syscall::HeldReleases::new();
-                let status = crate::syscall::address_region_unmap_prepared(
-                    prepared,
-                    &mut publisher,
-                    &mut self.core.registry,
-                    &mut self.core.memory,
-                    &mut self.core.tasks,
-                    &mut self.core.regions,
-                    self.own.scheduled().process,
-                    address_region,
-                    address,
-                    byte_len,
-                    &mut held,
-                );
-                let settled = initiator.release(publisher.finish());
-                held.merge(settled, &mut self.core.cleanup);
-                status
+            // SAFETY: as for `map_memory`: the coherency domain lives in its stationary root
+            // binding until this shootdown's permit, which S, held until then, protects.
+            let mut publisher = unsafe {
+                crate::memory::address_region::CoherentAddressSpacePublisher::<
+                    _,
+                    _,
+                    { crate::cpu::CPU_CAPACITY },
+                    { user_access::LIVE_SHOOTDOWN_WAIT_STEPS },
+                >::new_deferred(&mut publisher, coherency, &mut driver)
             };
-            for candidate in candidates.into_iter().flatten() {
-                user.recycle_table_candidate(candidate);
-            }
-            user.select_process_for_return_validation(caller_process)
-                .unwrap_or_else(|error| {
-                    panic!("primordial unmap caller-root restoration failed: {error:?}")
-                });
-            status
-        })();
-        self.commit_runtime_phase(phase);
-        status
+            let status = crate::syscall::address_region_unmap_prepared(
+                prepared,
+                &mut publisher,
+                &mut self.core.registry,
+                &mut self.core.memory,
+                &mut self.core.tasks,
+                &mut self.core.regions,
+                self.own.scheduled().process,
+                address_region,
+                address,
+                byte_len,
+                held,
+            );
+            let published = publisher.finish_deferred();
+            let shootdown = Self::settle_or_defer_shootdown(
+                published,
+                initiator,
+                driver,
+                held,
+                &mut self.core.cleanup,
+            );
+            (status, shootdown)
+        };
+        for candidate in candidates.into_iter().flatten() {
+            session.recycle_table_candidate(candidate);
+        }
+        session
+            .select_process_for_return_validation(caller_process)
+            .unwrap_or_else(|error| {
+                panic!("primordial unmap caller-root restoration failed: {error:?}")
+            });
+        (status, shootdown)
     }
 
     // Out of line (D1 option B2): its held releases stay out of the
@@ -12219,83 +12433,88 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address: deepwyrm_abi::DwUserAddress,
         byte_len: u64,
         protections: u32,
-    ) -> deepwyrm_abi::DwStatus {
-        let phase = self.reserve_runtime_phase();
-        let status = (|| {
-            let prepared = match crate::syscall::prepare_address_region_mutation(
+        held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+    ) -> (deepwyrm_abi::DwStatus, Option<FamilyGShootdown>) {
+        let prepared = match crate::syscall::prepare_address_region_mutation(
+            &mut self.core.registry,
+            &self.core.tasks,
+            &self.core.regions,
+            self.own.scheduled().process,
+            address_region,
+            deepwyrm_abi::DW_RIGHT_MODIFY,
+            &mut self.core.cleanup,
+        ) {
+            Ok(target) => target,
+            Err(status) => return (status, None),
+        };
+        let target = prepared.target();
+        let caller_process = self.own.scheduled().process;
+        let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
+        let mut paging = self.paging.lock();
+        let mut session = paging.page_table_mutation_session(
+            self.own.active_root.as_ref().expect("active root"),
+            self.own.scheduled().process,
+        );
+        if session
+            .select_process_for_return_validation(target.process)
+            .is_err()
+        {
+            return (DW_STATUS_BAD_STATE, None);
+        }
+        let (status, shootdown) = {
+            let mut driver = user_access::LiveTlbShootdownDriver::current();
+            // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
+            let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);
+            let (mut publisher, coherency) = session
+                .publisher_with_coherency::<
+                    PRIMORDIAL_TABLE_CANDIDATES,
+                    PRIMORDIAL_JOURNAL_ENTRIES,
+                    PRIMORDIAL_INVALIDATIONS,
+                >(target.address_space, target.region_key, &mut candidates)
+                .unwrap_or_else(|_| panic!("primordial protect publisher unavailable"));
+            // SAFETY: as for `map_memory`: the coherency domain lives in its stationary root
+            // binding until this shootdown's permit, which S, held until then, protects.
+            let mut publisher = unsafe {
+                crate::memory::address_region::CoherentAddressSpacePublisher::<
+                    _,
+                    _,
+                    { crate::cpu::CPU_CAPACITY },
+                    { user_access::LIVE_SHOOTDOWN_WAIT_STEPS },
+                >::new_deferred(&mut publisher, coherency, &mut driver)
+            };
+            let status = crate::syscall::address_region_protect_prepared(
+                prepared,
+                &mut publisher,
                 &mut self.core.registry,
-                &self.core.tasks,
-                &self.core.regions,
+                &mut self.core.memory,
+                &mut self.core.tasks,
+                &mut self.core.regions,
                 self.own.scheduled().process,
                 address_region,
-                deepwyrm_abi::DW_RIGHT_MODIFY,
-                &mut self.core.cleanup,
-            ) {
-                Ok(target) => target,
-                Err(status) => return status,
-            };
-            let target = prepared.target();
-            let caller_process = self.own.scheduled().process;
-            let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-            let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
-                self.own.active_root.as_ref().expect("active root"),
-                self.own.scheduled().process,
+                address,
+                byte_len,
+                protections,
+                held,
             );
-            if user
-                .select_process_for_return_validation(target.process)
-                .is_err()
-            {
-                return DW_STATUS_BAD_STATE;
-            }
-            let status = {
-                let mut shootdown = user_access::LiveTlbShootdownDriver::current();
-                // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
-                let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&user);
-                let (mut publisher, coherency) = user
-                    .publisher_with_coherency::<
-                        PRIMORDIAL_TABLE_CANDIDATES,
-                        PRIMORDIAL_JOURNAL_ENTRIES,
-                        PRIMORDIAL_INVALIDATIONS,
-                    >(target.address_space, target.region_key, &mut candidates)
-                    .unwrap_or_else(|_| panic!("primordial protect publisher unavailable"));
-                let mut publisher =
-                    crate::memory::address_region::CoherentAddressSpacePublisher::<
-                        _,
-                        _,
-                        { crate::cpu::CPU_CAPACITY },
-                        1_000_000,
-                    >::new(&mut publisher, coherency, &mut shootdown);
-                let mut held = crate::syscall::HeldReleases::new();
-                let status = crate::syscall::address_region_protect_prepared(
-                    prepared,
-                    &mut publisher,
-                    &mut self.core.registry,
-                    &mut self.core.memory,
-                    &mut self.core.tasks,
-                    &mut self.core.regions,
-                    self.own.scheduled().process,
-                    address_region,
-                    address,
-                    byte_len,
-                    protections,
-                    &mut held,
-                );
-                let settled = initiator.release(publisher.finish());
-                held.merge(settled, &mut self.core.cleanup);
-                status
-            };
-            for candidate in candidates.into_iter().flatten() {
-                user.recycle_table_candidate(candidate);
-            }
-            user.select_process_for_return_validation(caller_process)
-                .unwrap_or_else(|error| {
-                    panic!("primordial protect caller-root restoration failed: {error:?}")
-                });
-            status
-        })();
-        self.commit_runtime_phase(phase);
-        status
+            let published = publisher.finish_deferred();
+            let shootdown = Self::settle_or_defer_shootdown(
+                published,
+                initiator,
+                driver,
+                held,
+                &mut self.core.cleanup,
+            );
+            (status, shootdown)
+        };
+        for candidate in candidates.into_iter().flatten() {
+            session.recycle_table_candidate(candidate);
+        }
+        session
+            .select_process_for_return_validation(caller_process)
+            .unwrap_or_else(|error| {
+                panic!("primordial protect caller-root restoration failed: {error:?}")
+            });
+        (status, shootdown)
     }
 
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {

@@ -1083,7 +1083,7 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     // D1 option B1: the map publisher's failure still returns BAD_STATE, now
     // after releasing the shootdown-initiator lock it took beneath P.
     assert!(primordial.contains(
-        "Err(_) => {\n                        initiator.release_unused();\n                        return Err(DW_STATUS_BAD_STATE);"
+        "Err(_) => {\n                                initiator.release_unused();\n                                return Err(DW_STATUS_BAD_STATE);"
     ));
     assert!(
         primordial

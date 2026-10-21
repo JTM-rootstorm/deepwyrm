@@ -1894,6 +1894,19 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.usercopy_process_address_space(active_root.usercopy_root(), process)
     }
 
+    /// The page-table mutation session for `process`'s current root (D1
+    /// option B3): root selection, table candidates and the coherent
+    /// publisher, with no usercopy.
+    pub(crate) fn page_table_mutation_session(
+        &mut self,
+        active_root: &ActiveRootSelection,
+        process: crate::task::ProcessKey,
+    ) -> user_access::PageTableMutationSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+        user_access::PageTableMutationSession::new(
+            self.usercopy_process_address_space(active_root.usercopy_root(), process),
+        )
+    }
+
     /// As `current_process_address_space`, from a copied selection identity
     /// (D1 commit 5). The copy is revalidated against the live binding, this
     /// CPU, CR3 and the residency epoch before the session exists.

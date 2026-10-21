@@ -506,6 +506,186 @@ fn a_coherent_publisher_finishes_with_its_settlement() {
     assert_eq!(authority.active_lease_count(), 0);
 }
 
+/// D1 option B3: a deferred coherent publisher returns after notifying its
+/// targets, and hands the published request back as a `PendingShootdown`;
+/// awaiting it, with no lock of the publisher's held, drives the targets and
+/// mints the permit. A publication whose targets are all acknowledged at
+/// once (here, only the initiator is resident) settles immediately, and one
+/// that publishes nothing settles as such.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test's coherency domain outlives every pending shootdown it hands back"
+)]
+fn a_deferred_coherent_publisher_hands_back_its_pending_shootdown() {
+    let mut authority = TestObjects::<2, 8>::new();
+    let object = object(&mut authority, Protection::READ_WRITE);
+    let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
+    let coherency = AddressSpaceCoherency::<4>::new(region.address_space_key());
+    let cpu0 = CpuIndex::new(0).unwrap();
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let _resident0 = coherency.enter(cpu0).unwrap();
+    let resident1 = coherency.enter(cpu1).unwrap();
+    let mut base = FakePublisher::for_region(&region);
+    let mut driver = DeterministicShootdownDriver::new(cpu0);
+
+    let authorization = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    // SAFETY: `coherency` outlives every pending shootdown in this test.
+    let mut publisher = unsafe {
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new_deferred(
+            &mut base,
+            &coherency,
+            &mut driver,
+        )
+    };
+    test_map(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        authorization,
+        0,
+        PAGE_SIZE,
+        Protection::READ_WRITE,
+    )
+    .unwrap();
+    // The model and page tables are committed, the target is notified, and
+    // nothing has waited.
+    let PublishedShootdown::Pending(pending) = publisher.finish_deferred() else {
+        panic!("a map with a remote resident did not leave a pending shootdown")
+    };
+    assert_eq!(driver.wait_steps, 0);
+    assert_eq!(driver.delivered.len(), 1);
+    assert_eq!(pending.request().generation(), 1);
+    // A second mutation meets the published one.
+    assert_eq!(
+        coherency
+            .prepare_mutation(
+                MappingMutation::Protect,
+                InvalidationScope::pages(PAGE_SIZE, PAGE_SIZE).unwrap()
+            )
+            .err(),
+        Some(AddressSpaceCoherencyError::MutationInFlight)
+    );
+    let pending = pending
+        .try_complete()
+        .expect_err("the remote target has not acknowledged");
+    let permit = pending.await_permit::<_, 8>(&mut driver);
+    assert_eq!(permit.request().mutation(), MappingMutation::Map);
+    assert_eq!(permit.target_count(), 2);
+    assert_eq!(driver.wait_steps, 1);
+
+    // With only the initiator resident, the publication settles at once.
+    coherency.leave_after_local_flush(resident1).unwrap();
+    // SAFETY: as above.
+    let mut publisher = unsafe {
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new_deferred(
+            &mut base,
+            &coherency,
+            &mut driver,
+        )
+    };
+    test_protect(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        PAGE_SIZE,
+        Protection::READ,
+    )
+    .unwrap();
+    assert!(matches!(
+        publisher.finish_deferred(),
+        PublishedShootdown::Settled(ShootdownOutcome::Completed(_))
+    ));
+    // An unchanged replacement publishes nothing.
+    // SAFETY: as above.
+    let mut publisher = unsafe {
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new_deferred(
+            &mut base,
+            &coherency,
+            &mut driver,
+        )
+    };
+    publisher
+        .publish_replace(region.address_space_key(), region.region_key(), &[], &[])
+        .unwrap();
+    assert!(matches!(
+        publisher.finish_deferred(),
+        PublishedShootdown::Settled(ShootdownOutcome::NothingPublished(_))
+    ));
+    // SAFETY: as above.
+    let mut publisher = unsafe {
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new_deferred(
+            &mut base,
+            &coherency,
+            &mut driver,
+        )
+    };
+    test_unmap(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        PAGE_SIZE,
+    )
+    .unwrap();
+    assert!(matches!(
+        publisher.finish_deferred(),
+        PublishedShootdown::Settled(ShootdownOutcome::Completed(_))
+    ));
+}
+
+/// D1 option B3: a pending shootdown is awaited for its permit; dropping one
+/// unacknowledged fails stop.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test's coherency domain outlives every pending shootdown it hands back"
+)]
+fn an_unawaited_pending_shootdown_panics() {
+    let mut authority = TestObjects::<2, 8>::new();
+    let object = object(&mut authority, Protection::READ_WRITE);
+    let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
+    let coherency = AddressSpaceCoherency::<4>::new(region.address_space_key());
+    let cpu0 = CpuIndex::new(0).unwrap();
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let _resident1 = coherency.enter(cpu1).unwrap();
+    let mut base = FakePublisher::for_region(&region);
+    let mut driver = DeterministicShootdownDriver::new(cpu0);
+    let authorization = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    // SAFETY: `coherency` outlives every pending shootdown in this test.
+    let mut publisher = unsafe {
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new_deferred(
+            &mut base,
+            &coherency,
+            &mut driver,
+        )
+    };
+    test_map(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        authorization,
+        0,
+        PAGE_SIZE,
+        Protection::READ_WRITE,
+    )
+    .unwrap();
+    let PublishedShootdown::Pending(pending) = publisher.finish_deferred() else {
+        panic!("a remote resident left nothing pending")
+    };
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));
+    assert_eq!(
+        dropped
+            .expect_err("an unawaited shootdown must panic")
+            .downcast_ref::<&str>()
+            .copied(),
+        Some("a published shootdown was dropped before its acknowledgement")
+    );
+}
+
 #[test]
 fn coherent_map_protect_unmap_wait_for_cross_cpu_acknowledgements() {
     let mut authority = TestObjects::<2, 8>::new();

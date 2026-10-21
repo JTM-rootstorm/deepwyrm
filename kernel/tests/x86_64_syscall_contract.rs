@@ -1198,15 +1198,15 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commits 5, 6, 6d, 7, 7b, 7c, 8 and 8b add the family-A, family-B,
-    // object-info, ChannelSend, ChannelReceive, ProcessCreate, wait and
-    // atomic-wait preparation holds, which service CPU0's timer expiries
-    // exactly like the ordinary hold.
+    // D1 commits 5, 6, 6d, 7, 7b, 7c, 8, 8b and option B3 add the family-A,
+    // family-B, object-info, ChannelSend, ChannelReceive, ProcessCreate, wait,
+    // atomic-wait and family-G first holds, which service CPU0's timer
+    // expiries exactly like the ordinary hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        12
+        13
     );
     let shared_carrier = runtime
         .split_once(
@@ -2319,7 +2319,7 @@ fn family_a_usercopy_runs_guard_free() {
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
     assert!(primordial.contains(
-        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n                .or_else(|| self.handle_wait(request))\n                .or_else(|| self.handle_atomic_wait(request))\n            {"
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n                .or_else(|| self.handle_wait(request))\n                .or_else(|| self.handle_atomic_wait(request))\n                .or_else(|| self.handle_address_region_mutation(request))\n            {"
     ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
@@ -2693,16 +2693,18 @@ fn family_g_publishers_run_under_the_shootdown_initiator_lock() {
             .split_once("\n    }\n")
             .unwrap_or_else(|| panic!("{name} extent"))
             .0;
-        // D1 option B2: the adapter's releases go into the held set, which
-        // merges into the shared queue only on S's released settlement.
+        // D1 option B3: on a page-table mutation session, S is taken before
+        // a deferred coherent publisher, the adapter pushes into the frame's
+        // held set, and the publication is settled now or handed on.
         let order = [
-            "PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(",
+            "paging.page_table_mutation_session(",
+            "PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);",
             "CoherentAddressSpacePublisher::<",
-            "let mut held = crate::syscall::HeldReleases::new();",
+            ">::new_deferred(",
             adapter,
-            "&mut held,",
-            "let settled = initiator.release(publisher.finish());",
-            "held.merge(settled, &mut self.core.cleanup);",
+            "held,",
+            "publisher.finish_deferred();",
+            "Self::settle_or_defer_shootdown(",
         ]
         .map(|anchor| {
             body.find(anchor)
@@ -2754,4 +2756,83 @@ fn root_teardown_runs_under_the_shootdown_initiator_lock() {
             .unwrap_or_else(|| panic!("teardown helper omits {anchor}"))
     });
     assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+/// Text test (D1 option B3, design §11.2.9): map, unmap and protect wait for
+/// their shootdown's acknowledgements with neither T nor P held. The first
+/// hold publishes; the facade awaits the pending shootdown through
+/// `await_shootdown`, which consumes a `GuardFree` token, releases S on the
+/// permit, and merges the held releases on it in a last hold, before
+/// `ready_to_return`'s drain. The family-G sessions are page-table mutation
+/// sessions, which carry no usercopy.
+#[test]
+fn family_g_waits_for_acknowledgement_outside_the_hold() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_address_region_mutation(")
+        .expect("family-G facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("family-G facade helper extent")
+        .0;
+    let order = [
+        "let mut held = crate::syscall::HeldReleases::new();",
+        "runtime.begin_address_region_mutation(request, &mut held)",
+        "FamilyGBegun::Returned(ready) => return Some(Ok(ready)),",
+        "user_access::await_shootdown(self.runtime.guard_free(), pending, &mut driver);",
+        "initiator.release(",
+        "ShootdownOutcome::Completed(permit)",
+        "let mut guard = self.runtime.lock();",
+        "runtime.finish_address_region_mutation(",
+    ]
+    .map(|anchor| {
+        helper
+            .find(anchor)
+            .unwrap_or_else(|| panic!("family-G helper omits {anchor}"))
+    });
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(primordial.contains(
+        ".or_else(|| self.handle_atomic_wait(request))\n                .or_else(|| self.handle_address_region_mutation(request))"
+    ));
+    assert!(
+        primordial
+            .contains("\"family-G requests are served by the CPU-local facade (D1 option B3)\"")
+    );
+    let finish = primordial
+        .split_once("    fn finish_address_region_mutation(")
+        .expect("family-G last hold")
+        .1
+        .split_once("\n    }\n")
+        .expect("family-G last hold extent")
+        .0;
+    let merge = finish
+        .find("held.merge(settlement, &mut self.core.cleanup);")
+        .expect("merge on the permit");
+    let ready = finish
+        .find("self.ready_to_return(")
+        .expect("leave through ready_to_return");
+    assert!(merge < ready);
+
+    let user_access = source("src/arch/x86_64/mm/activation/user_access.rs");
+    assert!(user_access.contains(
+        "pub(crate) fn await_shootdown(\n    _guard_free: crate::arch::x86_64::syscall::GuardFree<'_>,"
+    ));
+    let session = user_access
+        .split_once("pub(crate) struct PageTableMutationSession<")
+        .expect("page-table mutation session")
+        .1
+        .split_once("/// Waits, with neither T nor P held")
+        .expect("page-table mutation session extent")
+        .0;
+    for usercopy in ["preflight_owned_output", "commit_owned_output", "fn pin("] {
+        assert!(
+            !session.contains(usercopy),
+            "the page-table mutation session exposes usercopy: {usercopy}"
+        );
+    }
+    assert!(session.contains("impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_authority::PagingHeld\n    for PageTableMutationSession<"));
+    assert!(
+        !user_access
+            .contains("super::runtime_authority::PagingHeld\n    for LiveProcessAddressSpace<")
+    );
 }

@@ -16,13 +16,110 @@ static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
     [const { LiveTlbMailbox::new() }; crate::cpu::CPU_CAPACITY];
 static LIVE_TLB_READY: AtomicBool = AtomicBool::new(false);
 
-// A process session is built from a held P guard and borrows it, so it
-// witnesses P for the shootdown-initiator lock S (D1 option B1).
+/// A page-table mutation session (D1 option B3, design §11.2.9): the
+/// target-root selection, table candidates and coherent publisher of one
+/// family-G transaction, and no usercopy. It is distinct from the usercopy
+/// session so that commit 9 can retire the usercopy session's unguarded
+/// constructor while T-held page-table work keeps this one. It is built from
+/// a held P guard and borrows it, so it witnesses P for the
+/// shootdown-initiator lock S.
+pub(crate) struct PageTableMutationSession<
+    'borrow,
+    'root,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
+    session: LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+}
+
+impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    PageTableMutationSession<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    pub(super) const fn new(
+        session: LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+    ) -> Self {
+        Self { session }
+    }
+
+    pub(crate) fn select_process_for_return_validation(
+        &mut self,
+        process: crate::task::ProcessKey,
+    ) -> Result<(), super::RootBindingError> {
+        self.session.select_process_for_return_validation(process)
+    }
+
+    pub(crate) fn prepare_table_candidate(
+        &mut self,
+        level: TableLevel,
+    ) -> Result<TableCandidateGrant, LiveUserAccessError> {
+        self.session.prepare_table_candidate(level)
+    }
+
+    pub(crate) fn recycle_table_candidate(&mut self, candidate: TableCandidateGrant) {
+        self.session.recycle_table_candidate(candidate);
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "the publisher and its coherency domain share the session's one borrow"
+    )]
+    pub(crate) fn publisher_with_coherency<
+        'publisher,
+        const CANDIDATE_CAPACITY: usize,
+        const ENTRY_CAPACITY: usize,
+        const INVALIDATION_CAPACITY: usize,
+    >(
+        &'publisher mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        region: crate::memory::address_region::RegionKey,
+        candidates: &'publisher mut [Option<TableCandidateGrant>; CANDIDATE_CAPACITY],
+    ) -> Result<
+        (
+            crate::arch::x86_64::mm::X86AddressSpacePublisher<
+                'publisher,
+                TrackedActiveTarget<'borrow>,
+                RANGE_CAPACITY,
+                ROLE_CAPACITY,
+                CANDIDATE_CAPACITY,
+                ENTRY_CAPACITY,
+                INVALIDATION_CAPACITY,
+            >,
+            &'publisher crate::memory::address_region::AddressSpaceCoherency<
+                { crate::cpu::CPU_CAPACITY },
+            >,
+        ),
+        crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
+    > {
+        self.session
+            .publisher_with_coherency::<CANDIDATE_CAPACITY, ENTRY_CAPACITY, INVALIDATION_CAPACITY>(
+                address_space,
+                region,
+                candidates,
+            )
+    }
+}
+
 #[cfg(deepwyrm_integrated)]
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_authority::PagingHeld
-    for LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+    for PageTableMutationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
 }
+
+/// Waits, with neither T nor P held, for every acknowledgement of a family-G
+/// shootdown published beneath them, and mints its reclaim permit (D1 option
+/// B3, design §11.2.9). The `GuardFree` token makes "no runtime lock across
+/// the acknowledgement wait" (H0 §12.8) a type fact. Each wait step services
+/// this CPU's own mailbox.
+pub(crate) fn await_shootdown(
+    _guard_free: crate::arch::x86_64::syscall::GuardFree<'_>,
+    pending: crate::memory::address_region::PendingShootdown<{ crate::cpu::CPU_CAPACITY }>,
+    driver: &mut LiveTlbShootdownDriver,
+) -> crate::memory::address_region::ReclaimPermit {
+    pending.await_permit::<_, LIVE_SHOOTDOWN_WAIT_STEPS>(driver)
+}
+
+/// The acknowledgement wait's bound, in wait steps.
+pub(crate) const LIVE_SHOOTDOWN_WAIT_STEPS: usize = 1_000_000;
 
 /// Bounded e2 adapter for the live address-space publisher.
 ///
