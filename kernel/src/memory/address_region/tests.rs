@@ -421,6 +421,91 @@ fn replacement_publishes_model_and_lease_together() {
     assert_eq!(authority.active_lease_count(), 1);
 }
 
+/// D1 option B1: a coherent publisher hands back the settlement of the one
+/// shootdown it published, which releases S: the permit of a published
+/// mutation, or proof that nothing was published (an unchanged replacement,
+/// or an inner publication that failed before the request was published).
+#[test]
+fn a_coherent_publisher_finishes_with_its_settlement() {
+    let mut authority = TestObjects::<2, 8>::new();
+    let object = object(&mut authority, Protection::READ_WRITE);
+    let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
+    let coherency = AddressSpaceCoherency::<4>::new(region.address_space_key());
+    let cpu0 = CpuIndex::new(0).unwrap();
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let _resident0 = coherency.enter(cpu0).unwrap();
+    let _resident1 = coherency.enter(cpu1).unwrap();
+    let mut base = FakePublisher::for_region(&region);
+    let mut driver = DeterministicShootdownDriver::new(cpu0);
+
+    let authorization = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    let mut publisher =
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+    test_map(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        authorization,
+        0,
+        PAGE_SIZE,
+        Protection::READ_WRITE,
+    )
+    .unwrap();
+    let ShootdownOutcome::Completed(permit) = publisher.finish() else {
+        panic!("a published map finished without its permit")
+    };
+    assert_eq!(permit.request().generation(), 1);
+    assert_eq!(permit.request().mutation(), MappingMutation::Map);
+    assert_eq!(permit.target_count(), 2);
+
+    // An unchanged replacement publishes nothing.
+    let mut publisher =
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+    publisher
+        .publish_replace(region.address_space_key(), region.region_key(), &[], &[])
+        .unwrap();
+    assert!(matches!(
+        publisher.finish(),
+        ShootdownOutcome::NothingPublished(_)
+    ));
+
+    // A failed inner publication publishes nothing, and leaves no mutation
+    // in flight.
+    base.fail = true;
+    let mut publisher =
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+    assert!(
+        test_protect(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            Protection::READ,
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        publisher.finish(),
+        ShootdownOutcome::NothingPublished(_)
+    ));
+    assert_eq!(coherency.published_generation(), 1);
+    base.fail = false;
+    let mut publisher =
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+    test_unmap(
+        &mut region,
+        &mut authority,
+        &mut publisher,
+        PAGE_SIZE,
+        PAGE_SIZE,
+    )
+    .unwrap();
+    assert!(matches!(publisher.finish(), ShootdownOutcome::Completed(_)));
+    assert_eq!(authority.active_lease_count(), 0);
+}
+
 #[test]
 fn coherent_map_protect_unmap_wait_for_cross_cpu_acknowledgements() {
     let mut authority = TestObjects::<2, 8>::new();

@@ -210,4 +210,150 @@ mod tests {
         assert!(overlap.is_err());
         mailbox.cancel_if_published();
     }
+
+    /// D1 option B (design §11.2.9): the host model of two initiators racing
+    /// on one target CPU's mailbox. Each initiator mutates its own address
+    /// space; CPU 1 is resident in both, so both shootdowns target CPU 1's
+    /// one-slot mailbox. Each initiator takes S beneath P, as the live
+    /// publisher does, then holds S alone, with T and P released, through the
+    /// acknowledgement, and releases it on the permit.
+    ///
+    /// The second initiator starts only once the first's request is
+    /// published, and the target services the mailbox only once the second
+    /// initiator is spinning on S, or after a bounded wait. With S, the
+    /// second spins until the first is acknowledged. Without S, it publishes
+    /// into the occupied slot and `LiveTlbMailbox::publish` panics: removing
+    /// S fails this test.
+    #[test]
+    fn s_keeps_two_initiators_from_racing_on_one_target_mailbox() {
+        use super::super::runtime_authority::{
+            PagingLock, RuntimeAuthorityHandle, RuntimeAuthorityLock, ShootdownInitiatorLock,
+        };
+        use crate::memory::address_region::{
+            AddressSpaceCoherency, AddressSpaceKey, InvalidationScope, MappingMutation,
+            ShootdownOutcome,
+        };
+        use core::sync::atomic::{AtomicBool, AtomicUsize};
+
+        type Coherency = AddressSpaceCoherency<{ crate::cpu::CPU_CAPACITY }>;
+
+        static SECOND_SPINS_ON_S: AtomicBool = AtomicBool::new(false);
+        fn note_spin() {
+            SECOND_SPINS_ON_S.store(true, Ordering::Release);
+        }
+        fn no_service() {}
+
+        /// Counts an initiator out when its thread ends, even by a panic.
+        struct Finished<'a>(&'a AtomicUsize);
+        impl Drop for Finished<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        /// One initiator: S beneath P beneath T, then T and P drop and S is
+        /// held alone through the acknowledgement, released on the permit.
+        fn initiate(
+            mut handle: RuntimeAuthorityHandle<'_, ()>,
+            paging: &PagingLock<()>,
+            initiator_lock: &ShootdownInitiatorLock,
+            mailbox: &LiveTlbMailbox,
+            space: &Coherency,
+            published: Option<&AtomicBool>,
+        ) {
+            let initiator = {
+                let mut guard = handle.lock();
+                let (_, mut access) = guard.with_paging(paging);
+                let held = access.lock();
+                initiator_lock.acquire_beneath(&held)
+            };
+            let transaction = space
+                .prepare_mutation(
+                    MappingMutation::Unmap,
+                    InvalidationScope::pages(0x4000, 0x1000).unwrap(),
+                )
+                .unwrap();
+            let mut barrier = transaction.publish();
+            mailbox.publish(space, barrier.request());
+            if let Some(published) = published {
+                published.store(true, Ordering::Release);
+            }
+            let permit = loop {
+                match barrier.try_complete() {
+                    Ok(permit) => break permit,
+                    Err(pending) => barrier = pending,
+                }
+                std::thread::yield_now();
+            };
+            drop(initiator.release(ShootdownOutcome::Completed(permit)));
+        }
+
+        let runtime = RuntimeAuthorityLock::new((), no_service);
+        let paging = PagingLock::new((), no_service);
+        let initiator_lock = ShootdownInitiatorLock::new(note_spin);
+        let mailbox = LiveTlbMailbox::new();
+        let target = crate::cpu::CpuIndex::new(1).unwrap();
+        let spaces = [
+            Coherency::new(AddressSpaceKey::for_test(21, 31)),
+            Coherency::new(AddressSpaceKey::for_test(22, 32)),
+        ];
+        let _residents = spaces.each_ref().map(|space| space.enter(target).unwrap());
+        let first_published = AtomicBool::new(false);
+        let finished = AtomicUsize::new(0);
+        let acknowledged = AtomicUsize::new(0);
+        let [first_handle, second_handle] = runtime.handles::<2>();
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let _finished = Finished(&finished);
+                initiate(
+                    first_handle,
+                    &paging,
+                    &initiator_lock,
+                    &mailbox,
+                    &spaces[0],
+                    Some(&first_published),
+                );
+            });
+            let second = scope.spawn(|| {
+                let _finished = Finished(&finished);
+                while !first_published.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                initiate(
+                    second_handle,
+                    &paging,
+                    &initiator_lock,
+                    &mailbox,
+                    &spaces[1],
+                    None,
+                );
+            });
+            // The target CPU: it services only once the second initiator spins
+            // on S, or after a bounded wait, then until both initiators end.
+            scope.spawn(|| {
+                let mut waited = 0_u32;
+                while !SECOND_SPINS_ON_S.load(Ordering::Acquire) && waited < 200_000 {
+                    waited += 1;
+                    std::thread::yield_now();
+                }
+                while finished.load(Ordering::Acquire) < 2 {
+                    if let Some((coherency, request)) = mailbox.consume() {
+                        mailbox.release_after_local_serialization();
+                        coherency.acknowledge(target, request).unwrap();
+                        acknowledged.fetch_add(1, Ordering::AcqRel);
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            (first.join(), second.join())
+        });
+        assert!(first.is_ok(), "the first initiator failed");
+        assert!(
+            second.is_ok(),
+            "the second initiator published into an occupied target mailbox"
+        );
+        assert_eq!(acknowledged.load(Ordering::Acquire), 2);
+        assert!(SECOND_SPINS_ON_S.load(Ordering::Acquire));
+    }
 }

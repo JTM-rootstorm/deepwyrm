@@ -100,6 +100,13 @@ mod cpu_slots;
 ))]
 #[path = "activation/runtime_authority.rs"]
 mod runtime_authority;
+// A coherent publisher's settlement releases the shootdown-initiator lock S
+// (D1 option B, design §11.2.9).
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+impl runtime_authority::ShootdownSettled for crate::memory::address_region::ShootdownOutcome {}
 // The e2 TLB mailbox `user_access.rs` uses, host-compiled under `test` so its
 // tests run (S2K-0).
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]

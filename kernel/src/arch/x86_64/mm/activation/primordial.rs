@@ -32,6 +32,7 @@ use super::GuardFree;
 use super::cpu_slots::{CpuOwner, CpuSlots, OtherCpus, RemotelyStaged};
 use super::runtime_authority::{
     PagingAccess, PagingLock, RuntimeAuthorityGuard, RuntimeAuthorityHandle, RuntimeAuthorityLock,
+    ShootdownInitiatorLock,
 };
 use crate::one_shot::init_fields;
 use core::cell::UnsafeCell;
@@ -1610,6 +1611,11 @@ static PRIMORDIAL_RUNTIME_AUTHORITY: crate::one_shot::OneShotStorage<
 static PRIMORDIAL_PAGING: crate::one_shot::OneShotStorage<
     PagingLock<super::PrimordialActivePaging>,
 > = crate::one_shot::OneShotStorage::new();
+
+/// The shootdown-initiator lock, S (D1 option B, design §11.2.9): one TLB
+/// shootdown in flight system-wide. Taken beneath P, after T.
+static PRIMORDIAL_SHOOTDOWN_INITIATOR: ShootdownInitiatorLock =
+    ShootdownInitiatorLock::new(user_access::service_local_tlb_shootdown);
 
 // Pin budget (D1 commit 6, design §11.2.3 family B). A family-B output pin
 // now lives across a runtime-authority hold, one per CPU, while the CPU in
@@ -12026,13 +12032,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .map_err(|_| DW_STATUS_NO_RESOURCES)?,
                 );
                 let mut shootdown = user_access::LiveTlbShootdownDriver::current();
-                let (mut publisher, coherency) = user
-                .publisher_with_coherency::<
-                    PRIMORDIAL_TABLE_CANDIDATES,
-                    PRIMORDIAL_JOURNAL_ENTRIES,
-                    PRIMORDIAL_INVALIDATIONS,
-                >(target.address_space, target.region_key, &mut candidates)
-                .map_err(|_| DW_STATUS_BAD_STATE)?;
+                // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
+                let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&user);
+                let (mut publisher, coherency) = match user
+                    .publisher_with_coherency::<
+                        PRIMORDIAL_TABLE_CANDIDATES,
+                        PRIMORDIAL_JOURNAL_ENTRIES,
+                        PRIMORDIAL_INVALIDATIONS,
+                    >(target.address_space, target.region_key, &mut candidates)
+                {
+                    Ok(parts) => parts,
+                    Err(_) => {
+                        initiator.release_unused();
+                        return Err(DW_STATUS_BAD_STATE);
+                    }
+                };
                 let mut publisher =
                     crate::memory::address_region::CoherentAddressSpacePublisher::<
                         _,
@@ -12040,7 +12054,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         { crate::cpu::CPU_CAPACITY },
                         1_000_000,
                     >::new(&mut publisher, coherency, &mut shootdown);
-                crate::syscall::address_region_map_prepared_model(
+                let result = crate::syscall::address_region_map_prepared_model(
                     prepared,
                     &mut publisher,
                     &mut self.core.registry,
@@ -12053,7 +12067,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     args,
                     protection,
                     &mut self.core.cleanup,
-                )
+                );
+                let _settled = initiator.release(publisher.finish());
+                result
             })();
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);
@@ -12115,6 +12131,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             let status = {
                 let mut shootdown = user_access::LiveTlbShootdownDriver::current();
+                // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
+                let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&user);
                 let (mut publisher, coherency) = user
                 .publisher_with_coherency::<
                     PRIMORDIAL_TABLE_CANDIDATES,
@@ -12129,7 +12147,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         { crate::cpu::CPU_CAPACITY },
                         1_000_000,
                     >::new(&mut publisher, coherency, &mut shootdown);
-                crate::syscall::address_region_unmap_prepared(
+                let status = crate::syscall::address_region_unmap_prepared(
                     prepared,
                     &mut publisher,
                     &mut self.core.registry,
@@ -12141,7 +12159,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     address,
                     byte_len,
                     &mut self.core.cleanup,
-                )
+                );
+                let _settled = initiator.release(publisher.finish());
+                status
             };
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);
@@ -12193,6 +12213,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             let status = {
                 let mut shootdown = user_access::LiveTlbShootdownDriver::current();
+                // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
+                let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&user);
                 let (mut publisher, coherency) = user
                     .publisher_with_coherency::<
                         PRIMORDIAL_TABLE_CANDIDATES,
@@ -12207,7 +12229,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         { crate::cpu::CPU_CAPACITY },
                         1_000_000,
                     >::new(&mut publisher, coherency, &mut shootdown);
-                crate::syscall::address_region_protect_prepared(
+                let status = crate::syscall::address_region_protect_prepared(
                     prepared,
                     &mut publisher,
                     &mut self.core.registry,
@@ -12220,7 +12242,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     byte_len,
                     protections,
                     &mut self.core.cleanup,
-                )
+                );
+                let _settled = initiator.release(publisher.finish());
+                status
             };
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);

@@ -907,12 +907,14 @@ fn every_if_clear_spin_services_the_local_tlb_mailbox() {
     assert!(handler.contains("service_tlb_mailbox_on(cpu);"));
 
     let authority = source("src/arch/x86_64/mm/activation/runtime_authority.rs");
+    // D1 option B1 adds the shootdown-initiator lock S, whose spin services
+    // the mailbox too (design §11.2.9, item 2).
     assert_eq!(
         authority
             .matches("(self.spin_service)();\n            core::hint::spin_loop();")
             .count(),
-        2,
-        "both runtime lock spins call their spin service"
+        3,
+        "the runtime, paging and shootdown-initiator lock spins call their spin service"
     );
 
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
@@ -922,5 +924,10 @@ fn every_if_clear_spin_services_the_local_tlb_mailbox() {
             .count(),
         2,
         "the live runtime authority and paging lock both service the mailbox"
+    );
+    assert!(
+        primordial
+            .contains("ShootdownInitiatorLock::new(user_access::service_local_tlb_shootdown);"),
+        "the live shootdown-initiator lock services the mailbox"
     );
 }

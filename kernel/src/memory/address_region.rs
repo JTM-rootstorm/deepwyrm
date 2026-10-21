@@ -39,8 +39,9 @@ pub(crate) use crate::cpu::CpuIndex;
 pub(crate) use coherency::{
     AddressSpaceCoherency, AddressSpaceCoherencyError, CoherentAddressSpacePublisher,
     CoherentPublishError, CpuSet, InvalidationScope, LeavePublication, MappingMutation,
-    MutationTransaction, ReclaimPermit, Residency, ResidencyWitness, ShootdownAcknowledgement,
-    ShootdownBarrier, ShootdownDriver, ShootdownRequest,
+    MutationTransaction, NothingPublished, ReclaimPermit, Residency, ResidencyWitness,
+    ShootdownAcknowledgement, ShootdownBarrier, ShootdownDriver, ShootdownOutcome,
+    ShootdownRequest,
 };
 
 const USER_CANONICAL_END: u64 = 0x0000_8000_0000_0000;

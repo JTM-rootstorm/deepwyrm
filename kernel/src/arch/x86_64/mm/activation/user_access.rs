@@ -16,6 +16,14 @@ static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
     [const { LiveTlbMailbox::new() }; crate::cpu::CPU_CAPACITY];
 static LIVE_TLB_READY: AtomicBool = AtomicBool::new(false);
 
+// A process session is built from a held P guard and borrows it, so it
+// witnesses P for the shootdown-initiator lock S (D1 option B1).
+#[cfg(deepwyrm_integrated)]
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_authority::PagingHeld
+    for LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+}
+
 /// Bounded e2 adapter for the live address-space publisher.
 ///
 /// One runtime mapping transaction owns this value. The runtime's existing

@@ -1080,7 +1080,11 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
         );
     }
     assert!(primordial.contains(".map_err(|_| DW_STATUS_NO_RESOURCES)?"));
-    assert!(primordial.contains(".map_err(|_| DW_STATUS_BAD_STATE)?"));
+    // D1 option B1: the map publisher's failure still returns BAD_STATE, now
+    // after releasing the shootdown-initiator lock it took beneath P.
+    assert!(primordial.contains(
+        "Err(_) => {\n                        initiator.release_unused();\n                        return Err(DW_STATUS_BAD_STATE);"
+    ));
     assert!(
         primordial
             .matches("for candidate in candidates.into_iter().flatten()")

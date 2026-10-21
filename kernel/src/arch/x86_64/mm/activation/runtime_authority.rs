@@ -357,6 +357,99 @@ impl<P> Drop for PagingGuard<'_, P> {
     }
 }
 
+/// A witness that this CPU holds P: a [`PagingGuard`], or a session built
+/// from one and borrowing it. S is acquired only beneath such a witness.
+pub(super) trait PagingHeld {}
+
+impl<P> PagingHeld for PagingGuard<'_, P> {}
+
+/// Proof that the one shootdown an S guard covered is settled: its reclaim
+/// permit, or proof that its publisher published nothing. An S guard is
+/// released only by consuming one ([`ShootdownInitiatorGuard::release`]).
+pub(super) trait ShootdownSettled {}
+
+/// The shootdown-initiator lock, S (D1 option B, design §11.2.9): one TLB
+/// shootdown in flight system-wide, so each target CPU's one-slot mailbox
+/// never meets a second request, and a second mutation of an address space
+/// waits its turn rather than meeting `MutationInFlight`.
+///
+/// The order is T, then P, then S. S is acquired only beneath a held P
+/// ([`ShootdownInitiatorLock::acquire_beneath`]), and so, by P's own order,
+/// beneath T. Unlike P, its guard borrows only the lock, not the P guard, so
+/// it can outlive the T and P guards it was taken beneath: it is released by
+/// consuming the settlement of the shootdown it covered, not by scope.
+/// While holding only S a CPU acquires nothing; it waits only for
+/// acknowledgements, which targets give from e2 or from inside any IF-clear
+/// spin. S's own spin calls the [`SpinService`] like T's and P's, and only a
+/// CPU holding T spins on it, so at most one CPU spins on S at a time.
+pub(super) struct ShootdownInitiatorLock {
+    locked: AtomicBool,
+    /// Called on every iteration of the spin, as for the runtime authority.
+    spin_service: SpinService,
+}
+
+impl ShootdownInitiatorLock {
+    pub(super) const fn new(spin_service: SpinService) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            spin_service,
+        }
+    }
+
+    /// Takes S beneath `_paging`, a witness that this CPU holds P.
+    pub(super) fn acquire_beneath(&self, _paging: &impl PagingHeld) -> ShootdownInitiatorGuard<'_> {
+        self.acquire()
+    }
+
+    fn acquire(&self) -> ShootdownInitiatorGuard<'_> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            (self.spin_service)();
+            core::hint::spin_loop();
+        }
+        ShootdownInitiatorGuard { lock: self }
+    }
+}
+
+/// A held S. Neither `Clone` nor `Copy`. Dropping it unreleased is a kernel
+/// bug and panics.
+#[must_use = "S is released only by consuming the settlement of the shootdown it covered"]
+pub(super) struct ShootdownInitiatorGuard<'s> {
+    lock: &'s ShootdownInitiatorLock,
+}
+
+impl ShootdownInitiatorGuard<'_> {
+    /// Releases S on the settlement of the shootdown it covered, and hands the
+    /// settlement back for the reclamation it gates.
+    pub(super) fn release<R: ShootdownSettled>(self, settled: R) -> R {
+        self.unlock();
+        settled
+    }
+
+    /// Releases an S whose transaction failed before it built a coherent
+    /// publisher, so it covered no shootdown. Every S whose transaction
+    /// reached a publisher is released through [`Self::release`], on that
+    /// publisher's settlement.
+    pub(super) fn release_unused(self) {
+        self.unlock();
+    }
+
+    fn unlock(self) {
+        let lock = self.lock;
+        core::mem::forget(self);
+        lock.locked.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for ShootdownInitiatorGuard<'_> {
+    fn drop(&mut self) {
+        panic!("the shootdown-initiator lock was dropped without its settlement");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -551,5 +644,80 @@ mod tests {
         // `AtomicU64`s, read here while no guard exists.
         let (next, serving) = unsafe { (pair.read(), pair.add(1).read()) };
         assert_eq!((next, serving), (1, 1));
+    }
+
+    struct Settled;
+    impl ShootdownSettled for Settled {}
+
+    /// D1 option B1: S is taken beneath a held P, survives the T and P
+    /// guards it was taken beneath, excludes a second initiator until it is
+    /// released on a settlement, and is free again afterwards.
+    #[test]
+    fn s_outlives_t_and_p_and_is_released_only_on_a_settlement() {
+        let lock = RuntimeAuthorityLock::new((), no_service);
+        let paging = PagingLock::new((), no_service);
+        let initiator_lock = ShootdownInitiatorLock::new(no_service);
+        let [mut handle] = lock.handles::<1>();
+        let initiator = {
+            let mut guard = handle.lock();
+            let (_, mut access) = guard.with_paging(&paging);
+            let held = access.lock();
+            initiator_lock.acquire_beneath(&held)
+        };
+        assert!(!paging.locked.load(Ordering::Relaxed));
+        assert!(initiator_lock.locked.load(Ordering::Relaxed));
+        drop(handle.guard_free());
+        let Settled = initiator.release(Settled);
+        assert!(!initiator_lock.locked.load(Ordering::Relaxed));
+        initiator_lock.acquire().release_unused();
+        assert!(!initiator_lock.locked.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn dropping_an_unreleased_s_panics() {
+        let initiator_lock = ShootdownInitiatorLock::new(no_service);
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(initiator_lock.acquire());
+        }));
+        let message = dropped.expect_err("an unreleased S must panic");
+        assert_eq!(
+            message.downcast_ref::<&str>().copied(),
+            Some("the shootdown-initiator lock was dropped without its settlement")
+        );
+    }
+
+    static S_SERVICED: ModelMailbox = ModelMailbox::new();
+    static S_UNSERVICED: ModelMailbox = ModelMailbox::new();
+
+    /// The initiator holds S alone while the target spins on S, as a CPU
+    /// holding T spins for it (design §11.2.9, item 2).
+    fn s_initiator_is_acknowledged(
+        mailbox: &'static ModelMailbox,
+        spin_service: SpinService,
+    ) -> bool {
+        let initiator_lock = ShootdownInitiatorLock::new(spin_service);
+        let spinning = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let held = initiator_lock.acquire();
+            let spinner = scope.spawn(|| {
+                spinning.store(true, Ordering::Release);
+                initiator_lock.acquire().release_unused();
+            });
+            while !spinning.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let acknowledged = mailbox.publish_and_wait();
+            held.release_unused();
+            spinner.join().expect("target thread");
+            acknowledged
+        })
+    }
+
+    #[test]
+    fn an_s_spinner_acknowledges_only_when_its_spin_services_the_mailbox() {
+        assert!(!s_initiator_is_acknowledged(&S_UNSERVICED, no_service));
+        assert!(s_initiator_is_acknowledged(&S_SERVICED, || {
+            S_SERVICED.service()
+        }));
     }
 }

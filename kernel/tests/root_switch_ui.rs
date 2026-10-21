@@ -167,6 +167,27 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
                 "error[E0499]: cannot borrow `handle` as mutable more than once at a time",
             ),
         },
+        // D1 option B1 (design §11.2.9): the shootdown-initiator lock S is taken
+        // only beneath a held P, outlives the T and P guards, and is released only
+        // by consuming the settlement of the shootdown it covered.
+        UiCase {
+            fixture: "shootdown_initiator_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "shootdown_initiator_without_paging.rs",
+            expected_error: Some("error[E0277]: the trait bound `(): PagingHeld` is not satisfied"),
+        },
+        UiCase {
+            fixture: "shootdown_initiator_without_settlement.rs",
+            expected_error: Some(
+                "error[E0277]: the trait bound `u32: ShootdownSettled` is not satisfied",
+            ),
+        },
+        UiCase {
+            fixture: "shootdown_initiator_outlives_settlement.rs",
+            expected_error: Some("error[E0382]: use of moved value: `settled`"),
+        },
     ] {
         run_case(&rustc, &manifest_dir, &output_dir, &case);
     }

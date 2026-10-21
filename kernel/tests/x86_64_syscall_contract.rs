@@ -2661,3 +2661,51 @@ fn atomic_wait_compares_outside_the_hold() {
         "unreachable!(\"AtomicWait32 is served by the CPU-local facade (D1 commit 8b)\")"
     ));
 }
+
+/// Text test (D1 option B1, design §11.2.9): map, unmap and protect take the
+/// shootdown-initiator lock S beneath P before their coherent publisher can
+/// prepare a mutation, and release it on that publisher's settlement, so one
+/// shootdown is in flight system-wide.
+#[test]
+fn family_g_publishers_run_under_the_shootdown_initiator_lock() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    assert!(primordial.contains(
+        "static PRIMORDIAL_SHOOTDOWN_INITIATOR: ShootdownInitiatorLock =\n    ShootdownInitiatorLock::new(user_access::service_local_tlb_shootdown);"
+    ));
+    for (name, adapter) in [
+        (
+            "map_memory",
+            "crate::syscall::address_region_map_prepared_model(",
+        ),
+        (
+            "unmap_memory",
+            "crate::syscall::address_region_unmap_prepared(",
+        ),
+        (
+            "protect_memory",
+            "crate::syscall::address_region_protect_prepared(",
+        ),
+    ] {
+        let body = primordial
+            .split_once(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("{name} exists"))
+            .1
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("{name} extent"))
+            .0;
+        let order = [
+            "PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(",
+            "CoherentAddressSpacePublisher::<",
+            adapter,
+            "initiator.release(publisher.finish())",
+        ]
+        .map(|anchor| {
+            body.find(anchor)
+                .unwrap_or_else(|| panic!("{name} omits {anchor}"))
+        });
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "{name} misorders S"
+        );
+    }
+}

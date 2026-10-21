@@ -627,6 +627,26 @@ impl<const CPUS: usize> ShootdownBarrier<'_, CPUS> {
     }
 }
 
+/// Proof that a coherent publisher published no shootdown (D1 option B,
+/// design §11.2.9): nothing to acknowledge, and so nothing whose reclamation
+/// waits on an acknowledgement. Only [`CoherentAddressSpacePublisher::finish`]
+/// mints one.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct NothingPublished {
+    _private: (),
+}
+
+/// The settlement of the one shootdown a coherent publisher may publish.
+/// It releases the shootdown-initiator lock S that covered the publisher.
+#[must_use = "a shootdown settlement releases S and gates its transaction's reclamation"]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ShootdownOutcome {
+    /// Every target acknowledged the published request.
+    Completed(ReclaimPermit),
+    /// The publisher published nothing.
+    NothingPublished(NothingPublished),
+}
+
 /// Proof that the exact snapshotted CPUs acknowledged one mutation generation.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ReclaimPermit {
@@ -672,6 +692,8 @@ pub(crate) enum CoherentPublishError<E> {
 /// invalidations. This adapter reserves the root mutation first, publishes the
 /// request only after `P` succeeds, acknowledges the initiating CPU, delivers
 /// remote notifications, and does not return until it owns a reclaim permit.
+/// It publishes at most one shootdown, and [`Self::finish`] hands back that
+/// shootdown's settlement (D1 option B).
 pub(crate) struct CoherentAddressSpacePublisher<
     'a,
     P,
@@ -682,6 +704,7 @@ pub(crate) struct CoherentAddressSpacePublisher<
     publisher: &'a mut P,
     coherency: &'a AddressSpaceCoherency<CPUS>,
     driver: &'a mut D,
+    completed: Option<ReclaimPermit>,
 }
 
 impl<'a, P, D, const CPUS: usize, const WAIT_STEPS: usize>
@@ -696,7 +719,23 @@ impl<'a, P, D, const CPUS: usize, const WAIT_STEPS: usize>
             publisher,
             coherency,
             driver,
+            completed: None,
         }
+    }
+
+    /// The settlement of the shootdown this publisher published, if any.
+    pub(crate) fn finish(self) -> ShootdownOutcome {
+        match self.completed {
+            Some(permit) => ShootdownOutcome::Completed(permit),
+            None => ShootdownOutcome::NothingPublished(NothingPublished { _private: () }),
+        }
+    }
+
+    fn record_completion(&mut self, permit: ReclaimPermit) {
+        assert!(
+            self.completed.replace(permit).is_none(),
+            "one coherent publisher published two shootdowns"
+        );
     }
 }
 
@@ -774,13 +813,19 @@ where
         }
 
         match barrier.try_complete() {
-            Ok(_permit) => return Ok(()),
+            Ok(permit) => {
+                self.record_completion(permit);
+                return Ok(());
+            }
             Err(pending) => barrier = pending,
         }
         for _ in 0..WAIT_STEPS {
             self.driver.wait_step(self.coherency);
             match barrier.try_complete() {
-                Ok(_permit) => return Ok(()),
+                Ok(permit) => {
+                    self.record_completion(permit);
+                    return Ok(());
+                }
                 Err(pending) => barrier = pending,
             }
         }
