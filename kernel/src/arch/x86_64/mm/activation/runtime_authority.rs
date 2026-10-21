@@ -7,7 +7,9 @@
 //! `&mut self`. A CPU's guard therefore borrows that CPU's handle for its
 //! whole lifetime, which is what lets the guard-free token (S2K-3) be a
 //! borrow-checker fact. Nothing in interrupt context locks it (D1 commit 2,
-//! design §11.2.4): the handle is a CPU's only way in.
+//! design §11.2.4): the handle is a CPU's only way in. `PagingLock` is the
+//! paging authority's lock beneath it (D1 commit 3), reachable only through a
+//! held guard.
 //!
 //! Split out of the target-only `primordial.rs` (S2K-3) because it uses only
 //! atomics and an `UnsafeCell`, so the host build compiles it, host Clippy
@@ -206,6 +208,111 @@ impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
     }
 }
 
+/// The paging authority's lock, P (D1 commit 3, design §11.2.4).
+///
+/// P is a component lock beneath the runtime authority, T, in the order
+/// DW0-H §12.5 permits: always T, then P, and never P before T. The order
+/// is a type fact. The only way to reach P is a [`PagingAccess`], which only
+/// [`RuntimeAuthorityGuard::with_paging`] mints, and which mutably borrows
+/// that T guard for its whole life. So:
+/// - a P guard cannot outlive the T guard beneath which it was taken;
+/// - no code holds P without holding T, so none can take T after P;
+/// - the CPU's handle stays borrowed by its T guard, so T cannot be taken
+///   twice either.
+///
+/// It lives outside T's value, so a later D1 step can give usercopy its own
+/// way in without reaching into T's cell.
+pub(super) struct PagingLock<P> {
+    locked: AtomicBool,
+    value: UnsafeCell<P>,
+}
+
+// SAFETY: `value` is written once before any AP carrier is released, never moved afterward, and
+// every access goes through a `PagingGuard`, which holds `locked` (acquired with Acquire, released
+// with Release). This is the same explicit DW0-H bridge as `RuntimeAuthorityLock`'s, for a paging
+// authority whose type deliberately does not claim `Send`/`Sync` on its own.
+unsafe impl<P> Sync for PagingLock<P> {}
+
+impl<P> PagingLock<P> {
+    pub(super) const fn new(value: P) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn acquire(&self) -> PagingGuard<'_, P> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        PagingGuard { lock: self }
+    }
+}
+
+impl<'g, T> RuntimeAuthorityGuard<'g, T> {
+    /// Splits this T guard into its value and access to `paging` beneath it.
+    /// The access mutably borrows the guard, so P is reached only while T is
+    /// held, and only after it.
+    pub(super) fn with_paging<'a, P>(
+        &'a mut self,
+        paging: &'a PagingLock<P>,
+    ) -> (&'a mut T, PagingAccess<'a, P>) {
+        let access = PagingAccess {
+            lock: paging,
+            _beneath_runtime_guard: PhantomData,
+        };
+        (&mut **self, access)
+    }
+}
+
+/// The right to take P during one T hold. Neither `Clone` nor `Copy`, and
+/// constructible only by [`RuntimeAuthorityGuard::with_paging`].
+pub(super) struct PagingAccess<'a, P> {
+    lock: &'a PagingLock<P>,
+    _beneath_runtime_guard: PhantomData<&'a mut ()>,
+}
+
+impl<P> PagingAccess<'_, P> {
+    /// Takes P. The guard mutably borrows this access until it drops, so P
+    /// is never taken twice on one CPU.
+    pub(super) fn lock(&mut self) -> PagingGuard<'_, P> {
+        self.lock.acquire()
+    }
+}
+
+pub(super) struct PagingGuard<'a, P> {
+    lock: &'a PagingLock<P>,
+}
+
+impl<P> Deref for PagingGuard<'_, P> {
+    type Target = P;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `acquire` is the only constructor of a guard and returns only after it owns
+        // `locked`; `drop` releases it with a Release store that the next `acquire` reads with
+        // Acquire.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<P> DerefMut for PagingGuard<'_, P> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as in `deref`, the guard owns `locked`, and `&mut self` on the guard makes this
+        // the only reference to the value for its lifetime.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<P> Drop for PagingGuard<'_, P> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -244,6 +351,28 @@ mod tests {
         assert_eq!(lock.tickets.next_ticket.load(Ordering::Relaxed), 1);
         handle.lock()[0] = 5;
         assert_eq!(*handle.lock(), [5, 4]);
+    }
+
+    /// P is reached beneath a T guard, serializes its value, and is
+    /// released when its guard drops, while T stays held.
+    #[test]
+    fn paging_is_taken_beneath_the_runtime_guard_and_released() {
+        let lock = RuntimeAuthorityLock::new(1_u32);
+        let paging = PagingLock::new(10_u32);
+        let [mut handle] = lock.handles::<1>();
+        let mut guard = handle.lock();
+        let (value, mut access) = guard.with_paging(&paging);
+        *value += 1;
+        *access.lock() += 5;
+        assert!(!paging.locked.load(Ordering::Relaxed));
+        {
+            let held = access.lock();
+            assert_eq!(*held, 15);
+            assert!(paging.locked.load(Ordering::Relaxed));
+        }
+        assert!(!paging.locked.load(Ordering::Relaxed));
+        drop(guard);
+        assert_eq!(*handle.lock(), 2);
     }
 
     #[test]

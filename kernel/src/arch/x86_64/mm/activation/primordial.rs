@@ -30,7 +30,9 @@ use super::root_switch::{
 
 use super::GuardFree;
 use super::cpu_slots::{CpuOwner, CpuSlots, OtherCpus, RemotelyStaged};
-use super::runtime_authority::{RuntimeAuthorityHandle, RuntimeAuthorityLock};
+use super::runtime_authority::{
+    PagingAccess, PagingLock, RuntimeAuthorityGuard, RuntimeAuthorityHandle, RuntimeAuthorityLock,
+};
 use crate::one_shot::init_fields;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -1602,6 +1604,17 @@ static PRIMORDIAL_RUNTIME_AUTHORITY: crate::one_shot::OneShotStorage<
     >,
 > = crate::one_shot::OneShotStorage::new();
 
+/// The primordial runtime's paging authority, P, owned once for the kernel's
+/// lifetime beside the runtime authority, T, and reached only beneath a T
+/// guard (D1 commit 3, design §11.2.4).
+static PRIMORDIAL_PAGING: crate::one_shot::OneShotStorage<
+    PagingLock<super::PrimordialActivePaging>,
+> = crate::one_shot::OneShotStorage::new();
+
+/// The paging authority P guards.
+type RuntimePaging<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> =
+    ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>;
+
 struct SharedRuntimeStorage(UnsafeCell<MaybeUninit<PrimordialRuntimeShared>>);
 
 impl SharedRuntimeStorage {
@@ -2385,6 +2398,7 @@ fn bind_runtime_carrier_facades<
 
 fn carrier_resource_tuple<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     runtime: &PrimordialRuntimeCore<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    paging: &RuntimePaging<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
     cpu: crate::cpu::CpuIndex,
     expected_cpu_lifecycle: crate::arch::x86_64::smp::CpuLifecycle,
     expected_runtime_lifecycle: crate::arch::x86_64::syscall::RuntimeCarrierLifecycle,
@@ -2420,16 +2434,13 @@ fn carrier_resource_tuple<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usiz
     {
         fail_live_carrier_admission(runtime.shared, cpu, "CPU admission stacks are not private");
     }
-    let root = runtime
-        .active
-        .kernel_execution_root(cpu)
-        .unwrap_or_else(|_| {
-            fail_live_carrier_admission(runtime.shared, cpu, "CPU retained root unavailable")
-        });
+    let root = paging.kernel_execution_root(cpu).unwrap_or_else(|_| {
+        fail_live_carrier_admission(runtime.shared, cpu, "CPU retained root unavailable")
+    });
     if root.cpu() != cpu || root.root_physical_start() == 0 {
         fail_live_carrier_admission(runtime.shared, cpu, "CPU retained root identity drifted");
     }
-    if !runtime.active.validates_cpu_scratch_binding(cpu)
+    if !paging.validates_cpu_scratch_binding(cpu)
         || !crate::arch::x86_64::ipi::live_ipi_transport_is_bound()
         || !crate::arch::x86_64::ipi::live_rendezvous_handler_is_bound()
         || !user_access::live_tlb_shootdown_is_ready()
@@ -2508,15 +2519,17 @@ fn prepare_runtime_carrier_admission<const RANGE_CAPACITY: usize, const ROLE_CAP
 ) {
     // SAFETY: [P-FACADE] facade 0's handle, borrowed for this function only; the APs are parked,
     // and the loop below touches only their facades, not facade 0.
-    let runtime = unsafe { (*facades.as_ptr()).runtime.lock() };
+    let mut runtime = unsafe { (*facades.as_ptr()).runtime.lock() };
     for cpu_index in 1..live_cpu_count {
         // SAFETY: [P-FACADE] an element of the permanent facade array (`cpu_index` is below the live
         // count); its fields are read and written in place, without a reference to the facade.
         let facade = unsafe { facades.add(cpu_index) }.as_ptr();
         // SAFETY: [P-FACADE] as above.
         let (cpu, shared) = unsafe { ((*facade).cpu, (*facade).shared) };
+        let (state, mut paging) = runtime.split_paging();
         let resources = carrier_resource_tuple(
-            &runtime.core,
+            &state.core,
+            &paging.lock(),
             cpu,
             crate::arch::x86_64::smp::CpuLifecycle::Parked,
             crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Parked,
@@ -2544,9 +2557,11 @@ fn normalize_bootstrap_carrier<const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
     let (cpu, shared) = unsafe { ((*facade).cpu, (*facade).shared) };
     let resources = {
         // SAFETY: [P-FACADE] facade 0's handle, borrowed for this block only.
-        let runtime = unsafe { (*facade).runtime.lock() };
+        let mut runtime = unsafe { (*facade).runtime.lock() };
+        let (state, mut paging) = runtime.split_paging();
         carrier_resource_tuple(
-            &runtime.core,
+            &state.core,
+            &paging.lock(),
             cpu,
             crate::arch::x86_64::smp::runtime_pre_admission_lifecycle(cpu.index()),
             crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
@@ -2629,9 +2644,11 @@ fn release_runtime_carrier_facades<const RANGE_CAPACITY: usize, const ROLE_CAPAC
             core::hint::spin_loop();
         }
         let revalidated = {
-            let runtime = runtime.lock();
+            let mut runtime = runtime.lock();
+            let (state, mut paging) = runtime.split_paging();
             carrier_resource_tuple(
-                &runtime.core,
+                &state.core,
+                &paging.lock(),
                 cpu,
                 crate::arch::x86_64::smp::CpuLifecycle::Executing,
                 crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
@@ -3232,7 +3249,9 @@ impl CpuOwnedState {
 /// exclusively owned here because their adapter surfaces do not yet provide
 /// transactional interior synchronization.
 struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
-    active: ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    /// The paging authority's lock, P. Its value lives outside this lock's;
+    /// only a carrier's `PagingAccess` takes it (D1 commit 3).
+    paging: &'roles PagingLock<RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
     stopping_claim_was_suspended: bool,
     rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
@@ -3300,11 +3319,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// CPU has a root-switch flight in progress, which only
     /// `on_root_switch_flight` may commit or cancel.
     #[track_caller]
-    fn on<'a>(
+    fn on_with<'a>(
         &'a mut self,
         owned: &'a mut CpuOwnedState,
+        paging: PagingAccess<'a, RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     ) -> PrimordialRuntimeCarrier<'a, 'roles, RANGE_CAPACITY, ROLE_CAPACITY> {
-        let carrier = self.on_root_switch_flight(owned);
+        let carrier = self.on_root_switch_flight_with(owned, paging);
         if carrier.own.root_switch_flight.is_some() {
             panic!("ordinary runtime carrier built during an in-flight root switch");
         }
@@ -3313,17 +3333,56 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// One CPU's carrier for the guard hold that commits or cancels its
     /// in-flight root switch; the commit or cancel checks the flight itself.
-    fn on_root_switch_flight<'a>(
+    fn on_root_switch_flight_with<'a>(
         &'a mut self,
         owned: &'a mut CpuOwnedState,
+        paging: PagingAccess<'a, RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     ) -> PrimordialRuntimeCarrier<'a, 'roles, RANGE_CAPACITY, ROLE_CAPACITY> {
         let (own, others) = self.cpus.split(&owned.owner);
         PrimordialRuntimeCarrier {
             core: &mut self.core,
+            paging,
             own,
             others,
             owned,
         }
+    }
+}
+
+/// A carrier is built only from a held runtime guard, which mints its
+/// access to the paging lock beneath it (D1 commit 3).
+impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    RuntimeAuthorityGuard<'_, PrimordialRuntimeState<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>
+{
+    /// The ordinary carrier for this hold.
+    #[track_caller]
+    fn on<'a>(
+        &'a mut self,
+        owned: &'a mut CpuOwnedState,
+    ) -> PrimordialRuntimeCarrier<'a, 'roles, RANGE_CAPACITY, ROLE_CAPACITY> {
+        let (state, paging) = self.split_paging();
+        state.on_with(owned, paging)
+    }
+
+    /// The carrier for the hold that commits or cancels a root-switch flight.
+    fn on_root_switch_flight<'a>(
+        &'a mut self,
+        owned: &'a mut CpuOwnedState,
+    ) -> PrimordialRuntimeCarrier<'a, 'roles, RANGE_CAPACITY, ROLE_CAPACITY> {
+        let (state, paging) = self.split_paging();
+        state.on_root_switch_flight_with(owned, paging)
+    }
+
+    /// The guarded state and access to P beneath this guard, for the holds
+    /// that need no carrier.
+    fn split_paging(
+        &mut self,
+    ) -> (
+        &mut PrimordialRuntimeState<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+        PagingAccess<'_, RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    ) {
+        let paging = self.core.paging;
+        self.with_paging(paging)
     }
 }
 
@@ -3334,6 +3393,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 struct PrimordialRuntimeCarrier<'a, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     core: &'a mut PrimordialRuntimeCore<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+    /// This hold's right to take P beneath its T guard.
+    paging: PagingAccess<'a, RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
     own: &'a mut CpuSharedState,
     others: OtherCpus<'a, CpuSharedState>,
     owned: &'a mut CpuOwnedState,
@@ -3473,8 +3534,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 _ => panic!("remote stop root switch omitted its precommitted Process root"),
             };
         let prepared = self
-            .core
-            .active
+            .paging
+            .lock()
             .prepare_kernel_execution_root_switch(previous)
             .unwrap_or_else(|(error, recovered)| {
                 self.own.active_root = CarrierActiveRoot::StopPrecommitted(recovered);
@@ -3488,8 +3549,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_root_switch_flight(executed.flight);
         let flight = executed.flight;
         let kernel = self
-            .core
-            .active
+            .paging
+            .lock()
             .commit_kernel_execution_root_switch(executed.into_executed());
         self.own.active_root = CarrierActiveRoot::Kernel(kernel);
         self.finish_root_switch_flight(flight);
@@ -3510,8 +3571,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn prepare_terminal_kernel_root_switch(&mut self) -> PreparedTerminalKernelRootSwitch {
         let previous = self.own.active_root.take_process();
         let prepared = self
-            .core
-            .active
+            .paging
+            .lock()
             .prepare_kernel_execution_root_switch(previous)
             .unwrap_or_else(|(error, recovered)| {
                 self.own.active_root = CarrierActiveRoot::Process(recovered);
@@ -3525,8 +3586,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_root_switch_flight(executed.flight);
         let flight = executed.flight;
         let kernel = self
-            .core
-            .active
+            .paging
+            .lock()
             .commit_kernel_execution_root_switch(executed.into_executed());
         self.own.active_root = CarrierActiveRoot::Kernel(kernel);
         self.finish_root_switch_flight(flight);
@@ -3545,11 +3606,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn prepare_terminal_primordial_root_switch(&mut self) -> PreparedTerminalProcessRootSwitch {
+        let cpu = self.cpu();
         let prepared = self
-            .core
-            .active
+            .paging
+            .lock()
             .prepare_process_root_selection(
-                self.cpu(),
+                cpu,
                 self.core.primordial_process,
                 self.core.primordial_address_space,
             )
@@ -3562,20 +3624,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 _ => panic!("terminal idle lost its kernel execution root"),
             };
         let prepared = self
-            .core
-            .active
-            .prepare_from_kernel_execution_root_switch(prepared, previous)
-            .unwrap_or_else(|failure| {
-                let (error, prepared, previous) = failure.into_parts();
-                self.core
-                    .active
-                    .abandon_process_root_selection(prepared)
-                    .unwrap_or_else(|abandon| {
-                        panic!("terminal publisher-root abandonment failed: {abandon:?}")
-                    });
-                self.own.active_root = CarrierActiveRoot::Kernel(previous);
-                panic!("terminal publisher-root preflight failed: {error:?}")
-            });
+            .paging
+            .lock()
+            .prepare_from_kernel_execution_root_switch(prepared, previous);
+        let prepared = prepared.unwrap_or_else(|failure| {
+            let (error, prepared, previous) = failure.into_parts();
+            self.paging
+                .lock()
+                .abandon_process_root_selection(prepared)
+                .unwrap_or_else(|abandon| {
+                    panic!("terminal publisher-root abandonment failed: {abandon:?}")
+                });
+            self.own.active_root = CarrierActiveRoot::Kernel(previous);
+            panic!("terminal publisher-root preflight failed: {error:?}")
+        });
         let flight = self.begin_root_switch_flight();
         PreparedTerminalProcessRootSwitch::new(flight, prepared)
     }
@@ -3587,8 +3649,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_root_switch_flight(executed.flight);
         let flight = executed.flight;
         let selected = self
-            .core
-            .active
+            .paging
+            .lock()
             .commit_from_kernel_execution_root_switch(executed.into_executed());
         self.own.active_root = CarrierActiveRoot::Process(selected);
         self.finish_root_switch_flight(flight);
@@ -3601,8 +3663,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_root_switch_flight(failure.flight);
         let flight = failure.flight;
         let (error, prepared, previous) = failure.into_failure().into_parts();
-        self.core
-            .active
+        self.paging
+            .lock()
             .abandon_process_root_selection(prepared)
             .unwrap_or_else(|abandon| {
                 panic!("cancelled terminal publisher switch lost residency: {abandon:?}")
@@ -3618,10 +3680,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             panic!("AP kernel-root entry requires an unselected AP carrier");
         }
+        let cpu = self.cpu();
         let prepared = self
-            .core
-            .active
-            .prepare_ap_kernel_root_entry(self.cpu())
+            .paging
+            .lock()
+            .prepare_ap_kernel_root_entry(cpu)
             .unwrap_or_else(|error| panic!("AP kernel-root entry preflight failed: {error:?}"));
         self.own.active_root = CarrierActiveRoot::Transitioning;
         let flight = self.begin_root_switch_flight();
@@ -3641,8 +3704,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.assert_root_switch_flight(executed.flight);
         let flight = executed.flight;
         let kernel = self
-            .core
-            .active
+            .paging
+            .lock()
             .commit_ap_kernel_root_entry(executed.into_executed());
         self.own.active_root = CarrierActiveRoot::Kernel(kernel);
         self.finish_root_switch_flight(flight);
@@ -3904,7 +3967,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .stack_bounds(self.own.scheduled().stack_id)
             .unwrap_or_else(|error| panic!("could not load fresh Thread stack: {error:?}"));
         let state = {
-            let mut mappings = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut mappings = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -4717,7 +4781,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .as_ref()
             .is_some_and(|root| root.selects_exact(self.cpu(), process, address_space))
         {
-            if let Err(error) = self.core.active.validate_current_process_root_selection(
+            if let Err(error) = self.paging.lock().validate_current_process_root_selection(
                 self.own.active_root.as_ref().expect("active root"),
                 process,
                 address_space,
@@ -4756,25 +4820,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .record_current(thread, stack_id, context_id);
             return;
         }
+        let cpu = self.cpu();
         let prepared = self
-            .core
-            .active
-            .prepare_process_root_selection(self.cpu(), process, address_space)
+            .paging
+            .lock()
+            .prepare_process_root_selection(cpu, process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
         let previous =
             core::mem::replace(&mut self.own.active_root, CarrierActiveRoot::Transitioning);
         let selected = match previous {
             CarrierActiveRoot::Unselected => {
-                match self
-                    .core
-                    .active
-                    .activate_process_root_selection(prepared, None)
-                {
+                let activated = self
+                    .paging
+                    .lock()
+                    .activate_process_root_selection(prepared, None);
+                match activated {
                     Ok(selected) => selected,
                     Err(failure) => {
                         let (error, prepared, previous) = failure.into_parts();
                         debug_assert!(previous.is_none());
-                        self.core.active
+                        self.paging.lock()
                         .abandon_process_root_selection(prepared)
                         .unwrap_or_else(|abandon| {
                             panic!("failed first root selection could not be abandoned: {abandon:?}")
@@ -4785,16 +4850,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             }
             CarrierActiveRoot::Process(previous) => {
-                match self
-                    .core
-                    .active
-                    .activate_process_root_selection(prepared, Some(previous))
-                {
+                let activated = self
+                    .paging
+                    .lock()
+                    .activate_process_root_selection(prepared, Some(previous));
+                match activated {
                     Ok(selected) => selected,
                     Err(failure) => {
                         let (error, prepared, previous) = failure.into_parts();
-                        self.core
-                            .active
+                        self.paging
+                            .lock()
                             .abandon_process_root_selection(prepared)
                             .unwrap_or_else(|abandon| {
                                 panic!("failed root selection could not be abandoned: {abandon:?}")
@@ -4806,26 +4871,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                 }
             }
-            CarrierActiveRoot::Kernel(previous) => match self
-                .core
-                .active
-                .activate_from_kernel_execution_root(prepared, previous)
-            {
-                Ok(selected) => selected,
-                Err(failure) => {
-                    let (error, prepared, previous) = failure.into_parts();
-                    self.core
-                        .active
+            CarrierActiveRoot::Kernel(previous) => {
+                let activated = self
+                    .paging
+                    .lock()
+                    .activate_from_kernel_execution_root(prepared, previous);
+                match activated {
+                    Ok(selected) => selected,
+                    Err(failure) => {
+                        let (error, prepared, previous) = failure.into_parts();
+                        self.paging
+                        .lock()
                         .abandon_process_root_selection(prepared)
                         .unwrap_or_else(|abandon| {
                             panic!(
                                 "failed kernel-root selection could not be abandoned: {abandon:?}"
                             )
                         });
-                    self.own.active_root = CarrierActiveRoot::Kernel(previous);
-                    panic!("could not activate scheduler-current root from kernel root: {error:?}");
+                        self.own.active_root = CarrierActiveRoot::Kernel(previous);
+                        panic!(
+                            "could not activate scheduler-current root from kernel root: {error:?}"
+                        );
+                    }
                 }
-            },
+            }
             CarrierActiveRoot::StopPrecommitted(_) | CarrierActiveRoot::Transitioning => {
                 panic!("runtime carrier has no stable root while selecting scheduler current")
             }
@@ -4892,8 +4961,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .as_ref()
             .is_some_and(|root| root.selects_exact(self.cpu(), process, address_space))
         {
-            self.core
-                .active
+            self.paging
+                .lock()
                 .validate_current_process_root_selection(
                     self.own.active_root.as_ref().expect("active root"),
                     process,
@@ -4905,77 +4974,79 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.publish_scheduler_root_identity(identity);
             return None;
         }
+        let cpu = self.cpu();
         let prepared = self
-            .core
-            .active
-            .prepare_process_root_selection(self.cpu(), process, address_space)
+            .paging
+            .lock()
+            .prepare_process_root_selection(cpu, process, address_space)
             .unwrap_or_else(|error| panic!("could not prepare scheduler-current root: {error:?}"));
         let previous =
             core::mem::replace(&mut self.own.active_root, CarrierActiveRoot::Transitioning);
-        let kind =
-            match previous {
-                CarrierActiveRoot::Unselected => self
-                    .core
-                    .active
-                    .prepare_process_root_switch(prepared, None)
-                    .map(PreparedSchedulerRootSwitchKind::Process)
-                    .unwrap_or_else(|failure| {
-                        let (error, prepared, previous) = failure.into_parts();
-                        debug_assert!(previous.is_none());
-                        self.core.active
-                        .abandon_process_root_selection(prepared)
-                        .unwrap_or_else(|abandon| {
-                            panic!(
-                                "failed first root selection could not be abandoned: {abandon:?}"
-                            )
-                        });
-                        self.own.active_root = CarrierActiveRoot::Unselected;
-                        panic!("could not prepare first scheduler-current root switch: {error:?}");
-                    }),
-                CarrierActiveRoot::Process(previous) => self
-                    .core
-                    .active
-                    .prepare_process_root_switch(prepared, Some(previous))
-                    .map(PreparedSchedulerRootSwitchKind::Process)
-                    .unwrap_or_else(|failure| {
-                        let (error, prepared, previous) = failure.into_parts();
-                        self.core
-                            .active
-                            .abandon_process_root_selection(prepared)
-                            .unwrap_or_else(|abandon| {
-                                panic!("failed root selection could not be abandoned: {abandon:?}")
-                            });
-                        self.own.active_root =
-                        CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
-                            panic!(
-                                "runtime carrier lost its Process root during switch preparation"
-                            )
-                        }));
-                        panic!("could not prepare scheduler-current root switch: {error:?}");
-                    }),
-                CarrierActiveRoot::Kernel(previous) => self
-                    .core
-                    .active
-                    .prepare_from_kernel_execution_root_switch(prepared, previous)
-                    .map(PreparedSchedulerRootSwitchKind::FromKernel)
-                    .unwrap_or_else(|failure| {
-                        let (error, prepared, previous) = failure.into_parts();
-                        self.core.active
-                        .abandon_process_root_selection(prepared)
-                        .unwrap_or_else(|abandon| {
-                            panic!(
-                                "failed kernel-root selection could not be abandoned: {abandon:?}"
-                            )
-                        });
-                        self.own.active_root = CarrierActiveRoot::Kernel(previous);
-                        panic!(
-                            "could not prepare scheduler-current switch from kernel root: {error:?}"
-                        );
-                    }),
-                CarrierActiveRoot::StopPrecommitted(_) | CarrierActiveRoot::Transitioning => {
-                    panic!("runtime carrier has no stable root while preparing scheduler current")
-                }
-            };
+        let kind = match previous {
+            CarrierActiveRoot::Unselected => ({
+                let switched = self
+                    .paging
+                    .lock()
+                    .prepare_process_root_switch(prepared, None);
+                switched
+            })
+            .map(PreparedSchedulerRootSwitchKind::Process)
+            .unwrap_or_else(|failure| {
+                let (error, prepared, previous) = failure.into_parts();
+                debug_assert!(previous.is_none());
+                self.paging
+                    .lock()
+                    .abandon_process_root_selection(prepared)
+                    .unwrap_or_else(|abandon| {
+                        panic!("failed first root selection could not be abandoned: {abandon:?}")
+                    });
+                self.own.active_root = CarrierActiveRoot::Unselected;
+                panic!("could not prepare first scheduler-current root switch: {error:?}");
+            }),
+            CarrierActiveRoot::Process(previous) => ({
+                let switched = self
+                    .paging
+                    .lock()
+                    .prepare_process_root_switch(prepared, Some(previous));
+                switched
+            })
+            .map(PreparedSchedulerRootSwitchKind::Process)
+            .unwrap_or_else(|failure| {
+                let (error, prepared, previous) = failure.into_parts();
+                self.paging
+                    .lock()
+                    .abandon_process_root_selection(prepared)
+                    .unwrap_or_else(|abandon| {
+                        panic!("failed root selection could not be abandoned: {abandon:?}")
+                    });
+                self.own.active_root = CarrierActiveRoot::Process(previous.unwrap_or_else(|| {
+                    panic!("runtime carrier lost its Process root during switch preparation")
+                }));
+                panic!("could not prepare scheduler-current root switch: {error:?}");
+            }),
+            CarrierActiveRoot::Kernel(previous) => ({
+                let switched = self
+                    .paging
+                    .lock()
+                    .prepare_from_kernel_execution_root_switch(prepared, previous);
+                switched
+            })
+            .map(PreparedSchedulerRootSwitchKind::FromKernel)
+            .unwrap_or_else(|failure| {
+                let (error, prepared, previous) = failure.into_parts();
+                self.paging
+                    .lock()
+                    .abandon_process_root_selection(prepared)
+                    .unwrap_or_else(|abandon| {
+                        panic!("failed kernel-root selection could not be abandoned: {abandon:?}")
+                    });
+                self.own.active_root = CarrierActiveRoot::Kernel(previous);
+                panic!("could not prepare scheduler-current switch from kernel root: {error:?}");
+            }),
+            CarrierActiveRoot::StopPrecommitted(_) | CarrierActiveRoot::Transitioning => {
+                panic!("runtime carrier has no stable root while preparing scheduler current")
+            }
+        };
         let flight = self.begin_root_switch_flight();
         Some(PreparedSchedulerRootSwitch::new(flight, identity, kind))
     }
@@ -4986,11 +5057,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (identity, kind) = executed.into_parts();
         let selected = match kind {
             ExecutedSchedulerRootSwitchKind::Process(executed) => {
-                self.core.active.commit_process_root_switch(executed)
+                self.paging.lock().commit_process_root_switch(executed)
             }
             ExecutedSchedulerRootSwitchKind::FromKernel(executed) => self
-                .core
-                .active
+                .paging
+                .lock()
                 .commit_from_kernel_execution_root_switch(executed),
         };
         self.own.active_root = CarrierActiveRoot::Process(selected);
@@ -5007,8 +5078,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let error = match failure.into_kind() {
             FailedSchedulerRootSwitchKind::Process(failure) => {
                 let (error, prepared, previous) = failure.into_parts();
-                self.core
-                    .active
+                self.paging
+                    .lock()
                     .abandon_process_root_selection(prepared)
                     .unwrap_or_else(|abandon| {
                         panic!("cancelled Process root switch lost residency: {abandon:?}")
@@ -5020,8 +5091,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             FailedSchedulerRootSwitchKind::FromKernel(failure) => {
                 let (error, prepared, previous) = failure.into_parts();
-                self.core
-                    .active
+                self.paging
+                    .lock()
                     .abandon_process_root_selection(prepared)
                     .unwrap_or_else(|abandon| {
                         panic!("cancelled kernel-root switch lost residency: {abandon:?}")
@@ -5138,17 +5209,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.core.cleanup,
             );
         }
-        let mut user = self.core.active.current_process_address_space(
-            self.own.active_root.as_ref().expect("active Process root"),
-            self.own.scheduled().process,
-        );
-        if let Some(output) = discarded {
-            user.discard_owned_output(output)
-                .unwrap_or_else(|_| panic!("rendezvous suspended output pin drifted"));
-        }
-        if let Some(pin) = atomic_pin {
-            user.release_atomic_u32(pin)
-                .unwrap_or_else(|_| panic!("rendezvous suspended atomic pin drifted"));
+        {
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
+                self.own.active_root.as_ref().expect("active Process root"),
+                self.own.scheduled().process,
+            );
+            if let Some(output) = discarded {
+                user.discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("rendezvous suspended output pin drifted"));
+            }
+            if let Some(pin) = atomic_pin {
+                user.release_atomic_u32(pin)
+                    .unwrap_or_else(|_| panic!("rendezvous suspended atomic pin drifted"));
+            }
         }
         self.absorb_service_cleanup();
     }
@@ -5354,11 +5428,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("exception terminal output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("exception terminal atomic pin drifted"));
         }
         self.absorb_service_cleanup();
@@ -5384,8 +5458,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address_space: crate::memory::address_region::AddressSpaceKey,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
-        self.core
-            .active
+        self.paging
+            .lock()
             .validate_current_process_root_selection(
                 self.own.active_root.as_ref().ok_or(())?,
                 process,
@@ -5395,10 +5469,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.own.scheduled().process != process || self.own.scheduled().root_key != root_key {
             return Err(());
         }
-        let mut user = self
-            .core
-            .active
-            .current_process_address_space(self.own.active_root.as_ref().ok_or(())?, process);
+        let mut paging = self.paging.lock();
+        let mut user =
+            paging.current_process_address_space(self.own.active_root.as_ref().ok_or(())?, process);
         loop {
             let mapping = self
                 .core
@@ -5466,7 +5539,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if process == current_process {
             return Err(());
         }
-        let mut user = self.core.active.current_process_address_space(
+        let mut paging = self.paging.lock();
+        let mut user = paging.current_process_address_space(
             self.own.active_root.as_ref().ok_or(())?,
             current_process,
         );
@@ -5563,8 +5637,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         drained: crate::task::BlockedOperationsDrained,
     ) -> Result<(), ()> {
         if process != self.core.primordial_process {
-            self.core
-                .active
+            self.paging
+                .lock()
                 .teardown_empty_child_address_space(process, address_space)
                 .map_err(|_| ())?;
         }
@@ -5925,9 +5999,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<(), ()> {
         let parent_release = {
             let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+            let mut paging = self.paging.lock();
             let mut finalizer = crate::object::PayloadFinalizer::new(
                 &mut self.core.registry,
-                &mut *self.core.active.target.roles,
+                &mut *paging.target.roles,
                 &mut self.core.memory,
                 &self.core.shared.events,
                 &self.core.shared.timers,
@@ -5988,9 +6063,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 {
                     let batch = {
                         let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                        let mut paging = self.paging.lock();
                         let mut finalizer = crate::object::PayloadFinalizer::new(
                             &mut self.core.registry,
-                            &mut *self.core.active.target.roles,
+                            &mut *paging.target.roles,
                             &mut self.core.memory,
                             &self.core.shared.events,
                             &self.core.shared.timers,
@@ -6019,9 +6095,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             let parent_release = {
                 let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
+                let mut paging = self.paging.lock();
                 let mut finalizer = crate::object::PayloadFinalizer::new(
                     &mut self.core.registry,
-                    &mut *self.core.active.target.roles,
+                    &mut *paging.target.roles,
                     &mut self.core.memory,
                     &self.core.shared.events,
                     &self.core.shared.timers,
@@ -6231,26 +6308,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // child's low half. The child is then noncurrent, so teardown can
             // use its exact scratch-selected publisher and finally reclaim its
             // owned PML4 without ever publishing through the primordial root.
+            let cpu = self.cpu();
             let prepared = self
-                .core
-                .active
+                .paging
+                .lock()
                 .prepare_process_root_selection(
-                    self.cpu(),
+                    cpu,
                     self.core.primordial_process,
                     self.core.primordial_address_space,
                 )
                 .map_err(|_| 0x7000_0006_u32)?;
             let previous = Some(self.own.active_root.take_process());
-            let selected = match self
-                .core
-                .active
-                .activate_process_root_selection(prepared, previous)
-            {
+            let activated = self
+                .paging
+                .lock()
+                .activate_process_root_selection(prepared, previous);
+            let selected = match activated {
                 Ok(selected) => selected,
                 Err(failure) => {
                     let (_error, prepared, previous) = failure.into_parts();
-                    self.core
-                        .active
+                    self.paging
+                        .lock()
                         .abandon_process_root_selection(prepared)
                         .unwrap_or_else(|error| {
                             panic!("terminal safe-root rollback drifted: {error:?}")
@@ -6271,8 +6349,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &proof,
             )
             .map_err(|_| 0x7000_0008_u32)?;
-            self.core
-                .active
+            self.paging
+                .lock()
                 .teardown_empty_child_address_space(self.own.scheduled().process, address_space)
                 .map_err(|_| 0x7000_0009_u32)?;
         }
@@ -6520,8 +6598,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(crate::arch::x86_64::rendezvous::RemoteStopError::WrongIdentity);
         }
-        self.core
-            .active
+        self.paging
+            .lock()
             .validate_current_process_root_selection(
                 root,
                 self.own.scheduled().process,
@@ -6610,7 +6688,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 CarrierActiveRoot::StopPrecommitted(root) => root,
                 _ => panic!("remote stop root release without an exact Process selection"),
             };
-        match self.core.active.enter_kernel_execution_root(previous) {
+        match self.paging.lock().enter_kernel_execution_root(previous) {
             Ok(kernel) => self.own.active_root = CarrierActiveRoot::Kernel(kernel),
             Err((error, recovered)) => {
                 self.own.active_root = CarrierActiveRoot::StopPrecommitted(recovered);
@@ -6676,7 +6754,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self.core.active.current_process_address_space(
+        let mut paging = self.paging.lock();
+        let mut mappings = paging.current_process_address_space(
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
@@ -6701,7 +6780,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .authorize_submission(self.own.scheduled().process)
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1_submit_detail(error)));
         let record = {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -6741,7 +6821,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .authorize_submission(self.own.scheduled().process)
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1b_submit_detail(error)));
         let record = {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -6781,7 +6862,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .authorize_submission(self.own.scheduled().process)
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1c_submit_detail(error)));
         let record = {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -6828,7 +6910,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1d_submit_detail(error)));
         if mode == 0 {
             let record = {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -6852,7 +6935,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         } else {
             let readiness = {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -6894,7 +6978,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .authorize_submission(self.own.scheduled().process)
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1e_submit_detail(error)));
         let record = {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -6932,7 +7017,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let phase = self.reserve_runtime_phase();
         let record = {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -7104,7 +7190,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 // Authority is checked before usercopy.  The copied handles are
                 // inspected only; no handle/object reference is retained.
                 let bytes = {
-                    let mut user = self.core.active.current_process_address_space(
+                    let mut paging = self.paging.lock();
+                    let mut user = paging.current_process_address_space(
                         self.own.active_root.as_ref().expect("active root"),
                         self.own.scheduled().process,
                     );
@@ -7714,12 +7801,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
-        let mut mappings = self.core.active.current_process_address_space(
+        let mut paging = self.paging.lock();
+        let mut mappings = paging.current_process_address_space(
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
         frame.authorize_return(current_binding_generation, &mut mappings)?;
         drop(mappings);
+        drop(paging);
         #[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
         self.drain_wrcap_record();
         Ok(())
@@ -7738,7 +7827,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .services
             .operation_owner(self.own.scheduled().thread);
         let resumed = {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -8989,9 +9079,11 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 fail_live_carrier_admission(this.shared, this.cpu, "AP execution identity drifted");
             }
             let observed_resources = {
-                let runtime = this.runtime.lock();
+                let mut runtime = this.runtime.lock();
+                let (state, mut paging) = runtime.split_paging();
                 carrier_resource_tuple(
-                    &runtime.core,
+                    &state.core,
+                    &paging.lock(),
                     this.cpu,
                     crate::arch::x86_64::smp::CpuLifecycle::Executing,
                     crate::arch::x86_64::syscall::RuntimeCarrierLifecycle::Executing,
@@ -9656,6 +9748,10 @@ pub(super) fn enter(
     let mut bsp_owned = owned[crate::cpu::CpuIndex::BOOTSTRAP.index()]
         .take()
         .unwrap_or_else(|| panic!("no owner-local state for the BSP"));
+    // The paging authority's lock, P, lives in its own permanent storage beside the runtime
+    // authority's, outside the value T guards, and is reached only beneath a T guard (D1 commit 3).
+    let paging: &'static PagingLock<RuntimePaging<'static, RANGE_CAPACITY, ROLE_CAPACITY>> =
+        PRIMORDIAL_PAGING.init(PagingLock::new(active));
     // Permanent storage (S2K-4, reset R2D): the lock and the carrier it guards live in one-shot
     // static storage for the kernel's lifetime, not on the boot stack. Built in place there (S2K
     // stage 4), so no whole-carrier temporary is materialized in this frame first.
@@ -9672,7 +9768,7 @@ pub(super) fn enter(
                     init_fields!(
                         core::ptr::addr_of_mut!((*state).core),
                         PrimordialRuntimeCore {
-                            active: active,
+                            paging: paging,
                             stopping_claim: None,
                             stopping_claim_was_suspended: false,
                             rendezvous_reaper: None,
@@ -9782,7 +9878,8 @@ pub(super) fn enter(
             .stack_bounds(stack_id)
             .unwrap_or_else(|error| panic!("could not load primordial kernel stack: {error:?}"));
         let state = {
-            let mut mappings = runtime.core.active.current_process_address_space(
+            let mut paging = runtime.paging.lock();
+            let mut mappings = paging.current_process_address_space(
                 runtime.own.active_root.as_ref().expect("active root"),
                 process,
             );
@@ -9889,7 +9986,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_result,
                 result_size,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10024,7 +10122,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .unwrap_or_else(|_| {
                             panic!("F-service prepare has an invalid root identity")
                         });
-                    let mut user = self.core.active.current_process_address_space(
+                    let mut paging = self.paging.lock();
+                    let mut user = paging.current_process_address_space(
                         self.own.active_root.as_ref().expect("active root"),
                         self.own.scheduled().process,
                     );
@@ -10212,7 +10311,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_size,
                 out_required_size,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10265,7 +10365,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_handle,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10286,7 +10387,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_size,
                 out_required_size,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10312,7 +10414,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_handle,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10335,7 +10438,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_thread,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10351,7 +10455,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ))
             }
             NativeSyscallRequest::ThreadStart { args, args_size } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10366,6 +10471,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     &mut self.core.cleanup,
                 );
                 drop(user);
+                drop(paging);
                 #[cfg(any(
                     deepwyrm_wyr1b_evidence,
                     deepwyrm_wyr1c_evidence,
@@ -10407,7 +10513,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_handle,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10462,7 +10569,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_resource,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10485,7 +10593,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 width,
                 out_value,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10527,7 +10636,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 requested_rights,
                 out_interrupt,
             } => {
-                let mut user = self.core.active.current_process_address_space(
+                let mut paging = self.paging.lock();
+                let mut user = paging.current_process_address_space(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -10604,7 +10714,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> deepwyrm_abi::DwStatus {
         let phase = self.reserve_runtime_phase();
         let status = (|| {
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -10766,7 +10877,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let target = prepared.target();
             let caller_process = self.own.scheduled().process;
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -10843,7 +10955,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let target = prepared.target();
             let caller_process = self.own.scheduled().process;
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
-            let mut user = self.core.active.current_process_address_space(
+            let mut paging = self.paging.lock();
+            let mut user = paging.current_process_address_space(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -10954,11 +11067,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("primordial exit output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("primordial exit atomic pin drifted"));
         }
         self.absorb_service_cleanup();
@@ -11066,11 +11179,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("process-exit output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("process-exit atomic pin drifted"));
         }
         self.absorb_service_cleanup();
@@ -11356,11 +11469,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("process termination output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("process termination atomic pin drifted"));
         }
         self.absorb_service_cleanup();
@@ -11480,11 +11593,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("TaskGroup termination output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("TaskGroup termination atomic pin drifted"));
         }
         self.absorb_service_cleanup();
@@ -11783,11 +11896,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("Thread termination output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("Thread termination atomic pin drifted"));
         }
         self.absorb_service_cleanup();
@@ -11879,11 +11992,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         for output in discarded.into_iter().flatten() {
             output
-                .discard_terminal(&self.core.active.user_pins)
+                .discard_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("terminal adapter output pin drifted"));
         }
         for pin in atomic_pins.into_iter().flatten() {
-            pin.release_terminal(&self.core.active.user_pins)
+            pin.release_terminal(&self.paging.lock().user_pins)
                 .unwrap_or_else(|_| panic!("terminal adapter atomic pin drifted"));
         }
         self.absorb_service_cleanup();

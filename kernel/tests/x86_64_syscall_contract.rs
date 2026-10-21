@@ -1861,7 +1861,10 @@ fn i1_runtime_join_keeps_cpu_identity_and_dispatch_release_separate() {
     assert!(live.contains("runtime_binding() -> Option<RuntimeBindingState>"));
     assert!(live.contains("!= Some(RuntimeCarrierLifecycle::Executing)"));
     assert!(primordial.contains("current_thread_on(self.cpu())"));
-    assert!(primordial.contains("prepare_process_root_selection(self.cpu"));
+    // D1 commit 3: the CPU is read before P is taken beneath the guard.
+    assert!(primordial.contains(
+        "let cpu = self.cpu();\n        let prepared = self\n            .paging\n            .lock()\n            .prepare_process_root_selection(cpu, process, address_space)"
+    ));
     assert!(primordial.contains("terminal_reaper_next_on(self.cpu())"));
     assert!(primordial.contains("schedule_next_on(this.cpu)"));
     assert!(primordial.contains("begin_execution(cpu_index)"));

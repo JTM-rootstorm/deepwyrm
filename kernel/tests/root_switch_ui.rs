@@ -135,6 +135,26 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
             fixture: "power_off_without_token.rs",
             expected_error: Some("error[E0308]: mismatched types"),
         },
+        // D1 commit 3 (design §11.2.4): the paging lock P is reached only beneath a
+        // held runtime guard T, cannot outlive it, and is not taken twice.
+        UiCase {
+            fixture: "paging_beneath_guard_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "paging_outlives_guard.rs",
+            expected_error: Some("error[E0505]: cannot move out of `guard` because it is borrowed"),
+        },
+        UiCase {
+            fixture: "paging_locked_twice.rs",
+            expected_error: Some(
+                "error[E0499]: cannot borrow `access` as mutable more than once at a time",
+            ),
+        },
+        UiCase {
+            fixture: "paging_without_guard.rs",
+            expected_error: Some("error[E0624]: method `acquire` is private"),
+        },
     ] {
         run_case(&rustc, &manifest_dir, &output_dir, &case);
     }
