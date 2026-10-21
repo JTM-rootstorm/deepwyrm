@@ -651,3 +651,352 @@ Rejected:
   smaller diff, but it leaves the owner-local facts shared and proves less.
 - **Moving the six facts into the facades and reaching them remotely
   through raw pointers.** That is the aliasing the stop prevented.
+
+### 11.2 D1 addendum: measured borrow sets and the prepare/commit split (2026-10-21)
+
+This is D1's first step under §11 item 6: documents only, no kernel change.
+H0 §12.8 stands. It was measured from source at deepwyrm `d2eef61` and
+rests on reading, not a run. Path abbreviations: `P` is
+`kernel/src/arch/x86_64/mm/activation/primordial.rs`, `A` is
+`kernel/src/syscall/adapters.rs`, and `F` is `kernel/src/syscall/f_services.rs`.
+
+#### 11.2.1 Borrow set of each syscall
+
+**Today, every ordinary syscall runs in one hold.** The facade calls
+`with_synchronized_runtime_at_safe_point` (`P:8287`). That function locks
+(`P:1955`), runs the carrier's `handle` (`P:9870`), and returns through
+`ready_to_return`. A suspended wait's result is written back on resume,
+also inside a hold (`P:9298`, then the carrier's `resume_suspended` at
+`P:7739`, which builds a user address space at `P:7754`). The F-service arms
+reach their adapters through `dispatch_prepared` (`F:212`). Every other arm
+goes through `handle_fallthrough` (`P:10217`) or `map_memory`,
+`unmap_memory` and `protect_memory` (`P:10606`, `:10755`, `:10831`).
+
+**How to read the table:**
+
+- `w` means the path takes the authority as `&mut`. It is a borrow, not
+  proof of a mutation.
+- `r` means `&`.
+- *Shared* lists members of `PrimordialRuntimeShared` (`P:1502`). Each has
+  its own interior synchronization, so they are outside the question.
+- *Paging* is the guarded `core.active` (`ActiveDeepPaging`):
+  - `U` is a usercopy walk. `current_process_address_space` holds
+    `&mut root_bindings` and `&mut FrameRoleManager` (`activation.rs:1886`,
+    `user_access.rs:264`).
+  - `M` is a page-table or frame-role mutation.
+- *Copy* is where the path touches user memory.
+
+| Syscall | Path | Registry | Tasks | Memory | Regions/Spaces | F-service/cleanup | Shared | Paging | Own CPU slot | Copy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| AbiGetInfo | `P:10219`, `A:473` | | | | | | | U | root (r) | out |
+| ClockGet | `F:455`, `A:514` | | | | | | clock | U | root (r) | out |
+| HandleClose | `P:10236`, `A:774` | w | w | | | cleanup | | | | none |
+| HandleDuplicate | `P:10272`, `A:799` | w | w | | | | | U | root (r) | out |
+| ObjectGetInfoV1 | `P:10291`, `A:906` | w | r | r | | | devices, interrupts | U | root (r) | out |
+| TaskGroupCreate | `P:10319`, `A:1471` | w | w | | | cleanup | | U | root (r) | out |
+| ThreadCreate | `P:10342`, `A:5081` | w | w | | | cleanup | | U | root (r) | out |
+| ThreadStart | `P:10362`, `A:6700` | w | w | | | cleanup | execution | U (validation walks) | root (r) | none |
+| MemoryObjectCreate | `P:10413`, `A:6945` | w | w | w | | cleanup | | M (zeroed backing) | root (r) | out |
+| ProcessCreate | `P:9895`, `A:2771` | w | w | | w / w | cleanup | | M (child root) | root (r) | in, out |
+| ChannelCreate | `F:278`, `A:2879` | w | w | | | | channels | U | root (r) | out |
+| ChannelSend | `F:292`, `A:3001` | w | w | | | cleanup | channels, waits, execution | U | staging (owner-local) | in (`A:3046`, `:3088`, before authority work) |
+| ChannelReceive | `F:317`, `A:3212` | w | w | | | cleanup | channels, waits, execution | U | staging (owner-local) | out |
+| WaitOne | `F:341`, `A:4560` | w | w | | | wait operations | events, timers, channels, interrupts, waits, execution, deadlines | U | `wait_control` (w) | out (owned, on resume) |
+| WaitMany | `F:366`, `A:4679` | w | w | | | wait operations | same as WaitOne | U | `wait_control` (w) | in, out (owned, on resume) |
+| EventCreate | `F:393`, `A:4837` | w | w | | | cleanup | events | U | root (r) | out |
+| EventSignal | `F:406`, `A:4893` | w | r | | | cleanup | events, waits, execution | | | none |
+| AtomicWait32 | `F:422`, `F:511` | (unused) | w | | regions (r) | atomic waits | execution, deadlines | U (pin) | `wait_control` (w) | in (atomic load under pin) |
+| AtomicWake | `F:441` | | w | | regions (r) | atomic ops | execution | U | root (r) | out |
+| TimerCreate | `F:464`, `A:4941` | w | w | | | cleanup | timers | U | root (r) | out |
+| TimerSet | `F:477`, `A:4997` | w | r | | | cleanup | timers, deadlines, waits, execution | | | none |
+| TimerCancel | `F:491`, `A:5045` | w | r | | | cleanup | timers, deadlines | | | none |
+| DeviceResourceClaim | `P:10468`, `A:1547` | w | w | | | | grants, devices | U | root (r) | out |
+| DevicePioRead | `P:10491`, `A:1884` | w | w | | | | devices, port I/O | U | root (r) | out |
+| DevicePioWrite | `P:10515`, `A:1922` | w | w | | | | devices, port I/O | | | none |
+| InterruptCreate | `P:10534`, `A:1954` | w | w | | | | devices, interrupts, platform | U | root (r) | out |
+| InterruptAck | `P:10556`, `A:2004` | w | w | | | cleanup | interrupts, platform, waits, execution | | | none |
+| AddressRegionMap | `P:10606` | w | w | w | regions (w) | cleanup | | M, then shootdown wait (`P:10701`) | root (r) | in (args), out (owned) |
+| AddressRegionUnmap | `P:10755` | w | w | w | regions (w) | cleanup | | M, then shootdown wait (`P:10789`) | | none |
+| AddressRegionProtect | `P:10831` | w | w | w | regions (w) | cleanup | | M, then shootdown wait (`P:10866`) | | none |
+| ProcessExit, ProcessTerminate, TaskGroupTerminate, ThreadTerminate | facade `P:8086-8285` | w | w | w | w | services, cleanup, rendezvous | execution | M (Process-scope root teardown) | own (w), remote (r) | none |
+| ThreadExit | `native.rs:783` (terminate-current path) | w | w | | | cleanup | execution | | own (w) | none |
+
+**Totals over 35 syscalls:**
+
+- **Registry and Tasks together: 31.** The four that need only one or
+  neither are AbiGetInfo, ClockGet, AtomicWait32 and AtomicWake.
+  - Every handle resolution goes through the Process handle table, which
+    lives in `TaskAuthority`.
+  - It retains or releases in the registry. That pairing is H0 §12.4's one
+    standing nested exception.
+- **Memory, Regions, Spaces and F-service state never appear without
+  Tasks.**
+- **Paging mutation (`M`): 8**, all of which also need Registry and Tasks:
+  MemoryObjectCreate, ProcessCreate, the three AddressRegion calls, and the
+  three Process-scope terminations.
+- **Usercopy: 21 syscalls**, every one inside the hold.
+
+#### 11.2.2 Where usercopy happens
+
+- **All usercopy is inside the hold.** The adapters already order it in an
+  F0-compatible way:
+  - input is snapshotted before the authority work (`A:3046`, `:3088`,
+    `:4273`);
+  - an output is preflighted and pinned first (`preflight_output`,
+    `A:350`), then committed after publication (`A:824`).
+- **The mechanism that makes copying safe without the lock already
+  exists.**
+  - Usercopy pins its range in `UserPinTracker` (`user_access.rs:335`),
+    which has its own spin lock.
+  - A pin fails any overlapping page-table mutation or address-space
+    teardown with `Conflict`, rather than waiting (`memory/usercopy.rs:293`,
+    `reserve_teardown`).
+  - The copy itself goes through the user virtual address once preflight
+    has walked the tables (`user_access.rs:447`, `:462`).
+  - What ties the copy to the guard is the walk. It reads the guarded
+    `root_bindings` and the plain `&mut FrameRoleManager`
+    (`user_access.rs:747-799`).
+- **A second hold violation: the shootdown acknowledgement wait.** The three
+  AddressRegion calls wait for remote TLB acknowledgement inside the hold,
+  through `CoherentAddressSpacePublisher` (`coherency.rs:745-751`, bounded
+  at `WAIT_STEPS`, then `panic!`). H0 §12.8 forbids that too.
+  - **Risk, reasoned from source and not reproduced:**
+    1. A target CPU runs a sibling Thread of the same address space.
+    2. It enters any syscall, or takes a quantum-expiry interrupt that
+       locks through `P:1785`, while the initiator is waiting.
+    3. That CPU spins in the ticket lock with IF clear
+       (`runtime_authority.rs:152`). It cannot take the shootdown IPI.
+    4. The initiator therefore panics with "address-space shootdown
+       acknowledgement timeout".
+  - D1 commit 4 removes it. An SMP stress with a multithreaded unmapper
+    would confirm the risk.
+
+#### 11.2.3 The prepare / commit split for each family
+
+**Every family has the same five parts:**
+
+- **Copy-in:** an owned copy-in before any lock.
+- **Prepare:** under the narrowest lock that suffices.
+- **Commit:** cannot fail.
+- **Copy-out:** into a range pinned during prepare, after release, so it
+  cannot fail either.
+- **Revalidation at commit:**
+  - `RuntimePhaseReservation` (`reserve_runtime_phase` and
+    `commit_runtime_phase`, `P:4669-4692`) checks that the scheduled Thread
+    and root binding generation have not changed. A syscall runs with IF
+    clear on one CPU and does not switch between its holds, so drift is an
+    invariant violation and stays a `panic!`. §2.4 finding 2 closes: the
+    check becomes live.
+  - Changes made by *other* CPUs between holds are caught by state that
+    already exists:
+    - a `ProcessOperationLease` taken in prepare;
+      `validate_process_operation` checks it at commit, and quiescing
+      refuses new leases (`task/authority.rs:629-651`);
+    - an object retain taken at resolution;
+    - the Stop poll that every acquisition already does
+      (`take_current_notification_at_safe_point`, `P:1958`).
+  - **If any check fails,** the payload is aborted: release the lease and
+    pins, cancel the reservations, `RuntimePhaseReservation::abort`. The
+    syscall returns `service_rendezvous` (for a Stop) or its status, with no
+    side effect published.
+
+**The families:**
+
+- **A. No authority** (AbiGetInfo, ClockGet). No runtime lock at all. Pin,
+  preflight and copy-out run under the paging lock only, and the copy runs
+  under the pin only.
+- **B. Output only** (HandleDuplicate, ObjectGetInfoV1, TaskGroupCreate,
+  ThreadCreate, ChannelCreate, EventCreate, TimerCreate,
+  DeviceResourceClaim, DevicePioRead, InterruptCreate, AtomicWake,
+  MemoryObjectCreate).
+  - Preflight and pin the output under the paging lock, before the
+    transaction guard.
+  - Prepare and commit happen in one guard hold. These adapters already
+    validate and publish atomically.
+  - Copy out after release.
+  - MemoryObjectCreate allocates its zeroed backing under the paging lock
+    before the guard, and frees it there if the commit is refused.
+  - **Named semantic change:** a sibling Thread can see, or close, a newly
+    published handle before the caller's copy-out stores its value. Today
+    the hold hides that window.
+- **C. No usercopy** (HandleClose, EventSignal, TimerSet, TimerCancel,
+  DevicePioWrite, InterruptAck). One short guard hold. The lock structure
+  does not change these.
+- **D. Copy-in** (ChannelSend, ProcessCreate, WaitMany items, map
+  arguments).
+  - Snapshot into owned storage before the guard. Channel staging is
+    already owner-local (`CpuOwnedState`).
+  - Transferred handle values are resolved under the guard.
+- **E. Waits** (WaitOne, WaitMany, AtomicWait32, resume).
+  - Register the waiter under the guard and decide on suspension there.
+  - Write the owned output (`OwnedLiveUserOutput`) on resume, after
+    release.
+  - AtomicWait32's compare-load moves out of the hold, futex-style:
+    1. register under the guard;
+    2. release;
+    3. load through the pin;
+    4. reacquire and either commit the suspension or cancel on mismatch.
+  - A wake after step 1 finds the waiter, so no wakeup is lost.
+- **F. ChannelReceive.** Dequeue into owner-local staging and install
+  handles under the guard. Copy the payload and handle values out after
+  release.
+- **G. AddressRegionMap, Unmap and Protect.**
+  1. Prepare under the guard: resolve handles, reserve the region, and take
+     table candidates under the paging lock beneath it.
+  2. Publish the page tables under the paging lock, still beneath the
+     guard.
+  3. Release both and wait for shootdown acknowledgement guard-free.
+  4. Reacquire the guard and commit lease release and reclamation, which
+     H0 §12.6 requires to follow acknowledgement.
+  - Publication is the point of no return, so that commit cannot fail.
+  - **Named semantic change:** an unmap or protect over a range that a
+    sibling Thread's in-flight syscall has pinned now fails on the pin
+    `Conflict`. The returned status is chosen in that commit. Today this
+    case cannot happen.
+- **H. Termination** (the five terminal syscalls). These belong to D2. D1
+  changes nothing here: they do no usercopy, and the remote-stop wait is
+  already guard-free (`await_remote_stop_permits` takes `GuardFree`).
+
+**Pin capacity** (`E5_USER_PIN_CAPACITY` = 32, `activation.rs:183`) must
+cover four CPUs × three transient pins plus every suspended wait's owned
+pin. The commit that introduces family B checks this.
+
+#### 11.2.4 The lock structure
+
+**Decision: one H0 §12.5 transaction guard for the object authorities,
+plus a separate paging lock. Not a lock per authority.**
+
+- **T, the runtime transaction guard,** is `RuntimeAuthorityLock`,
+  narrowed. It covers:
+  - Registry, Tasks, Memory, Regions and Spaces;
+  - `FServiceState` and the cleanup queues;
+  - the stopping, rendezvous and supervision fields;
+  - the `cpus[]` slots.
+
+  It is held only for prepare and commit, never across usercopy, a
+  shootdown wait, CR3 completion, idle, `sti; hlt` or user return.
+- **P, the paging lock,** covers `ActiveDeepPaging`: root bindings,
+  `FrameRoleManager` and the scratch bindings. `user_pins` already has its
+  own lock and becomes `&'static`, outside both.
+- **The `PrimordialRuntimeShared` authorities are unchanged.**
+- **Order:** T, then P. P is taken beneath T one component at a time
+  (§12.5: sequential, never nested), or alone for pin, preflight and walk.
+  Never P then T. The pin tracker's lock is a leaf. Shootdown waits and the
+  copies themselves hold neither lock.
+- **Families that need both T and P:** MemoryObjectCreate, ProcessCreate,
+  the three AddressRegion calls, and Process-scope termination. That is 8
+  of 35, and always sequential.
+
+**Why the measurement points this way:**
+
+- Registry and Tasks are written together by 31 of 35 syscalls.
+- Memory, Regions, Spaces and F-service state are strict subsets of that
+  group.
+
+Separate Registry and Tasks locks would therefore be taken back to back by
+nearly every syscall. That buys no parallelism, only an ordering obligation.
+§7's falsifier fires for the object half: a transaction guard is the right
+shape.
+
+It does not fire for paging. Only 8 of 35 mutate paging, and usercopy needs
+only a consistent walk. Paging must become separable anyway, so that copies
+and shootdown waits can leave T.
+
+The result is the `RuntimeCore`/`PagingAuthority` shape that §4.1 declined.
+§4.1's objection was that the non-nesting witness would force every adapter
+to split first. D1 is that split, so the objection no longer holds. The
+deleted types are not revived: T is the existing lock with less under it.
+
+**Quantum expiry may not need T at all.** `QuantumExpiryPublisher` locks T
+(`P:1785`) only to reach `core.shared.execution`. Its scheduler state sits
+behind its own `IrqSpinMutex` (`task/scheduler.rs:1788`), and tickets
+carry generations.
+
+- If no T-held transaction depends on excluding expiry publication,
+  `InterruptAuthorityHandle` can go. T would then never be taken from
+  interrupt context.
+- **Hypothesis:** commit 2 must check this before relying on it.
+
+#### 11.2.5 Token types
+
+- **`GuardFree`** widens to mean "this CPU holds neither T nor P".
+  - Both locks are acquired through the CPU's handle. P beneath T is
+    reached through T's guard.
+  - New consumers:
+    - the usercopy step, which makes H0 §12.8 for usercopy a type fact;
+    - the shootdown wait;
+    - `soft_off_then_halt`.
+- **`SafePointClear`** keeps its meaning (the entry poll before usercopy).
+  It is no longer sufficient by itself: each later T acquisition re-polls
+  Stop, as it does today.
+- **`BoundKernelStack`** is unchanged.
+- **`ReturnReady`** changes meaning.
+  - Today it is minted under T after the finalizer drain.
+  - Under D1 it also carries the pending copy-out, and a `GuardFree`
+    consumes it before user return.
+  - Its proof that finalizers are drained before userspace resumes still
+    holds, because a copy-out queues no finalizer.
+- **`CpuSlots`** is unchanged. The slots stay under T, and owner-only
+  mutation stays a type fact. Prepare copies the owner's facts that the
+  unguarded steps need (root identity and generation, Process) into the
+  payload, instead of reading the slot without T.
+
+#### 11.2.6 The stage-4 finding: `soft_off_then_halt`
+
+`soft_off_then_halt` is reached inside a T hold, from
+`prepare_terminal_handoff_detached` (`P:4260`) and
+`finish_primordial_terminal_handoff` (`P:4665`). It then runs `sti; hlt`.
+H0 §12.8 names `sti; hlt` explicitly.
+
+**Resolution:**
+
+- The decision stays under T, the `any_process_unexited_except` check
+  included.
+- The terminal step returns a power-off outcome.
+- The facade drops the guard and calls `soft_off_then_halt(GuardFree)`, so
+  calling it under a guard is a compile error.
+
+If commit 2 removes the interrupt handle, the timer path also stops being
+able to spin on T at all.
+
+#### 11.2.7 Implementation sequence
+
+Each commit is semantic and carries its own SMP VM evidence (§5.3).
+
+1. **Power off only after the runtime guard is released** (§11.2.6). Add a
+   UI case that calls `soft_off_then_halt` with a guard alive (E0499). The
+   evidence is a normal SMP run that reaches power-off. *This is the first
+   commit:* it is the smallest, it removes a present §12.8 violation, and
+   it does not depend on the rest.
+2. **Publish quantum expiry without T,** if the §11.2.4 hypothesis holds.
+   Otherwise record why and skip it.
+3. **Move `ActiveDeepPaging` under its own lock P.** All 53 `core.active`
+   uses take P beneath T. Behavior is unchanged except for the lock
+   structure, so this is the first commit that changes lock structure.
+4. **Take the shootdown wait out of the hold** (family G's guard-free
+   wait). This removes the §11.2.2 risk.
+5. **Add the usercopy session that requires `GuardFree`.** Family A leaves
+   T entirely.
+6. **Families B and C.** This includes the visible-before-reported
+   semantic change and the pin-capacity check.
+7. **Families D and F.**
+8. **Family E**, including AtomicWait32's reordering and resume copy-out.
+9. **Map's copy-in and copy-out, then delete the unguarded-under-T
+   constructor.** After this, `current_process_address_space` cannot be
+   reached while a T guard is alive. The coordinator then triages the KEEP
+   rows in §4.3's "coarse lock" group for conversion.
+
+**What would falsify this plan:**
+
+- A pin does not make copy-out infallible. For example, some teardown or
+  reclaim path bypasses `UserPinTracker`. Then post-release copy-out can
+  fail after publication, and family B needs a different shape.
+- Some path must take P and then T: a root-switch commit, or a
+  finalizer-driven reclaim. Then the T-then-P order is wrong and that path
+  must split first.
+- Publishing a handle before its copy-out breaks an F0 publication-order
+  guarantee. Then family B keeps copy-out inside a hold, and §12.8 needs
+  Mike's decision again.
+- Profiling shows T contention dominates SMP throughput once usercopy is
+  out. Then Registry and Tasks need splitting after all. This is a later
+  measurement, not a D1 blocker.
