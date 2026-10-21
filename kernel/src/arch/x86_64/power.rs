@@ -38,11 +38,13 @@ pub(crate) fn soft_off_then_halt() -> ! {
         }
     }
     loop {
+        // Not `nomem`: the `sti` lets this CPU's handlers run, and they read
+        // memory this path wrote first, so it must be a compiler barrier.
         // SAFETY: nothing remains runnable on this CPU. Keeping the interrupt
         // shadow matches the halt loop this replaced, so a platform that acts
         // on the S5 write asynchronously still gets serviced.
         unsafe {
-            core::arch::asm!("sti", "hlt", options(nomem, nostack));
+            core::arch::asm!("sti", "hlt", options(nostack));
         }
     }
 }

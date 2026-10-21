@@ -1116,6 +1116,9 @@ unsafe fn load_handler_addresses() -> Result<EarlyIdtHandlers, EarlyDescriptorIn
     reason = "the early descriptor path must enforce IF=0 before serial and IDT setup"
 )]
 unsafe fn disable_interrupts() {
+    // `nomem` is sound: `_dw_kernel_entry` already cleared IF, and Deepwyrm's
+    // IDT is loaded only later in this path, so no handler of ours runs on
+    // either side of this instruction.
     // SAFETY: this is the first instruction-class operation in the one-shot
     // early descriptor path and has the intentionally narrow effect of CLI.
     unsafe {

@@ -775,15 +775,19 @@ fn kernel_asm_blocks() -> Vec<(String, String, String)> {
 /// option, which no host test or type can observe.
 ///
 /// Enabling or disabling interrupts orders the memory an interrupt handler shares with the
-/// interrupted code, so such a block must not claim `nomem`. The only exception is a terminal
-/// `cli; hlt`, after which no code runs. `KNOWN` lists sites outside the S2K lane that were
-/// reported to the coordinator; each must still exist, so a fix forces its removal here.
+/// interrupted code, so such a block must not claim `nomem`. There are two exceptions. A terminal
+/// `cli; hlt` runs no code after it. Each `MEMORY_FREE` site states why no handler can run on
+/// either side of it. Each must still exist and claim `nomem`, so a change to one forces its
+/// entry to be re-argued here.
 #[test]
 fn interrupt_flag_changes_are_compiler_barriers() {
-    const KNOWN: [(&str, &str); 2] = [
-        ("src/arch/x86_64/mod.rs", "cli"),
-        ("src/arch/x86_64/power.rs", "sti; hlt"),
-    ];
+    const MEMORY_FREE: [(&str, &str, &str); 1] = [(
+        "src/arch/x86_64/mod.rs",
+        "cli",
+        "the early descriptor path's defensive CLI: `_dw_kernel_entry` cleared IF before any Rust \
+         ran, and Deepwyrm's IDT is loaded only after this instruction, so it changes no \
+         interrupt state that one of our handlers could observe",
+    )];
     let blocks = kernel_asm_blocks();
     let toggles_if = |template: &str| {
         template
@@ -800,18 +804,38 @@ fn interrupt_flag_changes_are_compiler_barriers() {
         }
         claimed.push((file.as_str(), template.as_str()));
     }
+    let memory_free = MEMORY_FREE.map(|(file, template, _reason)| (file, template));
     let mut unexpected = claimed.clone();
-    unexpected.retain(|site| !KNOWN.contains(site));
+    unexpected.retain(|site| !memory_free.contains(site));
     assert!(
         unexpected.is_empty(),
         "interrupt-flag changes that claim `nomem`: {unexpected:?}"
     );
-    for known in KNOWN {
+    for site in memory_free {
         assert!(
-            claimed.contains(&known),
-            "{known:?} no longer claims `nomem`; remove it from KNOWN"
+            claimed.contains(&site),
+            "{site:?} no longer claims `nomem`; remove it from MEMORY_FREE"
         );
     }
+    // The early CLI's reason: the entry shim clears IF first, and the CLI precedes the IDT load.
+    let entry = source("src/arch/x86_64/entry.S");
+    assert!(
+        entry.find("\n    cli\n").expect("entry clears IF")
+            < entry
+                .find("callq dw_kernel_rust_entry")
+                .expect("entry calls Rust")
+    );
+    let install = source("src/arch/x86_64/mod.rs");
+    let install = install
+        .split_once("pub unsafe fn install_early_descriptors()")
+        .expect("early descriptor install")
+        .1;
+    assert!(
+        install.find("disable_interrupts()").expect("early CLI")
+            < install
+                .find("initialize_and_activate()")
+                .expect("descriptor activation")
+    );
     assert!(
         blocks
             .iter()
