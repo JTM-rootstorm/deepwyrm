@@ -34,6 +34,11 @@ use super::adapters::{
     event_signal, process_create, resume_wait_thread_syscall, task_status, timer_cancel,
     timer_create, timer_set, wait_many_syscall_on, wait_one_syscall_on,
 };
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(unused_imports, reason = "only the live runtime begins prepared waits")
+)]
+use super::adapters::{PreparedWait, WaitResultBytes, settle_wait_begin, wait_prepared_begin};
 use super::native::{
     NativeIdleSuspendPoll, NativeSuspendPlan, NativeSyscallRequest, NativeSyscallResult,
 };
@@ -53,6 +58,126 @@ pub(crate) trait FAtomicUserAccess: UserPageBatchAccess + OwnedUserOutputAccess 
     fn load_atomic_u32_acquire(&mut self, pin: &Self::AtomicPin) -> u32;
 
     fn release_atomic_u32(&mut self, pin: Self::AtomicPin);
+}
+
+/// The user access a suspended F operation resumes against under the
+/// runtime authority (D1 commit 8, design §11.2.3 family E). It touches no
+/// user memory: it records the generic wait's output settlement and the
+/// atomic wait's pin release, for the caller to apply after the authority.
+/// The output and the pin were pinned before the wait suspended, so neither
+/// step can fail once it is applied.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only the live runtime defers a resume's settlement"
+    )
+)]
+pub(crate) struct DeferredWaitSettlement<OUTPUT, PIN> {
+    output: Option<(OUTPUT, WaitResultBytes)>,
+    pin: Option<PIN>,
+}
+
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only the live runtime defers a resume's settlement"
+    )
+)]
+impl<OUTPUT, PIN> DeferredWaitSettlement<OUTPUT, PIN> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            output: None,
+            pin: None,
+        }
+    }
+
+    /// The recorded output settlement and pin release, at most one of which
+    /// a resume produces.
+    pub(crate) fn into_parts(self) -> (Option<(OUTPUT, WaitResultBytes)>, Option<PIN>) {
+        assert!(
+            self.output.is_none() || self.pin.is_none(),
+            "one resumed F operation settled both an output and an atomic pin"
+        );
+        (self.output, self.pin)
+    }
+}
+
+impl<OUTPUT, PIN> crate::memory::usercopy::UserPageAccess for DeferredWaitSettlement<OUTPUT, PIN> {
+    type Error = crate::memory::usercopy::DeferredOutputUnavailable;
+    type Pinned<'a>
+        = crate::memory::usercopy::DeferredOutputPin<'a>
+    where
+        Self: 'a;
+
+    fn pin(
+        &mut self,
+        _range: crate::memory::user_range::UserRange,
+    ) -> Result<Self::Pinned<'_>, Self::Error> {
+        panic!("a resumed F operation does no usercopy under the runtime authority");
+    }
+}
+
+impl<OUTPUT, PIN> UserPageBatchAccess for DeferredWaitSettlement<OUTPUT, PIN> {
+    type PinnedBatch<'a>
+        = crate::memory::usercopy::DeferredBatchPin<'a>
+    where
+        Self: 'a;
+
+    fn pin_batch(
+        &mut self,
+        _ranges: [Option<crate::memory::user_range::UserRange>; 3],
+    ) -> Result<Self::PinnedBatch<'_>, Self::Error> {
+        panic!("a resumed F operation does no usercopy under the runtime authority");
+    }
+}
+
+impl<OUTPUT, PIN> OwnedUserOutputAccess for DeferredWaitSettlement<OUTPUT, PIN> {
+    type OwnedOutput = OUTPUT;
+
+    fn preflight_owned_output(
+        &mut self,
+        _range: crate::memory::user_range::UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        panic!("a resumed wait pinned its output before it suspended");
+    }
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]) {
+        let bytes = source
+            .try_into()
+            .expect("a resumed wait's result has its generated size");
+        assert!(
+            self.output.replace((output, Some(bytes))).is_none(),
+            "a resumed wait settled its output twice"
+        );
+    }
+
+    fn discard_owned_output(&mut self, output: Self::OwnedOutput) {
+        assert!(
+            self.output.replace((output, None)).is_none(),
+            "a resumed wait settled its output twice"
+        );
+    }
+}
+
+impl<OUTPUT, PIN> FAtomicUserAccess for DeferredWaitSettlement<OUTPUT, PIN> {
+    type AtomicPin = PIN;
+
+    fn pin_atomic_u32(&mut self, _address: DwUserAddress) -> Result<Self::AtomicPin, DwStatus> {
+        panic!("a resumed atomic wait pinned its word before it suspended");
+    }
+
+    fn load_atomic_u32_acquire(&mut self, _pin: &Self::AtomicPin) -> u32 {
+        panic!("a resumed atomic wait loads no user word");
+    }
+
+    fn release_atomic_u32(&mut self, pin: Self::AtomicPin) {
+        assert!(
+            self.pin.replace(pin).is_none(),
+            "a resumed atomic wait released its pin twice"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -832,6 +957,65 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         execution_generation: u64,
     ) -> Result<(), WaitSuspendError> {
         control.retire_idle_for_stop(thread, execution_generation)
+    }
+
+    /// The guarded half of `WaitOne` and `WaitMany` (D1 commit 8, design
+    /// §11.2.3 family E): the wait begins over input copied, and an output
+    /// pinned, before the runtime authority. A returning wait hands its
+    /// output back, with the result to commit into it, for the caller to
+    /// settle after the authority. A suspended wait keeps it in its operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the wait begin keeps every source authority and owner explicit"
+    )]
+    #[cfg_attr(
+        not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live runtime begins prepared waits")
+    )]
+    pub(crate) fn begin_prepared_wait<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const EVENTS: usize,
+        const TIMERS: usize,
+        const PAIRS: usize,
+        const DEPTH: usize,
+        const WAITERS: usize,
+    >(
+        &mut self,
+        control: &mut NativeWaitControl,
+        prepared: PreparedWait<OUTPUT>,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        events: &EventAuthority<EVENTS>,
+        timers: &TimerAuthority<TIMERS>,
+        channels: &ChannelAuthority<PAIRS, DEPTH>,
+        interrupts: Option<&dyn InterruptWaitSource>,
+        waits: &WaitRegistry<WAITERS>,
+        execution: &ExecutionDomain<EXECUTION>,
+        wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
+        current_cpu: crate::cpu::CpuIndex,
+        process: ProcessKey,
+        thread: ThreadKey,
+    ) -> (NativeSyscallResult, Option<(OUTPUT, WaitResultBytes)>) {
+        let (action, settlement) = settle_wait_begin(wait_prepared_begin(
+            prepared,
+            registry,
+            tasks,
+            events,
+            timers,
+            channels,
+            interrupts,
+            waits,
+            execution,
+            &mut self.wait_operations,
+            wait_deadlines,
+            current_cpu,
+            process,
+            thread,
+        ));
+        (control.accept(action), settlement)
     }
 
     #[allow(

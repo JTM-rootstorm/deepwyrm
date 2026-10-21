@@ -1198,15 +1198,15 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commits 5, 6, 6d, 7, 7b and 7c add the family-A, family-B,
-    // object-info, ChannelSend, ChannelReceive and ProcessCreate preparation
-    // holds, which service CPU0's timer expiries exactly like the ordinary
-    // hold.
+    // D1 commits 5, 6, 6d, 7, 7b, 7c and 8 add the family-A, family-B,
+    // object-info, ChannelSend, ChannelReceive, ProcessCreate and wait
+    // preparation holds, which service CPU0's timer expiries exactly like the
+    // ordinary hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        10
+        11
     );
     let shared_carrier = runtime
         .split_once(
@@ -2319,7 +2319,7 @@ fn family_a_usercopy_runs_guard_free() {
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
     assert!(primordial.contains(
-        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n            {"
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n                .or_else(|| self.handle_channel_receive(request))\n                .or_else(|| self.handle_process_create(request))\n                .or_else(|| self.handle_wait(request))\n            {"
     ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
@@ -2541,4 +2541,72 @@ fn process_create_copies_outside_its_transaction() {
         "the input copy and the result write take P alone"
     );
     assert!(primordial.contains("crate::syscall::DeferredProcessCreateAccess::new(&mut live)"));
+}
+
+/// Text test (D1 commit 8, design §11.2.3 family E): `WaitOne` and
+/// `WaitMany` copy their input and pin their output with P alone, begin the
+/// wait under the guard, and settle a returning wait's output with P alone.
+/// A suspended wait's resume records its output settlement or pin release
+/// under the guard and applies it with P alone after the guard is dropped.
+#[test]
+fn waits_settle_their_outputs_outside_the_hold() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_wait(")
+        .expect("wait facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("wait facade helper extent")
+        .0;
+    let order = [
+        "runtime.prepare_guard_free_usercopy()",
+        "crate::syscall::wait_one_input(",
+        "crate::syscall::wait_many_input(",
+        "runtime.begin_wait(prepared)",
+        "runtime.commit_runtime_phase(phase);",
+        ".commit_owned_output(output, &result)",
+    ]
+    .map(|anchor| {
+        helper
+            .find(anchor)
+            .unwrap_or_else(|| panic!("wait helper omits {anchor}"))
+    });
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        helper
+            .matches("self.paging.guard_free_access(self.runtime.guard_free())")
+            .count(),
+        2,
+        "the input copy and the output settlement take P alone"
+    );
+
+    // The carrier's resume records into a settlement, with no user session.
+    let resume = primordial
+        .split_once("    ) -> ResumeSettlement {")
+        .expect("carrier resume")
+        .1
+        .split_once("\n    }\n")
+        .expect("carrier resume extent")
+        .0;
+    assert!(resume.contains("let mut settlement = crate::syscall::DeferredWaitSettlement::new();"));
+    assert!(resume.contains("&mut settlement,"));
+    assert!(!resume.contains("self.paging.lock()"));
+    assert!(!resume.contains("current_process_address_space"));
+    // The facade drops the guard before applying it.
+    assert!(primordial.contains(
+        "let settlement = runtime.resume_suspended(frame);\n        drop(runtime);\n        drop(guard);\n        self.apply_resume_settlement(settlement);"
+    ));
+    let apply = primordial
+        .split_once("    fn apply_resume_settlement(")
+        .expect("settlement application")
+        .1
+        .split_once("\n    }\n")
+        .expect("settlement application extent")
+        .0;
+    assert!(apply.contains("self.paging.guard_free_access(self.runtime.guard_free())"));
+    assert!(apply.contains("paging.usercopy_process_address_space(root, process)"));
+    assert!(
+        primordial
+            .contains("\"WaitOne and WaitMany are served by the CPU-local facade (D1 commit 8)\"")
+    );
 }

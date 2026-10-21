@@ -18,8 +18,9 @@ mod f_services;
     reason = "the shared F12 service composition is consumed by the target runtime lane"
 )]
 pub(crate) use f_services::{
-    FAtomicUserAccess, FServiceDispatch, FServiceOperationOwner, FServiceOwnerError,
-    FServiceResume, FServiceResumeError, FServiceRoute, FServiceState, FServiceTerminalCleanup,
+    DeferredWaitSettlement, FAtomicUserAccess, FServiceDispatch, FServiceOperationOwner,
+    FServiceOwnerError, FServiceResume, FServiceResumeError, FServiceRoute, FServiceState,
+    FServiceTerminalCleanup,
 };
 
 #[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
@@ -71,8 +72,8 @@ pub(crate) use adapters::process_terminate;
 pub(crate) use adapters::{
     ChannelReceiveCopyOut, ChannelReceiveHold, ChannelReceiveOutputs, ChannelSendInputs,
     DeferredProcessCreateAccess, PreparedProcessCreate, PreparedProcessTermination,
-    PreparedTaskGroupTermination, PreparedThreadTermination, abi_get_info_with_features,
-    address_region_map_prepared_model, address_region_protect_prepared,
+    PreparedTaskGroupTermination, PreparedThreadTermination, PreparedWait, WaitResultBytes,
+    abi_get_info_with_features, address_region_map_prepared_model, address_region_protect_prepared,
     address_region_unmap_prepared, channel_create, channel_receive_output_ranges,
     channel_receive_precheck, channel_receive_reserve, channel_send_commit, channel_send_snapshot,
     clock_get_with, complete_deferred_current_reclaim_on,
@@ -86,6 +87,7 @@ pub(crate) use adapters::{
     prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
     prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
     process_create_input, process_create_with_root_prepared, process_exit_on, task_group_create,
+    wait_many_input, wait_one_input,
 };
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[allow(

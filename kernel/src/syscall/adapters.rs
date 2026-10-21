@@ -5217,25 +5217,157 @@ fn finish_wait_begin<U: OwnedUserOutputAccess>(
     user: &mut U,
     begin: WaitSyscallBegin<U::OwnedOutput>,
 ) -> WaitSyscallAction {
+    let (action, settlement) = settle_wait_begin(begin);
+    if let Some((output, result)) = settlement {
+        match result {
+            Some(result) => user.commit_owned_output(output, &result),
+            None => user.discard_owned_output(output),
+        }
+    }
+    action
+}
+
+/// The wait result to write into a pinned output (`None` to discard it).
+pub(crate) type WaitResultBytes = Option<[u8; DW_WAIT_RESULT_V1_SIZE as usize]>;
+
+/// Splits a wait's begin into its control action and, for a returning wait,
+/// the output to settle (D1 commit 8). A suspended wait's output stays in
+/// its wait operation, to be settled on resume.
+pub(crate) fn settle_wait_begin<OUTPUT>(
+    begin: WaitSyscallBegin<OUTPUT>,
+) -> (WaitSyscallAction, Option<(OUTPUT, WaitResultBytes)>) {
     match begin {
         WaitSyscallBegin::Returning {
             status,
             output,
             result,
         } => {
-            match result {
-                Some(result) => {
-                    assert_eq!(status, DW_STATUS_SUCCESS);
-                    user.commit_owned_output(output, &result);
-                }
-                None => user.discard_owned_output(output),
+            if result.is_some() {
+                assert_eq!(status, DW_STATUS_SUCCESS);
             }
-            WaitSyscallAction::Returning(status)
+            (WaitSyscallAction::Returning(status), Some((output, result)))
         }
-        WaitSyscallBegin::Suspended { wake, decision } => {
-            WaitSyscallAction::Suspended(WaitSuspendState { wake, decision })
-        }
+        WaitSyscallBegin::Suspended { wake, decision } => (
+            WaitSyscallAction::Suspended(WaitSuspendState { wake, decision }),
+            None,
+        ),
     }
+}
+
+/// A wait's caller-controlled input, copied and validated, and its result
+/// output, pinned (D1 commit 8, design §11.2.3 family E). `WaitOne` is the
+/// one-item form of `WaitMany`: both resolve their items under the runtime
+/// authority, through the same wait-set begin.
+#[must_use = "a prepared wait owns its pinned result output"]
+pub(crate) struct PreparedWait<OUTPUT> {
+    requests: [DwWaitItemV1; DW_WAIT_MANY_MAX_ITEMS as usize],
+    count: usize,
+    deadline: DwDeadline,
+    output: OUTPUT,
+}
+
+/// `WaitOne`'s input checks and result pin, in the adapter's order: the
+/// signal mask, then the output.
+pub(crate) fn wait_one_input<U: OwnedUserOutputAccess>(
+    user: &mut U,
+    handle: DwHandle,
+    signals: DwSignals,
+    deadline: DwDeadline,
+    out_result: DwUserAddress,
+) -> Result<PreparedWait<U::OwnedOutput>, DwStatus> {
+    if signals.0 == 0 || !deepwyrm_abi::dw_signals_are_known(signals) {
+        return Err(DW_STATUS_INVALID_ARGUMENT);
+    }
+    let output = preflight_owned_wait_output(user, out_result)?;
+    let mut requests = [DwWaitItemV1::default(); DW_WAIT_MANY_MAX_ITEMS as usize];
+    requests[0] = DwWaitItemV1 { handle, signals };
+    Ok(PreparedWait {
+        requests,
+        count: 1,
+        deadline,
+        output,
+    })
+}
+
+/// `WaitMany`'s item snapshot and result pin, in the adapter's order: the
+/// shape and items, then the output.
+pub(crate) fn wait_many_input<U: OwnedUserOutputAccess>(
+    user: &mut U,
+    items: DwUserAddress,
+    item_count: u32,
+    mode: u32,
+    deadline: DwDeadline,
+    out_result: DwUserAddress,
+) -> Result<PreparedWait<U::OwnedOutput>, DwStatus> {
+    let (requests, count) = snapshot_wait_many_requests(user, items, item_count, mode)?;
+    let output = preflight_owned_wait_output(user, out_result)?;
+    Ok(PreparedWait {
+        requests,
+        count,
+        deadline,
+        output,
+    })
+}
+
+/// A prepared wait's begin: resolve, register and decide on suspension. No
+/// user memory is touched; a returning wait hands its output back to settle.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the wait begin keeps every source authority and owner explicit"
+)]
+pub(crate) fn wait_prepared_begin<
+    OUTPUT,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EVENTS: usize,
+    const TIMERS: usize,
+    const CHANNEL_PAIRS: usize,
+    const CHANNEL_DEPTH: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    prepared: PreparedWait<OUTPUT>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    events: &EventAuthority<EVENTS>,
+    timers: &TimerAuthority<TIMERS>,
+    channels: &ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>,
+    interrupts: Option<&dyn InterruptWaitSource>,
+    waits: &WaitRegistry<WAITERS>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut WaitOperationRegistry<OUTPUT, EXECUTION>,
+    deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    current_cpu: crate::cpu::CpuIndex,
+    process: ProcessKey,
+    thread: ThreadKey,
+) -> WaitSyscallBegin<OUTPUT> {
+    let PreparedWait {
+        requests,
+        count,
+        deadline,
+        output,
+    } = prepared;
+    wait_many_requests_begin(
+        output,
+        registry,
+        tasks,
+        events,
+        timers,
+        channels,
+        interrupts,
+        waits,
+        execution,
+        operations,
+        deadline_authority,
+        current_cpu,
+        process,
+        thread,
+        &requests[..count],
+        deadline,
+    )
 }
 
 pub(crate) fn wait_one_syscall<
@@ -5324,17 +5456,14 @@ pub(crate) fn wait_one_syscall_on<
     deadline: DwDeadline,
     out_result: DwUserAddress,
 ) -> WaitSyscallAction {
-    if signals.0 == 0 || !deepwyrm_abi::dw_signals_are_known(signals) {
-        return WaitSyscallAction::Returning(DW_STATUS_INVALID_ARGUMENT);
-    }
-    let output = match preflight_owned_wait_output(user, out_result) {
-        Ok(output) => output,
+    let prepared = match wait_one_input(user, handle, signals, deadline, out_result) {
+        Ok(prepared) => prepared,
         Err(status) => return WaitSyscallAction::Returning(status),
     };
     finish_wait_begin(
         user,
-        wait_one_begin_with_interrupts(
-            output,
+        wait_prepared_begin(
+            prepared,
             registry,
             tasks,
             events,
@@ -5348,9 +5477,6 @@ pub(crate) fn wait_one_syscall_on<
             current_cpu,
             process,
             thread,
-            handle,
-            signals,
-            deadline,
         ),
     )
 }
@@ -5444,16 +5570,12 @@ pub(crate) fn wait_many_syscall_on<
     deadline: DwDeadline,
     out_result: DwUserAddress,
 ) -> WaitSyscallAction {
-    let (requests, count) = match snapshot_wait_many_requests(user, items, item_count, mode) {
-        Ok(requests) => requests,
+    let prepared = match wait_many_input(user, items, item_count, mode, deadline, out_result) {
+        Ok(prepared) => prepared,
         Err(status) => return WaitSyscallAction::Returning(status),
     };
-    let output = match preflight_owned_wait_output(user, out_result) {
-        Ok(output) => output,
-        Err(status) => return WaitSyscallAction::Returning(status),
-    };
-    let begin = wait_many_requests_begin(
-        output,
+    let begin = wait_prepared_begin(
+        prepared,
         registry,
         tasks,
         events,
@@ -5467,8 +5589,6 @@ pub(crate) fn wait_many_syscall_on<
         current_cpu,
         process,
         thread,
-        &requests[..count],
-        deadline,
     );
     finish_wait_begin(user, begin)
 }

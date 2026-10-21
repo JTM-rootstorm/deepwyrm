@@ -1793,6 +1793,23 @@ struct QuantumExpiryPublisher {
     shared: &'static PrimordialRuntimeShared,
 }
 
+/// A resumed F operation's user effects, recorded under the runtime
+/// authority and applied with P alone after it (D1 commit 8, design §11.2.3
+/// family E). The output and the atomic word were pinned before the
+/// operation suspended, so applying either cannot fail. Between the hold
+/// and the application the Thread runs with IF clear and passes no safe
+/// point, so no stop or teardown can take the pin first.
+#[must_use = "a resumed wait's output settlement or pin release must be applied"]
+struct ResumeSettlement {
+    root: super::UserCopyRoot,
+    process: ProcessKey,
+    output: Option<(
+        user_access::OwnedLiveUserOutput,
+        crate::syscall::WaitResultBytes,
+    )>,
+    pin: Option<user_access::OwnedLiveAtomicU32>,
+}
+
 impl crate::syscall::native::NativeQuantumExpiry for QuantumExpiryPublisher {
     fn publish_quantum_expiry(
         &mut self,
@@ -2624,6 +2641,119 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         }
         Some(Ok(ready))
+    }
+
+    /// `WaitOne` and `WaitMany` (design §11.2.3 family E, D1 commit 8).
+    /// 1. A first hold as for family A.
+    /// 2. With P alone, `wait_one_input` or `wait_many_input` checks the
+    ///    signals or snapshots the items, and pins the result output.
+    /// 3. A second hold resolves the items, registers the waiter and decides
+    ///    on suspension, then commits the phase and leaves through
+    ///    `ready_to_return`. A suspended wait keeps its output in its wait
+    ///    operation, for the resume to settle.
+    /// 4. A returning wait's result goes into the pinned output with P
+    ///    alone, or the output is discarded.
+    /// Statuses and their precedence are the adapter's. `None` for every
+    /// other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_wait(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        if !matches!(
+            request,
+            NativeSyscallRequest::WaitOne { .. } | NativeSyscallRequest::WaitMany { .. }
+        ) {
+            return None;
+        }
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let prepared = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            match request {
+                NativeSyscallRequest::WaitOne {
+                    handle,
+                    signals,
+                    deadline,
+                    out_result,
+                } => {
+                    crate::syscall::wait_one_input(&mut user, handle, signals, deadline, out_result)
+                }
+                NativeSyscallRequest::WaitMany {
+                    items,
+                    item_count,
+                    mode,
+                    deadline,
+                    out_result,
+                } => crate::syscall::wait_many_input(
+                    &mut user, items, item_count, mode, deadline, out_result,
+                ),
+                _ => unreachable!("wait classification drifted"),
+            }
+        };
+        let (ready, settlement) = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            let (result, settlement) = runtime.begin_wait(prepared);
+            runtime.commit_runtime_phase(phase);
+            (runtime.ready_to_return(result), settlement)
+        };
+        if let Some((output, result)) = settlement {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            match result {
+                Some(result) => user
+                    .commit_owned_output(output, &result)
+                    .unwrap_or_else(|_| panic!("pinned wait output commit drifted")),
+                None => user
+                    .discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("pinned wait output discard drifted")),
+            }
+        }
+        Some(Ok(ready))
+    }
+
+    /// Applies a resumed F operation's recorded user effects with P alone,
+    /// after the hold that resumed it (D1 commit 8).
+    #[inline(never)]
+    fn apply_resume_settlement(&mut self, settlement: ResumeSettlement) {
+        let ResumeSettlement {
+            root,
+            process,
+            output,
+            pin,
+        } = settlement;
+        if output.is_none() && pin.is_none() {
+            return;
+        }
+        let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+        let mut paging = access.lock();
+        let mut user = paging.usercopy_process_address_space(root, process);
+        if let Some(pin) = pin {
+            crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
+        }
+        if let Some((output, result)) = output {
+            match result {
+                Some(result) => user
+                    .commit_owned_output(output, &result)
+                    .unwrap_or_else(|_| panic!("pinned resumed wait output commit drifted")),
+                None => user
+                    .discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("pinned resumed wait output discard drifted")),
+            }
+        }
     }
 
     /// Runs one scheduler-current transaction under the same runtime guard as
@@ -8506,10 +8636,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    /// Resumes a suspended F operation under the runtime authority. Its user
+    /// effects, the wait output's settlement or the atomic pin's release, are
+    /// recorded, not applied: the caller applies them with P alone after the
+    /// authority (D1 commit 8, design §11.2.3 family E).
     fn resume_suspended(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
-    ) -> crate::syscall::native::NativeResumeOutcome {
+    ) -> ResumeSettlement {
         self.synchronize_scheduler_current();
         let publication = self.complete_physical_switch_handoff();
         crate::task::notify_completed_switch_runnable(publication);
@@ -8518,15 +8652,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .core
             .services
             .operation_owner(self.own.scheduled().thread);
+        let mut settlement = crate::syscall::DeferredWaitSettlement::new();
         let resumed = {
-            let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
-                self.own.active_root.as_ref().expect("active root"),
-                self.own.scheduled().process,
-            );
             let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
             self.core.services.resume_suspended(
-                &mut user,
+                &mut settlement,
                 &mut self.core.registry,
                 &mut self.core.tasks,
                 &self.core.shared.waits,
@@ -8541,7 +8671,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         #[cfg(feature = "test-support")]
         self.core.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
-        crate::syscall::native::NativeResumeOutcome::Resumed
+        let (output, pin) = settlement.into_parts();
+        ResumeSettlement {
+            root: self
+                .own
+                .active_root
+                .as_ref()
+                .expect("active root")
+                .usercopy_root(),
+            process: self.own.scheduled().process,
+            output,
+            pin,
+        }
     }
 }
 
@@ -9061,6 +9202,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_channel_send(request))
                 .or_else(|| self.handle_channel_receive(request))
                 .or_else(|| self.handle_process_create(request))
+                .or_else(|| self.handle_wait(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -10174,7 +10316,11 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             }
         }
-        runtime.resume_suspended(frame)
+        let settlement = runtime.resume_suspended(frame);
+        drop(runtime);
+        drop(guard);
+        self.apply_resume_settlement(settlement);
+        crate::syscall::native::NativeResumeOutcome::Resumed
     }
 }
 
@@ -10696,6 +10842,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             NativeSyscallRequest::ProcessCreate { .. } => {
                 unreachable!("ProcessCreate is served by the CPU-local facade (D1 commit 7c)")
             }
+            NativeSyscallRequest::WaitOne { .. } | NativeSyscallRequest::WaitMany { .. } => {
+                unreachable!(
+                    "WaitOne and WaitMany are served by the CPU-local facade (D1 commit 8)"
+                )
+            }
             request => {
                 let dispatch = {
                     let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -11050,6 +11201,45 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         clippy::type_complexity,
         reason = "the pinned output and its optional result travel together"
     )]
+    /// The guarded half of `WaitOne` and `WaitMany` (D1 commit 8): the
+    /// same wait begin as the ordinary dispatch, over prepared input.
+    fn begin_wait(
+        &mut self,
+        prepared: Result<
+            crate::syscall::PreparedWait<user_access::OwnedLiveUserOutput>,
+            deepwyrm_abi::DwStatus,
+        >,
+    ) -> (
+        NativeSyscallResult,
+        Option<(
+            user_access::OwnedLiveUserOutput,
+            crate::syscall::WaitResultBytes,
+        )>,
+    ) {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(status) => return (NativeSyscallResult::returning(status), None),
+        };
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let scheduled = self.own.scheduled();
+        self.core.services.begin_prepared_wait(
+            &mut self.own.wait_control,
+            prepared,
+            &mut self.core.registry,
+            &mut self.core.tasks,
+            &self.core.shared.events,
+            &self.core.shared.timers,
+            &self.core.shared.channels,
+            Some(&self.core.shared.interrupts),
+            &self.core.shared.waits,
+            &self.core.shared.execution,
+            Some(&mut wait_deadlines),
+            self.owned.owner.cpu(),
+            scheduled.process,
+            scheduled.thread,
+        )
+    }
+
     fn run_process_create(
         &mut self,
         prepared: Result<

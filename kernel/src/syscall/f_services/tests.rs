@@ -1,5 +1,6 @@
 extern crate std;
 
+use super::super::adapters::{wait_many_input, wait_one_input};
 use super::*;
 use crate::handle::{AcceptedObjectTypes, HandleTableError};
 use crate::memory::address_region::AtomicWaitKey;
@@ -14,7 +15,8 @@ use deepwyrm_abi::{
     DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RIGHT_INSPECT,
     DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
     DW_SIGNAL_READABLE, DW_SIGNAL_SIGNALED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT,
-    DW_TASK_STATE_CREATED, DW_WAIT_MODE_ANY, DwHandle, DwHandleTransferV1, DwRights,
+    DW_TASK_STATE_CREATED, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE, DwHandle, DwHandleTransferV1,
+    DwRights, DwSignals,
 };
 use std::vec;
 use std::vec::Vec;
@@ -1884,4 +1886,214 @@ fn a_pinned_atomic_wake_keeps_its_statuses_and_returns_its_pin() {
     );
     assert_eq!((status, pin), (DW_STATUS_BAD_ADDRESS, Some(7)));
     assert_eq!(output.written(), None);
+}
+
+/// D1 commit 8 (design §11.2.3 family E): a prepared wait begins with no
+/// user access at all. A returning wait hands back its pinned output and
+/// result. A suspended wait's resume records its output settlement on a
+/// `DeferredWaitSettlement`, and user memory changes only when the caller
+/// applies it, after the authority.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for this suspension test"
+)]
+fn a_prepared_wait_settles_its_output_only_after_the_authority() {
+    let mut fixture = Fixture::new();
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventCreate {
+                requested_rights: DwRights(DW_RIGHT_WAIT.0 | deepwyrm_abi::DW_RIGHT_SIGNAL.0),
+                out_event: DwUserAddress(BASE + 0x500),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let event = DwHandle(u64_at(&fixture.user, BASE + 0x500));
+    let out = DwUserAddress(BASE + 0x580);
+    let out_offset = FakeUserMemory::offset(out.0, DW_WAIT_RESULT_V1_SIZE as usize);
+    macro_rules! begin {
+        ($prepared:expr) => {
+            fixture.services.begin_prepared_wait(
+                &mut fixture.control,
+                $prepared,
+                &mut fixture.registry,
+                &mut fixture.tasks,
+                &fixture.events,
+                &fixture.timers,
+                &fixture.channels,
+                None,
+                &fixture.waits,
+                &fixture.execution,
+                Some(&mut fixture.wait_deadlines),
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                fixture.process,
+                fixture.thread,
+            )
+        };
+    }
+
+    // The input checks keep the adapter's statuses and pin nothing on failure.
+    assert_eq!(
+        wait_one_input(&mut fixture.user, event, DwSignals(0), DW_DEADLINE_NOW, out).err(),
+        Some(deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        wait_many_input(&mut fixture.user, out, 1, 7, DW_DEADLINE_NOW, out).err(),
+        Some(deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(fixture.user.owned_outputs, 0);
+
+    // A NOW wait on an unsignaled event returns TIMED_OUT and hands back its
+    // output to discard.
+    let prepared = wait_one_input(
+        &mut fixture.user,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DW_DEADLINE_NOW,
+        out,
+    )
+    .unwrap();
+    assert_eq!(fixture.user.owned_outputs, 1);
+    let (result, settlement) = begin!(prepared);
+    assert_eq!(result.status, DW_STATUS_TIMED_OUT);
+    let (output, bytes) = settlement.expect("a returning wait hands back its output");
+    assert_eq!(bytes, None);
+    assert_eq!(
+        fixture.user.owned_outputs, 1,
+        "nothing settles under the authority"
+    );
+    fixture.user.discard_owned_output(output);
+    assert_eq!(fixture.user.owned_outputs, 0);
+
+    // A wait on a signaled event returns its result, which reaches user
+    // memory only when the caller commits it.
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventSignal {
+                event,
+                clear_mask: DwSignals(0),
+                set_mask: DW_SIGNAL_SIGNALED,
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let prepared = wait_one_input(
+        &mut fixture.user,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DW_DEADLINE_NOW,
+        out,
+    )
+    .unwrap();
+    let (result, settlement) = begin!(prepared);
+    assert_eq!(result.status, DW_STATUS_SUCCESS);
+    let (output, bytes) = settlement.expect("a returning wait hands back its output");
+    let bytes = bytes.expect("a satisfied wait has a result");
+    assert!(
+        fixture.user.bytes[out_offset..out_offset + bytes.len()]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    fixture.user.commit_owned_output(output, &bytes);
+    assert_eq!(
+        &fixture.user.bytes[out_offset..out_offset + bytes.len()],
+        &bytes[..]
+    );
+    assert_eq!(fixture.user.owned_outputs, 0);
+    fixture.user.bytes[out_offset..out_offset + bytes.len()].fill(0);
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventSignal {
+                event,
+                clear_mask: DW_SIGNAL_SIGNALED,
+                set_mask: DwSignals(0),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+
+    // A finite wait suspends with no output handed back. Its resume records
+    // the discard on the settlement and leaves the pin in place.
+    let prepared = wait_one_input(
+        &mut fixture.user,
+        event,
+        DW_SIGNAL_SIGNALED,
+        DwDeadline(50),
+        out,
+    )
+    .unwrap();
+    let (result, settlement) = begin!(prepared);
+    assert_eq!(
+        result.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    assert!(settlement.is_none());
+    assert_eq!(
+        fixture.services.operation_owner(fixture.thread),
+        Ok(FServiceOperationOwner::GenericWait)
+    );
+    let wake = fixture
+        .services
+        .wait_operations
+        .wake_key_for_thread(fixture.thread)
+        .unwrap();
+    assert!(matches!(
+        // SAFETY: the fixture's running Thread is the physical carrier and the
+        // entry is a fixed synthetic address that this test never enters.
+        unsafe {
+            fixture.services.prepare_suspend(
+                &mut fixture.control,
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
+        NativeSuspendPlan::IdleCurrent
+    ));
+    let mut expired = [None; 8];
+    assert_eq!(fixture.wait_deadlines.queue.expire(50, &mut expired), 1);
+    assert!(claim_timeout_and_wake(&fixture.execution, wake).unwrap());
+    assert!(matches!(
+        // SAFETY: as for `prepare_suspend` above; the idle suspension it
+        // produced is this fixture's own.
+        unsafe {
+            fixture.services.poll_idle_suspend(
+                &mut fixture.control,
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
+        NativeIdleSuspendPoll::ResumeCurrent
+    ));
+    let mut deferred = DeferredWaitSettlement::<FakeOwnedOutput, FakeAtomicPin>::new();
+    let resumed = fixture
+        .services
+        .resume_suspended(
+            &mut deferred,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            fixture.thread,
+            Some(&mut fixture.wait_deadlines),
+        )
+        .unwrap();
+    assert_eq!(resumed.status(), DW_STATUS_TIMED_OUT);
+    assert!(fixture.services.is_quiescent());
+    assert_eq!(
+        fixture.user.owned_outputs, 1,
+        "the resume settles nothing itself"
+    );
+    let (output, pin) = deferred.into_parts();
+    assert!(pin.is_none());
+    let (output, bytes) = output.expect("the resume recorded its output settlement");
+    assert_eq!(bytes, None);
+    fixture.user.discard_owned_output(output);
+    assert_eq!(fixture.user.owned_outputs, 0);
+    assert!(fixture.control.is_clear());
+    close_event(&mut fixture, event);
 }
