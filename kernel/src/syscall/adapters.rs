@@ -3151,9 +3151,7 @@ pub(crate) fn channel_send_from_thread<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
-    #[cfg_attr(not(deepwyrm_dw1c_evidence), allow(unused_variables))] current_thread: Option<
-        ThreadKey,
-    >,
+    current_thread: Option<ThreadKey>,
     channel: DwHandle,
     bytes: DwUserAddress,
     byte_len: u32,
@@ -3162,26 +3160,71 @@ pub(crate) fn channel_send_from_thread<
     flags: u64,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
+    let inputs = match channel_send_snapshot(
+        user,
+        staging,
+        bytes,
+        byte_len,
+        transfers,
+        transfer_count,
+        flags,
+    ) {
+        Ok(inputs) => inputs,
+        Err(status) => return status,
+    };
+    channel_send_commit(
+        &inputs,
+        staging,
+        registry,
+        channels,
+        waits,
+        tasks,
+        execution,
+        current_process,
+        current_thread,
+        channel,
+        cleanup,
+    )
+}
+
+/// One `ChannelSend`'s validated transfer records and payload length, after
+/// its snapshot (D1 commit 7, design §11.2.3 family D). The payload itself
+/// is in the caller's staging buffer.
+pub(crate) struct ChannelSendInputs {
+    decoded: [DwHandleTransferV1; HANDLE_TRANSFER_LIMIT],
+    transfer_count: usize,
+    byte_len: usize,
+}
+
+/// The first half of `ChannelSend` (D1 commit 7): argument validation, the
+/// transfer-record snapshot and its validation, then the payload snapshot
+/// into `staging`, in that order. It touches no authority, so the live
+/// runtime runs it with no runtime lock held.
+pub(crate) fn channel_send_snapshot<U: UserPageAccess>(
+    user: &mut U,
+    staging: &mut [u8],
+    bytes: DwUserAddress,
+    byte_len: u32,
+    transfers: DwUserAddress,
+    transfer_count: u32,
+    flags: u64,
+) -> Result<ChannelSendInputs, DwStatus> {
     if byte_len > DW_CHANNEL_MAX_PAYLOAD || transfer_count > DW_CHANNEL_MAX_HANDLES || flags != 0 {
-        return DW_STATUS_INVALID_ARGUMENT;
+        return Err(DW_STATUS_INVALID_ARGUMENT);
     }
 
     let transfer_count = transfer_count as usize;
     let transfer_byte_len = transfer_count
         .checked_mul(DW_HANDLE_TRANSFER_V1_SIZE as usize)
         .expect("generated Channel transfer count fits usize");
-    let transfer_range =
-        match channel_buffer_range(transfers, transfer_byte_len, 8, UserAccess::READ) {
-            Ok(range) => range,
-            Err(status) => return status,
-        };
+    let transfer_range = channel_buffer_range(transfers, transfer_byte_len, 8, UserAccess::READ)?;
     let mut transfer_staging = [0_u8; HANDLE_TRANSFER_LIMIT * HANDLE_TRANSFER_BYTES];
     if let Err(error) = snapshot_from_user(
         user,
         transfer_range,
         &mut transfer_staging[..transfer_byte_len],
     ) {
-        return usercopy_status(error);
+        return Err(usercopy_status(error));
     }
     let mut decoded = [DwHandleTransferV1::default(); HANDLE_TRANSFER_LIMIT];
     for (index, record) in decoded[..transfer_count].iter_mut().enumerate() {
@@ -3192,13 +3235,13 @@ pub(crate) fn channel_send_from_thread<
             .expect("transfer staging record has generated fixed width");
         *record = decode_handle_transfer(bytes);
         if record.reserved0 != 0 || record.reserved.iter().any(|value| *value != 0) {
-            return DW_STATUS_INVALID_ARGUMENT;
+            return Err(DW_STATUS_INVALID_ARGUMENT);
         }
     }
     for left in 0..transfer_count {
         for right in left + 1..transfer_count {
             if decoded[left].handle == decoded[right].handle {
-                return DW_STATUS_INVALID_ARGUMENT;
+                return Err(DW_STATUS_INVALID_ARGUMENT);
             }
         }
     }
@@ -3206,7 +3249,7 @@ pub(crate) fn channel_send_from_thread<
         .iter()
         .any(|record| record.operation != DW_HANDLE_TRANSFER_MOVE)
     {
-        return DW_STATUS_INVALID_ARGUMENT;
+        return Err(DW_STATUS_INVALID_ARGUMENT);
     }
 
     let byte_len = byte_len as usize;
@@ -3214,14 +3257,55 @@ pub(crate) fn channel_send_from_thread<
         staging.len() >= DW_CHANNEL_MAX_PAYLOAD as usize,
         "F6 Channel staging must hold one ABI-maximum payload"
     );
-    let range = match channel_buffer_range(bytes, byte_len, 1, UserAccess::READ) {
-        Ok(range) => range,
-        Err(status) => return status,
-    };
+    let range = channel_buffer_range(bytes, byte_len, 1, UserAccess::READ)?;
     if let Err(error) = snapshot_from_user(user, range, &mut staging[..byte_len]) {
-        return usercopy_status(error);
+        return Err(usercopy_status(error));
     }
 
+    Ok(ChannelSendInputs {
+        decoded,
+        transfer_count,
+        byte_len,
+    })
+}
+
+/// The second half of `ChannelSend` (D1 commit 7): with the inputs
+/// snapshotted, resolves the endpoint, prepares the handle moves, and
+/// commits the send under the runtime's authorities.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the send commit keeps every authority it mutates explicit"
+)]
+pub(crate) fn channel_send_commit<
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const EXECUTION: usize,
+>(
+    inputs: &ChannelSendInputs,
+    staging: &[u8],
+    registry: &mut ObjectRegistry<OBJECTS>,
+    channels: &ChannelAuthority<PAIRS, DEPTH>,
+    waits: &WaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    current_process: ProcessKey,
+    #[cfg_attr(not(deepwyrm_dw1c_evidence), allow(unused_variables))] current_thread: Option<
+        ThreadKey,
+    >,
+    channel: DwHandle,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let ChannelSendInputs {
+        decoded,
+        transfer_count,
+        byte_len,
+    } = *inputs;
     let pin = match resolve_current_handle(
         tasks,
         registry,

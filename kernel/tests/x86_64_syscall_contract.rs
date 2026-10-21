@@ -1198,14 +1198,14 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commits 5, 6 and 6d add the family-A, family-B and object-info
-    // preparation holds, which service CPU0's timer expiries exactly like the
-    // ordinary hold.
+    // D1 commits 5, 6, 6d and 7 add the family-A, family-B, object-info and
+    // ChannelSend preparation holds, which service CPU0's timer expiries
+    // exactly like the ordinary hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        7
+        8
     );
     let shared_carrier = runtime
         .split_once(
@@ -2318,7 +2318,7 @@ fn family_a_usercopy_runs_guard_free() {
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
     assert!(primordial.contains(
-        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n            {"
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n                .or_else(|| self.handle_object_info(request))\n                .or_else(|| self.handle_channel_send(request))\n            {"
     ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
@@ -2435,4 +2435,33 @@ fn object_info_queries_under_the_hold_and_copies_outside_it() {
         "both copy steps take P alone"
     );
     assert!(primordial.contains(".or_else(|| self.handle_object_info(request))"));
+}
+
+/// Text test (D1 commit 7, design §11.2.3 family D): `ChannelSend`
+/// snapshots its transfer records and payload with P alone, into the CPU's
+/// owner-local staging, before the hold that commits the send.
+#[test]
+fn channel_send_copies_in_before_the_hold() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_channel_send(")
+        .expect("ChannelSend facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("ChannelSend facade helper extent")
+        .0;
+    let access = helper
+        .find("self.paging.guard_free_access(self.runtime.guard_free())")
+        .expect("guard-free P access");
+    let snapshot = helper
+        .find("crate::syscall::channel_send_snapshot(")
+        .expect("guard-free snapshot");
+    let lock = helper
+        .find("let mut guard = self.runtime.lock();")
+        .expect("commit hold");
+    let commit = helper
+        .find("runtime.commit_channel_send(&inputs, channel)")
+        .expect("guarded send commit");
+    assert!(access < snapshot && snapshot < lock && lock < commit);
+    assert!(helper.contains("&mut self.owned.channel_staging[..],"));
 }

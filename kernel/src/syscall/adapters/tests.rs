@@ -11610,3 +11610,75 @@ fn a_split_object_info_query_matches_the_combined_adapter() {
         );
     }
 }
+
+/// D1 commit 7: `ChannelSend`'s first half, which the live runtime runs with
+/// no runtime lock held, rejects malformed transfer records and an
+/// unreadable payload before any authority work, and snapshots a valid
+/// payload into the caller's staging.
+#[test]
+fn a_channel_send_snapshot_validates_and_copies_before_any_authority() {
+    use deepwyrm_abi::{DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_WAIT};
+
+    let record = |handle| deepwyrm_abi::DwHandleTransferV1 {
+        handle: DwHandle(handle),
+        requested_rights: DW_RIGHT_WAIT,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    let mut staging = std::vec![0_u8; DW_CHANNEL_MAX_PAYLOAD as usize];
+
+    // Two records naming one handle.
+    let mut user = FakeUserMemory::new();
+    write_handle_transfer(&mut user, BASE + 0x300, record(5));
+    write_handle_transfer(
+        &mut user,
+        BASE + 0x300 + u64::from(DW_HANDLE_TRANSFER_V1_SIZE),
+        record(5),
+    );
+    assert!(matches!(
+        channel_send_snapshot(
+            &mut user,
+            &mut staging,
+            DwUserAddress(BASE + 0x380),
+            1,
+            DwUserAddress(BASE + 0x300),
+            2,
+            0,
+        ),
+        Err(DW_STATUS_INVALID_ARGUMENT)
+    ));
+
+    // An unreadable payload.
+    let mut user = FakeUserMemory::new();
+    user.deny_read = true;
+    assert!(matches!(
+        channel_send_snapshot(
+            &mut user,
+            &mut staging,
+            DwUserAddress(BASE + 0x380),
+            1,
+            DwUserAddress(0),
+            0,
+            0,
+        ),
+        Err(DW_STATUS_BAD_ADDRESS)
+    ));
+
+    // A valid payload lands in the staging.
+    let mut user = FakeUserMemory::new();
+    user.bytes[FakeUserMemory::offset(BASE + 0x380, 1)] = 0x6b;
+    assert!(
+        channel_send_snapshot(
+            &mut user,
+            &mut staging,
+            DwUserAddress(BASE + 0x380),
+            1,
+            DwUserAddress(0),
+            0,
+            0,
+        )
+        .is_ok()
+    );
+    assert_eq!(staging[0], 0x6b);
+}

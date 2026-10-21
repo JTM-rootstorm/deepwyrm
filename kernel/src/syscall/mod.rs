@@ -84,22 +84,11 @@ pub(crate) use adapters::interrupt_ack_dw1e;
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-#[allow(
-    unused_imports,
-    reason = "the integrated F12 target probe consumes the synchronous compatibility adapter only when test support is selected"
-)]
 pub(crate) use adapters::{
-    DeferredMemoryObjectAccess, MemoryObjectBackingAccess, ProcessRootReservation,
-    ThreadStartMappingAccess, memory_object_create_owned, process_create_with_root,
-    process_terminate, thread_create, thread_start_with_access, thread_terminate,
-};
-#[cfg(deepwyrm_e7_guest)]
-pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
-#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::{
-    PreparedProcessTermination, PreparedTaskGroupTermination, PreparedThreadTermination,
-    abi_get_info_with_features, address_region_map_prepared_model, address_region_protect_prepared,
-    address_region_unmap_prepared, channel_create, clock_get_with,
+    ChannelSendInputs, PreparedProcessTermination, PreparedTaskGroupTermination,
+    PreparedThreadTermination, abi_get_info_with_features, address_region_map_prepared_model,
+    address_region_protect_prepared, address_region_unmap_prepared, channel_create,
+    channel_send_commit, channel_send_snapshot, clock_get_with,
     complete_deferred_current_reclaim_on,
     complete_prepared_process_termination_after_remote_stops_on,
     complete_prepared_task_group_termination_after_remote_stops_on,
@@ -112,6 +101,18 @@ pub(crate) use adapters::{
     prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
     process_exit_on, task_group_create,
 };
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unused_imports,
+    reason = "the integrated F12 target probe consumes the synchronous compatibility adapter only when test support is selected"
+)]
+pub(crate) use adapters::{
+    DeferredMemoryObjectAccess, MemoryObjectBackingAccess, ProcessRootReservation,
+    ThreadStartMappingAccess, memory_object_create_owned, process_create_with_root,
+    process_terminate, thread_create, thread_start_with_access, thread_terminate,
+};
+#[cfg(deepwyrm_e7_guest)]
+pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 #[cfg(all(
     not(deepwyrm_integrated),
     any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest)

@@ -2303,6 +2303,71 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ))
     }
 
+    /// `ChannelSend` (design §11.2.3 family D, D1 commit 7). It copies in
+    /// before the authority work.
+    /// 1. A first hold as for family A.
+    /// 2. With P alone, `channel_send_snapshot` runs the adapter's first half:
+    ///    argument validation, the transfer-record snapshot and its
+    ///    validation, and the payload snapshot into this CPU's owner-local
+    ///    Channel staging.
+    /// 3. A second hold runs the second half (`channel_send_commit`), commits
+    ///    the phase, and leaves through `ready_to_return`.
+    /// The halves run in the adapter's order, so statuses and their
+    /// precedence are unchanged. No usercopy runs under a runtime lock.
+    /// `None` for every other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_channel_send(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::ChannelSend {
+            channel,
+            bytes,
+            byte_len,
+            transfers,
+            transfer_count,
+            flags,
+        } = request
+        else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let snapshot = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            crate::syscall::channel_send_snapshot(
+                &mut user,
+                &mut self.owned.channel_staging[..],
+                bytes,
+                byte_len,
+                transfers,
+                transfer_count,
+                flags,
+            )
+        };
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        let status = match snapshot {
+            Err(status) => status,
+            Ok(inputs) => runtime.commit_channel_send(&inputs, channel),
+        };
+        runtime.commit_runtime_phase(phase);
+        Some(Ok(
+            runtime.ready_to_return(NativeSyscallResult::returning(status))
+        ))
+    }
+
     /// Runs one scheduler-current transaction under the same runtime guard as
     /// the final Stop arbitration. This closes both detached windows: a Stop
     /// published before root synchronization and one published after the CR3
@@ -8735,6 +8800,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .handle_guard_free_usercopy(request)
                 .or_else(|| self.handle_deferred_output(request))
                 .or_else(|| self.handle_object_info(request))
+                .or_else(|| self.handle_channel_send(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -10752,6 +10818,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.scheduled().process,
             handle,
             topic,
+        )
+    }
+
+    /// The guarded half of `ChannelSend` (D1 commit 7): the send commit over
+    /// the payload already snapshotted into this CPU's Channel staging.
+    fn commit_channel_send(
+        &mut self,
+        inputs: &crate::syscall::ChannelSendInputs,
+        channel: deepwyrm_abi::DwHandle,
+    ) -> deepwyrm_abi::DwStatus {
+        let scheduled = self.own.scheduled();
+        crate::syscall::channel_send_commit(
+            inputs,
+            &self.owned.channel_staging[..],
+            &mut self.core.registry,
+            &self.core.shared.channels,
+            &self.core.shared.waits,
+            &mut self.core.tasks,
+            &self.core.shared.execution,
+            scheduled.process,
+            Some(scheduled.thread),
+            channel,
+            &mut self.core.cleanup,
         )
     }
 
