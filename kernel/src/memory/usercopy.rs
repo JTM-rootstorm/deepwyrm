@@ -705,6 +705,102 @@ fn preflight_all<P: PinnedUserPages>(
     Ok(())
 }
 
+/// The largest output a deferred adapter writes: one handle, or a 32-bit
+/// port value.
+pub(crate) const DEFERRED_OUTPUT_MAX: usize = 8;
+
+/// A user-access stand-in for an adapter whose only usercopy is one output
+/// (D1 commit 6, design §11.2.3 family B).
+///
+/// The real output range is preflighted and pinned before the runtime
+/// authority is taken, as an owned output. The adapter then runs under the
+/// authority with this value as its user access. It keeps its own order of
+/// argument validation, then preflight, then authority work, then commit:
+/// - its preflight succeeds exactly when the early one did;
+/// - its commit only records the bytes.
+///
+/// After the authority is released, the caller copies the recorded bytes
+/// into the owned output, which cannot fail because it is pinned, or
+/// discards the output if nothing was written. So an early-preflight failure
+/// surfaces at the same point and with the same status as before, and a
+/// failed operation writes nothing.
+pub(crate) struct DeferredUserOutput {
+    /// The range the early preflight pinned, or `None` if it failed.
+    expected: Option<UserRange>,
+    written: Option<([u8; DEFERRED_OUTPUT_MAX], usize)>,
+}
+
+/// The early preflight failed, so the adapter's preflight fails too.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredOutputUnavailable;
+
+impl DeferredUserOutput {
+    pub(crate) const fn new(expected: Option<UserRange>) -> Self {
+        Self {
+            expected,
+            written: None,
+        }
+    }
+
+    /// The bytes the adapter committed, if it committed.
+    pub(crate) fn written(&self) -> Option<&[u8]> {
+        self.written.as_ref().map(|(bytes, len)| &bytes[..*len])
+    }
+}
+
+impl UserPageAccess for DeferredUserOutput {
+    type Error = DeferredOutputUnavailable;
+    type Pinned<'a>
+        = DeferredOutputPin<'a>
+    where
+        Self: 'a;
+
+    fn pin(&mut self, range: UserRange) -> Result<Self::Pinned<'_>, Self::Error> {
+        let expected = self.expected.ok_or(DeferredOutputUnavailable)?;
+        assert_eq!(
+            range, expected,
+            "deferred output range drifted from its early preflight"
+        );
+        Ok(DeferredOutputPin {
+            written: &mut self.written,
+            range,
+        })
+    }
+}
+
+/// The adapter's pin on a deferred output: its preflight is the early one,
+/// and its commit records the bytes.
+pub(crate) struct DeferredOutputPin<'a> {
+    written: &'a mut Option<([u8; DEFERRED_OUTPUT_MAX], usize)>,
+    range: UserRange,
+}
+
+impl PinnedUserPages for DeferredOutputPin<'_> {
+    type Error = DeferredOutputUnavailable;
+
+    fn preflight(&mut self, _chunk: UserPageChunk) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn read_exact(&mut self, _range: UserRange, _destination: &mut [u8]) {
+        panic!("a deferred output is written, never read");
+    }
+
+    fn write_exact(&mut self, range: UserRange, source: &[u8]) {
+        assert_eq!(range, self.range, "deferred output commit range drifted");
+        assert!(
+            source.len() <= DEFERRED_OUTPUT_MAX,
+            "deferred output exceeds its fixed buffer"
+        );
+        let mut bytes = [0; DEFERRED_OUTPUT_MAX];
+        bytes[..source.len()].copy_from_slice(source);
+        assert!(
+            self.written.replace((bytes, source.len())).is_none(),
+            "deferred output committed twice"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,5 +1262,52 @@ mod tests {
         drop(second_reservation);
         let first_reservation = tracker.reserve_teardown(first).unwrap();
         drop(first_reservation);
+    }
+
+    fn deferred_range(address: u64) -> UserRange {
+        UserRange::new(
+            UserAddressSpace::x86_64_four_level(PAGE_SIZE).unwrap(),
+            address,
+            8,
+            8,
+            UserAccess::WRITE,
+            EmptyAddressRule::Reject,
+        )
+        .unwrap()
+    }
+
+    /// D1 commit 6: an adapter's preflight-then-commit against a deferred
+    /// output records the bytes, and its preflight fails exactly when the
+    /// early one did.
+    #[test]
+    fn a_deferred_output_records_the_commit_and_mirrors_the_early_preflight() {
+        let range = deferred_range(0x4000);
+        let mut deferred = DeferredUserOutput::new(Some(range));
+        assert_eq!(deferred.written(), None);
+        let output = preflight_user_output(&mut deferred, range, 8).unwrap();
+        output.commit(&0x1122_3344_5566_7788_u64.to_le_bytes());
+        assert_eq!(
+            deferred.written(),
+            Some(&0x1122_3344_5566_7788_u64.to_le_bytes()[..])
+        );
+
+        let mut failed = DeferredUserOutput::new(None);
+        assert!(matches!(
+            preflight_user_output(&mut failed, range, 8),
+            Err(UserCopyError::Access(DeferredOutputUnavailable))
+        ));
+        assert_eq!(failed.written(), None);
+
+        // A preflight that is not committed writes nothing.
+        let mut abandoned = DeferredUserOutput::new(Some(range));
+        drop(preflight_user_output(&mut abandoned, range, 8).unwrap());
+        assert_eq!(abandoned.written(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "deferred output range drifted from its early preflight")]
+    fn a_deferred_output_refuses_a_range_it_did_not_preflight() {
+        let mut deferred = DeferredUserOutput::new(Some(deferred_range(0x4000)));
+        let _ = deferred.pin(deferred_range(0x5000));
     }
 }

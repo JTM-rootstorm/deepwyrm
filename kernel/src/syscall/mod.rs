@@ -101,12 +101,12 @@ pub(crate) use adapters::{
     complete_prepared_process_termination_after_remote_stops_on,
     complete_prepared_task_group_termination_after_remote_stops_on,
     complete_prepared_thread_termination_after_remote_stops_on, complete_wait_wakes,
-    decode_map_args, device_pio_read, device_pio_write, device_resource_claim, handle_close,
-    handle_duplicate, inspect_process_termination_threads, inspect_task_group_termination_threads,
-    inspect_thread_termination_threads, interrupt_create, object_get_info_v1_with_device_objects,
-    prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
-    prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
-    process_exit_on, task_group_create,
+    decode_map_args, device_pio_read, device_pio_write, device_resource_claim, event_create,
+    handle_close, handle_duplicate, inspect_process_termination_threads,
+    inspect_task_group_termination_threads, inspect_thread_termination_threads, interrupt_create,
+    object_get_info_v1_with_device_objects, output_range, prepare_address_region_mutation,
+    prepare_process_exit, prepare_process_terminate, prepare_process_unhandled_exception,
+    prepare_task_group_terminate, prepare_thread_terminate, process_exit_on, task_group_create,
 };
 #[cfg(all(
     not(deepwyrm_integrated),

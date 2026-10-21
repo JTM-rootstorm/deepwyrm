@@ -37,6 +37,8 @@ pub(crate) use transition::{
     InactiveRootAuthority, PreparedActivation,
 };
 
+#[cfg(test)]
+pub(crate) use journal::OwnedPageTableJournalError;
 #[allow(
     unused_imports,
     reason = "DW0-C exposes the sealed publisher before the live temporary mapper is wired"

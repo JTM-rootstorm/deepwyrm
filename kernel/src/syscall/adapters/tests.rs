@@ -11381,3 +11381,28 @@ fn every_map_capacity_source_names_a_distinct_resource() {
         "four distinct walls reach NO_RESOURCES on the region path: {names:?}"
     );
 }
+
+/// D1 commit 6 (design §11.2.8 decision 1): a family-B output stays pinned
+/// outside the runtime authority, so a sibling's unmap or protect can now
+/// meet it. The live publisher's mutation permit refuses the overlap with
+/// `UserPinError::Conflict` before any page-table write, and that failure is
+/// the documented `BAD_STATE`, never `NO_RESOURCES`.
+#[test]
+fn a_pinned_range_conflict_fails_unmap_and_protect_with_bad_state() {
+    use crate::arch::x86_64::mm::OwnedPageTableJournalError;
+    use crate::arch::x86_64::mm::X86AddressSpacePublishError;
+    use crate::memory::usercopy::UserPinError;
+    use address_region::AddressSpacePublishStatus;
+
+    let journal = X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(
+        UserPinError::Conflict,
+    ));
+    assert_eq!(journal.syscall_status(), DW_STATUS_BAD_STATE);
+    assert_eq!(journal.capacity_resource(), None);
+    let mapped = X86AddressSpacePublishError::Map(crate::arch::x86_64::mm::MapError::Access(
+        OwnedPageTableJournalError::Target(UserPinError::Conflict),
+    ));
+    assert_eq!(mapped.syscall_status(), DW_STATUS_BAD_STATE);
+    let coherent = crate::memory::address_region::CoherentPublishError::Publish(journal);
+    assert_eq!(coherent.syscall_status(), DW_STATUS_BAD_STATE);
+}

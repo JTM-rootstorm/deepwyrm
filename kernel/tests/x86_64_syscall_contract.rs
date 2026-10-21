@@ -1198,13 +1198,13 @@ fn live_timer_expiry_is_bound_and_serviced_only_from_carrier_safe_points() {
     assert!(runtime.contains("general Timer expiry service escaped CPU0 ownership"));
     assert!(runtime.contains(".expire(token, &self.core.shared.waits)"));
     assert!(runtime.contains("timer_expiries:\n        IrqSpinMutex<"));
-    // D1 commit 5 adds the family-A preparation hold, which services CPU0's
-    // timer expiries exactly like the ordinary syscall hold.
+    // D1 commits 5 and 6 add the family-A and family-B preparation holds,
+    // which service CPU0's timer expiries exactly like the ordinary hold.
     assert_eq!(
         runtime
             .matches("runtime.service_pending_timer_expiries_on_bootstrap();")
             .count(),
-        5
+        6
     );
     let shared_carrier = runtime
         .split_once(
@@ -2316,8 +2316,66 @@ fn family_a_usercopy_runs_guard_free() {
         .find("runtime.commit_runtime_phase(phase);")
         .expect("phase commit");
     assert!(prepare < copy && copy < walk && walk < commit);
-    assert!(primordial.contains("match self.handle_guard_free_usercopy(request) {"));
+    assert!(primordial.contains(
+        "let handled = match self\n                .handle_guard_free_usercopy(request)\n                .or_else(|| self.handle_deferred_output(request))\n            {"
+    ));
     assert!(primordial.contains(
         "NativeSyscallRequest::AbiGetInfo { .. } => {\n                unreachable!(\"AbiGetInfo must be served guard-free by the CPU-local facade\")"
     ));
+}
+
+/// Text test (D1 commit 6, design §11.2.3 family B): eight single-output
+/// syscalls pin their output before the runtime authority, run the unchanged
+/// adapter under it against a `DeferredUserOutput`, and copy the recorded
+/// bytes out after it, with no runtime lock held for either copy step.
+#[test]
+fn family_b_outputs_are_pinned_before_and_written_after_the_hold() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let helper = primordial
+        .split_once("    fn handle_deferred_output(")
+        .expect("family-B facade helper")
+        .1
+        .split_once("\n    }\n")
+        .expect("family-B facade helper extent")
+        .0;
+    for request in [
+        "NativeSyscallRequest::HandleDuplicate { out_handle, .. }",
+        "NativeSyscallRequest::TaskGroupCreate { out_handle, .. }",
+        "NativeSyscallRequest::ThreadCreate { out_thread, .. }",
+        "NativeSyscallRequest::DeviceResourceClaim { out_resource, .. }",
+        "NativeSyscallRequest::DevicePioRead { out_value, .. }",
+        "NativeSyscallRequest::InterruptCreate { out_interrupt, .. }",
+        "NativeSyscallRequest::EventCreate { out_event, .. }",
+        "NativeSyscallRequest::TimerCreate { out_timer, .. }",
+    ] {
+        assert!(helper.contains(request), "family B omits {request}");
+    }
+    let prepare = helper
+        .find("runtime.prepare_guard_free_usercopy()")
+        .expect("guarded preparation");
+    let pin = helper
+        .find("user.preflight_owned_output(range)")
+        .expect("early owned preflight");
+    let run = helper
+        .find("runtime.run_deferred_output(request, &mut deferred);")
+        .expect("guarded adapter run");
+    let copy = helper
+        .find(".commit_owned_output(output, bytes)")
+        .expect("guard-free copy-out");
+    assert!(prepare < pin && pin < run && run < copy);
+    // The adapter's preflight succeeds only if the early one pinned the range.
+    assert!(helper.contains(
+        "DeferredUserOutput::new(\n            pinned.as_ref().map(|(range, _)| *range),\n        );"
+    ));
+    assert_eq!(
+        helper
+            .matches("self.paging.guard_free_access(self.runtime.guard_free())")
+            .count(),
+        2,
+        "both copy steps take P alone"
+    );
+    assert!(
+        primordial
+            .contains("\"family-B requests are served by the CPU-local facade's deferred output\"")
+    );
 }

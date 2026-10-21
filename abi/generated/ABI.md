@@ -794,7 +794,7 @@ Transactionally map a page-aligned MemoryObject range using exact-size DwAddress
 
 ### `0x00020011` `address_region_unmap` (DW0-C)
 
-Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND. Failure leaves the complete range unchanged.
+Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; a range overlapping memory pinned for another Thread's in-flight syscall copy is BAD_STATE. Failure leaves the complete range unchanged.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
@@ -804,7 +804,7 @@ Transactionally remove a nonempty page-aligned fully mapped userspace range. Zer
 
 ### `0x00020012` `address_region_protect` (DW0-C)
 
-Transactionally change a nonempty page-aligned fully mapped userspace range without exceeding its captured mapping authority. Zero, unknown, or W+X protections and zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; exceeding mapping authority is ACCESS_DENIED. Failure leaves the complete range unchanged.
+Transactionally change a nonempty page-aligned fully mapped userspace range without exceeding its captured mapping authority. Zero, unknown, or W+X protections and zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; exceeding mapping authority is ACCESS_DENIED; a range overlapping memory pinned for another Thread's in-flight syscall copy is BAD_STATE. Failure leaves the complete range unchanged.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|

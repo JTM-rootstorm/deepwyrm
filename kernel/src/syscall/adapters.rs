@@ -318,6 +318,20 @@ fn user_address_space() -> UserAddressSpace {
         .expect("generated ABI page size satisfies the locked x86_64 user split")
 }
 
+/// The writable output range an adapter's `preflight_output` would pin, so
+/// a deferred-output caller can preflight it early (D1 commit 6).
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime defers outputs")
+)]
+pub(crate) fn output_range(
+    address: DwUserAddress,
+    byte_len: usize,
+    alignment: u64,
+) -> Result<UserRange, DwStatus> {
+    user_range(address, byte_len, alignment, UserAccess::WRITE)
+}
+
 fn user_range(
     address: DwUserAddress,
     byte_len: usize,

@@ -1611,6 +1611,18 @@ static PRIMORDIAL_PAGING: crate::one_shot::OneShotStorage<
     PagingLock<super::PrimordialActivePaging>,
 > = crate::one_shot::OneShotStorage::new();
 
+// Pin budget (D1 commit 6, design §11.2.3 family B). A family-B output pin
+// now lives across a runtime-authority hold, one per CPU, while the CPU in
+// the hold may hold up to three batch pins and a family-A copy holds one
+// under P. Taking the coordinator's bound of three transient pins per CPU,
+// the transient demand must fit the tracker. Suspended waits' owned pins
+// come on top, at most one per Thread; that budget is reported with this
+// commit rather than asserted (E8 and fairness select 64 Threads).
+const _: () = assert!(
+    super::E5_USER_PIN_CAPACITY >= 3 * crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
+    "the user-pin tracker cannot hold every CPU's transient usercopy pins"
+);
+
 /// The paging authority P guards.
 type RuntimePaging<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> =
     ActiveDeepPaging<LiveActivePagingTarget<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>;
@@ -1950,6 +1962,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// taking P alone through a `GuardFree`, so H0 §12.8 holds by
     /// construction. A last hold commits the phase and leaves through
     /// `ready_to_return`. `None` for every other request.
+    // Kept out of line so the ordinary syscall handler's frame, which the
+    // stack oracles measure, does not absorb this family A path's locals.
+    #[inline(never)]
     fn handle_guard_free_usercopy(
         &mut self,
         request: NativeSyscallRequest,
@@ -2000,10 +2015,94 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Some(Ok(runtime.ready_to_return(result)))
     }
 
+    /// Family B (design §11.2.3, D1 commit 6): a syscall whose only usercopy
+    /// is one fixed-size output. Its output is preflighted and pinned before
+    /// the authority work, and written after it, with no runtime lock held
+    /// for either.
+    /// 1. As for family A, a first hold checks the Thread, reserves the
+    ///    phase, and copies the root identity.
+    /// 2. With P alone (`GuardFree`), the output range is pinned as an owned
+    ///    output.
+    /// 3. A second hold runs the unchanged adapter against a
+    ///    `DeferredUserOutput`. The adapter keeps its order of validation,
+    ///    then preflight, then authority work, then commit, so statuses are
+    ///    unchanged. The hold then commits the phase and leaves through
+    ///    `ready_to_return`.
+    /// 4. With P alone again, the recorded bytes go into the pinned output,
+    ///    which cannot fail, or the output is discarded if nothing was
+    ///    written.
+    /// `None` for every other request.
+    // Kept out of line so the ordinary syscall handler's frame, which the
+    // stack oracles measure, does not absorb this family B path's locals.
+    #[inline(never)]
+    fn handle_deferred_output(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let (address, byte_len, alignment) = match request {
+            NativeSyscallRequest::HandleDuplicate { out_handle, .. }
+            | NativeSyscallRequest::TaskGroupCreate { out_handle, .. } => (out_handle, 8, 8),
+            NativeSyscallRequest::ThreadCreate { out_thread, .. } => (out_thread, 8, 8),
+            NativeSyscallRequest::DeviceResourceClaim { out_resource, .. } => (out_resource, 8, 8),
+            NativeSyscallRequest::DevicePioRead { out_value, .. } => (out_value, 4, 4),
+            NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => (out_interrupt, 8, 8),
+            NativeSyscallRequest::EventCreate { out_event, .. } => (out_event, 8, 8),
+            NativeSyscallRequest::TimerCreate { out_timer, .. } => (out_timer, 8, 8),
+            _ => return None,
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let range = crate::syscall::output_range(address, byte_len, alignment).ok();
+        let pinned = range.and_then(|range| {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            user.preflight_owned_output(range)
+                .ok()
+                .map(|output| (range, output))
+        });
+        let mut deferred = crate::memory::usercopy::DeferredUserOutput::new(
+            pinned.as_ref().map(|(range, _)| *range),
+        );
+        let ready = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            let status = runtime.run_deferred_output(request, &mut deferred);
+            runtime.commit_runtime_phase(phase);
+            runtime.ready_to_return(NativeSyscallResult::returning(status))
+        };
+        if let Some((_, output)) = pinned {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            match deferred.written() {
+                Some(bytes) => user
+                    .commit_owned_output(output, bytes)
+                    .unwrap_or_else(|_| panic!("pinned deferred output commit drifted")),
+                None => user
+                    .discard_owned_output(output)
+                    .unwrap_or_else(|_| panic!("pinned deferred output discard drifted")),
+            }
+        }
+        Some(Ok(ready))
+    }
+
     /// Runs one scheduler-current transaction under the same runtime guard as
     /// the final Stop arbitration. This closes both detached windows: a Stop
     /// published before root synchronization and one published after the CR3
     /// operation but before the caller reacquires runtime authority.
+    // Inlined into each caller, as it was when the ordinary syscall path was its
+    // only caller: the family-A and family-B helpers (D1 commits 5 and 6) add
+    // instances, and an out-of-line instance would add a frame and a return
+    // word to the ordinary syscall chain the stack oracles measure.
+    #[inline(always)]
     fn with_synchronized_runtime_at_safe_point<T>(
         &mut self,
         operation: impl FnOnce(
@@ -8423,7 +8522,10 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     break 'handled crate::syscall::native::ReturnReady::complete_remote_stop();
                 }
             }
-            let handled = match self.handle_guard_free_usercopy(request) {
+            let handled = match self
+                .handle_guard_free_usercopy(request)
+                .or_else(|| self.handle_deferred_output(request))
+            {
                 Some(handled) => handled,
                 None => {
                     let cpu = self.cpu;
@@ -10242,6 +10344,142 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.ready_to_return(result)
     }
 
+    /// The guarded half of a family-B syscall (D1 commit 6). This is the same
+    /// adapter call as the ordinary dispatch, with the deferred output as its
+    /// user access. The F-service creators queue their releases directly on
+    /// the carrier's cleanup queue. The ordinary route reached the same queue
+    /// through `absorb_service_cleanup`.
+    fn run_deferred_output(
+        &mut self,
+        request: NativeSyscallRequest,
+        user: &mut crate::memory::usercopy::DeferredUserOutput,
+    ) -> deepwyrm_abi::DwStatus {
+        let process = self.own.scheduled().process;
+        match request {
+            NativeSyscallRequest::HandleDuplicate {
+                handle,
+                requested_rights,
+                out_handle,
+            } => crate::syscall::handle_duplicate(
+                user,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                process,
+                handle,
+                requested_rights,
+                out_handle,
+            ),
+            NativeSyscallRequest::TaskGroupCreate {
+                parent,
+                requested_rights,
+                out_handle,
+            } => crate::syscall::task_group_create(
+                user,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                process,
+                parent,
+                requested_rights,
+                out_handle,
+                &mut self.core.cleanup,
+            ),
+            NativeSyscallRequest::ThreadCreate {
+                process: target,
+                requested_rights,
+                out_thread,
+            } => crate::syscall::thread_create(
+                user,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                process,
+                target,
+                requested_rights,
+                out_thread,
+                &mut self.core.cleanup,
+            ),
+            NativeSyscallRequest::DeviceResourceClaim {
+                resource_domain,
+                resource_id,
+                requested_rights,
+                out_resource,
+            } => crate::syscall::device_resource_claim(
+                user,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                &self.core.shared.boot_resource_grants,
+                &self.core.shared.device_resources,
+                process,
+                resource_domain,
+                resource_id,
+                requested_rights,
+                out_resource,
+            ),
+            NativeSyscallRequest::DevicePioRead {
+                resource,
+                offset,
+                width,
+                out_value,
+            } => {
+                let mut io = crate::arch::x86_64::io_port::X86PortIo;
+                crate::syscall::device_pio_read(
+                    user,
+                    &mut self.core.registry,
+                    &mut self.core.tasks,
+                    &self.core.shared.device_resources,
+                    &mut io,
+                    process,
+                    resource,
+                    offset,
+                    width,
+                    out_value,
+                )
+            }
+            NativeSyscallRequest::InterruptCreate {
+                resource,
+                requested_rights,
+                out_interrupt,
+            } => crate::syscall::interrupt_create(
+                user,
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                &self.core.shared.device_resources,
+                &self.core.shared.interrupts,
+                &self.core.shared.interrupt_platform,
+                process,
+                resource,
+                requested_rights,
+                out_interrupt,
+            ),
+            NativeSyscallRequest::EventCreate {
+                requested_rights,
+                out_event,
+            } => crate::syscall::event_create(
+                user,
+                &mut self.core.registry,
+                &self.core.shared.events,
+                &mut self.core.tasks,
+                process,
+                requested_rights,
+                out_event,
+                &mut self.core.cleanup,
+            ),
+            NativeSyscallRequest::TimerCreate {
+                requested_rights,
+                out_timer,
+            } => crate::syscall::timer_create(
+                user,
+                &mut self.core.registry,
+                &self.core.shared.timers,
+                &mut self.core.tasks,
+                process,
+                requested_rights,
+                out_timer,
+                &mut self.core.cleanup,
+            ),
+            _ => unreachable!("deferred-output classification drifted"),
+        }
+    }
+
     /// The guarded half of a family-A syscall's preparation (D1 commit 5):
     /// the same running-Thread check and I1 observation as `handle`, the
     /// phase reservation, and a copy of this CPU's root identity for the
@@ -10424,6 +10662,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             NativeSyscallRequest::AbiGetInfo { .. } => {
                 unreachable!("AbiGetInfo must be served guard-free by the CPU-local facade")
             }
+            NativeSyscallRequest::HandleDuplicate { .. }
+            | NativeSyscallRequest::TaskGroupCreate { .. }
+            | NativeSyscallRequest::ThreadCreate { .. }
+            | NativeSyscallRequest::DeviceResourceClaim { .. }
+            | NativeSyscallRequest::DevicePioRead { .. }
+            | NativeSyscallRequest::InterruptCreate { .. } => {
+                unreachable!(
+                    "family-B requests are served by the CPU-local facade's deferred output"
+                )
+            }
             NativeSyscallRequest::HandleClose { handle } => {
                 #[cfg(deepwyrm_i1_evidence)]
                 let closed_process = self
@@ -10460,26 +10708,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
                 NativeSyscallResult::returning(status)
             }
-            NativeSyscallRequest::HandleDuplicate {
-                handle,
-                requested_rights,
-                out_handle,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::handle_duplicate(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    self.own.scheduled().process,
-                    handle,
-                    requested_rights,
-                    out_handle,
-                ))
-            }
             NativeSyscallRequest::ObjectGetInfoV1 {
                 handle,
                 topic,
@@ -10509,50 +10737,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     ),
                 )
             }
-            NativeSyscallRequest::TaskGroupCreate {
-                parent,
-                requested_rights,
-                out_handle,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::task_group_create(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    self.own.scheduled().process,
-                    parent,
-                    requested_rights,
-                    out_handle,
-                    &mut self.core.cleanup,
-                ))
-            }
             NativeSyscallRequest::TaskGroupTerminate { .. } => {
                 unreachable!("TaskGroupTerminate must be intercepted by the CPU-local facade")
-            }
-            NativeSyscallRequest::ThreadCreate {
-                process,
-                requested_rights,
-                out_thread,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::thread_create(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    self.own.scheduled().process,
-                    process,
-                    requested_rights,
-                    out_thread,
-                    &mut self.core.cleanup,
-                ))
             }
             NativeSyscallRequest::ThreadStart { args, args_size } => {
                 let mut paging = self.paging.lock();
@@ -10663,55 +10849,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 protections,
             )),
             NativeSyscallRequest::ProcessExit { exit_code } => self.exit_process(exit_code),
-            NativeSyscallRequest::DeviceResourceClaim {
-                resource_domain,
-                resource_id,
-                requested_rights,
-                out_resource,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::device_resource_claim(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    &self.core.shared.boot_resource_grants,
-                    &self.core.shared.device_resources,
-                    self.own.scheduled().process,
-                    resource_domain,
-                    resource_id,
-                    requested_rights,
-                    out_resource,
-                ))
-            }
-            NativeSyscallRequest::DevicePioRead {
-                resource,
-                offset,
-                width,
-                out_value,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                let mut io = crate::arch::x86_64::io_port::X86PortIo;
-                NativeSyscallResult::returning(crate::syscall::device_pio_read(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    &self.core.shared.device_resources,
-                    &mut io,
-                    self.own.scheduled().process,
-                    resource,
-                    offset,
-                    width,
-                    out_value,
-                ))
-            }
             NativeSyscallRequest::DevicePioWrite {
                 resource,
                 offset,
@@ -10729,29 +10866,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     offset,
                     width,
                     value,
-                ))
-            }
-            NativeSyscallRequest::InterruptCreate {
-                resource,
-                requested_rights,
-                out_interrupt,
-            } => {
-                let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
-                    self.own.active_root.as_ref().expect("active root"),
-                    self.own.scheduled().process,
-                );
-                NativeSyscallResult::returning(crate::syscall::interrupt_create(
-                    &mut user,
-                    &mut self.core.registry,
-                    &mut self.core.tasks,
-                    &self.core.shared.device_resources,
-                    &self.core.shared.interrupts,
-                    &self.core.shared.interrupt_platform,
-                    self.own.scheduled().process,
-                    resource,
-                    requested_rights,
-                    out_interrupt,
                 ))
             }
             NativeSyscallRequest::InterruptAck { interrupt } => {

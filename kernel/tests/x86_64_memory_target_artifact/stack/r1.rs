@@ -1,9 +1,9 @@
 use super::*;
 
 /// The R5E-measured selector-34 syscall chain, restored to exact equalities.
-pub(crate) const EXPECTED_COMMON: usize = 14_608;
-pub(crate) const EXPECTED_TERMINATE: usize = 20_432;
-pub(crate) const EXPECTED_REQUIRED: usize = 57_296;
+pub(crate) const EXPECTED_COMMON: usize = 14_656;
+pub(crate) const EXPECTED_TERMINATE: usize = 20_480;
+pub(crate) const EXPECTED_REQUIRED: usize = 57_344;
 
 /// Reset-card-R1 thread-stack bound for selector 34 (`dynamic-launch-saturation`).
 ///
@@ -185,5 +185,5 @@ pub(super) fn r1_thread_requirement_fits_the_ordinary_arena_without_e8s_widening
         assert!(EXPECTED_REQUIRED + 64 * 1024 <= ORDINARY);
         assert!(EXPECTED_REQUIRED < super::wyr1e_thread::EXPECTED_REQUIRED);
     }
-    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 466_992);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 466_944);
 }

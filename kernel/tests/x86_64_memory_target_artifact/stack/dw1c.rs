@@ -6,9 +6,9 @@ pub(crate) fn validate_dw1c_stack_margins(
     terminal_stack_bytes: usize,
 ) {
     const RAW_SYSCALL_FRAME_BYTES: usize = 144;
-    // One assembly call into the dispatcher plus five calls between the six
+    // One assembly call into the dispatcher plus six calls between the seven
     // trace-witnessed Rust frames below.
-    const TRACE_CALL_RETURN_WORDS: usize = 6;
+    const TRACE_CALL_RETURN_WORDS: usize = 7;
     const ARCHITECTURAL_HEADROOM_BYTES: usize = 4 * 1024;
     const REQUIRED_SPARE_BYTES: usize = 32 * 1024;
 
@@ -27,18 +27,16 @@ pub(crate) fn validate_dw1c_stack_margins(
             && symbol.contains("RuntimeCarrierFacade<")
             && !symbol.contains("::{closure")
     });
-    // S2K: `dispatch_frame` is no longer emitted as its own function in this
-    // selector either; LLVM folds it into its one caller, the trampoline, as
-    // R5E recorded for E8. Its slots are inside `runtime_trampoline`, one return
-    // word shallower. Assert the fold: if it is emitted again, the chain must be
-    // re-measured rather than silently lose a level.
-    assert!(
-        !sizes.iter().any(|entry| {
-            entry.symbol.contains("syscall::native::dispatch_frame::<")
-                && entry.symbol.contains("RuntimeCarrierFacade<128, 4096>")
-        }),
-        "DW1C dispatch_frame is emitted again; re-measure the trace-bound chain"
-    );
+    // S2K folded `dispatch_frame` into the trampoline. D1 commit 6 (the
+    // family-A and family-B facade helpers) changes the inlining: it is its own
+    // function again, as it has been for E8 since D1 commit 3, so the chain
+    // carries its frame and one more return word. Selecting it asserts the
+    // emission: if it folds again, the chain must be re-measured.
+    let dispatch_frame = one_stack_size(sizes, "DW1C runtime dispatch frame", |symbol| {
+        symbol.contains("syscall::native::dispatch_frame::<")
+            && symbol.contains("RuntimeCarrierFacade<128, 4096>")
+            && !symbol.contains("::{closure")
+    });
     let runtime_handler = one_stack_size(sizes, "DW1C runtime handler", |symbol| {
         symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && symbol
@@ -61,6 +59,7 @@ pub(crate) fn validate_dw1c_stack_margins(
         syscall_dispatch,
         bound_dispatch,
         runtime_trampoline,
+        dispatch_frame,
         runtime_handler,
         service_dispatch,
         coherent_commit,
