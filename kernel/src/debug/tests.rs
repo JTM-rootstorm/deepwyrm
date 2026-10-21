@@ -205,7 +205,7 @@ fn raw_machine_record_reports_a_distinct_drain_timeout() {
 }
 
 #[test]
-fn panic_records_are_structured_bounded_and_redactable() {
+fn panic_records_are_structured_bounded_and_complete() {
     let record = PanicRecord {
         reason: "kernel panic while validating boot information",
         cpu_id: Some(2),
@@ -214,16 +214,17 @@ fn panic_records_are_structured_bounded_and_redactable() {
         backtrace_frames: &[0xffff_8000_0000_1111; MAX_BACKTRACE_FRAMES + 1],
     };
     let mut serial = Com1::new(FakePort::ready());
-    render_panic_record(&mut serial, &record, false).unwrap();
+    render_panic_record(&mut serial, &record).unwrap();
     let port = serial.io;
     let bytes = port.bytes();
     let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
-    assert!(text.starts_with("[DW0][PANIC][kernel] reason="));
-    assert!(text.contains("reason=redacted"));
-    assert!(text.contains("cpu=2 ip=redacted fault=redacted"));
-    assert!(text.contains("frames=redacted,redacted"));
+    assert!(text.starts_with(
+        "[DW0][PANIC][kernel] reason=kernel panic while validating boot information\r\n"
+    ));
+    assert!(text.contains("cpu=2 ip=0xffff800000001234 fault=0xffff800000005678"));
+    assert!(text.contains("frames=0xffff800000001111,0xffff800000001111"));
     assert!(text.contains(",..."));
-    assert!(!text.contains("ffff8000"));
+    assert!(!text.contains("redacted"));
 }
 
 #[test]

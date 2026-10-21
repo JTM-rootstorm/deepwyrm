@@ -63,7 +63,7 @@ const MAX_SUBSYSTEM_BYTES: usize = 32;
     )
 )]
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 192;
-const MAX_PANIC_REASON_BYTES: usize = 192;
+const MAX_PANIC_REASON_BYTES: usize = 256;
 const MAX_BACKTRACE_FRAMES: usize = 16;
 #[cfg(any(test, feature = "test-support"))]
 const MAX_RAW_RECORD_BYTES: usize = 64;
@@ -445,8 +445,9 @@ fn emit_cpu_state_record<P: BytePortIo>(
         .map_err(|_| SerialError::TransmitTimeout)
 }
 
-/// Emits one bounded panic record. Address-bearing fields are redacted outside
-/// debug builds so a release serial log cannot disclose kernel layout.
+/// Emits one bounded panic record. Every field is written in every build:
+/// COM1 is the trusted diagnostic channel, and a production crash must say
+/// what failed, where, and on which CPU.
 #[cfg_attr(
     test,
     allow(dead_code, reason = "target wrapper exercises the renderer indirectly")
@@ -456,23 +457,17 @@ fn emit_panic_record<P: BytePortIo>(
     record: &PanicRecord<'_>,
 ) -> Result<(), SerialError> {
     let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
-    render_panic_record(serial, record, cfg!(debug_assertions))
+    render_panic_record(serial, record)
 }
 
 fn render_panic_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     record: &PanicRecord<'_>,
-    expose_addresses: bool,
 ) -> Result<(), SerialError> {
     serial
         .write_str("[DW0][PANIC][kernel] reason=")
         .map_err(|_| SerialError::TransmitTimeout)?;
-    let reason = if expose_addresses {
-        record.reason
-    } else {
-        "redacted"
-    };
-    write_limited(serial, reason.as_bytes(), MAX_PANIC_REASON_BYTES)?;
+    write_limited(serial, record.reason.as_bytes(), MAX_PANIC_REASON_BYTES)?;
     serial
         .write_str("\n[DW0][PANIC][kernel] cpu=")
         .map_err(|_| SerialError::TransmitTimeout)?;
@@ -480,11 +475,11 @@ fn render_panic_record<P: BytePortIo>(
     serial
         .write_str(" ip=")
         .map_err(|_| SerialError::TransmitTimeout)?;
-    write_address(serial, record.instruction_pointer, expose_addresses)?;
+    write_address(serial, record.instruction_pointer)?;
     serial
         .write_str(" fault=")
         .map_err(|_| SerialError::TransmitTimeout)?;
-    write_address(serial, record.fault_address, expose_addresses)?;
+    write_address(serial, record.fault_address)?;
     serial
         .write_str("\n[DW0][PANIC][kernel] frames=")
         .map_err(|_| SerialError::TransmitTimeout)?;
@@ -500,7 +495,7 @@ fn render_panic_record<P: BytePortIo>(
                 .write_str(",")
                 .map_err(|_| SerialError::TransmitTimeout)?;
         }
-        write_address(serial, Some(frame), expose_addresses)?;
+        write_address(serial, Some(frame))?;
     }
     if record.backtrace_frames.len() > MAX_BACKTRACE_FRAMES {
         serial
@@ -544,16 +539,10 @@ fn write_optional_u32<P: BytePortIo>(
 fn write_address<P: BytePortIo>(
     serial: &mut Com1<P>,
     value: Option<u64>,
-    expose: bool,
 ) -> Result<(), SerialError> {
-    match (value, expose) {
-        (Some(value), true) => {
-            write!(serial, "0x{value:016x}").map_err(|_| SerialError::TransmitTimeout)
-        }
-        (Some(_), false) => serial
-            .write_str("redacted")
-            .map_err(|_| SerialError::TransmitTimeout),
-        (None, _) => serial
+    match value {
+        Some(value) => write!(serial, "0x{value:016x}").map_err(|_| SerialError::TransmitTimeout),
+        None => serial
             .write_str("unavailable")
             .map_err(|_| SerialError::TransmitTimeout),
     }
@@ -688,6 +677,16 @@ pub(crate) fn emit_early_panic_record(record: &PanicRecord<'_>) -> Result<(), Se
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
     let mut reason = PanicReasonBuffer::new();
+    // The source location first, so a truncated message still names the site.
+    if let Some(location) = info.location() {
+        let _ = write!(
+            &mut reason,
+            "{}:{}:{}: ",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    }
     let _ = write!(&mut reason, "{}", info.message());
     let record = PanicRecord {
         reason: reason.as_str(),
