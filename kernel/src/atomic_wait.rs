@@ -12,9 +12,9 @@ use deepwyrm_abi::DW_ATOMIC_WAKE_ALL;
 pub(crate) use crate::memory::address_region::AtomicWaitKey;
 use crate::sync::IrqSpinMutex;
 use crate::task::{
-    BlockWakeKey, BlockedOperation, BlockedOperationError, BlockedOperationRegistry,
-    BlockedOperationWinner, ExecutionDomain, ProcessKey, ScheduleDecision, SchedulerError,
-    TaskAuthority, ThreadKey,
+    BlockReservation, BlockWakeKey, BlockedOperation, BlockedOperationError,
+    BlockedOperationRegistry, BlockedOperationWinner, ExecutionDomain, ProcessKey,
+    ScheduleDecision, SchedulerError, TaskAuthority, ThreadKey,
 };
 use crate::time::DeadlineRegistration;
 use crate::wait::engine::{WaitDeadline, WaitDeadlineAuthority, WaitDeadlineError};
@@ -79,6 +79,7 @@ impl AtomicWaitRegistration {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AtomicWaitRegisterOutcome {
     Mismatch { observed: u32 },
@@ -120,10 +121,13 @@ impl<const CAPACITY: usize> AtomicWakeBatch<CAPACITY> {
 
 /// Per-key registration index for `atomic_wait32`.
 ///
-/// `observe` and `register_if_expected` execute their load closure while the
-/// same IRQ-safe index lock used by `claim_wake` is held.  The F9 adapter must
-/// call the first for the initial comparison and the second after it has
-/// prepared the scheduler block, thereby closing compare/register lost wakes.
+/// `observe` executes its load closure while the same IRQ-safe index lock used
+/// by `claim_wake` is held. The F9 transaction compares once before it
+/// prepares the scheduler block, registers with `register` after it, and
+/// compares again after the registration (D1 commit 8b). A wake that changes
+/// the word after the registration finds the waiter, and a change made before
+/// it is visible to the second compare, so no wake is lost. The live runtime
+/// makes the second compare with no runtime lock held.
 pub(crate) struct AtomicWaitRegistry<const CAPACITY: usize> {
     domain: u64,
     next_sequence: AtomicU64,
@@ -147,6 +151,7 @@ impl<const CAPACITY: usize> AtomicWaitRegistry<CAPACITY> {
 
     /// Rechecks a pinned aligned word and publishes a waiter atomically with
     /// respect to `atomic_wake` for all keys in this bounded registry.
+    #[cfg(test)]
     pub(crate) fn register_if_expected(
         &self,
         key: AtomicWaitKey,
@@ -159,6 +164,29 @@ impl<const CAPACITY: usize> AtomicWaitRegistry<CAPACITY> {
         if observed != expected {
             return Ok(AtomicWaitRegisterOutcome::Mismatch { observed });
         }
+        self.register_locked(&mut slots, key, wake)
+            .map(AtomicWaitRegisterOutcome::Registered)
+    }
+
+    /// Publishes a waiter with no compare (D1 commit 8b). The caller loads the
+    /// word after this registration and settles the wait on what it saw: a
+    /// wake that changed the word after this point finds the registration,
+    /// and a change made before it is visible to the later load.
+    pub(crate) fn register(
+        &self,
+        key: AtomicWaitKey,
+        wake: BlockWakeKey,
+    ) -> Result<AtomicWaitRegistration, AtomicWaitError> {
+        let mut slots = self.slots.lock();
+        self.register_locked(&mut slots, key, wake)
+    }
+
+    fn register_locked(
+        &self,
+        slots: &mut [AtomicWaitSlot; CAPACITY],
+        key: AtomicWaitKey,
+        wake: BlockWakeKey,
+    ) -> Result<AtomicWaitRegistration, AtomicWaitError> {
         let (index, generation) = slots
             .iter()
             .enumerate()
@@ -186,15 +214,13 @@ impl<const CAPACITY: usize> AtomicWaitRegistry<CAPACITY> {
             wake,
             sequence,
         });
-        Ok(AtomicWaitRegisterOutcome::Registered(
-            AtomicWaitRegistration {
-                domain: self.domain,
-                slot: slot_index,
-                generation,
-                key,
-                wake,
-            },
-        ))
+        Ok(AtomicWaitRegistration {
+            domain: self.domain,
+            slot: slot_index,
+            generation,
+            key,
+            wake,
+        })
     }
 
     /// Removes this exact registration when it still remains in the index.
@@ -622,22 +648,132 @@ fn begin_atomic_wait_with_post_registration<
     mut load: impl FnMut(&PIN) -> u32,
     after_registration: impl FnOnce(),
 ) -> Result<AtomicWaitBegin<PIN>, AtomicWaitBeginFailure<PIN>> {
-    if registry.observe(|| load(&pin)) != expected {
-        return Ok(AtomicWaitBegin::Mismatch(pin));
-    }
-    if deadline == WaitDeadline::Now {
-        return Ok(AtomicWaitBegin::TimedOut(pin));
-    }
-
-    let block = match execution.prepare_block_current_on(cpu, thread) {
-        Ok(block) => block,
-        Err(error) => {
-            return Err(AtomicWaitBeginFailure {
-                error: AtomicWaitBeginError::Scheduler(error),
-                pin,
-            });
+    let observed = registry.observe(|| load(&pin));
+    let pending = match register_atomic_wait(
+        key,
+        observed,
+        expected,
+        deadline,
+        registry,
+        tasks,
+        execution,
+        deadline_authority
+            .as_mut()
+            .map(|authority| &mut **authority as &mut dyn WaitDeadlineAuthority),
+        cpu,
+        process,
+        thread,
+    ) {
+        Ok(pending) => pending,
+        Err(AtomicWaitUnregistered::Mismatch) => return Ok(AtomicWaitBegin::Mismatch(pin)),
+        Err(AtomicWaitUnregistered::TimedOut) => return Ok(AtomicWaitBegin::TimedOut(pin)),
+        Err(AtomicWaitUnregistered::Failed(error)) => {
+            return Err(AtomicWaitBeginFailure { error, pin });
         }
     };
+    after_registration();
+    let matched = registry.observe(|| load(&pin)) == expected;
+    settle_atomic_wait(
+        pending,
+        pin,
+        matched,
+        registry,
+        tasks,
+        execution,
+        operations,
+        deadline_authority,
+        cpu,
+        process,
+        thread,
+    )
+}
+
+/// An atomic wait's first phase ended with nothing registered (D1 commit 8b).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AtomicWaitUnregistered {
+    /// The early compare failed.
+    Mismatch,
+    /// The deadline is `NOW` or already expired.
+    TimedOut,
+    /// The registration failed and was rolled back.
+    Failed(AtomicWaitBeginError),
+}
+
+/// An atomic wait whose waiter is registered but not yet decided by its
+/// second compare (D1 commit 8b, design §11.2.3 family E). It owns the
+/// prepared scheduler block, the winner-ledger entry, the finite deadline
+/// and the key registration, and `settle_atomic_wait` consumes it.
+///
+/// The live runtime registers in one hold of the runtime authority, loads the
+/// word with no runtime lock held, and settles in a second hold. Invariant
+/// (abandonment): a pending wait never outlives its owner's syscall. The
+/// facade keeps it in a local across the two holds. Between them the Thread
+/// runs with IF clear on its own CPU and passes no safe point: no Stop poll,
+/// no `sti`, no switch. So no stop, termination or teardown can reach its
+/// prepared block there. A wake or deadline that wins in that window is
+/// recorded in the winner ledger, and the settlement honors it. Dropping an
+/// unsettled one panics.
+#[must_use = "a registered atomic wait must be settled"]
+pub(crate) struct PendingAtomicWait {
+    parts: Option<PendingAtomicWaitParts>,
+}
+
+struct PendingAtomicWaitParts {
+    block: BlockReservation,
+    blocked: BlockedOperation<()>,
+    deadline: Option<DeadlineRegistration>,
+    registration: AtomicWaitRegistration,
+}
+
+impl Drop for PendingAtomicWait {
+    fn drop(&mut self) {
+        if let Some(parts) = self.parts.take() {
+            // The parts are leaked, not dropped: each would fail stop on its
+            // own and turn this report into a double panic.
+            core::mem::forget(parts);
+            panic!("an atomic wait registration outlived its syscall");
+        }
+    }
+}
+
+/// An atomic wait's first phase: the early compare against `observed`, the
+/// `NOW` deadline, then the scheduler block, the winner-ledger entry, the
+/// finite deadline and the key registration. The pin stays with the caller,
+/// which makes the second compare through it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the wait registration keeps predicate, deadline, scheduler, registry, process, and thread authorities explicit"
+)]
+pub(crate) fn register_atomic_wait<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    key: AtomicWaitKey,
+    observed: u32,
+    expected: u32,
+    deadline: WaitDeadline,
+    registry: &AtomicWaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    cpu: crate::cpu::CpuIndex,
+    process: ProcessKey,
+    thread: ThreadKey,
+) -> Result<PendingAtomicWait, AtomicWaitUnregistered> {
+    if observed != expected {
+        return Err(AtomicWaitUnregistered::Mismatch);
+    }
+    if deadline == WaitDeadline::Now {
+        return Err(AtomicWaitUnregistered::TimedOut);
+    }
+
+    let block = execution
+        .prepare_block_current_on(cpu, thread)
+        .map_err(|error| AtomicWaitUnregistered::Failed(AtomicWaitBeginError::Scheduler(error)))?;
     let wake = block.wake_key();
     let blocked = match BlockedOperation::publish_for_process(
         execution.blocked_operations(),
@@ -652,10 +788,9 @@ fn begin_atomic_wait_with_post_registration<
             execution
                 .cancel_block_on(cpu, block)
                 .expect("fresh F9 block reservation remains cancellable");
-            return Err(AtomicWaitBeginFailure {
-                error: AtomicWaitBeginError::Blocked(error),
-                pin,
-            });
+            return Err(AtomicWaitUnregistered::Failed(
+                AtomicWaitBeginError::Blocked(error),
+            ));
         }
     };
 
@@ -675,10 +810,9 @@ fn begin_atomic_wait_with_post_registration<
                 execution
                     .cancel_block_on(cpu, block)
                     .expect("F9 missing-deadline block remains cancellable");
-                return Err(AtomicWaitBeginFailure {
-                    error: AtomicWaitBeginError::Deadline(WaitDeadlineError::Fault),
-                    pin,
-                });
+                return Err(AtomicWaitUnregistered::Failed(
+                    AtomicWaitBeginError::Deadline(WaitDeadlineError::Fault),
+                ));
             };
             match (**authority).register_wait_deadline(deadline_ns, wake) {
                 Ok(registration) => Some(registration),
@@ -694,7 +828,7 @@ fn begin_atomic_wait_with_post_registration<
                     execution
                         .cancel_block_on(cpu, block)
                         .expect("F9 expired-deadline block remains cancellable");
-                    return Ok(AtomicWaitBegin::TimedOut(pin));
+                    return Err(AtomicWaitUnregistered::TimedOut);
                 }
                 Err(error) => {
                     blocked
@@ -708,33 +842,16 @@ fn begin_atomic_wait_with_post_registration<
                     execution
                         .cancel_block_on(cpu, block)
                         .expect("F9 deadline-failure block remains cancellable");
-                    return Err(AtomicWaitBeginFailure {
-                        error: AtomicWaitBeginError::Deadline(error),
-                        pin,
-                    });
+                    return Err(AtomicWaitUnregistered::Failed(
+                        AtomicWaitBeginError::Deadline(error),
+                    ));
                 }
             }
         }
     };
 
-    let registration = match registry.register_if_expected(key, wake, expected, || load(&pin)) {
-        Ok(AtomicWaitRegisterOutcome::Registered(registration)) => registration,
-        Ok(AtomicWaitRegisterOutcome::Mismatch { .. }) => {
-            blocked
-                .complete_for_process(
-                    execution.blocked_operations(),
-                    tasks,
-                    BlockedOperationWinner::Cancelled,
-                    |()| (),
-                )
-                .expect("F9 reread mismatch cleanup remains exact");
-            cancel_deadline(&mut deadline_authority, deadline_registration)
-                .expect("F9 reread mismatch deadline remains cancellable");
-            execution
-                .cancel_block_on(cpu, block)
-                .expect("F9 reread mismatch block remains cancellable");
-            return Ok(AtomicWaitBegin::Mismatch(pin));
-        }
+    let registration = match registry.register(key, wake) {
+        Ok(registration) => registration,
         Err(error) => {
             blocked
                 .complete_for_process(
@@ -749,66 +866,136 @@ fn begin_atomic_wait_with_post_registration<
             execution
                 .cancel_block_on(cpu, block)
                 .expect("F9 registration failure block remains cancellable");
-            return Err(AtomicWaitBeginFailure {
-                error: AtomicWaitBeginError::Registry(error),
-                pin,
-            });
+            return Err(AtomicWaitUnregistered::Failed(
+                AtomicWaitBeginError::Registry(error),
+            ));
         }
     };
+    Ok(PendingAtomicWait {
+        parts: Some(PendingAtomicWaitParts {
+            block,
+            blocked,
+            deadline: deadline_registration,
+            registration,
+        }),
+    })
+}
 
-    let mut operation = Some(AtomicWaitOperation::new(
-        process,
-        thread,
+/// An atomic wait's second phase, on its second compare (`matched`):
+/// - a wake or deadline that already won is honored, whatever the compare saw;
+/// - otherwise a mismatch cancels the registration, block and deadline;
+/// - otherwise the pin moves into a published operation and the block
+///   commits.
+///
+/// Every claimant of the winner ledger (a wake, a deadline expiry, terminal
+/// teardown) runs under the same runtime authority as this call, so no
+/// winner can appear between its read of the ledger and the block commit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the wait settlement keeps registry, scheduler, operation, deadline, process, and thread authorities explicit"
+)]
+pub(crate) fn settle_atomic_wait<
+    PIN,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    mut pending: PendingAtomicWait,
+    pin: PIN,
+    matched: bool,
+    registry: &AtomicWaitRegistry<WAITERS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    operations: &mut AtomicWaitOperationRegistry<PIN, EXECUTION>,
+    mut deadline_authority: Option<&mut dyn WaitDeadlineAuthority>,
+    cpu: crate::cpu::CpuIndex,
+    process: ProcessKey,
+    thread: ThreadKey,
+) -> Result<AtomicWaitBegin<PIN>, AtomicWaitBeginFailure<PIN>> {
+    let PendingAtomicWaitParts {
+        block,
         blocked,
-        pin,
+        deadline,
         registration,
-        deadline_registration,
-    ));
-    if let Err(error) = operations.publish(&mut operation) {
-        registry
-            .cancel_if_live(registration)
-            .expect("fresh F9 registration remains cancellable");
-        let operation = operation
-            .take()
-            .expect("failed F9 operation publication remains caller-owned");
-        let (pin, _, deadline) = operation
-            .complete(
-                execution.blocked_operations(),
-                tasks,
-                BlockedOperationWinner::Cancelled,
-            )
-            .expect("unpublished F9 operation cleanup remains exact");
-        cancel_deadline(&mut deadline_authority, deadline)
-            .expect("unpublished F9 deadline remains cancellable");
-        execution
-            .cancel_block_on(cpu, block)
-            .expect("unpublished F9 block remains cancellable");
-        return Err(AtomicWaitBeginFailure {
-            error: AtomicWaitBeginError::Registry(error),
-            pin,
-        });
-    }
-
-    after_registration();
-
-    match execution.blocked_operations().winner(wake) {
-        Ok(None) => {
+    } = pending
+        .parts
+        .take()
+        .expect("a pending atomic wait is settled once");
+    let wake = block.wake_key();
+    let winner = match execution.blocked_operations().winner(wake) {
+        Ok(winner) => winner,
+        Err(error) => panic!("fresh F9 blocked-operation ledger disappeared: {error:?}"),
+    };
+    match winner {
+        None if matched => {
+            let mut operation = Some(AtomicWaitOperation::new(
+                process,
+                thread,
+                blocked,
+                pin,
+                registration,
+                deadline,
+            ));
+            if let Err(error) = operations.publish(&mut operation) {
+                registry
+                    .cancel_if_live(registration)
+                    .expect("fresh F9 registration remains cancellable");
+                let operation = operation
+                    .take()
+                    .expect("failed F9 operation publication remains caller-owned");
+                let (pin, _, deadline) = operation
+                    .complete(
+                        execution.blocked_operations(),
+                        tasks,
+                        BlockedOperationWinner::Cancelled,
+                    )
+                    .expect("unpublished F9 operation cleanup remains exact");
+                cancel_deadline(&mut deadline_authority, deadline)
+                    .expect("unpublished F9 deadline remains cancellable");
+                execution
+                    .cancel_block_on(cpu, block)
+                    .expect("unpublished F9 block remains cancellable");
+                return Err(AtomicWaitBeginFailure {
+                    error: AtomicWaitBeginError::Registry(error),
+                    pin,
+                });
+            }
             let decision = execution
                 .commit_published_block_on(cpu, block)
                 .expect("registered F9 block commit remains valid");
             Ok(AtomicWaitBegin::Suspended { wake, decision })
         }
-        Ok(Some(
-            winner @ (BlockedOperationWinner::AtomicWake | BlockedOperationWinner::Timeout),
-        )) => {
-            let operation = operations
-                .take_wake(wake)
-                .expect("pre-block F9 winner retains operation ownership");
+        None => {
+            assert!(
+                registry
+                    .cancel_if_live(registration)
+                    .expect("undecided F9 registration remains exact"),
+                "an undecided F9 registration left the index"
+            );
+            blocked
+                .complete_for_process(
+                    execution.blocked_operations(),
+                    tasks,
+                    BlockedOperationWinner::Cancelled,
+                    |()| (),
+                )
+                .expect("F9 reread mismatch cleanup remains exact");
+            cancel_deadline(&mut deadline_authority, deadline)
+                .expect("F9 reread mismatch deadline remains cancellable");
+            execution
+                .cancel_block_on(cpu, block)
+                .expect("F9 reread mismatch block remains cancellable");
+            Ok(AtomicWaitBegin::Mismatch(pin))
+        }
+        Some(winner @ (BlockedOperationWinner::AtomicWake | BlockedOperationWinner::Timeout)) => {
             registry
-                .cancel_if_live(operation.registration())
+                .cancel_if_live(registration)
                 .expect("pre-block F9 registration cleanup remains exact");
-            let (pin, _, deadline) = operation
-                .complete(execution.blocked_operations(), tasks, winner)
+            blocked
+                .complete_for_process(execution.blocked_operations(), tasks, winner, |()| ())
                 .expect("pre-block F9 completion remains exact");
             cancel_deadline(&mut deadline_authority, deadline)
                 .expect("pre-block F9 deadline remains cancellable");
@@ -821,8 +1008,7 @@ fn begin_atomic_wait_with_post_registration<
                 Ok(AtomicWaitBegin::TimedOut(pin))
             }
         }
-        Ok(Some(other)) => panic!("unexpected F9 winner before block commit: {other:?}"),
-        Err(error) => panic!("fresh F9 blocked-operation ledger disappeared: {error:?}"),
+        Some(other) => panic!("unexpected F9 winner before block commit: {other:?}"),
     }
 }
 
@@ -1832,5 +2018,165 @@ mod tests {
 
         objects.cancel_creation(replacement).unwrap();
         objects.cancel_creation(unrelated).unwrap();
+    }
+
+    /// D1 commit 8b: the live two-phase shape on a remote CPU. A wake that
+    /// claims the registered waiter between the two holds wins, whatever the
+    /// second compare saw, and the prepared block is cancelled, not committed.
+    #[test]
+    fn a_wake_between_the_holds_wins_over_the_second_compare() {
+        let waiter_cpu = crate::cpu::CpuIndex::new(1).unwrap();
+        let (mut tasks, execution, process, thread, key) = running_fixture_on(waiter_cpu);
+        let registrations = AtomicWaitRegistry::<1>::new();
+        let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
+        let Ok(pending) = register_atomic_wait(
+            key,
+            7,
+            7,
+            WaitDeadline::Infinite,
+            &registrations,
+            &mut tasks,
+            &execution,
+            None,
+            waiter_cpu,
+            process,
+            thread,
+        ) else {
+            panic!("a matching infinite wait did not register")
+        };
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(
+            wake_atomic_waiters(&registrations, &execution, key, 1).unwrap(),
+            1
+        );
+        let outcome = settle_atomic_wait(
+            pending,
+            0xc5,
+            false,
+            &registrations,
+            &mut tasks,
+            &execution,
+            &mut operations,
+            None,
+            waiter_cpu,
+            process,
+            thread,
+        )
+        .unwrap_or_else(|failure| panic!("settlement failed: {:?}", failure.error));
+        assert!(matches!(outcome, AtomicWaitBegin::Ready(0xc5)));
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Running)
+        );
+        assert!(execution.suspended_claim_on(waiter_cpu).is_none());
+        assert!(registrations.is_empty());
+        assert!(operations.is_empty());
+        assert!(!execution.blocked_operations().has_thread(thread));
+    }
+
+    /// D1 commit 8b: with no winner, a second-compare mismatch cancels the
+    /// registration and block; a match publishes the operation and commits
+    /// the block.
+    #[test]
+    fn the_second_compare_cancels_or_suspends_an_undecided_wait() {
+        let (mut tasks, execution, process, thread, key) = running_fixture();
+        let registrations = AtomicWaitRegistry::<1>::new();
+        let mut operations = AtomicWaitOperationRegistry::<u32, 1>::new();
+        for matched in [false, true] {
+            let Ok(pending) = register_atomic_wait(
+                key,
+                7,
+                7,
+                WaitDeadline::Infinite,
+                &registrations,
+                &mut tasks,
+                &execution,
+                None,
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                process,
+                thread,
+            ) else {
+                panic!("a matching infinite wait did not register")
+            };
+            let outcome = settle_atomic_wait(
+                pending,
+                0x5e,
+                matched,
+                &registrations,
+                &mut tasks,
+                &execution,
+                &mut operations,
+                None,
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                process,
+                thread,
+            )
+            .unwrap_or_else(|failure| panic!("settlement failed: {:?}", failure.error));
+            if !matched {
+                assert!(matches!(outcome, AtomicWaitBegin::Mismatch(0x5e)));
+                assert!(registrations.is_empty());
+                assert!(operations.is_empty());
+                assert!(!execution.blocked_operations().has_thread(thread));
+                assert_eq!(
+                    execution.scheduler_state(thread),
+                    Some(SchedulerThreadState::Running)
+                );
+                continue;
+            }
+            let AtomicWaitBegin::Suspended { wake, .. } = outcome else {
+                panic!("a matched undecided wait did not suspend")
+            };
+            assert_eq!(
+                execution.scheduler_state(thread),
+                Some(SchedulerThreadState::Blocked)
+            );
+            assert_eq!(
+                wake_atomic_waiters(&registrations, &execution, key, 1).unwrap(),
+                1
+            );
+            let (pin, winner) = finish_atomic_wait(
+                &registrations,
+                &mut tasks,
+                &execution,
+                &mut operations,
+                None,
+                wake,
+            )
+            .unwrap();
+            assert_eq!((pin, winner), (0x5e, BlockedOperationWinner::AtomicWake));
+        }
+    }
+
+    /// D1 commit 8b, abandonment: a registration whose syscall ends without
+    /// settling it fails stop rather than leaving a waiter, a prepared block
+    /// and a Process lease behind.
+    #[test]
+    fn an_unsettled_atomic_wait_registration_panics() {
+        let (mut tasks, execution, process, thread, key) = running_fixture();
+        let registrations = AtomicWaitRegistry::<1>::new();
+        let Ok(pending) = register_atomic_wait(
+            key,
+            7,
+            7,
+            WaitDeadline::Infinite,
+            &registrations,
+            &mut tasks,
+            &execution,
+            None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            process,
+            thread,
+        ) else {
+            panic!("a matching infinite wait did not register")
+        };
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));
+        let message = dropped.expect_err("an unsettled registration must panic");
+        assert_eq!(
+            message.downcast_ref::<&str>().copied(),
+            Some("an atomic wait registration outlived its syscall")
+        );
+        // The leaked block, ledger entry and lease leave the fixture
+        // unclosable, which is the failure the panic exists to stop.
+        core::mem::forget(tasks);
     }
 }

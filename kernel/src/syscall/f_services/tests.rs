@@ -2,6 +2,7 @@ extern crate std;
 
 use super::super::adapters::{wait_many_input, wait_one_input};
 use super::*;
+use crate::atomic_wait::register_atomic_wait;
 use crate::handle::{AcceptedObjectTypes, HandleTableError};
 use crate::memory::address_region::AtomicWaitKey;
 use crate::memory::user_range::{UserAccess, UserPageChunk, UserRange};
@@ -2096,4 +2097,198 @@ fn a_prepared_wait_settles_its_output_only_after_the_authority() {
     assert_eq!(fixture.user.owned_outputs, 0);
     assert!(fixture.control.is_clear());
     close_event(&mut fixture, event);
+}
+
+/// D1 commit 8b (design §11.2.3 family E): a live `AtomicWait32` registers
+/// in one hold, compares through its pin with no runtime lock, and settles
+/// in another. The first hold keeps the adapter's statuses and returns any
+/// pin it took. A wake that wins between the holds is honored over the
+/// second compare. A matched wait suspends with its pin in the operation,
+/// and its resume records the pin's release for the caller to apply.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for this suspension test"
+)]
+fn a_two_phase_atomic_wait_settles_outside_its_holds() {
+    let mut fixture = Fixture::new();
+    let address = DwUserAddress(BASE + 0x700);
+    macro_rules! register {
+        ($pinned:expr, $deadline:expr) => {
+            fixture
+                .services
+                .register_atomic_wait_pinned::<3, 3, 2, 16, 4, 8>(
+                    $pinned,
+                    &mut fixture.tasks,
+                    &fixture.execution,
+                    &fixture.regions,
+                    fixture.process,
+                    fixture.thread,
+                    address,
+                    7,
+                    $deadline,
+                    crate::cpu::CpuIndex::BOOTSTRAP,
+                    None,
+                )
+        };
+    }
+
+    // The pin failed: its status and no pin.
+    assert!(matches!(
+        register!(Err(DW_STATUS_BAD_ADDRESS), DW_DEADLINE_INFINITE),
+        Err((DW_STATUS_BAD_ADDRESS, None))
+    ));
+    // The address names no stable key: the adapter's status, and the pin
+    // comes back for release, before any compare.
+    let pin = fixture.user.pin_atomic_u32(address).unwrap();
+    let Err((status, Some(pin))) = register!(Ok((pin, 6)), DW_DEADLINE_INFINITE) else {
+        panic!("an unresolved key returned no pin")
+    };
+    assert_eq!(status, DW_STATUS_BAD_ADDRESS);
+    fixture.user.release_atomic_u32(pin);
+    assert_eq!(fixture.user.atomic_pins, 0);
+
+    // The registration and settlement over a resolved key.
+    let key = stable_atomic_key(&mut fixture.registry);
+    macro_rules! pending {
+        () => {
+            match register_atomic_wait(
+                key,
+                7,
+                7,
+                WaitDeadline::Infinite,
+                &fixture.services.atomic_waits,
+                &mut fixture.tasks,
+                &fixture.execution,
+                None,
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                fixture.process,
+                fixture.thread,
+            ) {
+                Ok(pending) => pending,
+                Err(_) => panic!("a matching infinite atomic wait did not register"),
+            }
+        };
+    }
+    macro_rules! settle {
+        ($pending:expr, $pin:expr, $matched:expr) => {
+            fixture.services.settle_atomic_wait_pinned(
+                &mut fixture.control,
+                $pending,
+                $pin,
+                $matched,
+                &mut fixture.tasks,
+                &fixture.execution,
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                fixture.process,
+                fixture.thread,
+                None,
+            )
+        };
+    }
+
+    // A wake between the holds wins over a mismatching second compare.
+    let pin = fixture.user.pin_atomic_u32(address).unwrap();
+    let pending = pending!();
+    assert_eq!(
+        wake_atomic_waiters(&fixture.services.atomic_waits, &fixture.execution, key, 1).unwrap(),
+        1
+    );
+    let (result, pin) = settle!(pending, pin, false);
+    assert_eq!(result.status, DW_STATUS_SUCCESS);
+    fixture
+        .user
+        .release_atomic_u32(pin.expect("a ready wait returns its pin"));
+    assert!(fixture.services.is_quiescent());
+    assert_eq!(
+        fixture.execution.scheduler_state(fixture.thread),
+        Some(SchedulerThreadState::Running)
+    );
+
+    // With no winner, a mismatching second compare cancels: WOULD_BLOCK, and
+    // a later wake finds no waiter.
+    let pin = fixture.user.pin_atomic_u32(address).unwrap();
+    let pending = pending!();
+    let (result, pin) = settle!(pending, pin, false);
+    assert_eq!(result.status, DW_STATUS_WOULD_BLOCK);
+    fixture
+        .user
+        .release_atomic_u32(pin.expect("a mismatched wait returns its pin"));
+    assert_eq!(
+        wake_atomic_waiters(&fixture.services.atomic_waits, &fixture.execution, key, 1).unwrap(),
+        0
+    );
+    assert!(fixture.services.is_quiescent());
+
+    // A matching second compare suspends with the pin in the operation.
+    let pin = fixture.user.pin_atomic_u32(address).unwrap();
+    let pending = pending!();
+    let (result, pin) = settle!(pending, pin, true);
+    assert!(pin.is_none());
+    assert_eq!(
+        result.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    assert_eq!(
+        fixture.services.operation_owner(fixture.thread),
+        Ok(FServiceOperationOwner::AtomicWait)
+    );
+    assert!(matches!(
+        // SAFETY: the fixture's running Thread is the physical carrier and the
+        // entry is a fixed synthetic address that this test never enters.
+        unsafe {
+            fixture.services.prepare_suspend(
+                &mut fixture.control,
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
+        NativeSuspendPlan::IdleCurrent
+    ));
+    assert_eq!(
+        wake_atomic_waiters(&fixture.services.atomic_waits, &fixture.execution, key, 1).unwrap(),
+        1
+    );
+    assert!(matches!(
+        // SAFETY: as for `prepare_suspend` above; the idle suspension it
+        // produced is this fixture's own.
+        unsafe {
+            fixture.services.poll_idle_suspend(
+                &mut fixture.control,
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
+        NativeIdleSuspendPoll::ResumeCurrent
+    ));
+    let mut deferred = DeferredWaitSettlement::<FakeOwnedOutput, FakeAtomicPin>::new();
+    let resumed = fixture
+        .services
+        .resume_suspended(
+            &mut deferred,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            fixture.thread,
+            None,
+        )
+        .unwrap();
+    assert_eq!(resumed.status(), DW_STATUS_SUCCESS);
+    assert_eq!(
+        fixture.user.atomic_pins, 1,
+        "the resume releases nothing itself"
+    );
+    let (output, pin) = deferred.into_parts();
+    assert!(output.is_none());
+    fixture
+        .user
+        .release_atomic_u32(pin.expect("the resume recorded its pin release"));
+    assert_eq!(fixture.user.atomic_pins, 0);
+    assert!(fixture.services.is_quiescent());
+    assert!(fixture.control.is_clear());
 }

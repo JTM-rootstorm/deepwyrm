@@ -18,9 +18,9 @@ mod f_services;
     reason = "the shared F12 service composition is consumed by the target runtime lane"
 )]
 pub(crate) use f_services::{
-    DeferredWaitSettlement, FAtomicUserAccess, FServiceDispatch, FServiceOperationOwner,
-    FServiceOwnerError, FServiceResume, FServiceResumeError, FServiceRoute, FServiceState,
-    FServiceTerminalCleanup,
+    AtomicWaitHold, DeferredWaitSettlement, FAtomicUserAccess, FServiceDispatch,
+    FServiceOperationOwner, FServiceOwnerError, FServiceResume, FServiceResumeError, FServiceRoute,
+    FServiceState, FServiceTerminalCleanup,
 };
 
 #[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]

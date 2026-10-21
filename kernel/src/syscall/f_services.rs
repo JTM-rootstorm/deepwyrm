@@ -13,7 +13,8 @@ use deepwyrm_abi::{
 
 use crate::atomic_wait::{
     AtomicWaitBegin, AtomicWaitBeginError, AtomicWaitOperationRegistry, AtomicWaitRegistry,
-    begin_atomic_wait, finish_atomic_wait, finish_terminal_atomic_wait, wake_atomic_waiters,
+    AtomicWaitUnregistered, PendingAtomicWait, begin_atomic_wait, finish_atomic_wait,
+    finish_terminal_atomic_wait, register_atomic_wait, settle_atomic_wait, wake_atomic_waiters,
 };
 use crate::device::InterruptWaitSource;
 use crate::ipc::ChannelAuthority;
@@ -179,6 +180,12 @@ impl<OUTPUT, PIN> FAtomicUserAccess for DeferredWaitSettlement<OUTPUT, PIN> {
         );
     }
 }
+
+/// The first hold's outcome for a live `AtomicWait32` (D1 commit 8b): the
+/// registered waiter and its pin, for the caller to compare through with no
+/// runtime lock held and then settle in a second hold; or the status the wait
+/// returns with, and the pin it took, if any, to release after the hold.
+pub(crate) type AtomicWaitHold<PIN> = Result<(PendingAtomicWait, PIN), (DwStatus, Option<PIN>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FServiceOperationOwner {
@@ -664,34 +671,13 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             Ok(pin) => pin,
             Err(status) => return NativeSyscallResult::returning(status),
         };
-        let lease = match tasks.acquire_process_operation(process) {
-            Ok(lease) => lease,
-            // As in `adapters.rs`: the blind arm this replaces reported a stale
-            // handle as "not accepting operations".
-            Err(error) => {
-                user.release_atomic_u32(pin);
-                return NativeSyscallResult::returning(task_status(error));
-            }
-        };
-        let key = match regions
-            .resolve_atomic_wait_key_for_operation(tasks, &lease, process, address.0)
-        {
+        let key = match resolve_atomic_wait_key(tasks, regions, process, address) {
             Ok(key) => key,
-            Err(_) => {
-                tasks
-                    .release_process_operation(lease)
-                    .unwrap_or_else(|(error, _)| {
-                        panic!("F9 key-resolution cleanup lost process lease: {error:?}")
-                    });
+            Err(status) => {
                 user.release_atomic_u32(pin);
-                return NativeSyscallResult::returning(DW_STATUS_BAD_ADDRESS);
+                return NativeSyscallResult::returning(status);
             }
         };
-        tasks
-            .release_process_operation(lease)
-            .unwrap_or_else(|(error, _)| {
-                panic!("F9 key resolution leaked process lease: {error:?}")
-            });
         let begin = begin_atomic_wait(
             pin,
             key,
@@ -730,6 +716,134 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                 user.release_atomic_u32(failure.pin);
                 NativeSyscallResult::returning(status)
             }
+        }
+    }
+
+    /// The first hold of a live `AtomicWait32` (D1 commit 8b, design §11.2.3
+    /// family E). `pinned` is the word's pin and the value loaded through it
+    /// with no runtime lock before this hold, or the pin's failure. In the
+    /// adapter's order: the pin, the stable key, the early compare, the
+    /// `NOW` deadline, then the registration, whose second compare the
+    /// caller makes through the pin after this hold.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "atomic wait keeps the mapping pin, stable-key resolver, scheduler, and deadline owners explicit"
+    )]
+    #[cfg_attr(
+        not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live runtime splits AtomicWait32")
+    )]
+    pub(crate) fn register_atomic_wait_pinned<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+        const REGION_OBJECTS: usize,
+        const REGION_SLOTS: usize,
+    >(
+        &self,
+        pinned: Result<(AtomicPin, u32), DwStatus>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &ExecutionDomain<EXECUTION>,
+        regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+        process: ProcessKey,
+        thread: ThreadKey,
+        address: DwUserAddress,
+        expected: u32,
+        deadline: DwDeadline,
+        cpu: crate::cpu::CpuIndex,
+        wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
+    ) -> AtomicWaitHold<AtomicPin> {
+        let (pin, observed) = pinned.map_err(|status| (status, None))?;
+        let key = match resolve_atomic_wait_key(tasks, regions, process, address) {
+            Ok(key) => key,
+            Err(status) => return Err((status, Some(pin))),
+        };
+        let status = match register_atomic_wait(
+            key,
+            observed,
+            expected,
+            wait_deadline(deadline),
+            &self.atomic_waits,
+            tasks,
+            execution,
+            wait_deadlines,
+            cpu,
+            process,
+            thread,
+        ) {
+            Ok(pending) => return Ok((pending, pin)),
+            Err(AtomicWaitUnregistered::Mismatch) => DW_STATUS_WOULD_BLOCK,
+            Err(AtomicWaitUnregistered::TimedOut) => DW_STATUS_TIMED_OUT,
+            Err(AtomicWaitUnregistered::Failed(error)) => atomic_wait_status(error),
+        };
+        Err((status, Some(pin)))
+    }
+
+    /// The second hold of a live `AtomicWait32` (D1 commit 8b), on the second
+    /// compare the caller made through the pin with no runtime lock held.
+    /// Returns the syscall result and, unless the pin moved into a suspended
+    /// operation, the pin for the caller to release after the hold.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "atomic wait keeps the mapping pin, scheduler, operation, and deadline owners explicit"
+    )]
+    #[cfg_attr(
+        not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live runtime splits AtomicWait32")
+    )]
+    pub(crate) fn settle_atomic_wait_pinned<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &mut self,
+        control: &mut NativeWaitControl,
+        pending: PendingAtomicWait,
+        pin: AtomicPin,
+        matched: bool,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        execution: &ExecutionDomain<EXECUTION>,
+        cpu: crate::cpu::CpuIndex,
+        process: ProcessKey,
+        thread: ThreadKey,
+        wait_deadlines: Option<&mut dyn WaitDeadlineAuthority>,
+    ) -> (NativeSyscallResult, Option<AtomicPin>) {
+        match settle_atomic_wait(
+            pending,
+            pin,
+            matched,
+            &self.atomic_waits,
+            tasks,
+            execution,
+            &mut self.atomic_operations,
+            wait_deadlines,
+            cpu,
+            process,
+            thread,
+        ) {
+            Ok(AtomicWaitBegin::Mismatch(pin)) => (
+                NativeSyscallResult::returning(DW_STATUS_WOULD_BLOCK),
+                Some(pin),
+            ),
+            Ok(AtomicWaitBegin::TimedOut(pin)) => (
+                NativeSyscallResult::returning(DW_STATUS_TIMED_OUT),
+                Some(pin),
+            ),
+            Ok(AtomicWaitBegin::Ready(pin)) => {
+                (NativeSyscallResult::returning(DW_STATUS_SUCCESS), Some(pin))
+            }
+            Ok(AtomicWaitBegin::Suspended { wake, decision }) => (
+                control.accept(super::adapters::WaitSyscallAction::Suspended(
+                    super::adapters::WaitSuspendState::new(wake, decision),
+                )),
+                None,
+            ),
+            Err(failure) => (
+                NativeSyscallResult::returning(atomic_wait_status(failure.error)),
+                Some(failure.pin),
+            ),
         }
     }
 
@@ -1247,6 +1361,46 @@ fn atomic_wait_status(error: AtomicWaitBeginError) -> DwStatus {
 #[cfg(test)]
 #[path = "f_services/tests.rs"]
 mod tests;
+
+/// Resolves the stable key an `AtomicWait32` address names, under a Process
+/// operation lease held only for the lookup.
+fn resolve_atomic_wait_key<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    process: ProcessKey,
+    address: DwUserAddress,
+) -> Result<crate::atomic_wait::AtomicWaitKey, DwStatus> {
+    // As in `adapters.rs`: the blind arm this replaces reported a stale
+    // handle as "not accepting operations".
+    let lease = tasks
+        .acquire_process_operation(process)
+        .map_err(task_status)?;
+    match regions.resolve_atomic_wait_key_for_operation(tasks, &lease, process, address.0) {
+        Ok(key) => {
+            tasks
+                .release_process_operation(lease)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("F9 key resolution leaked process lease: {error:?}")
+                });
+            Ok(key)
+        }
+        Err(_) => {
+            tasks
+                .release_process_operation(lease)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("F9 key-resolution cleanup lost process lease: {error:?}")
+                });
+            Err(DW_STATUS_BAD_ADDRESS)
+        }
+    }
+}
 
 /// Resolves the stable key an `AtomicWake` address names, under a Process
 /// operation lease held only for the lookup.

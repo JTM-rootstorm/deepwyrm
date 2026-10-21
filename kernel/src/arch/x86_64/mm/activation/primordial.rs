@@ -2725,6 +2725,112 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Some(Ok(ready))
     }
 
+    /// `AtomicWait32` (design §11.2.3 family E, D1 commit 8b), futex-style:
+    /// the compare-load runs with no runtime lock held.
+    /// 1. A first hold as for family A.
+    /// 2. With P alone, the word is pinned and loaded for the early compare.
+    /// 3. A second hold resolves the stable key, makes the early compare,
+    ///    checks a `NOW` deadline, then prepares the block and registers the
+    ///    waiter, which a wake from now on finds.
+    /// 4. With P alone, the word is loaded again through the pin: the second
+    ///    compare.
+    /// 5. A third hold settles: a wake or deadline that already won is
+    ///    honored, a mismatch cancels the registration, and otherwise the pin
+    ///    moves into the suspended operation and the block commits. It then
+    ///    commits the phase and leaves through `ready_to_return`, as the
+    ///    second hold does when the wait returns before registering.
+    /// 6. With P alone, a pin that did not move is released.
+    /// Statuses and their precedence are the adapter's. `None` for every
+    /// other request.
+    // Kept out of line, like the other facade helpers, so the ordinary
+    // handler's measured frame does not absorb it.
+    #[inline(never)]
+    fn handle_atomic_wait(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::AtomicWait32 {
+            address,
+            expected,
+            deadline,
+        } = request
+        else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        }) else {
+            return Some(Err(()));
+        };
+        let pinned = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            crate::syscall::FAtomicUserAccess::pin_atomic_u32(&mut user, address).map(|pin| {
+                let observed =
+                    crate::syscall::FAtomicUserAccess::load_atomic_u32_acquire(&mut user, &pin);
+                (pin, observed)
+            })
+        };
+        enum Registered {
+            Returned(
+                crate::syscall::native::ReturnReady,
+                Option<user_access::OwnedLiveAtomicU32>,
+            ),
+            Pending(
+                crate::atomic_wait::PendingAtomicWait,
+                user_access::OwnedLiveAtomicU32,
+                crate::arch::x86_64::syscall::RuntimePhaseReservation,
+            ),
+        }
+        let registered = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            match runtime.register_atomic_wait(pinned, address, expected, deadline) {
+                Err((status, pin)) => {
+                    runtime.commit_runtime_phase(phase);
+                    Registered::Returned(
+                        runtime.ready_to_return(NativeSyscallResult::returning(status)),
+                        pin,
+                    )
+                }
+                Ok((pending, pin)) => Registered::Pending(pending, pin, phase),
+            }
+        };
+        let (ready, pin) = match registered {
+            Registered::Returned(ready, pin) => (ready, pin),
+            Registered::Pending(pending, pin, phase) => {
+                // The registration is published, and was released with the
+                // runtime authority. The fence orders it before this load,
+                // so a waker whose store this load misses finds the waiter.
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                let matched = {
+                    let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+                    let mut paging = access.lock();
+                    let mut user = paging.usercopy_process_address_space(root, process);
+                    crate::syscall::FAtomicUserAccess::load_atomic_u32_acquire(&mut user, &pin)
+                        == expected
+                };
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on(&mut self.owned);
+                let (result, pin) = runtime.settle_atomic_wait(pending, pin, matched);
+                runtime.commit_runtime_phase(phase);
+                (runtime.ready_to_return(result), pin)
+            }
+        };
+        if let Some(pin) = pin {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging.usercopy_process_address_space(root, process);
+            crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
+        }
+        Some(Ok(ready))
+    }
+
     /// Applies a resumed F operation's recorded user effects with P alone,
     /// after the hold that resumed it (D1 commit 8).
     #[inline(never)]
@@ -9203,6 +9309,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_channel_receive(request))
                 .or_else(|| self.handle_process_create(request))
                 .or_else(|| self.handle_wait(request))
+                .or_else(|| self.handle_atomic_wait(request))
             {
                 Some(handled) => handled,
                 None => {
@@ -10847,6 +10954,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     "WaitOne and WaitMany are served by the CPU-local facade (D1 commit 8)"
                 )
             }
+            NativeSyscallRequest::AtomicWait32 { .. } => {
+                unreachable!("AtomicWait32 is served by the CPU-local facade (D1 commit 8b)")
+            }
             request => {
                 let dispatch = {
                     let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -11201,6 +11311,54 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         clippy::type_complexity,
         reason = "the pinned output and its optional result travel together"
     )]
+    /// The first guarded half of `AtomicWait32` (D1 commit 8b).
+    fn register_atomic_wait(
+        &mut self,
+        pinned: Result<(user_access::OwnedLiveAtomicU32, u32), deepwyrm_abi::DwStatus>,
+        address: deepwyrm_abi::DwUserAddress,
+        expected: u32,
+        deadline: deepwyrm_abi::DwDeadline,
+    ) -> crate::syscall::AtomicWaitHold<user_access::OwnedLiveAtomicU32> {
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let scheduled = self.own.scheduled();
+        self.core.services.register_atomic_wait_pinned(
+            pinned,
+            &mut self.core.tasks,
+            &self.core.shared.execution,
+            &self.core.regions,
+            scheduled.process,
+            scheduled.thread,
+            address,
+            expected,
+            deadline,
+            self.owned.owner.cpu(),
+            Some(&mut wait_deadlines),
+        )
+    }
+
+    /// The second guarded half of `AtomicWait32` (D1 commit 8b).
+    fn settle_atomic_wait(
+        &mut self,
+        pending: crate::atomic_wait::PendingAtomicWait,
+        pin: user_access::OwnedLiveAtomicU32,
+        matched: bool,
+    ) -> (NativeSyscallResult, Option<user_access::OwnedLiveAtomicU32>) {
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let scheduled = self.own.scheduled();
+        self.core.services.settle_atomic_wait_pinned(
+            &mut self.own.wait_control,
+            pending,
+            pin,
+            matched,
+            &mut self.core.tasks,
+            &self.core.shared.execution,
+            self.owned.owner.cpu(),
+            scheduled.process,
+            scheduled.thread,
+            Some(&mut wait_deadlines),
+        )
+    }
+
     /// The guarded half of `WaitOne` and `WaitMany` (D1 commit 8): the
     /// same wait begin as the ordinary dispatch, over prepared input.
     fn begin_wait(
