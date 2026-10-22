@@ -1231,3 +1231,83 @@ so that D2 and D3 do not mistake it for one.
   publish and permit-gated reclamation are its commit point. The owned
   prepare payload and the owned transaction type, which replaces the
   adapters' borrow of the paging authority, are still to come.
+
+#### 11.2.11 ThreadExit in the live runtime (2026-10-22)
+
+**Gap.** `thread_exit` (DW0-E) is in the ABI schema, but the primordial
+runtime never dispatched it. It fell through to `NOT_SUPPORTED`
+(`handle_fallthrough`'s `_` arm). Stage 7 found this with a second
+Thread. Mike decided on 2026-10-22 to implement it. There is no ABI change.
+
+**What already exists.**
+- `TaskAuthority::exit_thread` records `NORMAL_EXIT` with the code. It
+  refuses a Thread that is not `RUNNING`. For the last live Thread it also
+  begins and finishes Process termination with the same record.
+- The `thread_exit` adapter is a BSP model: it retires through
+  `retire_exit_pins_defer_current` on the bootstrap CPU.
+- The live self-termination machinery already serves `ThreadTerminate` on
+  the caller's own handle: `complete_prepared_thread_termination_…` with
+  `target == current`, `quiesce_terminal_threads`, and the deferred current
+  retirement on the caller's CPU.
+
+**Design.** A new adapter, `thread_exit_on(cpu, …)`, does three things:
+1. It takes the `exit_thread` transition.
+2. It quiesces the one terminal Thread.
+3. It completes through the same self-target completion as
+   `ThreadTerminate`, with no remote Threads.
+
+The BSP `thread_exit` becomes a wrapper over it.
+
+The live carrier serves `ThreadExit` from `handle_fallthrough` in the
+ordinary single hold (`exit_thread`). It installs the deferred current and
+returns `TerminateCurrent`. The trampoline then hands off to the terminal
+reaper.
+
+- **Non-final exit.** Only the caller becomes terminal. The Process stays
+  live, so the terminal handoff must not treat it as retired:
+  - With a successor on this CPU, the existing path already skips
+    teardown, because the quiescence proof fails.
+  - With no successor, the handoff has assumed an exited Process: it
+    emitted the retirement record and tore the root down. It now checks
+    the retired Process's state. A live Process leaves its root for the
+    kernel root and idles (`FinishGenericChild`), with no teardown and no
+    record.
+  - This also fixes the same latent gap for a non-final self-`ThreadTerminate`.
+- **Final exit.** The Process exits with `NORMAL_EXIT` and the code, which
+  is `ProcessExit`'s record. Its handles drain, and the reaper takes the
+  existing exited-Process path.
+- **D1 holds.** `ThreadExit` reads and writes no user memory, so nothing
+  copies under T. Terminal output and atomic pins go through
+  `finish_terminal_adapter_resources` on a narrow session, as
+  `ThreadTerminate` does.
+- **Remote stops.** None are published. The caller is the only terminal
+  Thread; on a final exit no other live Thread exists. §11.2.10's per-CPU
+  stop state is untouched.
+- **Waits.** The exiting Thread is executing the syscall, so it owns no
+  suspended wait. The terminal wait cleanup runs for it anyway, uniformly.
+  Waiters on its EXITED (and on the Process's EXITED, for a final exit)
+  are claimed when the pins are collected, and become runnable at the
+  deferred reclaim. That is after this CPU has left the Thread's stack.
+
+**Races: exactly one winner.** Every terminal transition happens under T.
+`ThreadState::terminate` admits one terminal record.
+- **Self-exit first.** A later `thread_terminate` of that Thread is refused
+  (`BAD_STATE`, already exited). A later `process_terminate` excludes it,
+  because `process_termination_thread_keys` skips exited Threads. So no
+  Stop names it.
+- **Remote terminate first.** It publishes a Stop to the exiting Thread's
+  CPU.
+  - If the Thread has not yet entered the syscall, the entry safe point
+    takes the Stop.
+  - If it entered and then takes T, `exit_thread` refuses a non-`RUNNING`
+    Thread. The `BAD_STATE` it returns is never seen: the return safe
+    point services the Stop.
+
+  Either way the terminate's `AUTHORIZED` record stands.
+
+**Host models.** Each has a mutation check:
+- a non-final exit, where the sibling stays live and the record is
+  `NORMAL_EXIT` with the code;
+- a final exit, where the Process exits with the same record;
+- both orders of an exit racing a terminate;
+- a waiter on the exiting Thread's EXITED.
