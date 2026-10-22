@@ -277,11 +277,17 @@ impl<'artifact> DirectCallGraph<'artifact> {
     pub(super) fn new(sizes: &[StackSize], disassembly: &'artifact str) -> Self {
         let mut frames = BTreeMap::new();
         for entry in sizes {
-            assert!(
-                frames.insert(entry.symbol.clone(), entry.bytes).is_none(),
-                "duplicate .stack_sizes entry for {}",
-                entry.symbol
-            );
+            // Distinct monomorphizations can share a demangled name. Their
+            // calls are merged by name below, which is conservative only when
+            // every same-named frame has the same size; a conflict has no
+            // single frame authority and is refused (D1 commit 9).
+            if let Some(previous) = frames.insert(entry.symbol.clone(), entry.bytes) {
+                assert_eq!(
+                    previous, entry.bytes,
+                    "conflicting duplicate .stack_sizes entries for {}",
+                    entry.symbol
+                );
+            }
         }
         let (calls, indirect_calls) = parsed_calls(disassembly);
         let known_symbols = text_disassembly(disassembly)
@@ -827,7 +833,7 @@ fn direct_call_stack_path_uses_the_deepest_accepted_objdump_branch() {
 }
 
 #[test]
-#[should_panic(expected = "duplicate .stack_sizes entry for root")]
+#[should_panic(expected = "conflicting duplicate .stack_sizes entries for root")]
 fn direct_call_graph_rejects_conflicting_duplicate_frame_authority() {
     let sizes = [
         StackSize {
@@ -1276,6 +1282,8 @@ mod e7;
 mod f12;
 #[path = "stack/f9.rs"]
 mod f9;
+#[path = "stack/family_g.rs"]
+mod family_g;
 #[path = "stack/geometry.rs"]
 mod geometry;
 #[path = "stack/ist.rs"]
@@ -1297,6 +1305,7 @@ pub(super) use dw1c::validate_dw1c_stack_margins;
 pub(super) use e7::validate_e7_stack_margin;
 pub(super) use f9::validate_f9_stack_context_evidence;
 pub(super) use f12::validate_f12_stack_context_evidence;
+pub(super) use family_g::validate_family_g_facade_stack_margin;
 pub(super) use geometry::linked_boot_stack_payload_bytes;
 pub(super) use geometry::linked_privilege_entry_stack_payload_bytes;
 pub(super) use geometry::linked_terminal_reaper_stack_payload_bytes;

@@ -690,6 +690,15 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
                 linked_terminal_reaper_stack_payload_bytes(&stack_symbols),
             );
         }
+        // D1 commit 9: the live family-G facade path, on the SMP product.
+        if selector == "normal-preemption-smp" {
+            validate_family_g_facade_stack_margin(
+                &stack_sizes(&llvm_readelf, &stack_kernel),
+                &stack_disassembly,
+                linked_thread_kernel_stack_payload_bytes(&stack_symbols),
+                selector,
+            );
+        }
         if selector == "dynamic-launch-saturation" {
             validate_r1_thread_stack_margin(
                 &stack_sizes(&llvm_readelf, &stack_kernel),
