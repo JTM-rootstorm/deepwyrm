@@ -47,6 +47,7 @@ mod address_space;
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
+            all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)),
         )
     )
 ))]

@@ -1126,7 +1126,7 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(
         primordial.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;"
+            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;"
         )
     );
     assert!(

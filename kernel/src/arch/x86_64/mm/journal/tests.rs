@@ -881,6 +881,121 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
     assert_eq!(roles.check_invariants(), Ok(()));
 }
 
+/// Stage 7's question, answered on the live publisher type: does a
+/// create/map/write/unmap/close round leave anything behind that the next
+/// round's publish consumes? The publisher's only bound is per publish
+/// (`changed_pages` against `INVALIDATION_CAPACITY` in `publish_pages`), so
+/// with room for exactly one page every round must still fit.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host integration model attests synthetic frame zeroing, root ownership, and handle authority"
+)]
+fn one_page_map_unmap_rounds_never_accumulate_publisher_capacity() {
+    const ROUNDS: usize = 512;
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let capabilities = PagingCapabilities {
+        physical_limit: limit,
+    };
+    let mut roles = synthetic_frame_role_manager::<1, 32>(0x1000, 16);
+    let owner = roles.create_table_owner().unwrap();
+    let allocation = roles.allocate(1).unwrap();
+    // SAFETY: the synthetic frame manager's allocations are host memory
+    // that no page table has used, so they are zero by construction.
+    let root = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    // SAFETY: `root` is the committed PML4 this model owns exclusively.
+    let page_tables =
+        unsafe { PageTableRoot::from_owned_root(root.physical_start(), capabilities) }.unwrap();
+    let mut candidates: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
+    for (slot, level) in [TableLevel::Pt, TableLevel::Pdpt, TableLevel::Pd]
+        .into_iter()
+        .enumerate()
+    {
+        let allocation = roles.allocate(1).unwrap();
+        // SAFETY: as for the root, an unused synthetic allocation is zero.
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
+    }
+    let allocation = roles.allocate(1).unwrap();
+    // SAFETY: as for the root, an unused synthetic allocation is zero.
+    let backing = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let backing = roles.assign_object_backing(backing).unwrap();
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut objects = MemoryObjectAuthority::<1, 2>::new();
+    objects
+        .grant_backing(
+            &creation,
+            backing,
+            BASE_PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    let object_owner = registry.creation_into_internal(creation).unwrap();
+    // SAFETY: this model creates the only address-space authority it uses.
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = spaces.create_address_space().unwrap();
+    let mut region = spaces
+        .create_region::<1>(address_space, 0x4000, BASE_PAGE_SIZE)
+        .unwrap();
+    let mut target = FakeTarget::default();
+    // SAFETY: the address-space and region keys were issued for the root and
+    // region this publisher binds.
+    let mut publisher = unsafe {
+        X86AddressSpacePublisher::<_, 1, 32, 3, 32, 1>::new(
+            region.address_space_key(),
+            region.region_key(),
+            &page_tables,
+            root,
+            &mut roles,
+            &mut target,
+            &mut candidates,
+        )
+    }
+    .unwrap();
+    for round in 0..ROUNDS {
+        let resolved = crate::handle::resolve_test_internal_owner(
+            &mut registry,
+            &object_owner,
+            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+        );
+        let authorization = region
+            .authorize_map(&objects, resolved, Protection::READ_WRITE)
+            .unwrap();
+        let mapped = region
+            .map(
+                &mut objects,
+                &mut registry,
+                &mut publisher,
+                0x4000,
+                authorization,
+                0,
+                BASE_PAGE_SIZE,
+                Protection::READ_WRITE,
+            )
+            .unwrap_or_else(|failure| panic!("round {round} map failed: {:?}", failure.error()));
+        assert!(mapped.is_empty());
+        assert_eq!(objects.active_lease_count(), 1);
+        let unmapped = region
+            .unmap(
+                &mut objects,
+                &mut registry,
+                &mut publisher,
+                0x4000,
+                BASE_PAGE_SIZE,
+            )
+            .unwrap_or_else(|failure| panic!("round {round} unmap failed: {:?}", failure.error()));
+        assert!(unmapped.is_empty());
+        assert_eq!(objects.active_lease_count(), 0);
+        assert!(region.mappings().iter().all(Option::is_none));
+    }
+    assert_eq!(publisher.target.invalidated.len(), 2 * ROUNDS);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
 #[test]
 #[allow(
     unsafe_code,

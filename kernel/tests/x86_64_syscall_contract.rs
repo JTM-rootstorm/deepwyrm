@@ -998,8 +998,10 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
     // F3A.6y. Production derives this from the producer's measured archive
     // rather than pinning the Wave 4 literal; the other arms below still pin
-    // their own forms, which is what keeps this selector's 32 distinct from
-    // production's derived value.
+    // their own forms, which is what keeps this selector's ceiling distinct
+    // from production's derived value. Selector 22's ceiling is the named
+    // `bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES`, host-tested against the
+    // measured stage-7 archive.
     assert!(
         runtime.contains(
             "const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();"
@@ -1010,7 +1012,7 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     ));
     assert!(
         runtime.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;"
+            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;"
         )
     );
     assert!(

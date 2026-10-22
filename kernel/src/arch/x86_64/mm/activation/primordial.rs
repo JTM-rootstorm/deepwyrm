@@ -810,8 +810,11 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
 // and the historical Wave 4 value when nothing measured it, so a standalone
 // `cargo build` is unchanged.
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();
+// Selector 22: see `bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES`. The 32-page
+// guess this replaces surfaced a 39-page archive as an opaque NO_RESOURCES from
+// the bootstrap's bootfs mapping; the admission check in `enter` now names it.
 #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 32;
+const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;
 #[cfg(deepwyrm_wrcap_relay)]
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;
 // Selector 25's accepted WYR1-A inputs were 170,496 and 169,896 bytes (42
@@ -10801,6 +10804,13 @@ pub(super) fn enter(
         "bootstrap",
     );
     let bootfs = copy_module(&mut active, modules.bootfs(), &BOOTFS_BYTES, "bootfs");
+    #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
+    if !matches!(
+        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
+        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
+    ) {
+        crate::test_support::complete_fail(0x2210_b001)
+    }
     #[cfg(deepwyrm_wyr1_evidence)]
     if !matches!(
         bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
