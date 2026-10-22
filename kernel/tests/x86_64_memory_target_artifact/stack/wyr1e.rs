@@ -56,19 +56,26 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
     let (ready, ready_bytes) = select("q35 ready wakes", &|symbol| {
         symbol == "<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes"
     });
-    // R5E: the winning-index fold no longer has its own frame. It used to be
-    // emitted as `ready_wakes::{closure#2}`'s `Iterator>::fold::<u32` and
-    // called from `ready_wakes`; it is now folded into `ready_wakes` itself,
-    // whose frame absorbed it. Assert the fold rather than tolerate a missing
-    // anchor, so re-emitting it fails here and forces a re-measurement.
-    assert!(
-        !sizes.iter().any(|entry| {
+    // The winning-index fold of `ready_wakes`. R5E saw it folded into
+    // `ready_wakes`, whose frame absorbed it. Since D1 commit 9 the artifact
+    // also emits `ready_wakes::{closure#2}`'s fold out of line, for another
+    // caller's inlined copy; `ready_wakes` itself may or may not call it.
+    // Measure the emitted chain: if `ready_wakes` calls the fold, its frame
+    // joins the ready-wakes phase; otherwise `ready_wakes` must call no
+    // out-of-line fold.
+    let ready_fold = sizes
+        .iter()
+        .any(|entry| {
             entry
                 .symbol
                 .contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
-        }),
-        "selector-33 ready-wakes fold is emitted again; re-measure the ready-wakes phase"
-    );
+        })
+        .then(|| {
+            select("q35 ready-wakes fold", &|symbol| {
+                symbol
+                    .contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
+            })
+        });
     let (record_pending, record_pending_bytes) = select("q35 coalesced record", &|symbol| {
         symbol
             == "<deepwyrm_kernel::device::q35_interrupt::Q35InterruptPlatform>::record_pending_delivery"
@@ -126,10 +133,25 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
         );
     }
     let ready_body = function_body(disassembly, &ready);
-    assert!(
-        !ready_body.contains("Iterator>::fold::<u32"),
-        "selector-33 ready-wakes frame calls an out-of-line fold again"
-    );
+    // The fold's stack-size entry can be identical-code-folded with other
+    // monomorphizations and list them all, so the call is matched by the
+    // `ready_wakes` fold it names, not by the merged entry's full text.
+    let calls_ready_fold = ready_body.lines().any(|line| {
+        line.contains("\tcall\t")
+            && line.contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}>")
+            && line.contains("Iterator>::fold::<u32")
+    });
+    let ready_fold_bytes = match (&ready_fold, calls_ready_fold) {
+        (Some((_, bytes)), true) => Some(*bytes),
+        (None, true) => panic!("selector-33 ready-wakes frame calls a fold with no stack entry"),
+        (_, false) => {
+            assert!(
+                !ready_body.contains("Iterator>::fold::<u32"),
+                "selector-33 ready-wakes frame calls an out-of-line fold it does not name"
+            );
+            None
+        }
+    };
     assert!(
         function_body(disassembly, &handler).contains(&format!(" <{after_eoi}>")),
         "selector-33 handler omitted its exact post-EOI completion target"
@@ -141,21 +163,34 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
         .filter(|line| line.contains("\tcall\tqword ptr [rip + "))
         .collect::<Vec<_>>();
     // `dispatch_and_eoi_with` has one source-level `eoi()` call, reached by
-    // both the bound-handler and absent-binding paths. It used to be emitted
-    // twice, once per path, with the completion tail between the copies; the
-    // two paths now merge before the shared call. The order this oracle exists
-    // to prove is unchanged and still read off the emitted body: the platform
-    // dispatch slot, then the EOI, then the post-EOI completion tail.
-    assert_eq!(dynamic_calls.len(), 2);
+    // both the bound-handler and absent-binding paths. LLVM emits it either
+    // once, after the two paths merge, or twice, once per path with the
+    // completion tail between the copies (as before R5E, and again since D1
+    // commit 9's codegen). Both shapes keep the order this oracle exists to
+    // prove, read off the emitted body: the platform dispatch slot, then the
+    // EOI, then the post-EOI completion tail.
     assert!(dynamic_calls[0].contains("external_interrupt::HANDLER>"));
-    assert!(dynamic_calls[1].contains("arch::x86_64::ipi::TRANSPORT"));
     let handler_slot = dispatcher.find(dynamic_calls[0]).unwrap();
-    let eoi_slot = dispatcher.find(dynamic_calls[1]).unwrap();
     let completion_tail = dispatcher
         .find("\tjmp\trcx")
         .expect("q35 dispatcher omitted the post-EOI completion tail");
-    assert!(handler_slot < eoi_slot);
-    assert!(eoi_slot < completion_tail);
+    match dynamic_calls.len() {
+        2 => {
+            assert!(dynamic_calls[1].contains("arch::x86_64::ipi::TRANSPORT"));
+            let eoi_slot = dispatcher.find(dynamic_calls[1]).unwrap();
+            assert!(handler_slot < eoi_slot);
+            assert!(eoi_slot < completion_tail);
+        }
+        3 => {
+            assert!(dynamic_calls[1].contains("arch::x86_64::ipi::TRANSPORT"));
+            assert!(dynamic_calls[2].contains("arch::x86_64::ipi::TRANSPORT"));
+            let first_eoi = dispatcher.find(dynamic_calls[1]).unwrap();
+            let second_eoi = dispatcher.find(dynamic_calls[2]).unwrap();
+            assert!(handler_slot < first_eoi);
+            assert!(first_eoi < completion_tail && completion_tail < second_eoi);
+        }
+        calls => panic!("q35 dispatcher has {calls} dynamic calls; re-read its emitted order"),
+    }
     assert_eq!(dispatcher.matches("\tjmp\trcx").count(), 1);
 
     let phase_total = |frames: &[usize]| {
@@ -174,7 +209,16 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
             .and_then(|bytes| bytes.checked_add(return_bytes))
             .expect("selector-33 phase stack bound fits usize")
     };
-    let ready_total = phase_total(&[dispatch_bytes, handler_bytes, deliver_bytes, ready_bytes]);
+    let ready_total = match ready_fold_bytes {
+        Some(fold_bytes) => phase_total(&[
+            dispatch_bytes,
+            handler_bytes,
+            deliver_bytes,
+            ready_bytes,
+            fold_bytes,
+        ]),
+        None => phase_total(&[dispatch_bytes, handler_bytes, deliver_bytes, ready_bytes]),
+    };
     let wake_total = phase_total(&[
         dispatch_bytes,
         handler_bytes,

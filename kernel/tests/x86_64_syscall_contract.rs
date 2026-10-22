@@ -2966,3 +2966,85 @@ fn user_return_validation_walks_use_a_session_without_usercopy() {
         );
     }
 }
+
+/// Text test (D1 commit 9): the live ordinary F-service dispatch gets no
+/// user session. Every dispatch arm that takes `user` belongs to a request a
+/// CPU-local facade helper serves first, and the arms left (EventSignal,
+/// TimerSet, TimerCancel) never name it. The stand-in panics on any use.
+#[test]
+fn ordinary_f_dispatch_holds_no_user_session() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let services = source("src/syscall/f_services.rs");
+    assert!(primordial.contains("let mut user = crate::syscall::UnreachableUserAccess::new();"));
+    let dispatch = services
+        .split_once("    pub(crate) fn dispatch_prepared<")
+        .expect("F dispatch")
+        .1
+        .split_once("            request => FServiceRoute::Fallthrough(request),")
+        .expect("F dispatch arms")
+        .0;
+    let arms: Vec<&str> = dispatch
+        .split("            NativeSyscallRequest::")
+        .skip(1)
+        .collect();
+    assert_eq!(arms.len(), 14);
+    let facade_served = [
+        (
+            "ProcessCreate",
+            ".or_else(|| self.handle_process_create(request))",
+        ),
+        (
+            "ChannelCreate",
+            "NativeSyscallRequest::ChannelCreate {\n                out_endpoint0,",
+        ),
+        (
+            "ChannelSend",
+            ".or_else(|| self.handle_channel_send(request))",
+        ),
+        (
+            "ChannelReceive",
+            ".or_else(|| self.handle_channel_receive(request))",
+        ),
+        ("WaitOne", ".or_else(|| self.handle_wait(request))"),
+        ("WaitMany", ".or_else(|| self.handle_wait(request))"),
+        (
+            "EventCreate",
+            "NativeSyscallRequest::EventCreate { out_event, .. } => handle(out_event),",
+        ),
+        (
+            "AtomicWait32",
+            ".or_else(|| self.handle_atomic_wait(request))",
+        ),
+        (
+            "AtomicWake",
+            "NativeSyscallRequest::AtomicWake { out_woken, .. } => {",
+        ),
+        (
+            "ClockGet",
+            "NativeSyscallRequest::AbiGetInfo { .. } | NativeSyscallRequest::ClockGet { .. }",
+        ),
+        (
+            "TimerCreate",
+            "NativeSyscallRequest::TimerCreate { out_timer, .. } => handle(out_timer),",
+        ),
+    ];
+    for arm in arms {
+        let name = arm.split([' ', '{']).next().unwrap();
+        let body = arm.split_once("=>").map_or(arm, |(_, body)| body);
+        if !body.contains("user") {
+            assert!(
+                ["EventSignal", "TimerSet", "TimerCancel"].contains(&name),
+                "unexpected arm without user: {name}"
+            );
+            continue;
+        }
+        let (_, served) = facade_served
+            .iter()
+            .find(|(served, _)| *served == name)
+            .unwrap_or_else(|| panic!("{name} copies but no facade helper serves it"));
+        assert!(
+            primordial.contains(served),
+            "{name}'s facade route is missing"
+        );
+    }
+}

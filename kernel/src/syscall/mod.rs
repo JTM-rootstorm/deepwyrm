@@ -20,7 +20,7 @@ mod f_services;
 pub(crate) use f_services::{
     AtomicWaitHold, DeferredWaitSettlement, FAtomicUserAccess, FServiceDispatch,
     FServiceOperationOwner, FServiceOwnerError, FServiceResume, FServiceResumeError, FServiceRoute,
-    FServiceState, FServiceTerminalCleanup,
+    FServiceState, FServiceTerminalCleanup, UnreachableUserAccess,
 };
 
 #[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]

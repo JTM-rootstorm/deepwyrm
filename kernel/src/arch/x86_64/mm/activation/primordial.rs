@@ -11230,11 +11230,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .unwrap_or_else(|_| {
                             panic!("F-service prepare has an invalid root identity")
                         });
-                    let mut paging = self.paging.lock();
-                    let mut user = paging.current_process_address_space(
-                        self.own.active_root.as_ref().expect("active root"),
-                        self.own.scheduled().process,
-                    );
+                    // Every copying F request is served by a facade helper
+                    // first (D1 commit 9); the arms left here touch no user
+                    // memory, so the dispatch gets no session.
+                    let mut user = crate::syscall::UnreachableUserAccess::new();
                     let scheduled = self.own.scheduled();
                     self.core.services.dispatch_prepared(
                         &mut self.own.wait_control,

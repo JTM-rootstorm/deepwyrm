@@ -2292,3 +2292,20 @@ fn a_two_phase_atomic_wait_settles_outside_its_holds() {
     assert!(fixture.services.is_quiescent());
     assert!(fixture.control.is_clear());
 }
+
+/// D1 commit 9: the ordinary dispatch's stand-in user access fails stop on
+/// any use; a copying request reaching it is a routing bug.
+#[test]
+fn the_unreachable_user_access_panics_on_any_use() {
+    let mut access = UnreachableUserAccess::<FakeOwnedOutput, FakeAtomicPin>::new();
+    let pinned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = access.pin_atomic_u32(DwUserAddress(BASE));
+    }));
+    assert_eq!(
+        pinned
+            .expect_err("the stand-in must panic")
+            .downcast_ref::<std::string::String>()
+            .map(std::string::String::as_str),
+        Some("an F request that copies reached the ordinary dispatch under the runtime authority")
+    );
+}

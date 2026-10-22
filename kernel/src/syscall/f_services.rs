@@ -181,6 +181,105 @@ impl<OUTPUT, PIN> FAtomicUserAccess for DeferredWaitSettlement<OUTPUT, PIN> {
     }
 }
 
+/// The user access the live ordinary F-service dispatch passes (D1 commit 9).
+/// Every F request that copies is served by a CPU-local facade helper,
+/// outside the runtime authority, before it could reach this dispatch: the
+/// arms that remain (EventSignal, TimerSet, TimerCancel) touch no user
+/// memory. So this access holds no session and panics on any use; reaching
+/// it is a routing bug, not a usercopy under T.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only the live runtime routes copying F requests elsewhere"
+    )
+)]
+pub(crate) struct UnreachableUserAccess<OUTPUT, PIN> {
+    _owned: core::marker::PhantomData<(OUTPUT, PIN)>,
+}
+
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only the live runtime routes copying F requests elsewhere"
+    )
+)]
+impl<OUTPUT, PIN> UnreachableUserAccess<OUTPUT, PIN> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            _owned: core::marker::PhantomData,
+        }
+    }
+}
+
+const UNREACHABLE_USER_ACCESS: &str =
+    "an F request that copies reached the ordinary dispatch under the runtime authority";
+
+impl<OUTPUT, PIN> crate::memory::usercopy::UserPageAccess for UnreachableUserAccess<OUTPUT, PIN> {
+    type Error = crate::memory::usercopy::DeferredOutputUnavailable;
+    type Pinned<'a>
+        = crate::memory::usercopy::DeferredOutputPin<'a>
+    where
+        Self: 'a;
+
+    fn pin(
+        &mut self,
+        _range: crate::memory::user_range::UserRange,
+    ) -> Result<Self::Pinned<'_>, Self::Error> {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+}
+
+impl<OUTPUT, PIN> UserPageBatchAccess for UnreachableUserAccess<OUTPUT, PIN> {
+    type PinnedBatch<'a>
+        = crate::memory::usercopy::DeferredBatchPin<'a>
+    where
+        Self: 'a;
+
+    fn pin_batch(
+        &mut self,
+        _ranges: [Option<crate::memory::user_range::UserRange>; 3],
+    ) -> Result<Self::PinnedBatch<'_>, Self::Error> {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+}
+
+impl<OUTPUT, PIN> OwnedUserOutputAccess for UnreachableUserAccess<OUTPUT, PIN> {
+    type OwnedOutput = OUTPUT;
+
+    fn preflight_owned_output(
+        &mut self,
+        _range: crate::memory::user_range::UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+
+    fn commit_owned_output(&mut self, _output: Self::OwnedOutput, _source: &[u8]) {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+
+    fn discard_owned_output(&mut self, _output: Self::OwnedOutput) {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+}
+
+impl<OUTPUT, PIN> FAtomicUserAccess for UnreachableUserAccess<OUTPUT, PIN> {
+    type AtomicPin = PIN;
+
+    fn pin_atomic_u32(&mut self, _address: DwUserAddress) -> Result<Self::AtomicPin, DwStatus> {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+
+    fn load_atomic_u32_acquire(&mut self, _pin: &Self::AtomicPin) -> u32 {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+
+    fn release_atomic_u32(&mut self, _pin: Self::AtomicPin) {
+        panic!("{UNREACHABLE_USER_ACCESS}");
+    }
+}
+
 /// The first hold's outcome for a live `AtomicWait32` (D1 commit 8b): the
 /// registered waiter and its pin, for the caller to compare through with no
 /// runtime lock held and then settle in a second hold; or the status the wait
