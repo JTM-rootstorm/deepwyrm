@@ -1335,9 +1335,33 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
         // D1 commit 9: I2's stage 7 (concurrent unmap) starts a second Thread.
         "NativeSyscallRequest::ThreadCreate",
         "NativeSyscallRequest::ThreadStart",
+        // Design §11.2.11: and that Thread ends with ThreadExit.
+        "NativeSyscallRequest::ThreadExit",
     ] {
         assert!(runtime.contains(family), "live carrier omitted {family}");
     }
+    assert!(runtime.contains(
+        "NativeSyscallRequest::ThreadExit { exit_code } => self.exit_thread(exit_code),"
+    ));
+    assert!(runtime.contains("crate::syscall::thread_exit_on("));
+    assert!(adapters.contains("pub(crate) fn thread_exit_on<"));
+    // A Thread that leaves its Process live must not take the retired-Process
+    // arms of the terminal handoff, and the check precedes all of them.
+    let handoff = runtime
+        .split_once("fn prepare_terminal_handoff_detached(")
+        .expect("terminal handoff")
+        .1;
+    let live_check = handoff
+        .find(".process_info(retirement.retired_process)\n            .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)")
+        .expect("terminal handoff lost its live-Process check");
+    let first_retired_arm = handoff
+        .find("if retirement.retiring_wyr1_primordial")
+        .expect("terminal handoff lost its primordial arm");
+    assert!(live_check < first_retired_arm);
+    assert!(
+        handoff[live_check..first_retired_arm]
+            .contains("continuation: TerminalKernelContinuation::FinishGenericChild(retirement),")
+    );
     assert!(runtime.contains("fn prepare_remote_task_group_termination("));
     assert!(runtime.contains("fn complete_task_group_termination("));
     assert!(runtime.contains("PendingRemoteTermination::TaskGroup"));

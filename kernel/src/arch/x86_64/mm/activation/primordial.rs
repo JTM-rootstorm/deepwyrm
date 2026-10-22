@@ -5353,6 +5353,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
         }
 
+        // A Thread that left its Process live -- a non-final ThreadExit or a
+        // self ThreadTerminate (design §11.2.11) -- retired only itself. Every
+        // arm below treats the Process as retired: a retirement record, a
+        // quiescence proof, a root teardown. Leave the live root for the
+        // kernel root and idle instead.
+        if !self
+            .core
+            .tasks
+            .process_info(retirement.retired_process)
+            .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)
+        {
+            let prepared = self.prepare_terminal_kernel_root_switch();
+            return PreparedTerminalStep::KernelRoot {
+                prepared,
+                continuation: TerminalKernelContinuation::FinishGenericChild(retirement),
+            };
+        }
+
         #[cfg(any(
             deepwyrm_wyr1_evidence,
             deepwyrm_wyr1b_evidence,
@@ -12155,6 +12173,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 unreachable!("family-G requests are served by the CPU-local facade (D1 option B3)")
             }
             NativeSyscallRequest::ProcessExit { exit_code } => self.exit_process(exit_code),
+            NativeSyscallRequest::ThreadExit { exit_code } => self.exit_thread(exit_code),
             NativeSyscallRequest::DevicePioWrite {
                 resource,
                 offset,
@@ -12733,6 +12752,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| panic!("primordial exit atomic pin drifted"));
         }
         self.absorb_service_cleanup();
+        let result = NativeSyscallResult { status, control };
+        self.commit_runtime_phase(phase);
+        result
+    }
+
+    /// `ThreadExit` (design §11.2.11), in this one hold: only the caller
+    /// becomes terminal, so no remote Stop is ever published. It reads no
+    /// user memory; terminal pins settle on a narrow session.
+    fn exit_thread(&mut self, exit_code: u32) -> NativeSyscallResult {
+        let phase = self.reserve_runtime_phase();
+        let mut discarded: [Option<user_access::OwnedLiveUserOutput>; 1] = [None];
+        let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; 1] = [None];
+        let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
+        let (status, control, deferred) = {
+            let mut terminal = self.core.services.terminal_cleanup(
+                Some(&mut wait_deadlines),
+                |output| {
+                    assert!(discarded[0].replace(output).is_none());
+                },
+                |pin| {
+                    assert!(atomic_pins[0].replace(pin).is_none());
+                },
+            );
+            crate::syscall::thread_exit_on(
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                &self.core.shared.execution,
+                &self.core.shared.waits,
+                &mut terminal,
+                self.owned.owner.cpu(),
+                self.own.scheduled().process,
+                self.own.scheduled().thread,
+                exit_code,
+                &mut self.core.cleanup,
+            )
+        };
+        self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
         let result = NativeSyscallResult { status, control };
         self.commit_runtime_phase(phase);
         result

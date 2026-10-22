@@ -12511,3 +12511,515 @@ fn remote_stop_state_is_per_cpu_and_staging_is_counted() {
         );
     }
 }
+
+/// Two started Threads of one Process on a two-CPU domain, with a WAIT|MODIFY
+/// handle to each, for the live ThreadExit models (design §11.2.11).
+#[allow(clippy::type_complexity, reason = "test fixture tuple")]
+fn thread_exit_fixture() -> (
+    ObjectRegistry<16>,
+    Tasks,
+    ProcessKey,
+    ExecutionDomain<2>,
+    (ThreadKey, DwHandle),
+    (ThreadKey, DwHandle),
+    CleanupQueue<16>,
+) {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_RIGHT_WAIT};
+    let (mut registry, mut tasks, process, process_handle) = process_fixture();
+    let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
+    let mut cleanup = CleanupQueue::<16>::new();
+    let process_pin = resolve_current_handle(
+        &tasks,
+        &mut registry,
+        process,
+        process_handle,
+        DW_OBJECT_TYPE_PROCESS,
+        DW_RIGHT_MODIFY,
+    )
+    .unwrap();
+    let (first, first_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    let (second, second_ref) = tasks.create_thread(&mut registry, &process_pin).unwrap();
+    release_lookup_pin(&mut registry, process_pin, &mut cleanup);
+    let rights = DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_WAIT.0);
+    let first_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(first_ref, rights)
+        .unwrap();
+    let second_handle = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(second_ref, rights)
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, first, test_start(0x61))
+        .unwrap();
+    execution
+        .start_thread(&mut tasks, second, test_start(0x62))
+        .unwrap();
+    (
+        registry,
+        tasks,
+        process,
+        execution,
+        (first, first_handle),
+        (second, second_handle),
+        cleanup,
+    )
+}
+
+/// A non-final ThreadExit on an AP retires only the caller, records
+/// NORMAL_EXIT with its code, and leaves the Process and the sibling live.
+#[test]
+fn live_non_final_thread_exit_retires_only_the_caller() {
+    let (mut registry, mut tasks, process, execution, (exiting, _), (sibling, _), mut cleanup) =
+        thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exiting)
+    );
+    let (stack, context) = tasks.thread_execution_resources(exiting).unwrap().unwrap();
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            exiting,
+            0x5a,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .expect("a self exit defers its current execution resources");
+    let info = tasks.thread_info(exiting).unwrap();
+    assert_eq!(info.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
+    assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT);
+    assert_eq!(info.application_code, 0x5a);
+    assert_eq!(
+        tasks.process_info(process).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_RUNNING
+    );
+    assert_eq!(
+        execution.scheduler_state(sibling),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert!(execution.stack_bounds(stack).is_ok());
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
+    assert!(execution.stack_bounds(stack).is_err());
+    assert!(execution.load_context(context).is_err());
+    assert_eq!(execution.scheduler_state(exiting), None);
+    // The reaper's successor on this CPU is the live sibling.
+    assert_eq!(execution.terminal_reaper_next_on(cpu1), Some(sibling));
+    let _ = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu1,
+        sibling,
+        0,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// Exits `thread`, the Process's last live Thread, on `cpu` and reclaims it,
+/// returning the Process's terminal record.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper over live authorities"
+)]
+fn finish_live_thread_exit_process(
+    registry: &mut ObjectRegistry<16>,
+    tasks: &mut Tasks,
+    process: ProcessKey,
+    execution: &ExecutionDomain<2>,
+    waits: &WaitRegistry<4>,
+    cpu: crate::cpu::CpuIndex,
+    thread: ThreadKey,
+    code: u32,
+    cleanup: &mut CleanupQueue<16>,
+) -> deepwyrm_abi::DwTaskTerminationInfoV1 {
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            registry,
+            tasks,
+            execution,
+            waits,
+            &mut NoTerminalWaitCleanup,
+            cpu,
+            process,
+            thread,
+            code,
+            cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .expect("the final Thread's exit defers its current execution resources");
+    complete_deferred_current_reclaim_on(registry, execution, waits, cpu, deferred, cleanup);
+    tasks.process_info(process).unwrap()
+}
+
+/// The last live Thread's ThreadExit exits its Process with the same
+/// NORMAL_EXIT record ProcessExit would write.
+#[test]
+fn live_final_thread_exit_exits_the_process_normally_with_its_code() {
+    let (mut registry, mut tasks, process, execution, (first, _), (second, _), mut cleanup) =
+        thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(first)
+    );
+    let info = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu0,
+        first,
+        0x11,
+        &mut cleanup,
+    );
+    assert_eq!(info.state, deepwyrm_abi::DW_TASK_STATE_RUNNING);
+    assert_eq!(execution.terminal_reaper_next_on(cpu0), Some(second));
+    let info = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu0,
+        second,
+        0x7700_0042,
+        &mut cleanup,
+    );
+    assert_eq!(info.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
+    assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT);
+    assert_eq!(info.application_code, 0x7700_0042);
+    let thread = tasks.thread_info(second).unwrap();
+    assert_eq!(thread.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
+    assert_eq!(thread.application_code, 0x7700_0042);
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// Self-exit first: the sibling's later ThreadTerminate of the exited Thread
+/// is refused, and the NORMAL_EXIT record stands.
+#[test]
+fn live_thread_exit_before_a_terminate_keeps_the_exit_record() {
+    use deepwyrm_abi::DW_TERMINATION_AUTHORIZED;
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        execution,
+        (exiting, exiting_handle),
+        (sibling, _),
+        mut cleanup,
+    ) = thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exiting)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(sibling)
+    );
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            exiting,
+            0x5a,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    // The terminator runs before the exiting CPU's reaper reclaims it.
+    assert_eq!(
+        prepare_thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            process,
+            sibling,
+            exiting_handle,
+            DW_TERMINATION_AUTHORIZED,
+            0x33,
+            &mut cleanup,
+        )
+        .err(),
+        Some(DW_STATUS_BAD_STATE)
+    );
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
+    let info = tasks.thread_info(exiting).unwrap();
+    assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT);
+    assert_eq!(info.application_code, 0x5a);
+    let _ = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu0,
+        sibling,
+        0,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// Terminate first: the target's ThreadExit, still running on its own CPU
+/// until its Stop is serviced, is refused, and the AUTHORIZED record stands.
+#[test]
+fn live_terminate_before_a_thread_exit_keeps_the_terminate_record() {
+    use deepwyrm_abi::DW_TERMINATION_AUTHORIZED;
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        execution,
+        (exiting, exiting_handle),
+        (sibling, _),
+        mut cleanup,
+    ) = thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exiting)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(sibling)
+    );
+    let (stack, _) = tasks.thread_execution_resources(exiting).unwrap().unwrap();
+    let prepared = prepare_thread_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut NoTerminalWaitCleanup,
+        process,
+        sibling,
+        exiting_handle,
+        DW_TERMINATION_AUTHORIZED,
+        0x33,
+        &mut cleanup,
+    )
+    .unwrap();
+    // The target entered its syscall before seeing the Stop.
+    assert!(
+        terminal_outcome(
+            thread_exit_on(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut NoTerminalWaitCleanup,
+                cpu1,
+                process,
+                exiting,
+                0x5a,
+                &mut cleanup,
+            ),
+            DW_STATUS_BAD_STATE,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+    // Its return safe point services the Stop.
+    let running = execution.running_claim_on(cpu1).unwrap();
+    assert_eq!(running.thread(), exiting);
+    let _ = execution.stop_running_claim_on(running).unwrap();
+    execution.complete_switch_on(running).unwrap();
+    let mut permits = core::array::from_fn(|_| None);
+    permits[cpu1.index()] =
+        Some(crate::arch::x86_64::rendezvous::RemoteStopReclaimPermit::for_test(exiting));
+    assert!(
+        terminal_outcome(
+            complete_prepared_thread_termination_after_remote_stops_on(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut NoTerminalWaitCleanup,
+                cpu0,
+                process,
+                sibling,
+                prepared,
+                permits,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+    let info = tasks.thread_info(exiting).unwrap();
+    assert_eq!(info.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
+    assert_eq!(info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(info.detail, 0x33);
+    assert!(execution.stack_bounds(stack).is_err());
+    let _ = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu0,
+        sibling,
+        0,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// A sibling blocked on the exiting Thread's EXITED is claimed by the exit
+/// and becomes runnable at the deferred reclaim, observing EXITED.
+#[test]
+fn live_thread_exit_wakes_a_waiter_on_its_exited_signal() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_THREAD, DW_RIGHT_WAIT, DW_SIGNAL_EXITED};
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        execution,
+        (exiting, exiting_handle),
+        (waiter, _),
+        mut cleanup,
+    ) = thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exiting)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(waiter)
+    );
+    let target = tasks
+        .process_handles(process)
+        .unwrap()
+        .lookup(
+            &mut registry,
+            exiting_handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_THREAD),
+            DW_RIGHT_WAIT,
+        )
+        .unwrap();
+    let (blocked, _) = execution.block_current(waiter).unwrap();
+    let wake = blocked.into_wake_key();
+    let blocked_owner =
+        BlockedOperation::publish(execution.blocked_operations(), process, waiter, wake, ())
+            .unwrap();
+    let _registration = waits
+        .register(target.into_internal(), DW_SIGNAL_EXITED, 0, waiter, wake)
+        .unwrap();
+    // The waiter's CPU has switched away from it.
+    let switched = execution.suspended_claim_on(cpu0).unwrap();
+    execution.complete_switch_on(switched).unwrap();
+
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            exiting,
+            0x5a,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert_eq!(
+        execution.scheduler_state(waiter),
+        Some(SchedulerThreadState::Blocked)
+    );
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
+    assert_eq!(
+        execution.scheduler_state(waiter),
+        Some(SchedulerThreadState::Runnable)
+    );
+    let winner = execution
+        .blocked_operations()
+        .winner(wake)
+        .unwrap()
+        .expect("the EXITED transition claimed the waiter");
+    assert_eq!(
+        winner,
+        BlockedOperationWinner::Signal {
+            item_index: 0,
+            observed: DW_SIGNAL_EXITED,
+        }
+    );
+    blocked_owner
+        .complete_with(execution.blocked_operations(), winner, |()| ())
+        .unwrap();
+    assert_eq!(waits.len(), 0);
+    assert_eq!(execution.terminal_reaper_next_on(cpu1), Some(waiter));
+    let _ = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu1,
+        waiter,
+        0,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}

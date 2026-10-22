@@ -48,9 +48,10 @@ pub(crate) use adapters::copy_wyr1e_evidence_input;
     reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"
 )]
 pub(crate) use adapters::{
-    CleanupQueue, HeldReleases, StagedStopCleanup, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError,
-    WaitSuspendState, WaitSyscallAction, WaitTerminalCleanup, resume_wait_thread_syscall,
-    timer_cancel, timer_create, timer_set, wait_many_syscall, wait_one_syscall,
+    CleanupQueue, HeldReleases, NativeWaitControl, StagedStopCleanup, TerminalWaitCleanup,
+    WaitSuspendError, WaitSuspendState, WaitSyscallAction, WaitTerminalCleanup,
+    resume_wait_thread_syscall, timer_cancel, timer_create, timer_set, wait_many_syscall,
+    wait_one_syscall,
 };
 
 #[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
@@ -88,7 +89,7 @@ pub(crate) use adapters::{
     prepare_address_region_mutation, prepare_process_exit, prepare_process_terminate,
     prepare_process_unhandled_exception, prepare_task_group_terminate, prepare_thread_terminate,
     process_create_input, process_create_with_root_prepared, process_exit_on, task_group_create,
-    thread_start_input, thread_start_prepared, wait_many_input, wait_one_input,
+    thread_exit_on, thread_start_input, thread_start_prepared, wait_many_input, wait_one_input,
 };
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[allow(

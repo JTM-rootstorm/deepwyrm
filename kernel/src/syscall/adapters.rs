@@ -7195,6 +7195,8 @@ fn complete_prepared_process_termination_with_remote_threads<
     (DW_STATUS_SUCCESS, control, deferred)
 }
 
+/// BSP model of [`thread_exit_on`], kept for the host fixtures that drive
+/// one CPU: it also completes the physical switch the reaper would.
 pub(crate) fn thread_exit<
     const OBJECTS: usize,
     const GROUPS: usize,
@@ -7217,29 +7219,120 @@ pub(crate) fn thread_exit<
     SyscallControl,
     Option<DeferredCurrentExecutionResources>,
 ) {
+    let outcome = thread_exit_on(
+        registry,
+        tasks,
+        execution,
+        waits,
+        &mut NoTerminalWaitCleanup,
+        crate::cpu::CpuIndex::BOOTSTRAP,
+        current_process,
+        current_thread,
+        code,
+        cleanup,
+    );
+    if outcome.2.is_some() {
+        let claim = execution
+            .suspended_claim_on(crate::cpu::CpuIndex::BOOTSTRAP)
+            .expect("BSP ThreadExit model handoff retains its execution claim");
+        assert_eq!(claim.thread(), current_thread);
+        execution
+            .complete_switch_on(claim)
+            .expect("BSP ThreadExit model handoff follows current retirement");
+    }
+    outcome
+}
+
+/// `ThreadExit` (design §11.2.11): the calling Thread exits normally with
+/// `code`. Only the caller becomes terminal; when it is the Process's last
+/// live Thread, the Process exits with the same `NORMAL_EXIT` record. No
+/// other Thread is ever stopped, so this completes through the self-target
+/// `ThreadTerminate` path with no remote Threads.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the live terminal adapter binds every authority the self-target completion consumes"
+)]
+pub(crate) fn thread_exit_on<
+    C: TerminalWaitCleanup<OBJECTS, WAITERS, EXECUTION>,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+    const EXECUTION: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    execution: &ExecutionDomain<EXECUTION>,
+    waits: &WaitRegistry<WAITERS>,
+    terminal_waits: &mut C,
+    current_cpu: crate::cpu::CpuIndex,
+    current_process: ProcessKey,
+    current_thread: ThreadKey,
+    code: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> (
+    DwStatus,
+    SyscallControl,
+    Option<DeferredCurrentExecutionResources>,
+) {
     if let Err(status) = validate_running_caller(tasks, execution, current_process, current_thread)
     {
         return (status, SyscallControl::ReturnToCaller, None);
     }
-    let process = current_process;
     let pins = match tasks.exit_thread(current_thread, code) {
         Ok(pins) => pins,
+        // Only a final exit gates on the Process's operations, exactly as
+        // ProcessExit does; drain its Threads' terminal waits and retry once.
+        Err(TaskError::OperationsInFlight) => {
+            let threads = match tasks.process_thread_keys(current_process) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            };
+            for thread in threads.into_iter().flatten() {
+                terminal_waits
+                    .cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
+            }
+            match tasks.exit_thread(current_thread, code) {
+                Ok(pins) => pins,
+                Err(error) => {
+                    return (task_status(error), SyscallControl::ReturnToCaller, None);
+                }
+            }
+        }
         Err(error) => return (task_status(error), SyscallControl::ReturnToCaller, None),
     };
+    let pre_retired =
+        PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(pins.thread_keys()));
     if tasks
-        .process_info(process)
+        .process_info(current_process)
         .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)
     {
-        drain_exited_process_handles_staged(registry, tasks, process, cleanup).unwrap_or_else(
-            |error| panic!("final Thread exit could not drain Process handles: {error:?}"),
-        );
+        drain_exited_process_handles_staged(registry, tasks, current_process, cleanup)
+            .unwrap_or_else(|error| {
+                panic!("final Thread exit could not drain Process handles: {error:?}")
+            });
     }
-    let (pins, deferred) = execution.retire_exit_pins_defer_current(pins, current_thread);
-    collect_retired_pins(registry, execution, waits, pins, cleanup);
-    (
-        DW_STATUS_SUCCESS,
-        SyscallControl::TerminateCurrent,
-        Some(deferred),
+    complete_prepared_thread_termination_with_remote_threads(
+        registry,
+        tasks,
+        execution,
+        waits,
+        terminal_waits,
+        current_cpu,
+        current_process,
+        current_thread,
+        PreparedThreadTermination {
+            target: current_thread,
+            target_process: current_process,
+            pins,
+            pre_retired,
+        },
+        &[],
+        cleanup,
     )
 }
 
