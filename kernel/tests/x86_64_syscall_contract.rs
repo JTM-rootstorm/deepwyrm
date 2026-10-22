@@ -2920,3 +2920,49 @@ fn thread_start_copies_in_outside_the_hold() {
     assert!(!run.contains("current_process_address_space"));
     assert!(primordial.contains("\"ThreadStart is served by the CPU-local facade (D1 commit 9)\""));
 }
+
+/// Text test (D1 commit 9): the user-return validation walks (syscall
+/// return, timer return, fresh Thread entry, the BSP's initial return, and
+/// ThreadStart's RIP/RSP check) run on a return-validation session: read-only
+/// page-table walks of a resident root with no usercopy. They stay in their
+/// runtime-authority hold, which checks the root's binding generation.
+#[test]
+fn user_return_validation_walks_use_a_session_without_usercopy() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    assert_eq!(
+        primordial
+            .matches("paging.return_validation_session(")
+            .count(),
+        5
+    );
+    for walk in [
+        "ValidatedUserReturn::initial(context, &mut mappings)",
+        "frame.validate_and_sanitize(&mut mappings)",
+        "frame.authorize_return(current_binding_generation, &mut mappings)",
+    ] {
+        for (at, _) in primordial.match_indices(walk) {
+            let session = primordial[..at]
+                .rfind("let mut mappings = paging.")
+                .expect("walk session");
+            assert!(
+                primordial[session..at]
+                    .starts_with("let mut mappings = paging.return_validation_session("),
+                "{walk} walks a usercopy session"
+            );
+        }
+    }
+    let user_access = source("src/arch/x86_64/mm/activation/user_access.rs");
+    let session = user_access
+        .split_once("pub(crate) struct ReturnValidationSession<")
+        .expect("return-validation session")
+        .1
+        .split_once("impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>\n    crate::arch::x86_64::syscall::UserReturnMappingValidation\n    for ReturnValidationSession<")
+        .expect("return-validation session extent")
+        .0;
+    for usercopy in ["preflight_owned_output", "commit_owned_output", "fn pin("] {
+        assert!(
+            !session.contains(usercopy),
+            "the return-validation session exposes {usercopy}"
+        );
+    }
+}

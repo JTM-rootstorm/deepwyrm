@@ -5094,7 +5094,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| panic!("could not load fresh Thread stack: {error:?}"));
         let state = {
             let mut paging = self.paging.lock();
-            let mut mappings = paging.current_process_address_space(
+            let mut mappings = paging.return_validation_session(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -7905,7 +7905,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
         let mut paging = self.paging.lock();
-        let mut mappings = paging.current_process_address_space(
+        let mut mappings = paging.return_validation_session(
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
@@ -8952,7 +8952,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
         let mut paging = self.paging.lock();
-        let mut mappings = paging.current_process_address_space(
+        let mut mappings = paging.return_validation_session(
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
@@ -11100,7 +11100,7 @@ pub(super) fn enter(
             .unwrap_or_else(|error| panic!("could not load primordial kernel stack: {error:?}"));
         let state = {
             let mut paging = runtime.paging.lock();
-            let mut mappings = paging.current_process_address_space(
+            let mut mappings = paging.return_validation_session(
                 runtime.own.active_root.as_ref().expect("active root"),
                 process,
             );
