@@ -1886,7 +1886,33 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .with_temporary_mmio_frame(frame, operation)
     }
 
+    /// A usercopy session for a guest test runtime, which has no runtime
+    /// authority T (D1 commit 9). The primordial runtime never builds one:
+    /// its usercopy goes through the guard-free session.
+    #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
     pub(crate) fn current_process_address_space(
+        &mut self,
+        active_root: &ActiveRootSelection,
+        process: crate::task::ProcessKey,
+    ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+        self.usercopy_process_address_space(active_root.usercopy_root(), process)
+    }
+
+    /// The one usercopy the primordial runtime still makes under the runtime
+    /// authority: an evidence product's supervisor reading its fixed-size
+    /// evidence record (D1 commit 9). Compiled only into evidence builds, so
+    /// no production build can copy under T.
+    #[cfg(any(
+        deepwyrm_wyr1_evidence,
+        deepwyrm_wyr1f_supervisor_relay,
+        deepwyrm_wyr1b_evidence,
+        deepwyrm_wyr1c_evidence,
+        deepwyrm_wyr1d_evidence,
+        deepwyrm_wyr1e_evidence,
+        deepwyrm_r1_evidence,
+        deepwyrm_dw1c_evidence,
+    ))]
+    pub(crate) fn evidence_usercopy_under_runtime_authority(
         &mut self,
         active_root: &ActiveRootSelection,
         process: crate::task::ProcessKey,

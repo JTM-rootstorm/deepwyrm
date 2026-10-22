@@ -3092,3 +3092,59 @@ fn terminal_paging_work_uses_sessions_without_usercopy() {
         );
     }
 }
+
+/// Text test (D1 commit 9): the only usercopy the primordial runtime still
+/// makes under the runtime authority is an evidence supervisor reading its
+/// record, through a constructor compiled only into evidence builds. The
+/// guest runtimes' `current_process_address_space` (no T there) is compiled
+/// only into guest builds.
+#[test]
+fn usercopy_under_t_is_confined_to_evidence_builds() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let activation = source("src/arch/x86_64/mm/activation.rs");
+    assert!(!primordial.contains("current_process_address_space"));
+    let evidence_sites: Vec<usize> = primordial
+        .match_indices("paging.evidence_usercopy_under_runtime_authority(")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(evidence_sites.len(), 8);
+    for at in evidence_sites {
+        let function = primordial[..at]
+            .rfind("    fn ")
+            .expect("evidence intercept");
+        let header = &primordial[function..at];
+        assert!(
+            header.starts_with("    fn intercept_") && header.contains("_evidence_raw("),
+            "an evidence copy outside an evidence intercept"
+        );
+        let attributes = &primordial[primordial[..function].rfind("\n\n").unwrap()..function];
+        assert!(
+            attributes.contains("#[cfg("),
+            "an evidence intercept without its build gate"
+        );
+    }
+    assert!(activation.contains(
+        "    #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]\n    pub(crate) fn current_process_address_space("
+    ));
+    let evidence = activation
+        .split_once("    pub(crate) fn evidence_usercopy_under_runtime_authority(")
+        .expect("evidence constructor")
+        .0;
+    let gate = &evidence[evidence.rfind("    #[cfg(any(").expect("evidence gate")..];
+    for selector in [
+        "deepwyrm_wyr1_evidence",
+        "deepwyrm_wyr1f_supervisor_relay",
+        "deepwyrm_wyr1b_evidence",
+        "deepwyrm_wyr1c_evidence",
+        "deepwyrm_wyr1d_evidence",
+        "deepwyrm_wyr1e_evidence",
+        "deepwyrm_r1_evidence",
+        "deepwyrm_dw1c_evidence",
+    ] {
+        assert!(gate.contains(selector), "evidence gate omits {selector}");
+    }
+    assert!(
+        !gate.contains("not("),
+        "the evidence gate widens past its builds"
+    );
+}

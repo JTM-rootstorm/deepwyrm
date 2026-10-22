@@ -7929,7 +7929,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1_submit_detail(error)));
         let record = {
             let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
+            let mut user = paging.evidence_usercopy_under_runtime_authority(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -7970,7 +7970,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1b_submit_detail(error)));
         let record = {
             let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
+            let mut user = paging.evidence_usercopy_under_runtime_authority(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -8011,7 +8011,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1c_submit_detail(error)));
         let record = {
             let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
+            let mut user = paging.evidence_usercopy_under_runtime_authority(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -8059,7 +8059,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if mode == 0 {
             let record = {
                 let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
+                let mut user = paging.evidence_usercopy_under_runtime_authority(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -8084,7 +8084,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             let readiness = {
                 let mut paging = self.paging.lock();
-                let mut user = paging.current_process_address_space(
+                let mut user = paging.evidence_usercopy_under_runtime_authority(
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
@@ -8127,7 +8127,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|error| crate::test_support::complete_fail(wyr1e_submit_detail(error)));
         let record = {
             let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
+            let mut user = paging.evidence_usercopy_under_runtime_authority(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -8166,7 +8166,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let phase = self.reserve_runtime_phase();
         let record = {
             let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
+            let mut user = paging.evidence_usercopy_under_runtime_authority(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
@@ -8339,7 +8339,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 // inspected only; no handle/object reference is retained.
                 let bytes = {
                     let mut paging = self.paging.lock();
-                    let mut user = paging.current_process_address_space(
+                    let mut user = paging.evidence_usercopy_under_runtime_authority(
                         self.own.active_root.as_ref().expect("active root"),
                         self.own.scheduled().process,
                     );
