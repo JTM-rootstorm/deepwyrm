@@ -2543,7 +2543,18 @@ fn process_create_copies_outside_its_transaction() {
         2,
         "the input copy and the result write take P alone"
     );
-    assert!(primordial.contains("crate::syscall::DeferredProcessCreateAccess::new(&mut live)"));
+    // D1 commit 9: the child-root reservation runs on a page-table mutation
+    // session, which carries no usercopy.
+    assert!(primordial.contains("crate::syscall::DeferredProcessCreateAccess::new(&mut session)"));
+    let run = primordial
+        .split_once("    fn run_process_create(")
+        .expect("guarded ProcessCreate")
+        .1
+        .split_once("\n    }\n")
+        .expect("guarded ProcessCreate extent")
+        .0;
+    assert!(run.contains("paging.page_table_mutation_session("));
+    assert!(!run.contains("current_process_address_space"));
 }
 
 /// Text test (D1 commit 8, design §11.2.3 family E): `WaitOne` and

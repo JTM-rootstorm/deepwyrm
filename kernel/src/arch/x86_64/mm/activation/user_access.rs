@@ -59,6 +59,26 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.session.recycle_table_candidate(candidate);
     }
 
+    /// Publishes a child architecture root (D1 commit 9: ProcessCreate's
+    /// reservation, a page-table mutation).
+    pub(crate) fn reserve_child_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), super::RootBindingError> {
+        self.session
+            .reserve_child_address_space(process, address_space)
+    }
+
+    pub(crate) fn rollback_empty_child_address_space(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), super::RootBindingError> {
+        self.session
+            .rollback_empty_child_address_space(process, address_space)
+    }
+
     #[allow(
         clippy::type_complexity,
         reason = "the publisher and its coherency domain share the session's one borrow"

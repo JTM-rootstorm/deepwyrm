@@ -4544,7 +4544,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 }
 
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::ProcessRootReservation
-    for user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+    for user_access::PageTableMutationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     fn reserve_child_root(
         &mut self,
@@ -11761,11 +11761,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let process = self.own.scheduled().process;
         let (status, pending) = {
             let mut paging = self.paging.lock();
-            let mut live = paging.current_process_address_space(
+            let mut session = paging.page_table_mutation_session(
                 self.own.active_root.as_ref().expect("active root"),
                 process,
             );
-            let mut access = crate::syscall::DeferredProcessCreateAccess::new(&mut live);
+            let mut access = crate::syscall::DeferredProcessCreateAccess::new(&mut session);
             let status = crate::syscall::process_create_with_root_prepared(
                 prepared,
                 &mut access,

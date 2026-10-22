@@ -2341,17 +2341,19 @@ const PROCESS_CREATE_RESULT_BYTES: usize = DW_PROCESS_CREATE_RESULT_V1_SIZE as u
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
     allow(dead_code, reason = "only the live runtime defers ProcessCreate")
 )]
-pub(crate) struct DeferredProcessCreateAccess<'a, U: OwnedUserOutputAccess> {
-    inner: &'a mut U,
-    pending: Option<(U::OwnedOutput, Option<[u8; PROCESS_CREATE_RESULT_BYTES]>)>,
+pub(crate) struct DeferredProcessCreateAccess<'a, R, O> {
+    inner: &'a mut R,
+    pending: Option<(O, Option<[u8; PROCESS_CREATE_RESULT_BYTES]>)>,
 }
 
 #[cfg_attr(
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
     allow(dead_code, reason = "only the live runtime defers ProcessCreate")
 )]
-impl<'a, U: OwnedUserOutputAccess> DeferredProcessCreateAccess<'a, U> {
-    pub(crate) fn new(inner: &'a mut U) -> Self {
+impl<'a, R, O> DeferredProcessCreateAccess<'a, R, O> {
+    /// `inner` reserves the child's architecture root (D1 commit 9: the live
+    /// runtime's page-table mutation session, which carries no usercopy).
+    pub(crate) fn new(inner: &'a mut R) -> Self {
         Self {
             inner,
             pending: None,
@@ -2360,18 +2362,16 @@ impl<'a, U: OwnedUserOutputAccess> DeferredProcessCreateAccess<'a, U> {
 
     /// The pinned output, and the result to commit into it (`None` to
     /// discard). The transaction settles its output on every path.
-    pub(crate) fn into_pending(
-        self,
-    ) -> (U::OwnedOutput, Option<[u8; PROCESS_CREATE_RESULT_BYTES]>) {
+    pub(crate) fn into_pending(self) -> (O, Option<[u8; PROCESS_CREATE_RESULT_BYTES]>) {
         self.pending
             .expect("ProcessCreate transaction left its output unsettled")
     }
 }
 
-impl<U: OwnedUserOutputAccess> UserPageAccess for DeferredProcessCreateAccess<'_, U> {
-    type Error = U::Error;
+impl<R, O> UserPageAccess for DeferredProcessCreateAccess<'_, R, O> {
+    type Error = crate::memory::usercopy::DeferredOutputUnavailable;
     type Pinned<'b>
-        = U::Pinned<'b>
+        = crate::memory::usercopy::DeferredOutputPin<'b>
     where
         Self: 'b;
 
@@ -2380,8 +2380,8 @@ impl<U: OwnedUserOutputAccess> UserPageAccess for DeferredProcessCreateAccess<'_
     }
 }
 
-impl<U: OwnedUserOutputAccess> OwnedUserOutputAccess for DeferredProcessCreateAccess<'_, U> {
-    type OwnedOutput = U::OwnedOutput;
+impl<R, O> OwnedUserOutputAccess for DeferredProcessCreateAccess<'_, R, O> {
+    type OwnedOutput = O;
 
     fn preflight_owned_output(
         &mut self,
@@ -2408,8 +2408,8 @@ impl<U: OwnedUserOutputAccess> OwnedUserOutputAccess for DeferredProcessCreateAc
     }
 }
 
-impl<U: OwnedUserOutputAccess + ProcessRootReservation> ProcessRootReservation
-    for DeferredProcessCreateAccess<'_, U>
+impl<R: ProcessRootReservation, O> ProcessRootReservation
+    for DeferredProcessCreateAccess<'_, R, O>
 {
     fn reserve_child_root(
         &mut self,
