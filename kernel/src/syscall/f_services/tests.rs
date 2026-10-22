@@ -2309,3 +2309,123 @@ fn the_unreachable_user_access_panics_on_any_use() {
         Some("an F request that copies reached the ordinary dispatch under the runtime authority")
     );
 }
+
+/// The `f3a/d1h3-normal-01/smp` panic ("remote stop suspended idle control
+/// drifted before precommit"). A live idle suspension's poll finds its
+/// winner and returns `ResumeCurrent`; before the resume reaches its
+/// physical handoff, its safe-point check takes a remote Stop, so the stop's
+/// precommit finds the continuation still suspended on this CPU. The idle
+/// poll used to clear the control there, and the precommit's exact retire
+/// then failed. The control now stays `Resuming` with the exact suspension
+/// until the handoff, and the precommit retires it as it would an idle one.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for this suspension test"
+)]
+fn a_remote_stop_retires_a_resuming_idle_suspension() {
+    let mut fixture = Fixture::new();
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventCreate {
+                requested_rights: DW_RIGHT_WAIT,
+                out_event: DwUserAddress(BASE + 0x500),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let event = DwHandle(u64_at(&fixture.user, BASE + 0x500));
+    let wait = fixture.handled(NativeSyscallRequest::WaitOne {
+        handle: event,
+        signals: DW_SIGNAL_SIGNALED,
+        deadline: DwDeadline(50),
+        out_result: DwUserAddress(BASE + 0x580),
+    });
+    assert_eq!(
+        wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    let wake = fixture
+        .services
+        .wait_operations
+        .wake_key_for_thread(fixture.thread)
+        .unwrap();
+    assert!(matches!(
+        // SAFETY: the fixture's running Thread is the physical carrier and the
+        // entry is a fixed synthetic address that this test never enters.
+        unsafe {
+            fixture.services.prepare_suspend(
+                &mut fixture.control,
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
+        NativeSuspendPlan::IdleCurrent
+    ));
+    let mut expired = [None; 8];
+    assert_eq!(fixture.wait_deadlines.queue.expire(50, &mut expired), 1);
+    assert!(claim_timeout_and_wake(&fixture.execution, wake).unwrap());
+    assert!(matches!(
+        // SAFETY: as for `prepare_suspend` above; the idle suspension it
+        // produced is this fixture's own.
+        unsafe {
+            fixture.services.poll_idle_suspend_on(
+                &mut fixture.control,
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                &fixture.tasks,
+                &fixture.execution,
+                0xffff_8000_0012_3000,
+            )
+        }
+        .unwrap(),
+        NativeIdleSuspendPoll::ResumeCurrent
+    ));
+    // The resume has not reached its handoff, and a Stop's precommit retires
+    // the exact suspension.
+    assert!(!fixture.control.is_clear());
+    assert_eq!(
+        fixture.services.retire_idle_control_for_stop(
+            &mut fixture.control,
+            wake.thread(),
+            wake.execution_generation() + 1,
+        ),
+        Err(WaitSuspendError::InvalidDecision),
+        "a stale generation must not retire it"
+    );
+    assert_eq!(
+        fixture.services.retire_idle_control_for_stop(
+            &mut fixture.control,
+            wake.thread(),
+            wake.execution_generation(),
+        ),
+        Ok(())
+    );
+    assert!(fixture.control.is_clear());
+    // The operation itself is retired as the stop's cleanup would; here the
+    // resume completes it, which the timeout winner allows.
+    let resumed = fixture
+        .services
+        .resume_suspended(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            fixture.thread,
+            Some(&mut fixture.wait_deadlines),
+        )
+        .unwrap();
+    assert_eq!(resumed.status(), DW_STATUS_TIMED_OUT);
+    assert!(fixture.services.is_quiescent());
+    close_event(&mut fixture, event);
+}
+
+/// The normal path: a resuming idle suspension ends at the handoff.
+#[test]
+fn an_idle_resume_ends_at_its_handoff() {
+    let mut control = NativeWaitControl::new();
+    control.finish_idle_resume();
+    assert!(control.is_clear());
+}

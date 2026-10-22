@@ -10567,7 +10567,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut guard = self.runtime.lock();
             let runtime = guard.on(&mut self.owned);
             let suspended_claim = runtime.core.shared.execution.suspended_claim_on(self.cpu);
-            match (suspended_claim, runtime.own.deferred_current.as_ref()) {
+            let terminal = match (suspended_claim, runtime.own.deferred_current.as_ref()) {
                 (Some(suspended), Some(deferred)) => {
                     assert_eq!(
                         suspended.thread(),
@@ -10588,7 +10588,13 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     true
                 }
                 _ => false,
+            };
+            if terminal {
+                // The terminal reaper owns this continuation now; its idle
+                // resume ends here, as it always did, short of a handoff.
+                runtime.own.wait_control.finish_idle_resume();
             }
+            terminal
         };
         if terminal_current {
             return crate::syscall::native::NativeResumeOutcome::TerminateCurrent;
@@ -10599,7 +10605,13 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let publication = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
-            runtime.complete_physical_switch_handoff()
+            let publication = runtime.complete_physical_switch_handoff();
+            // The continuation gave up its suspended claim at this handoff, so
+            // its idle resume ends here: until now a remote stop could still
+            // find it suspended, and its precommit retires a resuming control
+            // exactly as an idle one.
+            runtime.own.wait_control.finish_idle_resume();
+            publication
         };
         crate::task::notify_completed_switch_runnable(publication);
         let mut guard = self.runtime.lock();

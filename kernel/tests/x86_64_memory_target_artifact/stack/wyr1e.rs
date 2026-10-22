@@ -57,25 +57,13 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
         symbol == "<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes"
     });
     // The winning-index fold of `ready_wakes`. R5E saw it folded into
-    // `ready_wakes`, whose frame absorbed it. Since D1 commit 9 the artifact
-    // also emits `ready_wakes::{closure#2}`'s fold out of line, for another
-    // caller's inlined copy; `ready_wakes` itself may or may not call it.
-    // Measure the emitted chain: if `ready_wakes` calls the fold, its frame
-    // joins the ready-wakes phase; otherwise `ready_wakes` must call no
-    // out-of-line fold.
-    let ready_fold = sizes
-        .iter()
-        .any(|entry| {
-            entry
-                .symbol
-                .contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
-        })
-        .then(|| {
-            select("q35 ready-wakes fold", &|symbol| {
-                symbol
-                    .contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}")
-            })
-        });
+    // `ready_wakes`, whose frame absorbed it. Since D1 commit 9 codegen emits
+    // it out of line in some builds, and its stack entry is identical-code
+    // folded with other instances (`take_ready`'s, another registry size's),
+    // so the disassembly may name any of them at the call. Measure the
+    // emitted chain: a fold `ready_wakes` calls joins the ready-wakes phase
+    // with its own frame, looked up by the name the call shows; otherwise
+    // `ready_wakes` calls no out-of-line fold.
     let (record_pending, record_pending_bytes) = select("q35 coalesced record", &|symbol| {
         symbol
             == "<deepwyrm_kernel::device::q35_interrupt::Q35InterruptPlatform>::record_pending_delivery"
@@ -133,25 +121,23 @@ pub(crate) fn validate_wyr1e_privilege_entry_stack_margin(
         );
     }
     let ready_body = function_body(disassembly, &ready);
-    // The fold's stack-size entry can be identical-code-folded with other
-    // monomorphizations and list them all, so the call is matched by the
-    // `ready_wakes` fold it names, not by the merged entry's full text.
-    let calls_ready_fold = ready_body.lines().any(|line| {
-        line.contains("\tcall\t")
-            && line.contains("<deepwyrm_kernel::wait::WaitRegistry<64>>::ready_wakes::{closure#2}>")
-            && line.contains("Iterator>::fold::<u32")
+    let ready_fold_calls: Vec<&str> = ready_body
+        .lines()
+        .filter(|line| line.contains("\tcall\t") && line.contains("Iterator>::fold::<u32"))
+        .filter_map(|line| {
+            let target = line.split_once(" <")?.1;
+            target.strip_suffix('>')
+        })
+        .collect();
+    assert!(
+        ready_fold_calls.len() <= 1,
+        "selector-33 ready-wakes frame calls several out-of-line folds: {ready_fold_calls:?}"
+    );
+    let ready_fold_bytes = ready_fold_calls.first().map(|fold| {
+        one_stack_size(sizes, "q35 ready-wakes fold", |symbol| {
+            symbol.contains(fold)
+        })
     });
-    let ready_fold_bytes = match (&ready_fold, calls_ready_fold) {
-        (Some((_, bytes)), true) => Some(*bytes),
-        (None, true) => panic!("selector-33 ready-wakes frame calls a fold with no stack entry"),
-        (_, false) => {
-            assert!(
-                !ready_body.contains("Iterator>::fold::<u32"),
-                "selector-33 ready-wakes frame calls an out-of-line fold it does not name"
-            );
-            None
-        }
-    };
     assert!(
         function_body(disassembly, &handler).contains(&format!(" <{after_eoi}>")),
         "selector-33 handler omitted its exact post-EOI completion target"

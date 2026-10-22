@@ -3189,3 +3189,32 @@ fn the_usercopy_session_is_built_only_behind_the_guard_free_token() {
         );
     }
 }
+
+/// Text test (the remote-stop precommit fix): a live idle suspension's
+/// resume ends at its physical handoff, in the hold that completes it, and
+/// on the terminal path; until then a remote stop's precommit retires the
+/// resuming control as an idle one.
+#[test]
+fn an_idle_resume_ends_at_its_physical_handoff() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    let resume = primordial
+        .rsplit_once("    fn resume_suspended(")
+        .expect("facade resume")
+        .1
+        .split_once("\n    }\n")
+        .expect("facade resume extent")
+        .0;
+    let handoff = resume
+        .find("let publication = runtime.complete_physical_switch_handoff();")
+        .expect("handoff hold");
+    let finish = resume[handoff..]
+        .find("runtime.own.wait_control.finish_idle_resume();")
+        .expect("resume ends at the handoff");
+    assert!(finish > 0);
+    let terminal = resume.find("if terminal {\n").expect("terminal resume");
+    assert!(resume[terminal..handoff].contains("runtime.own.wait_control.finish_idle_resume();"));
+    let services = source("src/syscall/adapters.rs");
+    assert!(services.contains(
+        "NativeIdleSuspendPoll::ResumeCurrent) {\n            // The suspended claim stays this CPU's until the resume's\n            // physical handoff (`finish_idle_resume`).\n            NativeWaitControlState::Resuming(state)"
+    ));
+}

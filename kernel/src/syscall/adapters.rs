@@ -4318,6 +4318,12 @@ enum NativeWaitControlState {
     Clear,
     Pending(WaitSuspendState),
     Idle(WaitSuspendState),
+    /// The live idle poll found the suspension's winner and returned
+    /// `ResumeCurrent`, but the resume has not yet completed its physical
+    /// handoff, so the blocked continuation still holds this CPU's suspended
+    /// claim. A remote stop that reaches its precommit in that window
+    /// retires this exact suspension as it would an idle one.
+    Resuming(WaitSuspendState),
 }
 
 /// Ephemeral control-plane state between native wait dispatch and the raw
@@ -4334,7 +4340,9 @@ impl NativeWaitControl {
     ) -> Option<crate::task::SchedulerQuantumTicket> {
         match self.state {
             NativeWaitControlState::Pending(state) => state.cancelled_quantum(),
-            NativeWaitControlState::Clear | NativeWaitControlState::Idle(_) => None,
+            NativeWaitControlState::Clear
+            | NativeWaitControlState::Idle(_)
+            | NativeWaitControlState::Resuming(_) => None,
         }
     }
 
@@ -4347,9 +4355,9 @@ impl NativeWaitControl {
     #[cfg(deepwyrm_i1_evidence)]
     pub(crate) const fn pending_wake_key(&self) -> Option<BlockWakeKey> {
         match self.state {
-            NativeWaitControlState::Pending(state) | NativeWaitControlState::Idle(state) => {
-                Some(state.wake_key())
-            }
+            NativeWaitControlState::Pending(state)
+            | NativeWaitControlState::Idle(state)
+            | NativeWaitControlState::Resuming(state) => Some(state.wake_key()),
             NativeWaitControlState::Clear => None,
         }
     }
@@ -4494,9 +4502,15 @@ impl NativeWaitControl {
         let poll = unsafe {
             poll_wait_idle_suspend_on(tasks, execution, cpu, state, trusted_first_run_entry)
         }?;
-        if !matches!(poll, NativeIdleSuspendPoll::Continue) {
-            self.state = NativeWaitControlState::Clear;
-        }
+        self.state = if matches!(poll, NativeIdleSuspendPoll::Continue) {
+            NativeWaitControlState::Idle(state)
+        } else if matches!(poll, NativeIdleSuspendPoll::ResumeCurrent) {
+            // The suspended claim stays this CPU's until the resume's
+            // physical handoff (`finish_idle_resume`).
+            NativeWaitControlState::Resuming(state)
+        } else {
+            NativeWaitControlState::Clear
+        };
         Ok(poll)
     }
 
@@ -4504,14 +4518,32 @@ impl NativeWaitControl {
         matches!(self.state, NativeWaitControlState::Clear)
     }
 
+    /// Ends a live idle suspension's resume at its physical handoff: the
+    /// blocked continuation gives up its suspended claim, so a remote stop
+    /// can no longer find it suspended (D1, the remote-stop precommit fix).
+    /// A resume after a switch finds the control already clear.
+    pub(crate) fn finish_idle_resume(&mut self) {
+        match self.state {
+            NativeWaitControlState::Resuming(_) | NativeWaitControlState::Clear => {
+                self.state = NativeWaitControlState::Clear;
+            }
+            NativeWaitControlState::Pending(_) | NativeWaitControlState::Idle(_) => {
+                panic!("a suspended resume found an unconsumed suspension handoff")
+            }
+        }
+    }
+
     /// Consumes only the exact idle control handoff retained by a physical
-    /// blocked continuation that an e1 safe point is about to retire.
+    /// blocked continuation that an e1 safe point is about to retire: still
+    /// idle, or already resuming but short of its physical handoff.
     pub(crate) fn retire_idle_for_stop(
         &mut self,
         thread: ThreadKey,
         execution_generation: u64,
     ) -> Result<(), WaitSuspendError> {
-        let NativeWaitControlState::Idle(state) = self.state else {
+        let (NativeWaitControlState::Idle(state) | NativeWaitControlState::Resuming(state)) =
+            self.state
+        else {
             return Err(WaitSuspendError::InvalidDecision);
         };
         let wake = state.wake_key();
