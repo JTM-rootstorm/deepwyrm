@@ -7,9 +7,9 @@ use super::*;
 /// dispatch frame it calls, and the production handler.
 /// `EXPECTED_TERMINATE` adds the task-group terminate helpers, and
 /// `EXPECTED_REQUIRED` adds architectural headroom and required spare.
-pub(crate) const EXPECTED_COMMON: usize = 50_560;
-pub(crate) const EXPECTED_TERMINATE: usize = 72_640;
-pub(crate) const EXPECTED_REQUIRED: usize = 109_504;
+pub(crate) const EXPECTED_COMMON: usize = 50_704;
+pub(crate) const EXPECTED_TERMINATE: usize = 72_784;
+pub(crate) const EXPECTED_REQUIRED: usize = 109_648;
 
 pub(crate) fn validate_wyr1e8_thread_stack_margin(
     sizes: &[StackSize],
@@ -37,21 +37,27 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
                 && symbol.contains("RuntimeCarrierFacade<128, 4096>")
                 && !symbol.contains("::{closure")
         });
-    // R5E recorded `dispatch_frame` folded into the trampoline. It was emitted
-    // again from deepwyrm 4341464 until S2K-6 folded it back, and emitted
-    // again from D1 commit 3. D1 commit 9 (the ordinary F dispatch's session
-    // replaced by a stateless stand-in) folds it once more: the trampoline
-    // calls the production handler directly, and the chain loses that frame
-    // and its return word. Assert the fold: if it is emitted again, the chain
-    // must be re-measured rather than silently gain a level.
-    assert!(
-        sizes.iter().all(
-            |size| !(size.symbol.contains("syscall::native::dispatch_frame::<")
+    // `dispatch_frame` folds into the trampoline or is emitted on its own,
+    // depending on codegen elsewhere in the artifact: folded at R5E, emitted
+    // from 4341464, folded at S2K-6, emitted from D1 commit 3, folded at D1
+    // commit 9's dispatch stand-in, emitted again one commit later. Measure
+    // the emitted chain either way: an emitted frame must be called by the
+    // trampoline and call the handler, and adds its frame and a return word;
+    // a folded one leaves the trampoline calling the handler directly.
+    let dispatch_frame = sizes
+        .iter()
+        .any(|size| {
+            size.symbol.contains("syscall::native::dispatch_frame::<")
                 && size.symbol.contains("RuntimeCarrierFacade<128, 4096>")
-                && !size.symbol.contains("::{closure"))
-        ),
-        "E8 runtime dispatch frame is emitted again; re-measure the chain"
-    );
+                && !size.symbol.contains("::{closure")
+        })
+        .then(|| {
+            select("E8 runtime dispatch frame", &|symbol| {
+                symbol.contains("syscall::native::dispatch_frame::<")
+                    && symbol.contains("RuntimeCarrierFacade<128, 4096>")
+                    && !symbol.contains("::{closure")
+            })
+        });
     let (runtime_handler, runtime_handler_bytes) = select("E8 runtime handler", &|symbol| {
         symbol.contains("RuntimeCarrierFacade<128, 4096>")
             && symbol
@@ -78,10 +84,26 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     // One indirect tail jump, through whichever register holds the handler.
     assert_eq!(bound_body.matches("\tjmp\tr").count(), 1);
     assert!(bound_body.contains("syscall::live::RUNTIME"));
-    assert!(
-        function_body(disassembly, &runtime_trampoline).contains(&format!(" <{runtime_handler}>")),
-        "E8 trampoline no longer calls the production handler directly"
-    );
+    match &dispatch_frame {
+        Some((dispatch_frame, _)) => {
+            assert!(
+                function_body(disassembly, &runtime_trampoline)
+                    .contains(&format!(" <{dispatch_frame}>")),
+                "E8 trampoline no longer calls the dispatch frame"
+            );
+            assert!(
+                function_body(disassembly, dispatch_frame)
+                    .contains(&format!(" <{runtime_handler}>")),
+                "E8 dispatch frame no longer reaches the production handler directly"
+            );
+        }
+        None => assert!(
+            function_body(disassembly, &runtime_trampoline)
+                .contains(&format!(" <{runtime_handler}>")),
+            "E8 trampoline no longer calls the production handler directly"
+        ),
+    }
+    let dispatch_frame_bytes = dispatch_frame.as_ref().map_or(0, |(_, bytes)| *bytes);
     assert!(
         function_body(disassembly, &runtime_handler).contains(&format!(" <{prepare_terminate}>"))
     );
@@ -92,10 +114,10 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     // The entry copies a 144-byte frame onto the Thread stack and calls the
     // dispatcher. The dispatcher pushes one word before calling the bound
     // runtime. That function tail-jumps into the installed trampoline, so it
-    // adds no second return word. The trampoline calls the production handler
-    // (the dispatch frame folded into it, D1 commit 9), and the handler calls
-    // the selected terminate helper.
-    const COMMON_RETURN_WORDS: usize = 3;
+    // adds no second return word. The trampoline calls the dispatch frame, if
+    // it is emitted, which calls the production handler, and the handler
+    // calls the selected terminate helper.
+    let common_return_words: usize = 3 + usize::from(dispatch_frame.is_some());
     const TERMINATE_RETURN_WORDS: usize = 2;
     assert_eq!(syscall_dispatch_bytes, size_of::<u64>());
     assert_eq!(bound_dispatch_bytes, 0);
@@ -103,12 +125,13 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
         syscall_dispatch_bytes,
         bound_dispatch_bytes,
         runtime_trampoline_bytes,
+        dispatch_frame_bytes,
         runtime_handler_bytes,
     ]
     .into_iter()
     .try_fold(0_usize, usize::checked_add)
     .expect("E8 common syscall frames fit usize");
-    let common_returns = COMMON_RETURN_WORDS * size_of::<u64>();
+    let common_returns = common_return_words * size_of::<u64>();
     let common = RAW_SYSCALL_FRAME_BYTES
         .checked_add(common_frames)
         .and_then(|bytes| bytes.checked_add(common_returns))
@@ -157,5 +180,5 @@ fn e8_thread_capacity_fits_the_ordinary_thread_stack_after_r5() {
         assert!(PRE_R5_REQUIRED > ORDINARY);
         assert!(EXPECTED_REQUIRED <= ORDINARY);
     }
-    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_784);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_640);
 }

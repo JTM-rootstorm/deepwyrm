@@ -1907,6 +1907,18 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// The pin-settlement session for `process`'s current root (D1 commit
+    /// 9): discards owned pins, with no usercopy.
+    pub(crate) fn pin_settlement_session(
+        &mut self,
+        active_root: &ActiveRootSelection,
+        process: crate::task::ProcessKey,
+    ) -> user_access::PinSettlementSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+        user_access::PinSettlementSession::new(
+            self.usercopy_process_address_space(active_root.usercopy_root(), process),
+        )
+    }
+
     /// The user-return validation session for `process`'s current root (D1
     /// commit 9): read-only page-table walks, with no usercopy.
     pub(crate) fn return_validation_session(

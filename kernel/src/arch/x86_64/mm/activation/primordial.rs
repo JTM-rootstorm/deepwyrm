@@ -6337,7 +6337,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         {
             let mut paging = self.paging.lock();
-            let mut user = paging.current_process_address_space(
+            let mut user = paging.pin_settlement_session(
                 self.own.active_root.as_ref().expect("active Process root"),
                 self.own.scheduled().process,
             );
@@ -6597,7 +6597,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let mut paging = self.paging.lock();
         let mut user =
-            paging.current_process_address_space(self.own.active_root.as_ref().ok_or(())?, process);
+            paging.page_table_mutation_session(self.own.active_root.as_ref().ok_or(())?, process);
         loop {
             let mapping = self
                 .core
@@ -6666,10 +6666,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(());
         }
         let mut paging = self.paging.lock();
-        let mut user = paging.current_process_address_space(
-            self.own.active_root.as_ref().ok_or(())?,
-            current_process,
-        );
+        let mut user = paging
+            .page_table_mutation_session(self.own.active_root.as_ref().ok_or(())?, current_process);
         user.select_process_for_return_validation(process)
             .map_err(|_| ())?;
         loop {

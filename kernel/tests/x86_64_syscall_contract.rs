@@ -3048,3 +3048,47 @@ fn ordinary_f_dispatch_holds_no_user_session() {
         );
     }
 }
+
+/// Text test (D1 commit 9): the terminal unmaps of a quiesced Process run on
+/// a page-table mutation session, and a stop's suspended-pin discards on a
+/// pin-settlement session: neither carries usercopy. Terminal cleanup's
+/// broader shape is D2's.
+#[test]
+fn terminal_paging_work_uses_sessions_without_usercopy() {
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    for (name, session) in [
+        ("unmap_current_userspace", ".page_table_mutation_session("),
+        ("unmap_inactive_userspace", ".page_table_mutation_session("),
+        (
+            "transfer_suspended_service_cleanup_for_stop",
+            "paging.pin_settlement_session(",
+        ),
+    ] {
+        let body = primordial
+            .split_once(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("{name} exists"))
+            .1
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("{name} extent"))
+            .0;
+        assert!(body.contains(session), "{name} omits {session}");
+        assert!(
+            !body.contains("current_process_address_space"),
+            "{name} copies under T"
+        );
+    }
+    let user_access = source("src/arch/x86_64/mm/activation/user_access.rs");
+    let pins = user_access
+        .split_once("pub(crate) struct PinSettlementSession<")
+        .expect("pin-settlement session")
+        .1
+        .split_once("/// A user-return validation session")
+        .expect("pin-settlement session extent")
+        .0;
+    for usercopy in ["preflight_owned_output", "commit_owned_output", "fn pin("] {
+        assert!(
+            !pins.contains(usercopy),
+            "the pin-settlement session exposes {usercopy}"
+        );
+    }
+}

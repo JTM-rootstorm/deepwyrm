@@ -1227,7 +1227,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
         "validate_current_process_root_selection(",
         "self.own.scheduled().process != process",
         "self.own.scheduled().root_key != root_key",
-        ".current_process_address_space(",
+        ".page_table_mutation_session(",
         ".publisher::<",
         ".unmap(",
     ] {

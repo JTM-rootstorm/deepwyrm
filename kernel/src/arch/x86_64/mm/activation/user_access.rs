@@ -79,6 +79,39 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .rollback_empty_child_address_space(process, address_space)
     }
 
+    /// The plain (non-coherent) publisher, for the terminal unmaps of a
+    /// quiesced Process, whose root no other CPU uses (D1 commit 9; the
+    /// teardown's own shootdown story is D2's).
+    pub(crate) fn publisher<
+        'publisher,
+        const CANDIDATE_CAPACITY: usize,
+        const ENTRY_CAPACITY: usize,
+        const INVALIDATION_CAPACITY: usize,
+    >(
+        &'publisher mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        region: crate::memory::address_region::RegionKey,
+        candidates: &'publisher mut [Option<TableCandidateGrant>; CANDIDATE_CAPACITY],
+    ) -> Result<
+        crate::arch::x86_64::mm::X86AddressSpacePublisher<
+            'publisher,
+            TrackedActiveTarget<'borrow>,
+            RANGE_CAPACITY,
+            ROLE_CAPACITY,
+            CANDIDATE_CAPACITY,
+            ENTRY_CAPACITY,
+            INVALIDATION_CAPACITY,
+        >,
+        crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
+    > {
+        self.session
+            .publisher::<CANDIDATE_CAPACITY, ENTRY_CAPACITY, INVALIDATION_CAPACITY>(
+                address_space,
+                region,
+                candidates,
+            )
+    }
+
     #[allow(
         clippy::type_complexity,
         reason = "the publisher and its coherency domain share the session's one borrow"
@@ -123,6 +156,44 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_authority::PagingHeld
     for PageTableMutationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+}
+
+/// A pin-settlement session (D1 commit 9): releases a suspended operation's
+/// owned output pin, or atomic-word pin, without writing it. A stop that
+/// retires a suspended syscall discards its pins under the runtime authority;
+/// that is pin-tracker bookkeeping, not a usercopy. Terminal cleanup's
+/// broader shape is D2's.
+pub(crate) struct PinSettlementSession<
+    'borrow,
+    'root,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
+    session: LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+}
+
+impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    PinSettlementSession<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    pub(super) const fn new(
+        session: LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+    ) -> Self {
+        Self { session }
+    }
+
+    pub(crate) fn discard_owned_output(
+        &mut self,
+        output: OwnedLiveUserOutput,
+    ) -> Result<(), LiveUserAccessError> {
+        self.session.discard_owned_output(output)
+    }
+
+    pub(crate) fn release_atomic_u32(
+        &mut self,
+        word: OwnedLiveAtomicU32,
+    ) -> Result<(), LiveUserAccessError> {
+        self.session.release_atomic_u32(word)
+    }
 }
 
 /// A user-return validation session (D1 commit 9): read-only walks of a
