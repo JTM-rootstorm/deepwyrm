@@ -2050,7 +2050,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let result = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             NativeSyscallResult::returning(match request {
                 NativeSyscallRequest::AbiGetInfo {
                     out_info,
@@ -2166,7 +2168,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (atomic_pin, pinned, backing) = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             let atomic_pin = match request {
                 NativeSyscallRequest::AtomicWake { address, .. } => Some(
                     crate::syscall::FAtomicUserAccess::pin_atomic_u32(&mut user, address),
@@ -2264,7 +2268,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if released_pin.is_some() || pinned.is_some() || rollback.is_some() {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             if let Some(grant) = rollback {
                 crate::syscall::MemoryObjectBackingAccess::rollback_object_backing(
                     &mut user, grant,
@@ -2331,7 +2337,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let required = crate::syscall::output_range(out_required_size, 8, 8).and_then(|range| {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             user.preflight_owned_output(range)
                 .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)
         });
@@ -2345,7 +2353,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 };
                 let mut access = self.paging.guard_free_access(self.runtime.guard_free());
                 let mut paging = access.lock();
-                let mut user = paging.usercopy_process_address_space(root, process);
+                let mut user = paging
+                    .guard_free_value()
+                    .usercopy_process_address_space(root, process);
                 match queried {
                     Err(status) => {
                         user.discard_owned_output(required)
@@ -2408,7 +2418,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let snapshot = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             crate::syscall::channel_send_snapshot(
                 &mut user,
                 &mut self.owned.channel_staging[..],
@@ -2479,7 +2491,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let precheck = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             crate::syscall::channel_receive_precheck(
                 &mut user,
                 byte_capacity,
@@ -2521,7 +2535,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Ok(outputs) => {
                 let mut access = self.paging.guard_free_access(self.runtime.guard_free());
                 let mut paging = access.lock();
-                let mut user = paging.usercopy_process_address_space(root, process);
+                let mut user = paging
+                    .guard_free_value()
+                    .usercopy_process_address_space(root, process);
                 let (too_small, ranges) = match outputs {
                     crate::syscall::ChannelReceiveOutputs::TooSmall(range) => {
                         (true, [None, None, Some(range)])
@@ -2586,7 +2602,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if pins.iter().any(Option::is_some) {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             for (index, output) in pins.into_iter().enumerate() {
                 let Some(output) = output else {
                     continue;
@@ -2654,7 +2672,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let prepared = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             crate::syscall::process_create_input(
                 &mut user,
                 args,
@@ -2676,7 +2696,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if let Some((output, result)) = pending {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             match result {
                 Some(result) => user
                     .commit_owned_output(output, &result)
@@ -2726,7 +2748,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let prepared = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             match request {
                 NativeSyscallRequest::WaitOne {
                     handle,
@@ -2758,7 +2782,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if let Some((output, result)) = settlement {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             match result {
                 Some(result) => user
                     .commit_owned_output(output, &result)
@@ -2815,7 +2841,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let pinned = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             crate::syscall::FAtomicUserAccess::pin_atomic_u32(&mut user, address).map(|pin| {
                 let observed =
                     crate::syscall::FAtomicUserAccess::load_atomic_u32_acquire(&mut user, &pin);
@@ -2857,7 +2885,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 let matched = {
                     let mut access = self.paging.guard_free_access(self.runtime.guard_free());
                     let mut paging = access.lock();
-                    let mut user = paging.usercopy_process_address_space(root, process);
+                    let mut user = paging
+                        .guard_free_value()
+                        .usercopy_process_address_space(root, process);
                     crate::syscall::FAtomicUserAccess::load_atomic_u32_acquire(&mut user, &pin)
                         == expected
                 };
@@ -2871,7 +2901,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if let Some(pin) = pin {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
         }
         Some(Ok(ready))
@@ -2908,7 +2940,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let input = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             crate::syscall::thread_start_input(&mut user, args, args_size)
         };
         let mut guard = self.runtime.lock();
@@ -2967,7 +3001,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             } => {
                 let mut access = self.paging.guard_free_access(self.runtime.guard_free());
                 let mut paging = access.lock();
-                let mut user = paging.usercopy_process_address_space(root, process);
+                let mut user = paging
+                    .guard_free_value()
+                    .usercopy_process_address_space(root, process);
                 Some(map_input(&mut user, args, args_size, out_address))
             }
             _ => None,
@@ -3004,7 +3040,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if let Some((output, address)) = map_output {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
-            let mut user = paging.usercopy_process_address_space(root, process);
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
             match address {
                 Some(address) => user
                     .commit_owned_output(output, &address.to_le_bytes())
@@ -3032,7 +3070,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let mut access = self.paging.guard_free_access(self.runtime.guard_free());
         let mut paging = access.lock();
-        let mut user = paging.usercopy_process_address_space(root, process);
+        let mut user = paging
+            .guard_free_value()
+            .usercopy_process_address_space(root, process);
         if let Some(pin) = pin {
             crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
         }

@@ -1886,128 +1886,6 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .with_temporary_mmio_frame(frame, operation)
     }
 
-    /// A usercopy session for a guest test runtime, which has no runtime
-    /// authority T (D1 commit 9). The primordial runtime never builds one:
-    /// its usercopy goes through the guard-free session.
-    #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
-    pub(crate) fn current_process_address_space(
-        &mut self,
-        active_root: &ActiveRootSelection,
-        process: crate::task::ProcessKey,
-    ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-        self.usercopy_process_address_space(active_root.usercopy_root(), process)
-    }
-
-    /// The one usercopy the primordial runtime still makes under the runtime
-    /// authority: an evidence product's supervisor reading its fixed-size
-    /// evidence record (D1 commit 9). Compiled only into evidence builds, so
-    /// no production build can copy under T.
-    #[cfg(any(
-        deepwyrm_wyr1_evidence,
-        deepwyrm_wyr1f_supervisor_relay,
-        deepwyrm_wyr1b_evidence,
-        deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence,
-        deepwyrm_wyr1e_evidence,
-        deepwyrm_r1_evidence,
-        deepwyrm_dw1c_evidence,
-    ))]
-    pub(crate) fn evidence_usercopy_under_runtime_authority(
-        &mut self,
-        active_root: &ActiveRootSelection,
-        process: crate::task::ProcessKey,
-    ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-        self.usercopy_process_address_space(active_root.usercopy_root(), process)
-    }
-
-    /// The page-table mutation session for `process`'s current root (D1
-    /// option B3): root selection, table candidates and the coherent
-    /// publisher, with no usercopy.
-    pub(crate) fn page_table_mutation_session(
-        &mut self,
-        active_root: &ActiveRootSelection,
-        process: crate::task::ProcessKey,
-    ) -> user_access::PageTableMutationSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-        user_access::PageTableMutationSession::new(
-            self.usercopy_process_address_space(active_root.usercopy_root(), process),
-        )
-    }
-
-    /// The pin-settlement session for `process`'s current root (D1 commit
-    /// 9): discards owned pins, with no usercopy.
-    pub(crate) fn pin_settlement_session(
-        &mut self,
-        active_root: &ActiveRootSelection,
-        process: crate::task::ProcessKey,
-    ) -> user_access::PinSettlementSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-        user_access::PinSettlementSession::new(
-            self.usercopy_process_address_space(active_root.usercopy_root(), process),
-        )
-    }
-
-    /// The user-return validation session for `process`'s current root (D1
-    /// commit 9): read-only page-table walks, with no usercopy.
-    pub(crate) fn return_validation_session(
-        &mut self,
-        active_root: &ActiveRootSelection,
-        process: crate::task::ProcessKey,
-    ) -> user_access::ReturnValidationSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-        user_access::ReturnValidationSession::new(
-            self.usercopy_process_address_space(active_root.usercopy_root(), process),
-        )
-    }
-
-    /// As `current_process_address_space`, from a copied selection identity
-    /// (D1 commit 5). The copy is revalidated against the live binding, this
-    /// CPU, CR3 and the residency epoch before the session exists.
-    #[allow(
-        unsafe_code,
-        reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
-    )]
-    pub(crate) fn usercopy_process_address_space(
-        &mut self,
-        active_root: address_space::UserCopyRoot,
-        process: crate::task::ProcessKey,
-    ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-        let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
-            .and_then(crate::cpu::CpuIndex::new)
-            .unwrap_or_else(|| panic!("usercopy has no current architecture CPU binding"));
-        let observed_root: u64;
-        unsafe {
-            core::arch::asm!(
-                "mov {}, cr3",
-                out(reg) observed_root,
-                options(nostack, preserves_flags),
-            );
-        }
-        let (root, identity, address_space) = self
-            .root_bindings
-            .usercopy_root_for_process(&self.root, active_root, cpu, observed_root, process)
-            .unwrap_or_else(|error| {
-                panic!("process usercopy root is not current on this CPU: {error:?}")
-            });
-        let scratch = self
-            .target
-            .current_scratch_target()
-            .unwrap_or_else(|error| panic!("usercopy scratch CPU selection failed: {error:?}"));
-        let target = &mut self.target;
-        LiveProcessAddressSpace {
-            root: root as *const PageTableRoot,
-            primordial_root: &self.root,
-            identity,
-            address_space,
-            process,
-            root_bindings: &mut self.root_bindings,
-            roles: target.roles,
-            target: user_access::TrackedActiveTarget {
-                scratch,
-                pins: &self.user_pins,
-                address_space,
-            },
-            _root: core::marker::PhantomData,
-        }
-    }
-
     /// Revalidates a retained move-only selection against the physical CPU and
     /// CR3 without manufacturing a second residency token. Same-Process
     /// sibling switches use this before updating only carrier Thread state.
@@ -2320,6 +2198,171 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             &self.user_pins,
             reservation,
         )
+    }
+}
+
+/// The live process session's builder and every constructor of a session
+/// over it, sealed in one module (D1 commit 9): the builder is private here,
+/// so outside this module a usercopy session exists only through
+/// `GuardFreeValue::usercopy_process_address_space`, whose token only a
+/// guard-free P guard mints. "No usercopy under T" (H0 §12.8) is therefore a
+/// type fact for the primordial runtime. The page-table mutation,
+/// return-validation and pin-settlement sessions wrap the same builder and
+/// expose no copy. The guest runtimes' constructor (no T there) and the
+/// evidence supervisors' are compiled only into their own builds.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod live_sessions {
+    use super::*;
+
+    impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+        ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
+    {
+        /// A usercopy session for a guest test runtime, which has no runtime
+        /// authority T (D1 commit 9). The primordial runtime never builds one:
+        /// its usercopy goes through the guard-free session.
+        #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
+        pub(crate) fn current_process_address_space(
+            &mut self,
+            active_root: &ActiveRootSelection,
+            process: crate::task::ProcessKey,
+        ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            self.build_live_session(active_root.usercopy_root(), process)
+        }
+
+        /// The one usercopy the primordial runtime still makes under the runtime
+        /// authority: an evidence product's supervisor reading its fixed-size
+        /// evidence record (D1 commit 9). Compiled only into evidence builds, so
+        /// no production build can copy under T.
+        #[cfg(any(
+            deepwyrm_wyr1_evidence,
+            deepwyrm_wyr1f_supervisor_relay,
+            deepwyrm_wyr1b_evidence,
+            deepwyrm_wyr1c_evidence,
+            deepwyrm_wyr1d_evidence,
+            deepwyrm_wyr1e_evidence,
+            deepwyrm_r1_evidence,
+            deepwyrm_dw1c_evidence,
+        ))]
+        pub(crate) fn evidence_usercopy_under_runtime_authority(
+            &mut self,
+            active_root: &ActiveRootSelection,
+            process: crate::task::ProcessKey,
+        ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            self.build_live_session(active_root.usercopy_root(), process)
+        }
+
+        /// The page-table mutation session for `process`'s current root (D1
+        /// option B3): root selection, table candidates and the coherent
+        /// publisher, with no usercopy.
+        pub(crate) fn page_table_mutation_session(
+            &mut self,
+            active_root: &ActiveRootSelection,
+            process: crate::task::ProcessKey,
+        ) -> user_access::PageTableMutationSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+        {
+            user_access::PageTableMutationSession::new(
+                self.build_live_session(active_root.usercopy_root(), process),
+            )
+        }
+
+        /// The pin-settlement session for `process`'s current root (D1 commit
+        /// 9): discards owned pins, with no usercopy.
+        pub(crate) fn pin_settlement_session(
+            &mut self,
+            active_root: &ActiveRootSelection,
+            process: crate::task::ProcessKey,
+        ) -> user_access::PinSettlementSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            user_access::PinSettlementSession::new(
+                self.build_live_session(active_root.usercopy_root(), process),
+            )
+        }
+
+        /// The user-return validation session for `process`'s current root (D1
+        /// commit 9): read-only page-table walks, with no usercopy.
+        pub(crate) fn return_validation_session(
+            &mut self,
+            active_root: &ActiveRootSelection,
+            process: crate::task::ProcessKey,
+        ) -> user_access::ReturnValidationSession<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
+        {
+            user_access::ReturnValidationSession::new(
+                self.build_live_session(active_root.usercopy_root(), process),
+            )
+        }
+
+        /// The one builder of a live process session (D1 commit 5, sealed in D1
+        /// commit 9). The copied root identity is revalidated against the live
+        /// binding, this CPU, CR3 and the residency epoch before the session
+        /// exists. It is private to this module: a usercopy session reaches the
+        /// primordial runtime only through [`GuardFreeValue`]'s constructor, and
+        /// every other constructor here wraps it in a session with no usercopy
+        /// (or is compiled only into evidence or guest builds).
+        #[allow(
+            unsafe_code,
+            reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
+        )]
+        fn build_live_session(
+            &mut self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
+                .and_then(crate::cpu::CpuIndex::new)
+                .unwrap_or_else(|| panic!("usercopy has no current architecture CPU binding"));
+            let observed_root: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {}, cr3",
+                    out(reg) observed_root,
+                    options(nostack, preserves_flags),
+                );
+            }
+            let (root, identity, address_space) = self
+                .root_bindings
+                .usercopy_root_for_process(&self.root, active_root, cpu, observed_root, process)
+                .unwrap_or_else(|error| {
+                    panic!("process usercopy root is not current on this CPU: {error:?}")
+                });
+            let scratch = self
+                .target
+                .current_scratch_target()
+                .unwrap_or_else(|error| panic!("usercopy scratch CPU selection failed: {error:?}"));
+            let target = &mut self.target;
+            LiveProcessAddressSpace {
+                root: root as *const PageTableRoot,
+                primordial_root: &self.root,
+                identity,
+                address_space,
+                process,
+                root_bindings: &mut self.root_bindings,
+                roles: target.roles,
+                target: user_access::TrackedActiveTarget {
+                    scratch,
+                    pins: &self.user_pins,
+                    address_space,
+                },
+                _root: core::marker::PhantomData,
+            }
+        }
+    }
+
+    #[cfg(deepwyrm_integrated)]
+    impl<'v, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+        super::runtime_authority::GuardFreeValue<
+            'v,
+            ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>,
+        >
+    {
+        /// The usercopy session for `process`, from a copied root identity:
+        /// the only way the primordial runtime builds one, and only with P
+        /// taken guard-free.
+        pub(crate) fn usercopy_process_address_space(
+            self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> LiveProcessAddressSpace<'v, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            self.into_inner().build_live_session(active_root, process)
+        }
     }
 }
 

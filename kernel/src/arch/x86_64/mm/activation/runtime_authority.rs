@@ -267,6 +267,10 @@ impl<P> PagingLock<P> {
     }
 
     fn acquire(&self) -> PagingGuard<'_, P> {
+        self.acquire_in()
+    }
+
+    fn acquire_in<M>(&self) -> PagingGuard<'_, P, M> {
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -275,7 +279,10 @@ impl<P> PagingLock<P> {
             (self.spin_service)();
             core::hint::spin_loop();
         }
-        PagingGuard { lock: self }
+        PagingGuard {
+            lock: self,
+            _mode: PhantomData,
+        }
     }
 }
 
@@ -288,10 +295,11 @@ impl<P> PagingLock<P> {
     pub(super) fn guard_free_access<'a>(
         &'a self,
         _guard_free: GuardFree<'a>,
-    ) -> PagingAccess<'a, P> {
+    ) -> PagingAccess<'a, P, GuardFreeOnly> {
         PagingAccess {
             lock: self,
             _beneath_runtime_guard: PhantomData,
+            _mode: PhantomData,
         }
     }
 }
@@ -307,32 +315,65 @@ impl<'g, T> RuntimeAuthorityGuard<'g, T> {
         let access = PagingAccess {
             lock: paging,
             _beneath_runtime_guard: PhantomData,
+            _mode: PhantomData,
         };
         (&mut **self, access)
     }
 }
 
+/// P's mode when it is taken beneath a held T guard (D1 commit 9).
+pub(super) struct BeneathRuntime;
+
+/// P's mode when it is taken with no T guard on this CPU, through a
+/// `GuardFree` token (D1 commit 9). Only a guard in this mode mints the
+/// [`GuardFreeValue`] that the usercopy session's constructor consumes, so
+/// "no usercopy under T" (H0 §12.8) is a type fact.
+pub(super) struct GuardFreeOnly;
+
 /// The right to take P during one T hold, or during one guard-free usercopy.
 /// Neither `Clone` nor `Copy`, and constructible only by
-/// [`RuntimeAuthorityGuard::with_paging`] and [`PagingLock::guard_free_access`].
-pub(super) struct PagingAccess<'a, P> {
+/// [`RuntimeAuthorityGuard::with_paging`] (mode [`BeneathRuntime`]) and
+/// [`PagingLock::guard_free_access`] (mode [`GuardFreeOnly`]).
+pub(super) struct PagingAccess<'a, P, M = BeneathRuntime> {
     lock: &'a PagingLock<P>,
     _beneath_runtime_guard: PhantomData<&'a mut ()>,
+    _mode: PhantomData<M>,
 }
 
-impl<P> PagingAccess<'_, P> {
+impl<P, M> PagingAccess<'_, P, M> {
     /// Takes P. The guard mutably borrows this access until it drops, so P
-    /// is never taken twice on one CPU.
-    pub(super) fn lock(&mut self) -> PagingGuard<'_, P> {
-        self.lock.acquire()
+    /// is never taken twice on one CPU. It keeps the access's mode.
+    pub(super) fn lock(&mut self) -> PagingGuard<'_, P, M> {
+        self.lock.acquire_in()
     }
 }
 
-pub(super) struct PagingGuard<'a, P> {
+pub(super) struct PagingGuard<'a, P, M = BeneathRuntime> {
     lock: &'a PagingLock<P>,
+    _mode: PhantomData<M>,
 }
 
-impl<P> Deref for PagingGuard<'_, P> {
+/// P's value, reached through a guard taken with no T guard on this CPU (D1
+/// commit 9). Only [`PagingGuard::guard_free_value`] on a [`GuardFreeOnly`]
+/// guard mints one; the usercopy session's constructor consumes it.
+pub(super) struct GuardFreeValue<'v, P> {
+    value: &'v mut P,
+}
+
+impl<'v, P> GuardFreeValue<'v, P> {
+    pub(super) fn into_inner(self) -> &'v mut P {
+        self.value
+    }
+}
+
+impl<P> PagingGuard<'_, P, GuardFreeOnly> {
+    /// The value, for the work only a guard-free P holder may do: usercopy.
+    pub(super) fn guard_free_value(&mut self) -> GuardFreeValue<'_, P> {
+        GuardFreeValue { value: &mut **self }
+    }
+}
+
+impl<P, M> Deref for PagingGuard<'_, P, M> {
     type Target = P;
 
     fn deref(&self) -> &Self::Target {
@@ -343,7 +384,7 @@ impl<P> Deref for PagingGuard<'_, P> {
     }
 }
 
-impl<P> DerefMut for PagingGuard<'_, P> {
+impl<P, M> DerefMut for PagingGuard<'_, P, M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: as in `deref`, the guard owns `locked`, and `&mut self` on the guard makes this
         // the only reference to the value for its lifetime.
@@ -351,7 +392,7 @@ impl<P> DerefMut for PagingGuard<'_, P> {
     }
 }
 
-impl<P> Drop for PagingGuard<'_, P> {
+impl<P, M> Drop for PagingGuard<'_, P, M> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
     }
@@ -361,7 +402,8 @@ impl<P> Drop for PagingGuard<'_, P> {
 /// from one and borrowing it. S is acquired only beneath such a witness.
 pub(super) trait PagingHeld {}
 
-impl<P> PagingHeld for PagingGuard<'_, P> {}
+/// S is taken beneath P beneath T: a guard-free P does not witness it.
+impl<P> PagingHeld for PagingGuard<'_, P, BeneathRuntime> {}
 
 /// Proof that the one shootdown an S guard covered is settled: its reclaim
 /// permit, or proof that its publisher published nothing. An S guard is

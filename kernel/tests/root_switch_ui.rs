@@ -188,6 +188,31 @@ fn guard_free_tokens_cannot_be_minted_under_the_runtime_guard() {
             fixture: "shootdown_initiator_outlives_settlement.rs",
             expected_error: Some("error[E0382]: use of moved value: `settled`"),
         },
+        // D1 commit 9: P carries its mode. Only a guard-free P mints the token the
+        // usercopy session's constructor consumes, so no usercopy runs under T; and
+        // a guard-free P does not witness S, which is taken beneath T.
+        UiCase {
+            fixture: "usercopy_token_guard_free_compiles.rs",
+            expected_error: None,
+        },
+        UiCase {
+            fixture: "usercopy_token_beneath_runtime.rs",
+            expected_error: Some(
+                "error[E0599]: no method named `guard_free_value` found for struct `PagingGuard<'_, u64>` in the current scope",
+            ),
+        },
+        UiCase {
+            fixture: "usercopy_token_forged.rs",
+            expected_error: Some(
+                "error[E0451]: field `value` of struct `GuardFreeValue` is private",
+            ),
+        },
+        UiCase {
+            fixture: "shootdown_initiator_guard_free.rs",
+            expected_error: Some(
+                "error[E0277]: the trait bound `PagingGuard<'_, u64, GuardFreeOnly>: PagingHeld` is not satisfied",
+            ),
+        },
     ] {
         run_case(&rustc, &manifest_dir, &output_dir, &case);
     }

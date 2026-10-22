@@ -2315,7 +2315,7 @@ fn family_a_usercopy_runs_guard_free() {
         .find("self.paging.guard_free_access(self.runtime.guard_free())")
         .expect("guard-free P access");
     let walk = helper
-        .find("paging.usercopy_process_address_space(root, process)")
+        .find(".usercopy_process_address_space(root, process)")
         .expect("revalidated copied root");
     let commit = helper
         .find("runtime.commit_runtime_phase(phase);")
@@ -2618,7 +2618,7 @@ fn waits_settle_their_outputs_outside_the_hold() {
         .expect("settlement application extent")
         .0;
     assert!(apply.contains("self.paging.guard_free_access(self.runtime.guard_free())"));
-    assert!(apply.contains("paging.usercopy_process_address_space(root, process)"));
+    assert!(apply.contains(".usercopy_process_address_space(root, process)"));
     assert!(
         primordial
             .contains("\"WaitOne and WaitMany are served by the CPU-local facade (D1 commit 8)\"")
@@ -3124,7 +3124,7 @@ fn usercopy_under_t_is_confined_to_evidence_builds() {
         );
     }
     assert!(activation.contains(
-        "    #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]\n    pub(crate) fn current_process_address_space("
+        "        #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]\n        pub(crate) fn current_process_address_space("
     ));
     let evidence = activation
         .split_once("    pub(crate) fn evidence_usercopy_under_runtime_authority(")
@@ -3147,4 +3147,45 @@ fn usercopy_under_t_is_confined_to_evidence_builds() {
         !gate.contains("not("),
         "the evidence gate widens past its builds"
     );
+}
+
+/// Text test (D1 commit 9): the live process session has one builder,
+/// private to the sealed `live_sessions` module. Outside it, the primordial
+/// runtime gets a usercopy session only from `GuardFreeValue`, which only a
+/// guard-free P guard mints (the UI cases in `root_switch_ui.rs` pin that
+/// half). Rust privacy does not stop a child module of `activation` from
+/// naming the session's fields, so no struct literal may build one elsewhere.
+#[test]
+fn the_usercopy_session_is_built_only_behind_the_guard_free_token() {
+    let activation = source("src/arch/x86_64/mm/activation.rs");
+    let sealed = activation
+        .split_once("mod live_sessions {")
+        .expect("sealed session module")
+        .1;
+    assert!(sealed.contains("        fn build_live_session("));
+    assert!(!sealed.contains("pub(crate) fn build_live_session("));
+    assert!(!sealed.contains("pub(super) fn build_live_session("));
+    assert!(sealed.contains("super::runtime_authority::GuardFreeValue<"));
+    assert_eq!(activation.matches("LiveProcessAddressSpace {\n").count(), 1);
+    let before = activation.split_once("mod live_sessions {").unwrap().0;
+    assert!(!before.contains("LiveProcessAddressSpace {\n"));
+    assert!(!before.contains("fn usercopy_process_address_space("));
+    for file in [
+        "src/arch/x86_64/mm/activation/primordial.rs",
+        "src/arch/x86_64/mm/activation/user_access.rs",
+    ] {
+        assert!(
+            !source(file).contains("LiveProcessAddressSpace {\n"),
+            "{file} builds a process session by hand"
+        );
+    }
+    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
+    // Every usercopy session is reached through the guard-free token.
+    for (at, _) in primordial.match_indices(".usercopy_process_address_space(") {
+        let reach = primordial[..at].trim_end();
+        assert!(
+            reach.ends_with(".guard_free_value()"),
+            "a usercopy session reached without the guard-free token"
+        );
+    }
 }
