@@ -1222,6 +1222,11 @@ so that D2 and D3 do not mistake it for one.
   had already claimed.
 - `b9df931`: a remote stop's precommit now retires a resuming idle
   suspension.
+- `0a72afd`: one termination can stop several CPUs at once (stage 7's
+  two-Thread Process). A stopped CPU's claim and suspended flag now live
+  in that CPU's own `CpuSharedState`. The staged cleanup is a
+  `StagedStopCleanup` that counts outstanding stops and merges back only
+  when the last stopped CPU finishes.
 
 **What D2 and D3 inherit.**
 
@@ -1273,6 +1278,11 @@ reaper.
     kernel root and idles (`FinishGenericChild`), with no teardown and no
     record.
   - This also fixes the same latent gap for a non-final self-`ThreadTerminate`.
+- **Root fence for a self-exited Thread.** From its exit's hold until its
+  terminal handoff leaves the root, the exited Thread's CPU still holds
+  the suspended claim, the pins in `deferred_current`, and residency on
+  the Process root. It is excluded from every live snapshot. It still
+  counts as a resident for teardown (§11.2.12).
 - **Final exit.** The Process exits with `NORMAL_EXIT` and the code, which
   is `ProcessExit`'s record. Its handles drain, and the reaper takes the
   existing exited-Process path.
@@ -1289,7 +1299,13 @@ reaper.
   are claimed when the pins are collected, and become runnable at the
   deferred reclaim. That is after this CPU has left the Thread's stack.
 
-**Races: exactly one winner.** Every terminal transition happens under T.
+**Races: exactly one winner.** Every terminal transition happens under T,
+and `ProcessExit`, the unhandled-exception path, `ProcessTerminate` and
+`TaskGroupTerminate` race a self-exit in exactly the same way. A
+process-wide entry snapshots only live Threads (§11.2.12), so a sibling
+that already self-exited is never stopped and keeps its `NORMAL_EXIT`
+record. A self-exit that loses to any of these meets a non-`RUNNING`
+Thread.
 `ThreadState::terminate` admits one terminal record.
 - **Self-exit first.** A later `thread_terminate` of that Thread is refused
   (`BAD_STATE`, already exited). A later `process_terminate` excludes it,
@@ -1311,3 +1327,78 @@ reaper.
 - a final exit, where the Process exits with the same record;
 - both orders of an exit racing a terminate;
 - a waiter on the exiting Thread's EXITED.
+
+#### 11.2.12 Member versus live, retirement ownership, and residency-aware teardown (2026-10-22)
+
+Stage 7 hit a third defect of one class: teardown assumed one Thread per
+Process. The first was `0a72afd`, the second `9943710`. Three read-only
+analysis lanes reconciled the remaining defects; this section states the
+rules that close them.
+
+**1. Member versus live.**
+- A Process's *members* are every attached Thread: exited ones included,
+  with holes where a finalized Thread was removed. That is
+  `process_thread_keys`.
+- Its *live* Threads are the non-`EXITED` members, compacted in slot
+  order. That is `process_termination_thread_keys`.
+- Every process-wide terminal entry snapshots the live set: `ProcessExit`,
+  the unhandled exception, `ProcessTerminate` (self and non-self) and
+  `TaskGroupTerminate`. Exited Threads are never fed to
+  `terminal_stop_plan`.
+- **Invariant:** for an attached Thread, holding its `execution_pin` iff
+  it is not `EXITED`. So the live snapshot equals the terminal pin batch's
+  `ExitPins::thread_keys`.
+- The snapshot is the host-reachable `inspect_process_exit_threads`.
+
+**2. Retirement ownership by captured proof.**
+- A terminal handoff retires the Process (retirement record, idle-path
+  power-off decision, owner teardown) only if *this* Thread's own terminal
+  transition exited it. The proof is the deferred bundle's Process pin
+  (`DeferredCurrentExecutionResources::exits_process`). It is captured
+  before the deferred reclaim consumes it.
+- Re-reading `process_info` at handoff time is not ownership. Two CPUs can
+  both see `EXITED`: a sibling's non-final self-exit, then another
+  Thread's `ProcessExit`, both before either handoff.
+- **Invariant:** each Process exit has exactly one owner, the Thread whose
+  transition took the Process pin.
+- The route is the host-reachable `terminal_handoff_route`. With a
+  successor, the CPU switches to it. Without one, the owner retires; a
+  non-owner leaves the root and idles. Both attempt the teardown below.
+
+**3. Residency-aware teardown ownership.**
+- An exited Process's root is torn down when all four of these first hold
+  at once: exited, quiescent, root still bound, and no CPU resident on it.
+- Whichever CPU makes that true does the teardown:
+  - the initiator completing a remote termination, which supplies
+    quiescence; or
+  - the last resident CPU leaving the root at its terminal handoff, which
+    supplies zero residency.
+- A teardown site that finds another CPU resident does nothing. That
+  resident tears down when it leaves.
+- **Invariant:** exactly once, because the check and the teardown run
+  under T, and the teardown unbinds the root that the next check needs.
+- No status changes. Teardown is internal, and no syscall waits on it.
+- The decision is the host-reachable `exited_root_teardown`.
+
+**4. The terminal hold leaves `core.cleanup` drained.**
+- The terminal handoff's deferred reclaim pushes releases into
+  `core.cleanup`. Then T is released across the guard-free root switch.
+- A concurrent remote stop's commit requires `core.cleanup` empty
+  (sweep row 13), so the handoff drains it before releasing T.
+- This is safe even when the drain releases the Process's execution pin.
+  The bound root region holds its parent reference, so the Process cannot
+  be finalized before its root is retired.
+
+**5. ThreadTerminate of an exited Thread is `BAD_STATE`** (sweep row 14).
+`prepare_thread_terminate` already says so. The remote preflight returned
+a transient `WOULD_BLOCK` instead, when the exited target's CPU still held
+its claim. It now refuses the target first, with the same status.
+
+**6. An unstarted Thread does not keep its Process alive.** This is Mike's
+decision of 2026-10-22, on sweep row 16.
+- When the last *started* Thread exits, by `ThreadExit` or a self
+  `ThreadTerminate`, that exit is final. The Process exits, and every
+  `CREATED`, never-started sibling is retired with it, recording
+  `AUTHORIZED` with code 0, as `ProcessExit` records live siblings.
+- Termination of an unstarted Thread, and external termination, keep the
+  live-Thread rule.
