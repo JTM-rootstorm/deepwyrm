@@ -1191,3 +1191,43 @@ the minimal multithreaded unmapper:
 - Fail: any panic, including "address-space shootdown acknowledgement
   timeout", or a hang.
 - Before B3, it proves option A under contention. After B3, it proves B.
+
+#### 11.2.10 D1 residuals and status (2026-10-22)
+
+**Status.** D1 is complete at `9e7fa7d`, which includes option B
+(B1–B4) and commit 9.
+
+**Residuals.** None of these is enforced by a type. Each is named here
+so that D2 and D3 do not mistake it for one.
+
+- **S witnessed through P alone.** In principle, a page-table mutation
+  session built with P alone can witness S. The S guard is minted from a
+  held P guard. Nothing in the session's type proves that the session
+  holds S.
+- **`release_unused` is a discipline.** A prepared reservation that is
+  not committed must be released explicitly. No drop guard or type
+  requires it.
+- **`LiveProcessAddressSpace` fields.** A child module of `activation` can
+  still name the fields. A text test forbids it; privacy does not.
+- **The family-G stack oracle is trace-bound.** It sums the emitted
+  frames along the measured trace, not a whole-subtree direct-call bound.
+  Register-indirect spin-service calls and table calls are not named by
+  the call graph.
+- **Pin budget.** There are 32 pin slots against a measured worst case of
+  76 in the E8 and fairness selectors.
+
+**Pre-D1 races fixed during D1.** Neither was introduced by D1.
+
+- `dd03666`: an abandoned wait now completes with the winner an interrupt
+  had already claimed.
+- `b9df931`: a remote stop's precommit now retires a resuming idle
+  suspension.
+
+**What D2 and D3 inherit.**
+
+- **Terminal cleanup on narrow sessions.** Terminal cleanup's pin discards
+  and `unmap_*_userspace` already run on narrow sessions (`b854ca8`).
+- **The owned paging transaction (§11.2.9, "Overlap with D3").** B's
+  publish and permit-gated reclamation are its commit point. The owned
+  prepare payload and the owned transaction type, which replaces the
+  adapters' borrow of the paging authority, are still to come.
