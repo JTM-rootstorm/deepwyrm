@@ -12408,3 +12408,106 @@ fn a_deferred_process_create_settles_its_output_after_the_transaction() {
     finish_f10_task_cleanup(&mut fixture.registry, &mut fixture.tasks, cleanup);
     close_f10_fixture_with_open_channels(fixture, true, true, false);
 }
+
+/// Stage 7's smp panic: one Process termination stopped two CPUs at once --
+/// Thread B running on one, Thread A's suspended continuation on another --
+/// and the second stopped CPU's precommit met the first one's single staged
+/// slot. Each stopped CPU stages and finishes in its own runtime holds, so the
+/// interleaving below is the live one: X stages, Y stages, X finishes, Y
+/// finishes. Neither release may be finalizable before the last finish.
+#[test]
+fn two_concurrent_remote_stops_stage_and_finish_without_early_finalization() {
+    use deepwyrm_abi::{DW_OBJECT_TYPE_EVENT, DW_OBJECT_TYPE_TIMER};
+    let mut registry = ObjectRegistry::<8>::new();
+    let mut cleanup = CleanupQueue::<8>::new();
+    let mut staged = StagedStopCleanup::<8>::new();
+    assert!(!staged.is_staged());
+
+    let x_release = final_release_for_test(&mut registry, DW_OBJECT_TYPE_EVENT);
+    let x_id = x_release.id();
+    cleanup.push(x_release);
+    staged.stage(&mut cleanup, 4);
+    assert!(cleanup.is_empty());
+    assert!(staged.is_staged());
+
+    let y_release = final_release_for_test(&mut registry, DW_OBJECT_TYPE_TIMER);
+    let y_id = y_release.id();
+    cleanup.push(y_release);
+    staged.stage(&mut cleanup, 4);
+    assert!(cleanup.is_empty());
+
+    // X's post-ack continuation: Y has not acknowledged, so nothing returns.
+    assert!(!staged.finish(&mut cleanup));
+    assert!(
+        cleanup.is_empty(),
+        "a staged release became finalizable early"
+    );
+    assert!(staged.is_staged());
+
+    // Y's post-ack continuation: both releases return, in order.
+    assert!(staged.finish(&mut cleanup));
+    assert!(!staged.is_staged());
+    let first = cleanup.pop().unwrap();
+    let second = cleanup.pop().unwrap();
+    assert_eq!((first.id(), second.id()), (x_id, y_id));
+    assert!(cleanup.pop().is_none());
+    registry.complete_finalization(first).unwrap();
+    registry.complete_finalization(second).unwrap();
+
+    // A lone stop still round-trips in one stage/finish pair.
+    staged.stage(&mut cleanup, 4);
+    assert!(staged.finish(&mut cleanup));
+    assert!(!staged.is_staged());
+}
+
+#[test]
+#[should_panic(expected = "remote stop staged more cleanups than CPU slots")]
+fn staged_stop_cleanup_refuses_more_stops_than_cpu_slots() {
+    let mut cleanup = CleanupQueue::<2>::new();
+    let mut staged = StagedStopCleanup::<2>::new();
+    staged.stage(&mut cleanup, 1);
+    staged.stage(&mut cleanup, 1);
+}
+
+#[test]
+#[should_panic(expected = "post-ack carrier omitted staged cleanup")]
+fn staged_stop_cleanup_refuses_a_finish_without_a_stage() {
+    let mut cleanup = CleanupQueue::<2>::new();
+    let mut staged = StagedStopCleanup::<2>::new();
+    let _ = staged.finish(&mut cleanup);
+}
+
+/// The live runtime keeps each stopped CPU's claim in that CPU's own slot and
+/// stages through `StagedStopCleanup`; a shared single slot is what panicked.
+#[test]
+fn remote_stop_state_is_per_cpu_and_staging_is_counted() {
+    let primordial = include_str!("../../arch/x86_64/mm/activation/primordial.rs");
+    assert!(primordial.contains("rendezvous_cleanup: StagedStopCleanup<REGISTRY_OBJECTS>,"));
+    assert!(primordial.contains(
+        "    stopping_claim: Option<crate::task::SchedulerExecutionClaim>,\n    \
+         stopping_claim_was_suspended: bool,\n}\n\nimpl CpuSharedState {"
+    ));
+    // Precommit sets it; the commit and the post-ack continuation take it.
+    assert_eq!(
+        primordial
+            .matches("self.own.stopping_claim = Some(claim);")
+            .count(),
+        2
+    );
+    assert_eq!(
+        primordial
+            .matches("self\n            .own\n            .stopping_claim\n            .take()")
+            .count(),
+        2
+    );
+    for forbidden in [
+        "core.stopping_claim",
+        ".core\n            .stopping_claim",
+        "rendezvous_cleanup_staged",
+    ] {
+        assert!(
+            !primordial.contains(forbidden),
+            "{forbidden:?} reintroduced"
+        );
+    }
+}

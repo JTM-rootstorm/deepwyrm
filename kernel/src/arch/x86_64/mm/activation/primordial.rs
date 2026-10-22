@@ -89,7 +89,8 @@ use crate::syscall::native::{
     NativeSyscallResult, SyscallControl,
 };
 use crate::syscall::{
-    CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl, TerminalWaitCleanup,
+    CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl, StagedStopCleanup,
+    TerminalWaitCleanup,
 };
 #[cfg(any(
     deepwyrm_wyr1_evidence,
@@ -4292,6 +4293,11 @@ struct CpuSharedState {
     wait_control: NativeWaitControl,
     deferred_current: Option<crate::task::DeferredCurrentExecutionResources>,
     pending_quantum_cancellation: Option<crate::task::SchedulerQuantumTicket>,
+    /// This CPU's exact claim while it is being remote-stopped, from its
+    /// precommit until its post-acknowledgement continuation. Per CPU because
+    /// one termination can stop several CPUs, each across two runtime holds.
+    stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
+    stopping_claim_was_suspended: bool,
 }
 
 impl CpuSharedState {
@@ -4303,6 +4309,8 @@ impl CpuSharedState {
             wait_control: NativeWaitControl::new(),
             deferred_current: None,
             pending_quantum_cancellation: None,
+            stopping_claim: None,
+            stopping_claim_was_suspended: false,
         }
     }
 
@@ -4409,8 +4417,7 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     /// The paging authority's lock, P. Its value lives outside this lock's;
     /// only a carrier's `PagingAccess` takes it (D1 commit 3).
     paging: &'roles PagingLock<RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
-    stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
-    stopping_claim_was_suspended: bool,
+    /// Set and consumed within one stopped CPU's precommit hold.
     rendezvous_reaper: Option<crate::arch::x86_64::rendezvous::NativeRendezvousReaperEntry>,
     registry: Registry,
     memory: Memory,
@@ -4453,9 +4460,9 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     root_owner: Option<InternalRef>,
     cleanup: CleanupQueue<REGISTRY_OBJECTS>,
     // Pending final releases are moved before the irreversible stop commit.
-    // They are drained only by the post-ack kernel-root continuation.
-    rendezvous_cleanup: CleanupQueue<REGISTRY_OBJECTS>,
-    rendezvous_cleanup_staged: bool,
+    // They are drained only by a post-ack kernel-root continuation, the last
+    // one outstanding when several CPUs are stopped at once.
+    rendezvous_cleanup: StagedStopCleanup<REGISTRY_OBJECTS>,
     #[cfg(feature = "test-support")]
     g5_probe: G5PrimordialProbe,
 }
@@ -6339,13 +6346,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn stage_rendezvous_cleanup(&mut self) {
         assert!(
-            !self.core.rendezvous_cleanup_staged,
-            "remote stop staged cleanup twice"
+            self.own.stopping_claim.is_none(),
+            "remote stop staged cleanup twice on one CPU"
         );
-        self.core
-            .cleanup
-            .drain_into(&mut self.core.rendezvous_cleanup);
-        self.core.rendezvous_cleanup_staged = true;
+        self.core.rendezvous_cleanup.stage(
+            &mut self.core.cleanup,
+            crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
+        );
     }
 
     /// Moves a suspended F-service operation out of the stopped carrier before
@@ -6414,14 +6421,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_staged_rendezvous_cleanup(&mut self) {
-        assert!(
-            self.core.rendezvous_cleanup_staged,
-            "post-ack carrier omitted staged cleanup"
-        );
-        self.core.rendezvous_cleanup_staged = false;
-        self.core
-            .rendezvous_cleanup
-            .drain_into(&mut self.core.cleanup);
+        let _last = self.core.rendezvous_cleanup.finish(&mut self.core.cleanup);
         self.drain_finalizers()
             .unwrap_or_else(|_| panic!("post-ack rendezvous cleanup drifted"));
     }
@@ -6457,7 +6457,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// caller must drop the coarse runtime guard before consuming the result.
     fn prepare_after_rendezvous_stop(&mut self) -> PreparedRendezvousNext {
         let stopped_claim = self
-            .core
+            .own
             .stopping_claim
             .take()
             .unwrap_or_else(|| panic!("rendezvous continuation lost its stopped claim"));
@@ -7840,18 +7840,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let _ = reaper;
         self.own.active_root = CarrierActiveRoot::StopPrecommitted(root);
-        self.core.stopping_claim = Some(claim);
-        self.core.stopping_claim_was_suspended = was_suspended;
+        self.own.stopping_claim = Some(claim);
+        self.own.stopping_claim_was_suspended = was_suspended;
         Ok(witness)
     }
 
     fn release_running_ownership(&mut self) {
         let claim = self
-            .core
+            .own
             .stopping_claim
             .take()
             .unwrap_or_else(|| panic!("remote stop commit omitted its exact Running claim"));
-        if self.core.stopping_claim_was_suspended {
+        if self.own.stopping_claim_was_suspended {
             self.core
                 .shared
                 .execution
@@ -7870,7 +7870,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 });
             self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
         }
-        self.core.stopping_claim = Some(claim);
+        self.own.stopping_claim = Some(claim);
     }
 
     fn release_root_residency(&mut self) {
@@ -7890,11 +7890,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn deferred_cleanup_is_quiescent(&self) -> bool {
         let stopped = self
-            .core
+            .own
             .stopping_claim
             .unwrap_or_else(|| panic!("remote stop cleanup omitted its exact stopped claim"));
         self.core.cleanup.is_empty()
-            && self.core.rendezvous_cleanup_staged
+            && self.core.rendezvous_cleanup.is_staged()
             && self.stopped_service_state_is_quiescent()
             && self.own.deferred_current.is_none()
             && self
@@ -10651,7 +10651,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 .scheduler_state(claim.thread())
                                 .map(|state| (claim, state))
                         }) {
-                            None if runtime.core.stopping_claim.is_some() => {
+                            None if runtime.own.stopping_claim.is_some() => {
                                 panic!("resume crossed an in-progress remote-stop carrier")
                             }
                             None if runtime.own.deferred_current.is_some() => {
@@ -11049,8 +11049,6 @@ pub(super) fn enter(
                             core::ptr::addr_of_mut!((*state).core),
                             PrimordialRuntimeCore {
                                 paging: paging,
-                                stopping_claim: None,
-                                stopping_claim_was_suspended: false,
                                 rendezvous_reaper: None,
                                 registry: registry,
                                 memory: memory,
@@ -11086,8 +11084,7 @@ pub(super) fn enter(
                                 process_monitor: (Some(process_monitor)),
                                 root_owner: (Some(root_owner)),
                                 cleanup: (CleanupQueue::new()),
-                                rendezvous_cleanup: (CleanupQueue::new()),
-                                rendezvous_cleanup_staged: false,
+                                rendezvous_cleanup: (StagedStopCleanup::new()),
                                 #[cfg(feature = "test-support")]
                                 g5_probe: (G5PrimordialProbe::for_build()),
                             }

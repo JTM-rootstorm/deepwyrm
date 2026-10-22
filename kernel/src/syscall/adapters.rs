@@ -196,6 +196,62 @@ impl<const CAPACITY: usize> CleanupQueue<CAPACITY> {
     }
 }
 
+/// Final releases moved out of remote-stopped carriers before their stop
+/// commits, held until no stopped carrier's acknowledgement is outstanding.
+///
+/// One termination publishes a Stop to every CPU that runs, or holds the
+/// suspended continuation of, one of its Threads, and each stopped CPU stages
+/// from its own safe point under its own runtime hold. Two stops can therefore
+/// be staged at once. A release staged by one stopped CPU may be finalized only
+/// after that CPU's post-acknowledgement continuation, so the queue merges back
+/// only when the last outstanding stop finishes: finalization can be delayed,
+/// never early.
+pub(crate) struct StagedStopCleanup<const CAPACITY: usize> {
+    queue: CleanupQueue<CAPACITY>,
+    outstanding: usize,
+}
+
+impl<const CAPACITY: usize> StagedStopCleanup<CAPACITY> {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: CleanupQueue::new(),
+            outstanding: 0,
+        }
+    }
+
+    /// Moves `from`'s queued releases out of finalization reach for one more
+    /// stopped carrier. `limit` bounds the stops that can be in flight at once
+    /// (one per CPU slot).
+    pub(crate) fn stage(&mut self, from: &mut CleanupQueue<CAPACITY>, limit: usize) {
+        assert!(
+            self.outstanding < limit,
+            "remote stop staged more cleanups than CPU slots"
+        );
+        from.drain_into(&mut self.queue);
+        self.outstanding += 1;
+    }
+
+    /// Whether any stopped carrier still has its staged cleanup outstanding.
+    pub(crate) const fn is_staged(&self) -> bool {
+        self.outstanding != 0
+    }
+
+    /// Ends one stopped carrier's staging. Returns whether this was the last
+    /// outstanding stop, in which case every staged release moved to `into`.
+    pub(crate) fn finish(&mut self, into: &mut CleanupQueue<CAPACITY>) -> bool {
+        assert!(
+            self.outstanding != 0,
+            "post-ack carrier omitted staged cleanup"
+        );
+        self.outstanding -= 1;
+        if self.outstanding != 0 {
+            return false;
+        }
+        self.queue.drain_into(into);
+        true
+    }
+}
+
 pub(crate) trait TerminalWaitCleanup<
     const OBJECTS: usize,
     const WAITERS: usize,

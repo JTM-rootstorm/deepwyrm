@@ -48,7 +48,7 @@ pub(crate) use adapters::copy_wyr1e_evidence_input;
     reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"
 )]
 pub(crate) use adapters::{
-    CleanupQueue, HeldReleases, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError,
+    CleanupQueue, HeldReleases, StagedStopCleanup, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError,
     WaitSuspendState, WaitSyscallAction, WaitTerminalCleanup, resume_wait_thread_syscall,
     timer_cancel, timer_create, timer_set, wait_many_syscall, wait_one_syscall,
 };
