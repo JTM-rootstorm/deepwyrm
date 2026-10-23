@@ -1379,10 +1379,12 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     assert!(leave_root < first_retired_arm);
     assert!(
         handoff[leave_root..first_retired_arm]
-            .contains("continuation: TerminalKernelContinuation::FinishGenericChild(retirement),")
+            .contains("TerminalKernelContinuation::FinishGenericChild(retirement)")
     );
+    // The leave-root route itself may read the Process: whether it exited is
+    // one of the teardown's conditions (rule 3), not the route.
     assert!(
-        !handoff[..first_retired_arm].contains("process_info(retirement.retired_process)"),
+        !handoff[..leave_root].contains("process_info(retirement.retired_process)"),
         "the terminal handoff routes on a re-read of the Process"
     );
     assert!(runtime.contains("fn prepare_remote_task_group_termination("));
@@ -1464,6 +1466,98 @@ fn terminal_retirement_state_drains_the_shared_cleanup_queue() {
     assert!(
         !retirement[drain..state].contains("core.cleanup.push"),
         "a release is queued after the terminal drain"
+    );
+}
+
+/// Text test: exited-root teardown sites are target-only primordial.rs code.
+/// Each one asks the residency-aware `attempt_exited_root_teardown`, which is
+/// the only caller of the unconditional teardown, and a non-owner leaving the
+/// root of an exited child takes the publisher root to make that attempt
+/// (design §11.2.12 rule 3). The decision and its exactly-once property are
+/// the host models in `task::terminal_handoff` and
+/// `exited_root_teardown_counts_the_residency_its_teardown_refuses`.
+#[test]
+fn exited_root_teardown_sites_are_residency_aware() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    let attempt = runtime
+        .split_once("    fn attempt_exited_root_teardown(")
+        .expect("residency-aware teardown attempt")
+        .1
+        .split_once("\n    }\n")
+        .expect("teardown attempt end")
+        .0;
+    assert!(attempt.contains(
+        "crate::task::exited_root_teardown(exited, quiescent, bound.is_some(), residents)"
+    ));
+    // Only the primordial's publisher root skips the residency count.
+    let counted = attempt
+        .split_once("Some((_, address_space)) if process != self.core.primordial_process => self")
+        .expect("teardown attempt does not count a child root's residents")
+        .1;
+    assert!(
+        counted
+            .split_once("_ => 0,")
+            .expect("residency count arms")
+            .0
+            .contains(".child_root_resident_count(process, address_space)")
+    );
+    assert!(attempt.contains("if decision == crate::task::ExitedRootTeardown::TearDown {"));
+    assert_eq!(
+        runtime
+            .matches("self.finish_inactive_process_teardown(")
+            .count(),
+        1,
+        "an exited-root teardown bypasses the residency-aware attempt"
+    );
+    assert!(attempt.contains("self.finish_inactive_process_teardown("));
+    // Three remote completions, two successor variants, the publisher path.
+    assert_eq!(
+        runtime
+            .matches("self.attempt_exited_root_teardown(")
+            .count(),
+        6
+    );
+    let handoff = runtime
+        .split_once("fn prepare_terminal_handoff_detached(")
+        .expect("terminal handoff")
+        .1;
+    let leave_root = handoff
+        .split_once("if route == crate::task::TerminalHandoffRoute::LeaveRoot {")
+        .expect("terminal handoff lost its leave-root route")
+        .1
+        .split_once("\n        }\n")
+        .expect("leave-root route end")
+        .0;
+    // An exited child's non-owner attempts the teardown; a live Process's
+    // Thread, and the primordial's, only idle.
+    let owed = leave_root
+        .split_once(concat!(
+            "let owes_teardown_attempt = retirement.retired_process != self.core.primordial_process\n",
+            "                && self\n",
+            "                    .core\n",
+            "                    .tasks\n",
+            "                    .process_info(retirement.retired_process)\n",
+            "                    .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED);",
+        ))
+        .expect("leave-root route lost its owed-teardown condition")
+        .1;
+    assert!(owed.contains(concat!(
+        "let continuation = if owes_teardown_attempt {\n",
+        "                TerminalKernelContinuation::EnterPrimordialPublisher(retirement)\n",
+        "            } else {\n",
+        "                TerminalKernelContinuation::FinishGenericChild(retirement)\n",
+        "            };",
+    )));
+    let after_publisher = runtime
+        .split_once("fn continue_terminal_after_primordial_root(")
+        .expect("publisher continuation")
+        .1
+        .split_once("\n    }\n")
+        .expect("publisher continuation end")
+        .0;
+    assert!(
+        after_publisher.contains("self.attempt_exited_root_teardown(retirement.retired_process)")
     );
 }
 
@@ -1711,8 +1805,8 @@ fn final_external_thread_completion_retires_pins_before_process_root_teardown() 
         .find("exited_process.filter(|target| *target != self.own.scheduled().process)")
         .expect("external final-Process guard");
     let teardown = completion
-        .find("self.finish_inactive_process_teardown(")
-        .expect("inactive final-Process teardown");
+        .find("self.attempt_exited_root_teardown(target)")
+        .expect("residency-aware final-Process teardown");
 
     assert!(preserve < retire && retire < resources);
     assert!(resources < external_guard && external_guard < teardown);

@@ -61,7 +61,9 @@ pub(crate) use scheduler::{
     test,
     all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
 ))]
-pub(crate) use terminal_handoff::{TerminalHandoffRoute, terminal_handoff_route};
+pub(crate) use terminal_handoff::{
+    ExitedRootTeardown, TerminalHandoffRoute, exited_root_teardown, terminal_handoff_route,
+};
 
 #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
 #[allow(unused_imports)]

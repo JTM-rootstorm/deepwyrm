@@ -105,7 +105,10 @@ pub(crate) fn validate_dw1c_stack_margins(
     // Preserve that measured high-water mark while charging any future growth
     // in the exact target-emitted frames that were live at the fault.
     const OBSERVED_TERMINAL_DEPTH_BYTES: usize = 138_584;
-    const TERMINAL_TRACE_CALL_RETURN_WORDS: usize = 8;
+    // Design §11.2.12 added the residency-aware teardown attempt between the
+    // terminal continuation and the inactive teardown: one more frame, charged
+    // below as growth, and one more return word.
+    const TERMINAL_TRACE_CALL_RETURN_WORDS: usize = 9;
     const TERMINAL_ANCHOR_BASELINE_BYTES: usize = 131_760;
     let terminal_reaper = one_stack_size(sizes, "DW1C terminal reaper", |symbol| {
         symbol.contains("syscall::live::native_runtime_terminal_reaper::<")
@@ -116,6 +119,9 @@ pub(crate) fn validate_dw1c_stack_margins(
             && symbol.ends_with(
                 "as deepwyrm_kernel::syscall::native::NativeSyscallFrameRuntime>::terminate_current",
             )
+    });
+    let attempt_teardown = one_stack_size(sizes, "DW1C exited root teardown attempt", |symbol| {
+        symbol.contains("PrimordialRuntimeCarrier<128, 4096>>::attempt_exited_root_teardown")
     });
     let finish_inactive = one_stack_size(sizes, "DW1C inactive process teardown", |symbol| {
         symbol.contains("PrimordialRuntimeCarrier<128, 4096>>::finish_inactive_process_teardown")
@@ -145,6 +151,7 @@ pub(crate) fn validate_dw1c_stack_margins(
     let terminal_anchor_bytes = [
         terminal_reaper,
         terminate_current,
+        attempt_teardown,
         finish_inactive,
         unmap_inactive,
         platform_unmap,

@@ -5375,10 +5375,42 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // ThreadTerminate (§11.2.11) -- or whose Process another Thread's
         // transition exited, leaves the root for the kernel root and idles.
         if route == crate::task::TerminalHandoffRoute::LeaveRoot {
+            // A non-owner of an exited child may be the last CPU resident on
+            // its root, and then owes the teardown (§11.2.12 rule 3). Teardown
+            // runs from a Process root, so it takes the owner's way out through
+            // the primordial publisher root, without the record or the
+            // power-off decision.
+            let owes_teardown_attempt = retirement.retired_process != self.core.primordial_process
+                && self
+                    .core
+                    .tasks
+                    .process_info(retirement.retired_process)
+                    .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED);
+            // Under the WYR1 evidence products the publisher root can already
+            // be retired; that non-owner idles without the attempt.
+            #[cfg(any(
+                deepwyrm_wyr1_evidence,
+                deepwyrm_wyr1b_evidence,
+                deepwyrm_wyr1c_evidence,
+                deepwyrm_wyr1d_evidence,
+                deepwyrm_wyr1e_evidence,
+                deepwyrm_dw1e_evidence,
+                deepwyrm_r1_evidence,
+            ))]
+            let owes_teardown_attempt = owes_teardown_attempt
+                && matches!(
+                    self.core.tasks.root_region(self.core.primordial_process),
+                    Ok(Some(_))
+                );
+            let continuation = if owes_teardown_attempt {
+                TerminalKernelContinuation::EnterPrimordialPublisher(retirement)
+            } else {
+                TerminalKernelContinuation::FinishGenericChild(retirement)
+            };
             let prepared = self.prepare_terminal_kernel_root_switch();
             return PreparedTerminalStep::KernelRoot {
                 prepared,
-                continuation: TerminalKernelContinuation::FinishGenericChild(retirement),
+                continuation,
             };
         }
 
@@ -5613,18 +5645,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| {
                     crate::test_support::complete_fail(supervisor_evidence_detail(0xd002))
                 });
-            } else if self
-                .core
-                .tasks
-                .process_quiescence_proof(state.retirement.retired_process)
-                .is_ok()
-            {
-                self.finish_inactive_process_teardown(
-                    state.retirement.retired_process,
-                    state.retirement.retired_root_key,
-                    state.retirement.retired_address_space,
-                )
-                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
+            } else {
+                let _ = self.attempt_exited_root_teardown(state.retirement.retired_process);
             }
             #[cfg(not(any(
                 deepwyrm_wyr1_evidence,
@@ -5635,19 +5657,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 deepwyrm_dw1e_evidence,
                 deepwyrm_r1_evidence,
             )))]
-            if self
-                .core
-                .tasks
-                .process_quiescence_proof(state.retirement.retired_process)
-                .is_ok()
-            {
-                self.finish_inactive_process_teardown(
-                    state.retirement.retired_process,
-                    state.retirement.retired_root_key,
-                    state.retirement.retired_address_space,
-                )
-                .unwrap_or_else(|_| panic!("inactive exited Process teardown drifted"));
-            }
+            let _ = self.attempt_exited_root_teardown(state.retirement.retired_process);
         }
         #[cfg(any(
             deepwyrm_wyr1_evidence,
@@ -5796,12 +5806,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         retirement: TerminalRetirementState,
     ) -> PreparedTerminalStep {
-        self.finish_inactive_process_teardown(
-            retirement.retired_process,
-            retirement.retired_root_key,
-            retirement.retired_address_space,
-        )
-        .unwrap_or_else(|_| panic!("idle exited Process teardown drifted"));
+        let _ = self.attempt_exited_root_teardown(retirement.retired_process);
         let prepared = self.prepare_terminal_kernel_root_switch();
         PreparedTerminalStep::KernelRoot {
             prepared,
@@ -6797,6 +6802,71 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
+    /// Design §11.2.12 rule 3: tears an exited Process's root down if this
+    /// site is the one that makes all four conditions true -- exited,
+    /// quiescent, root still bound, no CPU resident. Every caller has left the
+    /// root or never entered it, so each resident counted is another CPU's,
+    /// which tears the root down itself when it leaves. The primordial's
+    /// address space stays as the idle carrier's publisher root, where idle
+    /// CPUs reside; its residency does not hold back the primordial's root
+    /// retirement, which `finish_quiesced_process_root_retirement` does
+    /// without a teardown.
+    // Kept out of line, with the teardown it calls, so the ordinary syscall
+    // handler's measured frame does not absorb the remote completions'
+    // teardown, and the DW1C terminal oracle can charge both frames.
+    #[inline(never)]
+    fn attempt_exited_root_teardown(
+        &mut self,
+        process: ProcessKey,
+    ) -> crate::task::ExitedRootTeardown {
+        let exited = self
+            .core
+            .tasks
+            .process_info(process)
+            .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED);
+        let quiescent = self.core.tasks.process_quiescence_proof(process).is_ok();
+        // A finalized Process has no root left to tear down.
+        let bound = self
+            .core
+            .tasks
+            .root_region(process)
+            .ok()
+            .flatten()
+            .map(|root_object| {
+                let root_key =
+                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                        root_object,
+                    );
+                let address_space = self
+                    .core
+                    .regions
+                    .region(root_key)
+                    .unwrap_or_else(|error| panic!("exited Process root disappeared: {error:?}"))
+                    .address_space_key();
+                (root_key, address_space)
+            });
+        let residents = match bound {
+            Some((_, address_space)) if process != self.core.primordial_process => self
+                .paging
+                .lock()
+                .child_root_resident_count(process, address_space)
+                .unwrap_or_else(|error| {
+                    panic!("exited Process root residency query failed: {error:?}")
+                }),
+            _ => 0,
+        };
+        let decision =
+            crate::task::exited_root_teardown(exited, quiescent, bound.is_some(), residents);
+        if decision == crate::task::ExitedRootTeardown::TearDown {
+            let (root_key, address_space) =
+                bound.unwrap_or_else(|| panic!("an exited root teardown is owed only while bound"));
+            self.finish_inactive_process_teardown(process, root_key, address_space)
+                .unwrap_or_else(|_| panic!("exited Process root teardown drifted"));
+        }
+        decision
+    }
+
+    #[inline(never)]
     fn finish_inactive_process_teardown(
         &mut self,
         process: ProcessKey,
@@ -13378,30 +13448,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 if target == self.own.scheduled().process {
                     continue;
                 }
-                let root_object = self
-                    .core
-                    .tasks
-                    .root_region(target)
-                    .unwrap_or_else(|error| {
-                        panic!("terminated TaskGroup child root lookup failed: {error:?}")
-                    })
-                    .unwrap_or_else(|| panic!("terminated TaskGroup child has no root region"));
-                let root_key =
-                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
-                        root_object,
-                    );
-                let address_space = self
-                    .core
-                    .regions
-                    .region(root_key)
-                    .unwrap_or_else(|error| {
-                        panic!("terminated TaskGroup child root disappeared: {error:?}")
-                    })
-                    .address_space_key();
-                self.finish_inactive_process_teardown(target, root_key, address_space)
-                    .unwrap_or_else(|_| {
-                        panic!("terminated TaskGroup inactive child teardown drifted")
-                    });
+                // Design §11.2.12 rule 3: an exited sibling's CPU may still be
+                // resident on the root; it then tears down when it leaves.
+                let _ = self.attempt_exited_root_teardown(target);
             }
         }
         let result = NativeSyscallResult { status, control };
@@ -13455,26 +13504,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.finish_terminal_adapter_resources(discarded, atomic_pins, control, deferred);
         if status == DW_STATUS_SUCCESS && control == SyscallControl::ReturnToCaller {
             if target != self.own.scheduled().process {
-                let root_object = self
-                    .core
-                    .tasks
-                    .root_region(target)
-                    .unwrap_or_else(|error| {
-                        panic!("terminated child root lookup failed: {error:?}")
-                    })
-                    .unwrap_or_else(|| panic!("terminated child has no root AddressRegion"));
-                let root_key =
-                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
-                        root_object,
-                    );
-                let address_space = self
-                    .core
-                    .regions
-                    .region(root_key)
-                    .unwrap_or_else(|error| panic!("terminated child root disappeared: {error:?}"))
-                    .address_space_key();
-                self.finish_inactive_process_teardown(target, root_key, address_space)
-                    .unwrap_or_else(|_| panic!("terminated inactive child teardown drifted"));
+                // Design §11.2.12 rule 3: an exited sibling's CPU may still be
+                // resident on the root; it then tears down when it leaves.
+                let _ = self.attempt_exited_root_teardown(target);
             }
         }
         let result = NativeSyscallResult { status, control };
@@ -13672,28 +13704,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if let Some(target) =
                 exited_process.filter(|target| *target != self.own.scheduled().process)
             {
-                let root_object = self
-                    .core
-                    .tasks
-                    .root_region(target)
-                    .unwrap_or_else(|error| {
-                        panic!("final-Thread child root lookup failed: {error:?}")
-                    })
-                    .unwrap_or_else(|| panic!("final-Thread child has no root AddressRegion"));
-                let root_key =
-                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
-                        root_object,
-                    );
-                let address_space = self
-                    .core
-                    .regions
-                    .region(root_key)
-                    .unwrap_or_else(|error| {
-                        panic!("final-Thread child root disappeared: {error:?}")
-                    })
-                    .address_space_key();
-                self.finish_inactive_process_teardown(target, root_key, address_space)
-                    .unwrap_or_else(|_| panic!("final-Thread inactive child teardown drifted"));
+                // Design §11.2.12 rule 3: an exited sibling's CPU may still be
+                // resident on the root; it then tears down when it leaves.
+                let _ = self.attempt_exited_root_teardown(target);
             }
         }
         let result = NativeSyscallResult { status, control };

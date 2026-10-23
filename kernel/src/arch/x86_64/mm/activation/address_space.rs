@@ -1010,6 +1010,23 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             .expect("binding slot remains live"))
     }
 
+    /// How many CPUs are resident on `process`'s bound root: the residency an
+    /// exited root's teardown waits out (design §11.2.12 rule 3), and exactly
+    /// what [`Self::teardown_empty_owned_settled`] refuses as `Resident`.
+    pub(crate) fn resident_count(
+        &self,
+        process: ProcessKey,
+        address_space: AddressSpaceKey,
+    ) -> Result<usize, RootBindingError> {
+        let slot = self.binding_slot(process, address_space)?;
+        Ok(self.entries[slot]
+            .as_ref()
+            .expect("binding slot remains live")
+            .coherency
+            .resident_cpus()
+            .count())
+    }
+
     fn binding_slot(
         &self,
         process: ProcessKey,

@@ -2175,6 +2175,16 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.root_bindings.abandon_selection(prepared)
     }
 
+    /// How many CPUs are resident on an exited child's root (design §11.2.12
+    /// rule 3); its teardown waits until none is.
+    pub(crate) fn child_root_resident_count(
+        &self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<usize, RootBindingError> {
+        self.root_bindings.resident_count(process, address_space)
+    }
+
     /// Retires an exited child's empty root. Returns the teardown barrier's
     /// permit, which releases the shootdown-initiator lock S its caller took
     /// beneath P (D1 option B4); an error means nothing was published.

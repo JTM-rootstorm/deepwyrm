@@ -2516,6 +2516,101 @@ fn key_root_mismatch_is_rejected_and_residency_blocks_teardown() {
     ));
 }
 
+/// Design §11.2.12 rule 3 on the real root bindings: the residency an
+/// exited root's teardown decision counts is exactly what the teardown itself
+/// refuses as `Resident`. With two CPUs resident the decision leaves the root
+/// to a resident; after both leave it tears down, once; afterwards the root
+/// is unbound and nothing more is due.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "synthetic roots exercise residency-aware teardown without dereferencing physical frames"
+)]
+fn exited_root_teardown_counts_the_residency_its_teardown_refuses() {
+    use crate::task::{ExitedRootTeardown, exited_root_teardown};
+    let mut roles = synthetic_frame_role_manager::<1, 16>(0x32_000, 8);
+    let owner_a = roles.create_table_owner().unwrap();
+    let owner_b = roles.create_table_owner().unwrap();
+    let identity_a = commit_table(&mut roles, owner_a, TableLevel::Pml4, None);
+    let identity_b = commit_table(&mut roles, owner_b, TableLevel::Pml4, None);
+    let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
+    // SAFETY: the synthetic role manager authenticated this exact root.
+    let root_a =
+        unsafe { PageTableRoot::from_owned_root(identity_a.physical_start(), capabilities) }
+            .unwrap();
+    // SAFETY: the synthetic role manager authenticated this exact root.
+    let root_b =
+        unsafe { PageTableRoot::from_owned_root(identity_b.physical_start(), capabilities) }
+            .unwrap();
+    let (process_a, process_b) = process_keys();
+    // SAFETY: this test-local authority is the only registry for its two
+    // synthetic roots and outlives every key it issues.
+    let mut authority =
+        unsafe { crate::memory::address_region::AddressSpaceAuthority::<2, 2>::new() };
+    let key_a = authority.create_address_space().unwrap();
+    let key_b = authority.create_address_space().unwrap();
+    let mut bindings = AddressSpaceRootBindings::<2, 2>::new();
+    bindings
+        .bind_primordial(&roles, key_a, process_a, &root_a, identity_a)
+        .unwrap();
+    bindings
+        .bind_owned(&roles, key_b, process_b, root_b, identity_b)
+        .unwrap_or_else(|_| panic!("child root binds"));
+    let decide = |bindings: &AddressSpaceRootBindings<2, 2>| match bindings
+        .resident_count(process_b, key_b)
+    {
+        Ok(residents) => exited_root_teardown(true, true, true, residents),
+        Err(RootBindingError::Missing) => exited_root_teardown(true, true, false, 0),
+        Err(error) => panic!("residency query failed: {error:?}"),
+    };
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let first = bindings
+        .prepare_selection(CpuIndex::BOOTSTRAP, process_b, key_b)
+        .unwrap();
+    let second = bindings.prepare_selection(cpu1, process_b, key_b).unwrap();
+    assert_eq!(bindings.resident_count(process_b, key_b), Ok(2));
+    assert_eq!(decide(&bindings), ExitedRootTeardown::LeftToResident);
+    let pins = UserPinTracker::<1>::new();
+    assert_eq!(
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        ),
+        Err(RootBindingError::Resident)
+    );
+    bindings.abandon_selection(first).unwrap();
+    assert_eq!(bindings.resident_count(process_b, key_b), Ok(1));
+    assert_eq!(decide(&bindings), ExitedRootTeardown::LeftToResident);
+    assert_eq!(
+        bindings.teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        ),
+        Err(RootBindingError::Resident)
+    );
+    bindings.abandon_selection(second).unwrap();
+    assert_eq!(decide(&bindings), ExitedRootTeardown::TearDown);
+    bindings
+        .teardown_empty_owned(
+            &mut roles,
+            &mut empty_flat_root_target(),
+            process_b,
+            key_b,
+            &pins,
+            pins.reserve_teardown(key_b).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(decide(&bindings), ExitedRootTeardown::NotDue);
+}
+
 #[test]
 #[allow(
     unsafe_code,

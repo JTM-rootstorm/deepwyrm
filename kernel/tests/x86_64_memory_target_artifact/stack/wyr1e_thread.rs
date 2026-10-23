@@ -7,9 +7,9 @@ use super::*;
 /// dispatch frame it calls, and the production handler.
 /// `EXPECTED_TERMINATE` adds the task-group terminate helpers, and
 /// `EXPECTED_REQUIRED` adds architectural headroom and required spare.
-pub(crate) const EXPECTED_COMMON: usize = 50_576;
-pub(crate) const EXPECTED_TERMINATE: usize = 72_656;
-pub(crate) const EXPECTED_REQUIRED: usize = 109_520;
+pub(crate) const EXPECTED_COMMON: usize = 50_720;
+pub(crate) const EXPECTED_TERMINATE: usize = 72_800;
+pub(crate) const EXPECTED_REQUIRED: usize = 109_664;
 
 pub(crate) fn validate_wyr1e8_thread_stack_margin(
     sizes: &[StackSize],
@@ -40,7 +40,9 @@ pub(crate) fn validate_wyr1e8_thread_stack_margin(
     // `dispatch_frame` folds into the trampoline or is emitted on its own,
     // depending on codegen elsewhere in the artifact: folded at R5E, emitted
     // from 4341464, folded at S2K-6, emitted from D1 commit 3, folded at D1
-    // commit 9's dispatch stand-in, emitted again one commit later. Measure
+    // commit 9's dispatch stand-in, emitted again one commit later, and --
+    // judging by the chain totals -- folded at design §11.2.12 rule 2 and
+    // emitted again at rule 3. Measure
     // the emitted chain either way: an emitted frame must be called by the
     // trampoline and call the handler, and adds its frame and a return word;
     // a folded one leaves the trampoline calling the handler directly.
@@ -180,5 +182,5 @@ fn e8_thread_capacity_fits_the_ordinary_thread_stack_after_r5() {
         assert!(PRE_R5_REQUIRED > ORDINARY);
         assert!(EXPECTED_REQUIRED <= ORDINARY);
     }
-    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_768);
+    assert_eq!(ORDINARY - EXPECTED_REQUIRED, 414_624);
 }
