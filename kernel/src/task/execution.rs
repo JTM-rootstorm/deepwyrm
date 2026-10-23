@@ -355,6 +355,11 @@ impl<const CAPACITY: usize> KernelContinuationPool<CAPACITY> {
         Ok(())
     }
 
+    /// Installs an arbitrary saved RSP. Host tests only: production continuations
+    /// are written by the context-switch assembly through `save_ptr` or built by
+    /// the validated initial frame, so no production path may compile against a
+    /// raw seed.
+    #[cfg(test)]
     fn seed(&self, context: ThreadContextId, rsp: u64) -> Result<(), ExecutionResourceError> {
         let slot = self.slot(context)?;
         slot.0

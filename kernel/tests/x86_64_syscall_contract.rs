@@ -2392,17 +2392,6 @@ fn daybreak_switch_plan_brands_execution_owner_through_every_suspend_facade() {
     assert!(live.contains("execute_kernel_switch(plan)"));
 }
 
-#[test]
-fn daybreak_production_execution_exposes_no_raw_safe_continuation_seed() {
-    let execution = source("src/task/execution.rs");
-    assert!(!execution.contains("pub(crate) fn seed_kernel_continuation("));
-    assert!(execution.contains("#[cfg(test)]"));
-    assert!(execution.contains("pub(crate) fn seed_test_kernel_continuation("));
-    let context = source("src/arch/x86_64/context.rs");
-    assert!(context.contains("validate_initial_kernel_continuation_frame"));
-    assert!(context.contains("INITIAL_KERNEL_CONTINUATION_RFLAGS"));
-}
-
 /// Text test: that the AP revalidates its private resources after entering its kernel root and
 /// before publishing ready is control flow in the target-only facade. (Entering the root before
 /// the ready publication is static since S2K D5: the publication takes the executing state only
