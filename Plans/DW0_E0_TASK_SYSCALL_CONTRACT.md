@@ -71,10 +71,17 @@ this is the construction interval implied by separate process/thread creation.
 The first successful thread start transitions the process to RUNNING. No thread
 may start in an EXITED process.
 
-`thread_exit(code)` records normal exit for only the calling thread. If another
-live thread remains, the process stays RUNNING. If it was the final live thread,
-the process atomically transitions to EXITED with `NORMAL_EXIT` and the same
-32-bit application code.
+`thread_exit(code)` records normal exit for the calling thread. If another
+started thread remains live, the process stays RUNNING and only the caller
+exits. If it was the final started thread, the exit is process-wide, exactly as
+`process_exit(code)` below: the process atomically transitions to EXITED with
+`NORMAL_EXIT` and the same 32-bit application code, and any thread that was
+created but never started records `AUTHORIZED` with zero application
+code/detail. A never-started thread does not keep its process alive. A
+`thread_terminate` of the calling thread is final in the same way, with the
+authorized record; terminating a never-started thread, or another thread, keeps
+the live-thread rule. (Mike's decision of 2026-10-22; Deepwyrm
+`Plans/DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md` §11.2.12 rule 6.)
 
 `process_exit(code)` is process-wide. The process transitions to EXITED with
 `NORMAL_EXIT` and `application_code = code`; every live thread is made terminal

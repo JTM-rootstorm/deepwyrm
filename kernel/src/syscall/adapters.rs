@@ -6368,6 +6368,18 @@ pub(crate) fn inspect_thread_termination_threads<
     if tasks.thread_info(target).map_err(task_status)?.state == DW_TASK_STATE_EXITED {
         return Err(DW_STATUS_BAD_STATE);
     }
+    // The last started Thread's self termination is process-wide (rule 6):
+    // it makes every never-started sibling terminal too, so the snapshot is
+    // the live set, which equals that transition's pin batch (rule 1).
+    if target == current_thread
+        && tasks
+            .is_last_started_thread(current_process, target)
+            .map_err(task_status)?
+    {
+        return tasks
+            .process_termination_thread_keys(current_process)
+            .map_err(task_status);
+    }
     let mut threads = [None; THREADS];
     *threads
         .first_mut()
@@ -7469,12 +7481,22 @@ pub(crate) fn prepare_thread_terminate<
             return Err(task_status(error));
         }
     };
-    let pins = match tasks.terminate_thread_authorized(target, detail) {
+    // The caller's own termination may be final (design §11.2.12 rule 6).
+    let terminate = |tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>| {
+        if target == current_thread {
+            tasks.terminate_current_thread_authorized(target, detail)
+        } else {
+            tasks.terminate_thread_authorized(target, detail)
+        }
+    };
+    let pins = match terminate(tasks) {
         Ok(pins) => pins,
         Err(TaskError::OperationsInFlight) => {
+            // A never-started sibling owns no wait, so the target's is the
+            // only one a final self termination must clean up.
             terminal_waits
                 .cleanup_terminal_wait(registry, tasks, waits, execution, target, cleanup);
-            match tasks.terminate_thread_authorized(target, detail) {
+            match terminate(tasks) {
                 Ok(pins) => pins,
                 Err(error) => {
                     release_lookup_pin(registry, pin, cleanup);

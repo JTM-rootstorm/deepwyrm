@@ -12524,6 +12524,23 @@ fn thread_exit_fixture() -> (
     (ThreadKey, DwHandle),
     CleanupQueue<16>,
 ) {
+    thread_exit_fixture_starting(true)
+}
+
+/// As [`thread_exit_fixture`]; with `start_second` false the second Thread is
+/// created but never started.
+#[allow(clippy::type_complexity, reason = "test fixture tuple")]
+fn thread_exit_fixture_starting(
+    start_second: bool,
+) -> (
+    ObjectRegistry<16>,
+    Tasks,
+    ProcessKey,
+    ExecutionDomain<2>,
+    (ThreadKey, DwHandle),
+    (ThreadKey, DwHandle),
+    CleanupQueue<16>,
+) {
     use deepwyrm_abi::{DW_OBJECT_TYPE_PROCESS, DW_RIGHT_WAIT};
     let (mut registry, mut tasks, process, process_handle) = process_fixture();
     let execution = ExecutionDomain::<2>::new(test_stack_bounds::<2>()).unwrap();
@@ -12554,9 +12571,11 @@ fn thread_exit_fixture() -> (
     execution
         .start_thread(&mut tasks, first, test_start(0x61))
         .unwrap();
-    execution
-        .start_thread(&mut tasks, second, test_start(0x62))
-        .unwrap();
+    if start_second {
+        execution
+            .start_thread(&mut tasks, second, test_start(0x62))
+            .unwrap();
+    }
     (
         registry,
         tasks,
@@ -13473,6 +13492,234 @@ fn thread_terminate_preflight_refuses_an_exited_target_as_bad_state() {
         &waits,
         cpu0,
         sibling,
+        0,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// Design §11.2.12 rule 6 (Mike's decision of 2026-10-22, sweep row 16): the
+/// last *started* Thread's ThreadExit is final. The Process exits with
+/// NORMAL_EXIT and the code, as ProcessExit records it, and the never-started
+/// sibling is retired with AUTHORIZED and code 0.
+#[test]
+fn the_last_started_threads_exit_retires_a_never_started_sibling() {
+    use deepwyrm_abi::{
+        DW_TASK_STATE_CREATED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
+    };
+    let (mut registry, mut tasks, process, execution, (started, _), (unstarted, _), mut cleanup) =
+        thread_exit_fixture_starting(false);
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(started)
+    );
+    assert_eq!(
+        tasks.thread_info(unstarted).unwrap().state,
+        DW_TASK_STATE_CREATED
+    );
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu0,
+            process,
+            started,
+            0x16,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(
+        deferred.exits_process(),
+        "the exit is final and owns the Process"
+    );
+    let info = tasks.process_info(process).unwrap();
+    assert_eq!(info.state, DW_TASK_STATE_EXITED);
+    assert_eq!(info.reason, DW_TERMINATION_NORMAL_EXIT);
+    assert_eq!(info.application_code, 0x16);
+    let caller = tasks.thread_info(started).unwrap();
+    assert_eq!(caller.reason, DW_TERMINATION_NORMAL_EXIT);
+    assert_eq!(caller.application_code, 0x16);
+    let sibling = tasks.thread_info(unstarted).unwrap();
+    assert_eq!(sibling.state, DW_TASK_STATE_EXITED);
+    assert_eq!(sibling.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(sibling.application_code, 0);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        deferred,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// Rule 6 for a self ThreadTerminate: the last started Thread terminating
+/// itself exits the Process with the authorized record, retires the
+/// never-started sibling with AUTHORIZED and code 0, and the preflight's
+/// snapshot is that transition's whole Thread set, as the live carrier asserts.
+#[test]
+fn the_last_started_threads_self_terminate_retires_a_never_started_sibling() {
+    use deepwyrm_abi::{DW_TASK_STATE_RUNNING, DW_TERMINATION_AUTHORIZED};
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        execution,
+        (started, started_handle),
+        (unstarted, _),
+        mut cleanup,
+    ) = thread_exit_fixture_starting(false);
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(started)
+    );
+    let snapshot = inspect_thread_termination_threads(
+        &tasks,
+        &execution,
+        process,
+        started,
+        started_handle,
+        DW_TERMINATION_AUTHORIZED,
+    )
+    .unwrap();
+    assert_eq!(snapshot, [Some(started), Some(unstarted)]);
+    let prepared = prepare_thread_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut NoTerminalWaitCleanup,
+        process,
+        started,
+        started_handle,
+        DW_TERMINATION_AUTHORIZED,
+        0x61,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.thread_keys(), snapshot);
+    assert_eq!(prepared.exited_process(), Some(process));
+    let deferred = terminal_outcome(
+        complete_prepared_thread_termination_after_remote_stops_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu0,
+            process,
+            started,
+            prepared,
+            core::array::from_fn(|_| None),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(deferred.exits_process());
+    let info = tasks.process_info(process).unwrap();
+    assert_eq!(info.state, DW_TASK_STATE_EXITED);
+    assert_eq!(info.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(info.detail, 0x61);
+    let sibling = tasks.thread_info(unstarted).unwrap();
+    assert_eq!(sibling.state, DW_TASK_STATE_EXITED);
+    assert_eq!(sibling.reason, DW_TERMINATION_AUTHORIZED);
+    assert_eq!(sibling.application_code, 0);
+    assert_eq!(sibling.detail, 0);
+    assert_ne!(
+        tasks.thread_info(started).unwrap().state,
+        DW_TASK_STATE_RUNNING
+    );
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        deferred,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// Rule 6 keeps the live-Thread rule for termination of an unstarted Thread:
+/// terminating the never-started sibling leaves the Process live.
+#[test]
+fn terminating_a_never_started_thread_keeps_its_process_live() {
+    use deepwyrm_abi::{DW_TASK_STATE_RUNNING, DW_TERMINATION_AUTHORIZED};
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        execution,
+        (started, _),
+        (_, unstarted_handle),
+        mut cleanup,
+    ) = thread_exit_fixture_starting(false);
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(started)
+    );
+    let prepared = prepare_thread_terminate(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut NoTerminalWaitCleanup,
+        process,
+        started,
+        unstarted_handle,
+        DW_TERMINATION_AUTHORIZED,
+        0x62,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.exited_process(), None);
+    assert!(
+        terminal_outcome(
+            complete_prepared_thread_termination_after_remote_stops_on(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut NoTerminalWaitCleanup,
+                cpu0,
+                process,
+                started,
+                prepared,
+                core::array::from_fn(|_| None),
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::ReturnToCaller,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        tasks.process_info(process).unwrap().state,
+        DW_TASK_STATE_RUNNING
+    );
+    let _ = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu0,
+        started,
         0,
         &mut cleanup,
     );

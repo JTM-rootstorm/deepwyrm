@@ -2964,9 +2964,19 @@ fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
         process_handle,
         current,
         current_handle,
-        awakened,
-        awakened_handle,
+        _unstarted,
+        unstarted_handle,
     ) = terminal_two_thread_fixture();
+    // The published work belongs to another Process. A never-started sibling
+    // of `current` does not keep its Process alive (design §11.2.12 rule 6),
+    // so it could not be started after `current`'s exit.
+    let (_other_process, other_process_handle) =
+        tasks.create_process(&mut registry, &root_owner).unwrap();
+    let other_owner = registry
+        .retain_internal_from_handle(&other_process_handle)
+        .unwrap();
+    let (awakened, awakened_handle) = tasks.create_thread(&mut registry, &other_owner).unwrap();
+    assert!(registry.release_internal(other_owner).unwrap().is_none());
     let execution = ExecutionDomain::<2>::new(terminal_stack_bounds::<2>()).unwrap();
     execution
         .start_thread(&mut tasks, current, terminal_start_state(13))
@@ -3002,7 +3012,13 @@ fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
     while let Some(pin) = deferred_pins.pop() {
         assert!(registry.release_internal(pin).unwrap().is_none());
     }
-    for reference in [current_handle, awakened_handle, process_handle] {
+    for reference in [
+        current_handle,
+        unstarted_handle,
+        process_handle,
+        awakened_handle,
+        other_process_handle,
+    ] {
         let _ = registry.release_handle(reference).unwrap();
     }
     let _ = registry.release_internal(root_owner).unwrap();

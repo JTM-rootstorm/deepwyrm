@@ -1081,24 +1081,16 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 .parent
                 .id(),
         );
-        let exits_process = !self.process_has_other_live_threads(process_key, key)?;
-        if !exits_process
-            && self.process(process_key)?.operations.phase
-                != ProcessLifecycleState::AcceptingOperations
+        // The last *started* Thread's exit is final (design §11.2.12 rule 6):
+        // the Process exits exactly as ProcessExit records it, retiring any
+        // never-started sibling with AUTHORIZED and code 0.
+        if self.is_last_started_thread(process_key, key)? {
+            return self.exit_process(process_key, key, code);
+        }
+        if self.process(process_key)?.operations.phase != ProcessLifecycleState::AcceptingOperations
         {
             return Err(TaskError::BadState);
         }
-        let quiescence = if exits_process {
-            Some(
-                self.begin_process_termination(process_key, TerminationRecord::normal(code))
-                    .map_err(|error| match error {
-                        ProcessGateError::Task(error) => error,
-                        ProcessGateError::OperationsInFlight => TaskError::OperationsInFlight,
-                    })?,
-            )
-        } else {
-            None
-        };
         let thread = self.threads[thread_slot]
             .as_mut()
             .expect("validated thread slot");
@@ -1113,12 +1105,52 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
                 "Thread lost its execution pin before resource retirement"
             );
         }
-
-        if let Some(proof) = quiescence {
-            self.finish_process_exit(&proof, TerminationRecord::normal(code))?;
-            pins.process = self.process_mut(process_key)?.execution_pin.take();
-        }
         Ok(pins)
+    }
+
+    /// ThreadTerminate of the calling Thread. The last started Thread's self
+    /// termination is final like its ThreadExit (design §11.2.12 rule 6): the
+    /// Process exits with the authorized record and any never-started
+    /// sibling records AUTHORIZED with code 0. Otherwise, and for every
+    /// external target, [`Self::terminate_thread_authorized`]'s live-Thread
+    /// rule applies.
+    pub(crate) fn terminate_current_thread_authorized(
+        &mut self,
+        key: ThreadKey,
+        detail: u32,
+    ) -> Result<ExitPins<THREADS>, TaskError> {
+        let process_key = self.thread_process(key)?;
+        if self.thread(key)?.state.state == DW_TASK_STATE_RUNNING
+            && self.is_last_started_thread(process_key, key)?
+        {
+            let authorized = TerminationRecord::authorized(detail);
+            return self.terminate_process_common(
+                process_key,
+                authorized,
+                Some((key, authorized)),
+                TerminationRecord::authorized(0),
+            );
+        }
+        self.terminate_thread_authorized(key, detail)
+    }
+
+    /// Whether `key`, a started Thread, is the last started Thread of
+    /// `process`: every other member has exited or never started. A
+    /// never-started Thread does not keep its Process alive (design
+    /// §11.2.12 rule 6, Mike's decision of 2026-10-22).
+    pub(crate) fn is_last_started_thread(
+        &self,
+        process: ProcessKey,
+        key: ThreadKey,
+    ) -> Result<bool, TaskError> {
+        let ids = self.process(process)?.threads;
+        for object in ids.into_iter().flatten() {
+            let other = ThreadKey(object);
+            if other != key && self.thread(other)?.state.state == DW_TASK_STATE_RUNNING {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn terminate_thread_authorized(
