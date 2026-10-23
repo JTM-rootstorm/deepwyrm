@@ -6361,6 +6361,13 @@ pub(crate) fn inspect_thread_termination_threads<
         DW_RIGHT_MODIFY,
     )?);
     tasks.thread_process(target).map_err(task_status)?;
+    // An exited target is refused here, with the status
+    // `prepare_thread_terminate` returns for it (design §11.2.12 rule 5).
+    // Until its terminal handoff the target's CPU still holds its claim, so
+    // the stop plan would otherwise report a transient WOULD_BLOCK.
+    if tasks.thread_info(target).map_err(task_status)?.state == DW_TASK_STATE_EXITED {
+        return Err(DW_STATUS_BAD_STATE);
+    }
     let mut threads = [None; THREADS];
     *threads
         .first_mut()

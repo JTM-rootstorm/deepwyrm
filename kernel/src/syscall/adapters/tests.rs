@@ -13366,3 +13366,115 @@ fn a_final_thread_exit_owns_its_process_exit() {
     assert_eq!(proofs, [Some(false), Some(true)]);
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
+
+/// Sweep row 14, design §11.2.12 rule 5: ThreadTerminate of a Thread that
+/// already exited is BAD_STATE from the preflight, exactly as
+/// `prepare_thread_terminate` refuses it, even while the target's CPU still
+/// holds its claim (its terminal handoff has not run). A live target still
+/// passes the preflight.
+#[test]
+fn thread_terminate_preflight_refuses_an_exited_target_as_bad_state() {
+    use deepwyrm_abi::DW_TERMINATION_AUTHORIZED;
+    let (
+        mut registry,
+        mut tasks,
+        process,
+        execution,
+        (exiting, exiting_handle),
+        (sibling, _),
+        mut cleanup,
+    ) = thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exiting)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(sibling)
+    );
+    // Before the exit, the sibling's terminate of `exiting` passes.
+    let live = inspect_thread_termination_threads(
+        &tasks,
+        &execution,
+        process,
+        sibling,
+        exiting_handle,
+        DW_TERMINATION_AUTHORIZED,
+    )
+    .unwrap();
+    assert_eq!(live[0], Some(exiting));
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            exiting,
+            0x14,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    // The exited Thread's CPU still holds its claim.
+    assert!(execution.suspended_claim_on(cpu1).is_some());
+    assert_eq!(
+        inspect_thread_termination_threads(
+            &tasks,
+            &execution,
+            process,
+            sibling,
+            exiting_handle,
+            DW_TERMINATION_AUTHORIZED,
+        ),
+        Err(DW_STATUS_BAD_STATE)
+    );
+    assert_eq!(
+        prepare_thread_terminate(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            process,
+            sibling,
+            exiting_handle,
+            DW_TERMINATION_AUTHORIZED,
+            0x33,
+            &mut cleanup,
+        )
+        .err(),
+        Some(DW_STATUS_BAD_STATE)
+    );
+    // The refusal changes nothing: the exit record stands.
+    let info = tasks.thread_info(exiting).unwrap();
+    assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT);
+    assert_eq!(info.application_code, 0x14);
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
+    let _ = finish_live_thread_exit_process(
+        &mut registry,
+        &mut tasks,
+        process,
+        &execution,
+        &waits,
+        cpu0,
+        sibling,
+        0,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
