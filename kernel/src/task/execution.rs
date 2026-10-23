@@ -432,6 +432,14 @@ impl DeferredCurrentExecutionResources {
         self.cancelled_quantum
     }
 
+    /// Whether this Thread's own terminal transition exited its Process: the
+    /// bundle carries the Process pin only then. This is the retirement
+    /// ownership proof (design §11.2.12 rule 2); read it before the deferred
+    /// reclaim consumes the pin.
+    pub(crate) const fn exits_process(&self) -> bool {
+        self.process_pin.is_some()
+    }
+
     #[cfg(deepwyrm_dw1c_evidence)]
     pub(crate) const fn execution_generation(&self) -> u64 {
         self.execution_generation

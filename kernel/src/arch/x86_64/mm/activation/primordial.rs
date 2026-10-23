@@ -3270,6 +3270,9 @@ struct TerminalRetirementState {
     retired_process: ProcessKey,
     retired_root_key: crate::memory::address_region::AddressRegionObjectKey,
     retired_address_space: crate::memory::address_region::AddressSpaceKey,
+    /// This Thread's own transition exited the Process (design §11.2.12 rule
+    /// 2), captured from the deferred bundle before its reclaim.
+    exits_process: bool,
     #[cfg(deepwyrm_dw1c_evidence)]
     product_execution_generation: u64,
     #[cfg(any(
@@ -5221,6 +5224,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         });
         #[cfg(deepwyrm_dw1c_evidence)]
         let product_execution_generation = deferred.execution_generation();
+        let exits_process = deferred.exits_process();
         crate::syscall::complete_deferred_current_reclaim_on(
             &mut self.core.registry,
             &self.core.shared.execution,
@@ -5299,6 +5303,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             retired_process,
             retired_root_key,
             retired_address_space,
+            exits_process,
             #[cfg(deepwyrm_dw1c_evidence)]
             product_execution_generation,
             #[cfg(any(
@@ -5326,12 +5331,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn prepare_terminal_handoff_detached(&mut self) -> PreparedTerminalStep {
         let retirement = self.prepare_terminal_retirement_state();
-        if let Some(next) = self
+        let next = self
             .core
             .shared
             .execution
-            .terminal_reaper_next_on(self.cpu())
-        {
+            .terminal_reaper_next_on(self.cpu());
+        let route = crate::task::terminal_handoff_route(next.is_some(), retirement.exits_process);
+        if let Some(next) = next {
+            assert_eq!(route, crate::task::TerminalHandoffRoute::Successor);
             let (stack_id, context_id) = self
                 .core
                 .tasks
@@ -5361,17 +5368,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
         }
 
-        // A Thread that left its Process live -- a non-final ThreadExit or a
-        // self ThreadTerminate (design §11.2.11) -- retired only itself. Every
-        // arm below treats the Process as retired: a retirement record, a
-        // quiescence proof, a root teardown. Leave the live root for the
-        // kernel root and idle instead.
-        if !self
-            .core
-            .tasks
-            .process_info(retirement.retired_process)
-            .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)
-        {
+        // Every arm below retires the Process: a retirement record, the
+        // idle-path power-off decision, a root teardown. Only the Thread whose
+        // own transition exited it takes them (design §11.2.12 rule 2). One
+        // that left its Process live -- a non-final ThreadExit or a self
+        // ThreadTerminate (§11.2.11) -- or whose Process another Thread's
+        // transition exited, leaves the root for the kernel root and idles.
+        if route == crate::task::TerminalHandoffRoute::LeaveRoot {
             let prepared = self.prepare_terminal_kernel_root_switch();
             return PreparedTerminalStep::KernelRoot {
                 prepared,

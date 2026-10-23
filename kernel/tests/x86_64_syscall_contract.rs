@@ -1345,22 +1345,45 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     ));
     assert!(runtime.contains("crate::syscall::thread_exit_on("));
     assert!(adapters.contains("pub(crate) fn thread_exit_on<"));
-    // A Thread that leaves its Process live must not take the retired-Process
-    // arms of the terminal handoff, and the check precedes all of them.
+    // Only the Thread whose own transition exited its Process takes the
+    // retired-Process arms of the terminal handoff (design §11.2.12 rule 2).
+    // The route is decided on the proof captured before the reclaim, never on
+    // a re-read of the Process, and the leave-root check precedes every
+    // retired arm. The host models are
+    // `only_the_process_exit_owner_routes_its_handoff_to_retirement` and
+    // `a_final_thread_exit_owns_its_process_exit`.
+    let retirement = runtime
+        .split_once("fn prepare_terminal_retirement_state(&mut self) -> TerminalRetirementState {")
+        .expect("terminal retirement state")
+        .1;
+    let proof = retirement
+        .find("let exits_process = deferred.exits_process();")
+        .expect("terminal retirement lost its ownership proof");
+    let reclaim = retirement
+        .find("crate::syscall::complete_deferred_current_reclaim_on(")
+        .expect("terminal retirement lost its deferred reclaim");
+    assert!(proof < reclaim);
     let handoff = runtime
         .split_once("fn prepare_terminal_handoff_detached(")
         .expect("terminal handoff")
         .1;
-    let live_check = handoff
-        .find(".process_info(retirement.retired_process)\n            .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED)")
-        .expect("terminal handoff lost its live-Process check");
+    assert!(handoff.contains(
+        "let route = crate::task::terminal_handoff_route(next.is_some(), retirement.exits_process);"
+    ));
+    let leave_root = handoff
+        .find("if route == crate::task::TerminalHandoffRoute::LeaveRoot {")
+        .expect("terminal handoff lost its leave-root route");
     let first_retired_arm = handoff
         .find("if retirement.retiring_wyr1_primordial")
         .expect("terminal handoff lost its primordial arm");
-    assert!(live_check < first_retired_arm);
+    assert!(leave_root < first_retired_arm);
     assert!(
-        handoff[live_check..first_retired_arm]
+        handoff[leave_root..first_retired_arm]
             .contains("continuation: TerminalKernelContinuation::FinishGenericChild(retirement),")
+    );
+    assert!(
+        !handoff[..first_retired_arm].contains("process_info(retirement.retired_process)"),
+        "the terminal handoff routes on a re-read of the Process"
     );
     assert!(runtime.contains("fn prepare_remote_task_group_termination("));
     assert!(runtime.contains("fn complete_task_group_termination("));

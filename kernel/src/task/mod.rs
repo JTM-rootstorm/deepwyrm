@@ -21,6 +21,11 @@ mod authority;
 mod blocked_operation;
 mod execution;
 mod scheduler;
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+mod terminal_handoff;
 #[allow(
     unused_imports,
     reason = "Daybreak DB-04 blocked-operation ownership is consumed by F4/F7/F9 before live blocking publication"
@@ -52,6 +57,11 @@ pub(crate) use scheduler::{
     SchedulerQuantumTicket, SchedulerReservation, SchedulerReservationFailure,
     SchedulerThreadState,
 };
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+pub(crate) use terminal_handoff::{TerminalHandoffRoute, terminal_handoff_route};
 
 #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
 #[allow(unused_imports)]

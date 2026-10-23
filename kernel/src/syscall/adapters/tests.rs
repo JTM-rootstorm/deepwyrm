@@ -13208,3 +13208,161 @@ fn final_thread_exit_reclaim_leaves_releases_for_the_handoff_to_drain() {
     );
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
+
+/// Design §11.2.12 rule 2, stage 7's ordering: a sibling's non-final
+/// ThreadExit, then the last Thread's ProcessExit, both before either
+/// handoff. At handoff time both CPUs see the Process `EXITED`; only the
+/// ProcessExit bundle carries the Process pin, so exactly one handoff
+/// retires the Process and the other leaves the root.
+#[test]
+fn only_the_process_exit_owner_routes_its_handoff_to_retirement() {
+    use crate::task::{TerminalHandoffRoute, terminal_handoff_route};
+    let (mut registry, mut tasks, process, execution, (exited, _), (last, _), mut cleanup) =
+        thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exited)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(last)
+    );
+    let sibling = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            exited,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert!(
+        !sibling.exits_process(),
+        "a non-final exit owns no Process exit"
+    );
+    let prepared = prepare_process_exit(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut NoTerminalWaitCleanup,
+        process,
+        last,
+        0x2207_0001,
+        &mut cleanup,
+    )
+    .unwrap();
+    let owner = terminal_outcome(
+        complete_prepared_process_termination_after_remote_stops_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu0,
+            process,
+            last,
+            prepared,
+            core::array::from_fn(|_| None),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    // Both handoffs now meet an exited Process; re-reading it cannot tell
+    // the owner apart.
+    assert_eq!(
+        tasks.process_info(process).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_EXITED
+    );
+    assert!(owner.exits_process());
+    assert!(!sibling.exits_process());
+    let routes = [owner.exits_process(), sibling.exits_process()]
+        .map(|exits_process| terminal_handoff_route(false, exits_process));
+    assert_eq!(
+        routes,
+        [
+            TerminalHandoffRoute::RetireProcess,
+            TerminalHandoffRoute::LeaveRoot
+        ]
+    );
+    // A successor wins over either proof.
+    for exits_process in [false, true] {
+        assert_eq!(
+            terminal_handoff_route(true, exits_process),
+            TerminalHandoffRoute::Successor
+        );
+    }
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        sibling,
+        &mut cleanup,
+    );
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        owner,
+        &mut cleanup,
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// A final ThreadExit owns its Process's exit exactly as ProcessExit does.
+#[test]
+fn a_final_thread_exit_owns_its_process_exit() {
+    let (mut registry, mut tasks, process, execution, (first, _), (last, _), mut cleanup) =
+        thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    execution.schedule_next_on(cpu1).unwrap();
+    execution.schedule_next_on(cpu0).unwrap();
+    let mut proofs = [None, None];
+    for (index, (cpu, thread)) in [(cpu1, first), (cpu0, last)].into_iter().enumerate() {
+        let deferred = terminal_outcome(
+            thread_exit_on(
+                &mut registry,
+                &mut tasks,
+                &execution,
+                &waits,
+                &mut NoTerminalWaitCleanup,
+                cpu,
+                process,
+                thread,
+                7,
+                &mut cleanup,
+            ),
+            DW_STATUS_SUCCESS,
+            SyscallControl::TerminateCurrent,
+        )
+        .unwrap();
+        proofs[index] = Some(deferred.exits_process());
+        complete_deferred_current_reclaim_on(
+            &mut registry,
+            &execution,
+            &waits,
+            cpu,
+            deferred,
+            &mut cleanup,
+        );
+    }
+    assert_eq!(proofs, [Some(false), Some(true)]);
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
