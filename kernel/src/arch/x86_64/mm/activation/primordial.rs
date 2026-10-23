@@ -5287,6 +5287,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             None
         };
+        // Every terminal step below releases T before or across a guard-free
+        // root switch, and a concurrent remote stop's commit requires the
+        // shared queue empty (design §11.2.12 rule 4). The deferred reclaim
+        // above can queue the Process's execution pin; the bound root region
+        // still holds its parent reference, so the drain cannot finalize the
+        // Process before its root retires.
+        self.drain_finalizers()
+            .unwrap_or_else(|_| panic!("terminal handoff could not drain its releases"));
         TerminalRetirementState {
             retired_process,
             retired_root_key,

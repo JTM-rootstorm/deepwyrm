@@ -1412,6 +1412,38 @@ fn process_wide_self_entries_snapshot_live_threads() {
     }
 }
 
+/// Text test: the terminal retirement state is target-only primordial.rs code.
+/// Its hold drains the shared cleanup queue after the deferred reclaim and
+/// before any terminal step can release T (design §11.2.12 rule 4, sweep row
+/// 13); the host model is
+/// `final_thread_exit_reclaim_leaves_releases_for_the_handoff_to_drain`.
+#[test]
+fn terminal_retirement_state_drains_the_shared_cleanup_queue() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    let retirement = runtime
+        .split_once("fn prepare_terminal_retirement_state(&mut self) -> TerminalRetirementState {")
+        .expect("terminal retirement state")
+        .1
+        .split_once("\n    }\n")
+        .expect("terminal retirement state end")
+        .0;
+    let reclaim = retirement
+        .find("crate::syscall::complete_deferred_current_reclaim_on(")
+        .expect("terminal retirement lost its deferred reclaim");
+    let drain = retirement
+        .rfind("self.drain_finalizers()")
+        .expect("terminal retirement does not drain the shared cleanup queue");
+    let state = retirement
+        .rfind("TerminalRetirementState {")
+        .expect("terminal retirement lost its state");
+    assert!(reclaim < drain && drain < state);
+    assert!(
+        !retirement[drain..state].contains("core.cleanup.push"),
+        "a release is queued after the terminal drain"
+    );
+}
+
 /// Text test: the terminal handoff is target-only primordial.rs code until the D2 terminal engine.
 #[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {

@@ -13123,3 +13123,88 @@ fn process_exit_snapshot_after_a_sibling_self_exit_matches_its_pin_batch() {
     );
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
+
+/// Sweep row 13: a final ThreadExit's hold and its deferred reclaim leave
+/// final releases queued -- the drained Process handles and the retired
+/// Thread's pins. The live terminal handoff therefore drains `core.cleanup`
+/// before it releases T (design §11.2.12 rule 4); a concurrent remote stop's
+/// commit requires the shared queue empty.
+#[test]
+fn final_thread_exit_reclaim_leaves_releases_for_the_handoff_to_drain() {
+    let (mut registry, mut tasks, process, execution, (first, _), (last, _), mut cleanup) =
+        thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(first)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(last)
+    );
+    let non_final = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            first,
+            1,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        non_final,
+        &mut cleanup,
+    );
+    assert!(
+        cleanup.is_empty(),
+        "a non-final exit's handles stay installed, so nothing is final"
+    );
+    let last_deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu0,
+            process,
+            last,
+            2,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    assert_eq!(
+        tasks.process_info(process).unwrap().state,
+        deepwyrm_abi::DW_TASK_STATE_EXITED
+    );
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        last_deferred,
+        &mut cleanup,
+    );
+    assert!(
+        !cleanup.is_empty(),
+        "the handoff inherits final releases it must drain before releasing T"
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
