@@ -6284,6 +6284,25 @@ pub(crate) fn inspect_process_termination_threads<
         .map_err(task_status)
 }
 
+/// Snapshots the Threads a process-wide terminal entry on the caller's own
+/// Process -- ProcessExit or an unhandled exception -- makes terminal
+/// (design §11.2.12): the live, non-`EXITED` members, compacted in slot
+/// order. Because an attached Thread holds its execution pin iff it is not
+/// `EXITED`, this equals the terminal pin batch's `ExitPins::thread_keys`. The
+/// member list (`process_thread_keys`) also names exited Threads and holes,
+/// which have nothing to stop.
+pub(crate) fn inspect_process_exit_threads<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+) -> Result<[Option<ThreadKey>; THREADS], TaskError> {
+    tasks.process_termination_thread_keys(current_process)
+}
+
 /// Authenticates an external TaskGroup termination target and snapshots the
 /// recursive Thread set for which termination will emit terminal execution
 /// effects. Retained exited descendants stay inspectable but require no stop.

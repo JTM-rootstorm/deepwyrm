@@ -6529,11 +6529,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         exception: crate::task::TaskExceptionRecord,
     ) -> ProcessTerminationPreparation {
-        let inspected_threads = self
-            .core
-            .tasks
-            .process_thread_keys(self.own.scheduled().process)
-            .unwrap_or_else(|_| panic!("exception Process lost its Thread topology"));
+        let inspected_threads = crate::syscall::inspect_process_exit_threads(
+            &self.core.tasks,
+            self.own.scheduled().process,
+        )
+        .unwrap_or_else(|_| panic!("exception Process lost its Thread topology"));
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
             Err(()) => return ProcessTerminationPreparation::Retry,
@@ -12795,11 +12795,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn prepare_remote_process_exit(&mut self, exit_code: u32) -> ProcessTerminationPreparation {
-        let inspected_threads = self
-            .core
-            .tasks
-            .process_thread_keys(self.own.scheduled().process)
-            .unwrap_or_else(|_| panic!("exiting Process lost its Thread topology"));
+        let inspected_threads = crate::syscall::inspect_process_exit_threads(
+            &self.core.tasks,
+            self.own.scheduled().process,
+        )
+        .unwrap_or_else(|_| panic!("exiting Process lost its Thread topology"));
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
             Err(()) => return ProcessTerminationPreparation::Retry,

@@ -1297,3 +1297,172 @@ fn r5c_untaken_pins_keep_a_terminal_process_from_reaching_finalization() {
     let root_final = registry.release_internal(root_owner).unwrap().unwrap();
     finish_task_release(&mut tasks, &mut registry, root_final);
 }
+
+/// Sibling states a process-wide terminal entry can meet (design §11.2.12).
+/// Execution-level states (running elsewhere, blocked, runnable) are all
+/// task-level `Started`; what the snapshot depends on is the task state and
+/// whether the Thread still holds its execution pin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotSibling {
+    Started,
+    Created,
+    ExitedNotFinalized,
+    ExitedFinalized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessWideEntry {
+    ProcessExit,
+    Exception,
+    ProcessTerminate,
+    TaskGroup,
+}
+
+/// One row of the thread-set agreement table: the live snapshot a
+/// process-wide entry hands `terminal_stop_plan` must equal the pin batch the
+/// entry's transition produces, whatever state the middle sibling is in.
+fn assert_process_wide_snapshot_agrees(entry: ProcessWideEntry, sibling_state: SnapshotSibling) {
+    let mut registry = ObjectRegistry::<OBJECTS>::new();
+    let mut tasks = Tasks::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (group, group_handle) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let group_owner = registry.retain_internal_from_handle(&group_handle).unwrap();
+    let (process, process_handle) = tasks.create_process(&mut registry, &group_owner).unwrap();
+    release_nonfinal_pin(&mut registry, group_owner);
+    let process_owner = process_parent_pin(&mut registry, &process_handle);
+    let (lead, lead_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (sibling, sibling_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    let (tail, tail_handle) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    release_nonfinal_pin(&mut registry, process_owner);
+    for (thread, seed) in [(lead, 1), (tail, 3)] {
+        prepare_thread(&mut tasks, thread, seed);
+        tasks.start_thread(thread).unwrap();
+    }
+    let mut sibling_handle = Some(sibling_handle);
+    if sibling_state != SnapshotSibling::Created {
+        prepare_thread(&mut tasks, sibling, 2);
+        tasks.start_thread(sibling).unwrap();
+    }
+    if matches!(
+        sibling_state,
+        SnapshotSibling::ExitedNotFinalized | SnapshotSibling::ExitedFinalized
+    ) {
+        let pins = tasks.exit_thread(sibling, 9).unwrap();
+        assert!(!pins.exits_process());
+        assert!(
+            release_pins(&mut registry, pins)
+                .into_iter()
+                .flatten()
+                .next()
+                .is_none()
+        );
+    }
+    if sibling_state == SnapshotSibling::ExitedFinalized {
+        let release = registry
+            .release_handle(sibling_handle.take().unwrap())
+            .unwrap()
+            .unwrap();
+        finish_task_release(&mut tasks, &mut registry, release);
+    }
+
+    let live = match sibling_state {
+        SnapshotSibling::Started | SnapshotSibling::Created => [
+            Some(lead),
+            Some(sibling),
+            Some(tail),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        SnapshotSibling::ExitedNotFinalized | SnapshotSibling::ExitedFinalized => {
+            [Some(lead), Some(tail), None, None, None, None, None, None]
+        }
+    };
+    let snapshot = tasks.process_termination_thread_keys(process).unwrap();
+    assert_eq!(snapshot, live, "{entry:?} {sibling_state:?} live snapshot");
+    let members = tasks.process_thread_keys(process).unwrap();
+    match sibling_state {
+        SnapshotSibling::ExitedNotFinalized => {
+            assert_ne!(
+                members, snapshot,
+                "the member list names the exited sibling"
+            );
+        }
+        SnapshotSibling::ExitedFinalized => {
+            assert_eq!(members[1], None, "a finalized sibling leaves a hole");
+            assert_ne!(members, snapshot);
+        }
+        SnapshotSibling::Started | SnapshotSibling::Created => assert_eq!(members, snapshot),
+    }
+
+    let pins = match entry {
+        ProcessWideEntry::ProcessExit => tasks.exit_process(process, lead, 0x10).unwrap(),
+        ProcessWideEntry::Exception => tasks
+            .terminate_process_exception(process, lead, DW_EXCEPTION_PAGE_FAULT, 1, 0x4000)
+            .unwrap(),
+        ProcessWideEntry::ProcessTerminate => {
+            tasks.terminate_process_authorized(process, 0x22).unwrap()
+        }
+        ProcessWideEntry::TaskGroup => {
+            let teardown = tasks.terminate_group(group).unwrap();
+            assert_eq!(
+                teardown.thread_keys(),
+                snapshot,
+                "{sibling_state:?} teardown"
+            );
+            tasks.take_exited_process_exit_pins(process).unwrap()
+        }
+    };
+    assert_eq!(
+        pins.thread_keys(),
+        snapshot,
+        "{entry:?} {sibling_state:?} pin batch"
+    );
+    let (_, drained) = tasks
+        .drain_exited_process_handles_stepwise(&mut registry, process)
+        .unwrap();
+    assert_eq!(drained, 0);
+    assert!(
+        release_pins(&mut registry, pins)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
+    for handle in [Some(lead_handle), sibling_handle, Some(tail_handle)]
+        .into_iter()
+        .flatten()
+    {
+        let release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, release);
+    }
+    for handle in [process_handle, group_handle] {
+        let release = registry.release_handle(handle).unwrap().unwrap();
+        finish_task_release(&mut tasks, &mut registry, release);
+    }
+    let root_final = registry.release_internal(root_owner).unwrap().unwrap();
+    finish_task_release(&mut tasks, &mut registry, root_final);
+}
+
+#[test]
+fn process_wide_terminal_snapshots_agree_with_their_pin_batches() {
+    for entry in [
+        ProcessWideEntry::ProcessExit,
+        ProcessWideEntry::Exception,
+        ProcessWideEntry::ProcessTerminate,
+        ProcessWideEntry::TaskGroup,
+    ] {
+        for sibling in [
+            SnapshotSibling::Started,
+            SnapshotSibling::Created,
+            SnapshotSibling::ExitedNotFinalized,
+            SnapshotSibling::ExitedFinalized,
+        ] {
+            assert_process_wide_snapshot_agrees(entry, sibling);
+        }
+    }
+}

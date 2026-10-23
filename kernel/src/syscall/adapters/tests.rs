@@ -13023,3 +13023,103 @@ fn live_thread_exit_wakes_a_waiter_on_its_exited_signal() {
     );
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
 }
+
+/// Stage 7's third panic: a sibling self-exits, then the last Thread calls
+/// ProcessExit. The snapshot the live carrier hands `terminal_stop_plan` must
+/// be the live set, which is exactly the ProcessExit pin batch; the member
+/// list still names the exited sibling (design §11.2.12).
+#[test]
+fn process_exit_snapshot_after_a_sibling_self_exit_matches_its_pin_batch() {
+    let (mut registry, mut tasks, process, execution, (exited, _), (last, _), mut cleanup) =
+        thread_exit_fixture();
+    let waits = WaitRegistry::<4>::new();
+    let cpu0 = crate::cpu::CpuIndex::new(0).unwrap();
+    let cpu1 = crate::cpu::CpuIndex::new(1).unwrap();
+    assert_eq!(
+        execution.schedule_next_on(cpu1).unwrap().current,
+        Some(exited)
+    );
+    assert_eq!(
+        execution.schedule_next_on(cpu0).unwrap().current,
+        Some(last)
+    );
+    let deferred = terminal_outcome(
+        thread_exit_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu1,
+            process,
+            exited,
+            0,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    // The exited sibling's handoff has not run yet when ProcessExit begins.
+    let snapshot = inspect_process_exit_threads(&tasks, process).unwrap();
+    assert_eq!(snapshot, [Some(last), None]);
+    assert_eq!(
+        tasks.process_thread_keys(process).unwrap(),
+        [Some(exited), Some(last)]
+    );
+    let prepared = prepare_process_exit(
+        &mut registry,
+        &mut tasks,
+        &execution,
+        &waits,
+        &mut NoTerminalWaitCleanup,
+        process,
+        last,
+        0x2207_0000,
+        &mut cleanup,
+    )
+    .unwrap();
+    assert_eq!(prepared.thread_keys(), snapshot);
+    let last_deferred = terminal_outcome(
+        complete_prepared_process_termination_after_remote_stops_on(
+            &mut registry,
+            &mut tasks,
+            &execution,
+            &waits,
+            &mut NoTerminalWaitCleanup,
+            cpu0,
+            process,
+            last,
+            prepared,
+            core::array::from_fn(|_| None),
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS,
+        SyscallControl::TerminateCurrent,
+    )
+    .unwrap();
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu1,
+        deferred,
+        &mut cleanup,
+    );
+    complete_deferred_current_reclaim_on(
+        &mut registry,
+        &execution,
+        &waits,
+        cpu0,
+        last_deferred,
+        &mut cleanup,
+    );
+    let info = tasks.process_info(process).unwrap();
+    assert_eq!(info.state, deepwyrm_abi::DW_TASK_STATE_EXITED);
+    assert_eq!(info.application_code, 0x2207_0000);
+    assert_eq!(
+        tasks.thread_info(exited).unwrap().reason,
+        deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT
+    );
+    finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}

@@ -1380,6 +1380,38 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     );
 }
 
+/// Text test: the self-Process terminal entries are target-only primordial.rs
+/// code. Each snapshots the live set, never the member list, before
+/// `terminal_stop_plan` (design §11.2.12 rule 1); the agreement itself is the
+/// host model `process_exit_snapshot_after_a_sibling_self_exit_matches_its_pin_batch`.
+#[test]
+fn process_wide_self_entries_snapshot_live_threads() {
+    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
+
+    for entry in [
+        "fn prepare_remote_process_exception(",
+        "fn prepare_remote_process_exit(",
+    ] {
+        let snapshot = runtime
+            .split_once(entry)
+            .unwrap_or_else(|| panic!("live carrier lost {entry}"))
+            .1
+            .split_once("self.terminal_stop_plan(&inspected_threads)")
+            .unwrap_or_else(|| panic!("{entry} lost its terminal stop plan"))
+            .0;
+        assert!(
+            snapshot.contains(
+                "let inspected_threads = crate::syscall::inspect_process_exit_threads(\n            &self.core.tasks,\n            self.own.scheduled().process,\n        )"
+            ),
+            "{entry} does not snapshot the live set"
+        );
+        assert!(
+            !snapshot.contains("process_thread_keys"),
+            "{entry} reads the member list"
+        );
+    }
+}
+
 /// Text test: the terminal handoff is target-only primordial.rs code until the D2 terminal engine.
 #[test]
 fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
