@@ -521,6 +521,10 @@ fn with_bootstrap_local_apic<T>(
 /// Callers must already have proved the IOAPIC route masked and Delivery
 /// Status idle; this helper rejects execution on every non-bootstrap CPU.
 #[cfg(deepwyrm_dw1e_platform)]
+#[deny(
+    dead_code,
+    reason = "`time` allows dead code crate-wide; if this escapes its platform cfg, the synthetic-interrupt selector's check row must fail"
+)]
 pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
     with_bootstrap_local_apic(|controller, registers| {
         let state = controller
@@ -531,6 +535,10 @@ pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
 }
 
 #[cfg(deepwyrm_dw1e_platform)]
+#[deny(
+    dead_code,
+    reason = "`time` allows dead code crate-wide; if this escapes its platform cfg, the synthetic-interrupt selector's check row must fail"
+)]
 pub(crate) fn q35_current_cpu_is_bsp() -> Result<bool, LiveTimeError> {
     Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
 }
