@@ -474,12 +474,14 @@ struct CompletionHost {
     quiescent: Result<(), CompletionFailure>,
     observed_exit: bool,
     verified_quiescence: bool,
+    calls: Vec<&'static str>,
 }
 
 impl PrimordialCompletionBackend for CompletionHost {
     type Error = CompletionFailure;
 
     fn receive_ready(&mut self, output: &mut [u8; 40]) -> Result<usize, Self::Error> {
+        self.calls.push("receive_ready");
         let bytes = self.ready.as_ref().map_err(|error| *error)?;
         let copied = bytes.len().min(output.len());
         output[..copied].copy_from_slice(&bytes[..copied]);
@@ -488,11 +490,13 @@ impl PrimordialCompletionBackend for CompletionHost {
 
     fn observe_exit(&mut self) -> Result<PrimordialExitDisposition, Self::Error> {
         self.observed_exit = true;
+        self.calls.push("observe_exit");
         self.exit
     }
 
     fn verify_quiescent(&mut self) -> Result<(), Self::Error> {
         self.verified_quiescence = true;
+        self.calls.push("verify_quiescent");
         self.quiescent
     }
 }
@@ -504,6 +508,27 @@ fn completion_host(exit: PrimordialExitDisposition) -> CompletionHost {
         quiescent: Ok(()),
         observed_exit: false,
         verified_quiescence: false,
+        calls: Vec::new(),
+    }
+}
+
+/// READY is received, then the exit observed, then quiescence verified, all
+/// before any disposition is judged: a nonzero exit still reaches the
+/// quiescence check, whatever the outcome.
+#[test]
+fn completion_receives_ready_then_observes_exit_then_verifies_quiescence() {
+    for exit in [
+        PrimordialExitDisposition::Normal(0),
+        PrimordialExitDisposition::Normal(7),
+        PrimordialExitDisposition::UnhandledException,
+    ] {
+        let mut host = completion_host(exit);
+        let _ = complete_primordial_launch(&mut host);
+        assert_eq!(
+            host.calls,
+            ["receive_ready", "observe_exit", "verify_quiescent"],
+            "completion call order for {exit:?}"
+        );
     }
 }
 

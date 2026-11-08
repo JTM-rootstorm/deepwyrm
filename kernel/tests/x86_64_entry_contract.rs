@@ -1138,13 +1138,13 @@ fn g3_module_intake_initializes_its_storage_before_forming_a_slice() {
     assert!(!intake.contains("as_mut_ptr()"));
 }
 
+/// Text test: the unmap wrappers and `finish_terminal_teardown` are target-only primordial.rs
+/// code that no host build compiles; the design defers a host-driven terminal engine past S3.
 #[test]
 fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof() {
     let primordial =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
             .expect("read G5 primordial runtime source");
-    let completion = fs::read_to_string(kernel_root().join("src/boot/primordial/construction.rs"))
-        .expect("read primordial completion source");
     let primordial_unmap_start = primordial
         .find("fn unmap_primordial_userspace(")
         .expect("guarded primordial unmap helper");
@@ -1243,14 +1243,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
             && grant_owner < second_drain
             && second_drain < registry_proof
     );
-    let observe = completion
-        .find("let exit = backend.observe_exit();")
-        .unwrap();
-    let drain = completion
-        .find("let quiescent = backend.verify_quiescent();")
-        .unwrap();
-    let disposition = completion.find("match disposition").unwrap();
-    assert!(observe < drain && drain < disposition);
+    // The completion's call order is host-tested in boot/primordial/construction/tests.rs.
 }
 
 #[test]
