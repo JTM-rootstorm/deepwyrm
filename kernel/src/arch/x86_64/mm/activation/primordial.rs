@@ -514,21 +514,8 @@ const TASK_GROUPS: usize = super::wyr1f_fairness_resource_geometry::SELECTED.ide
 const TASK_GROUPS: usize = super::r1_resource_geometry::SELECTED.identities;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
-// Exact live bootstrap peak per Process: four inherited handles, one net
-// ChannelCreate/rights-reduction result, Process+root, and Thread fill eight
-// slots; the two reduced-right duplicates needed before the three-handle INIT
-// move raise the pre-transfer peak to ten.
-const INITIAL_BOOTSTRAP_HANDLES: usize = 4;
-const CHANNEL_CREATE_REDUCE_NET_HANDLES: usize = 1;
-const PROCESS_ROOT_HANDLES: usize = 2;
-const THREAD_HANDLES: usize = 1;
-const INIT_DUPLICATE_HANDLES: usize = 2;
-const INIT_MOVED_HANDLES: usize = 3;
-const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
-    + CHANNEL_CREATE_REDUCE_NET_HANDLES
-    + PROCESS_ROOT_HANDLES
-    + THREAD_HANDLES
-    + INIT_DUPLICATE_HANDLES;
+// The bootstrap handle deltas and peak live in `handle_capacity.rs`.
+use super::handle_capacity::{BOOTSTRAP_HANDLE_PEAK, INIT_MOVED_HANDLES};
 #[cfg(not(any(
     deepwyrm_production_product,
     deepwyrm_i2_stress,
@@ -560,26 +547,9 @@ const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;
 // handles + the ordinary six-handle loader delta produce the exact peak 13.
 #[cfg(deepwyrm_wyr1_evidence)]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 3;
-// Selector 30 receives the ordinary four bootstrap capabilities plus the
-// boot-resource domain.  After the first owner exits, bootstrap retains the
-// trigger's Process and launch Channel while the replacement owner loader
-// holds its net Channel, Process+root, Thread, and resource-domain staging
-// duplicate.  That exact replacement-launch peak is twelve handles.
+// Selector 30's replacement-launch peak: see `handle_capacity::D6_HANDLE_PEAK`.
 #[cfg(deepwyrm_dw1d_evidence)]
-const D6_INITIAL_HANDLES: usize = INITIAL_BOOTSTRAP_HANDLES + 1;
-#[cfg(deepwyrm_dw1d_evidence)]
-const D6_RETAINED_TRIGGER_HANDLES: usize = 2;
-#[cfg(deepwyrm_dw1d_evidence)]
-const D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES: usize = 1;
-#[cfg(deepwyrm_dw1d_evidence)]
-const D6_HANDLE_PEAK: usize = D6_INITIAL_HANDLES
-    + D6_RETAINED_TRIGGER_HANDLES
-    + CHANNEL_CREATE_REDUCE_NET_HANDLES
-    + PROCESS_ROOT_HANDLES
-    + THREAD_HANDLES
-    + D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES;
-#[cfg(deepwyrm_dw1d_evidence)]
-const HANDLES: usize = D6_HANDLE_PEAK;
+const HANDLES: usize = super::handle_capacity::D6_HANDLE_PEAK;
 #[cfg(deepwyrm_dw1b_evidence)]
 const HANDLES: usize = 16;
 #[cfg(deepwyrm_wyr1b_evidence)]

@@ -58,6 +58,10 @@ mod graph;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/primordial.rs"]
 mod primordial;
+// The primordial Process's handle-table geometry `primordial.rs` sizes from.
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+#[path = "activation/handle_capacity.rs"]
+mod handle_capacity;
 // The primordial carrier's move-only root-switch transactions, host-compiled
 // under `test` and generic over `RootSwitchTarget` (S2K-2).
 #[cfg(any(

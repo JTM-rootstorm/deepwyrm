@@ -1283,7 +1283,11 @@ fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
 
     let primordial =
         fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
-            .expect("read I0 primordial runtime source");
+            .expect("read I0 primordial runtime source")
+            + &fs::read_to_string(
+                kernel_root().join("src/arch/x86_64/mm/activation/handle_capacity.rs"),
+            )
+            .expect("read I0 handle-capacity source");
     let normalized_primordial = primordial.split_whitespace().collect::<Vec<_>>().join(" ");
     for required in [
         "const INITIAL_BOOTSTRAP_HANDLES: usize = 4;",
@@ -1299,7 +1303,7 @@ fn i0_live_handle_capacity_covers_both_init_duplicates_before_three_moves() {
         "const D6_INITIAL_HANDLES: usize = INITIAL_BOOTSTRAP_HANDLES + 1;",
         "const D6_RETAINED_TRIGGER_HANDLES: usize = 2;",
         "const D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES: usize = 1;",
-        "const HANDLES: usize = D6_HANDLE_PEAK;",
+        "const HANDLES: usize = super::handle_capacity::D6_HANDLE_PEAK;",
         "const _: [(); 12] = [(); HANDLES];",
         "const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];",
     ] {
