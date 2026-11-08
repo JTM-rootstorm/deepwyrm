@@ -3780,3 +3780,86 @@ fn r4d_deadline_wakes_from_cpu0_do_not_pile_onto_it() {
     );
     assert_eq!(scheduler.check_invariants(), Ok(()));
 }
+
+#[test]
+fn a_forged_wake_key_cannot_wake_a_blocked_thread() {
+    let scheduler = CooperativeScheduler::<2>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let blocked = thread_key(&mut registry);
+    let other = thread_key(&mut registry);
+    let block_cpu = cpu(1);
+    scheduler
+        .commit_on(block_cpu, scheduler.reserve(blocked).unwrap())
+        .unwrap();
+    assert_eq!(
+        scheduler.schedule_next_on(block_cpu).unwrap().current,
+        Some(blocked)
+    );
+    let claim = scheduler.running_claim_on(block_cpu).unwrap();
+    let block = scheduler
+        .prepare_block_current_on(block_cpu, blocked)
+        .unwrap();
+    let key = block.wake_key();
+    scheduler.commit_block_on(block_cpu, block).unwrap();
+    scheduler.complete_switch_on(claim).unwrap();
+    assert_eq!(
+        scheduler.state(blocked),
+        Some(SchedulerThreadState::Blocked)
+    );
+
+    // Each field the wake match compares is forged on its own: the Thread,
+    // the token, the blocking CPU and the execution generation.
+    for forged in [
+        BlockWakeKey {
+            thread: other,
+            ..key
+        },
+        BlockWakeKey {
+            token: key.token + 1,
+            ..key
+        },
+        BlockWakeKey { cpu: cpu(2), ..key },
+        BlockWakeKey {
+            execution_generation: key.execution_generation + 1,
+            ..key
+        },
+    ] {
+        assert_eq!(
+            scheduler.wake(forged),
+            Err(SchedulerError::StaleBlockToken),
+            "forged key {forged:?} woke the blocked Thread"
+        );
+        assert_eq!(
+            scheduler.state(blocked),
+            Some(SchedulerThreadState::Blocked)
+        );
+    }
+    assert_eq!(
+        scheduler.wake(BlockWakeKey {
+            domain: key.domain + 1,
+            ..key
+        }),
+        Err(SchedulerError::ForeignBlockToken)
+    );
+    scheduler.wake(key).unwrap();
+    assert_eq!(
+        scheduler.state(blocked),
+        Some(SchedulerThreadState::Runnable)
+    );
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn per_cpu_scheduler_tables_span_the_canonical_cpu_capacity() {
+    assert_eq!(crate::cpu::CPU_CAPACITY, 4);
+    assert_eq!(H2_SCHEDULER_CPU_CAPACITY, crate::cpu::CPU_CAPACITY);
+    assert!(SchedulerCpuId::new(crate::cpu::CPU_CAPACITY - 1).is_some());
+    assert!(SchedulerCpuId::new(crate::cpu::CPU_CAPACITY).is_none());
+    let scheduler = CooperativeScheduler::<1>::new();
+    let state = scheduler.state.lock();
+    // Type ascriptions: a per-CPU table sized by anything other than the
+    // canonical CPU capacity fails to compile.
+    let _: &[Option<RunningClaim>; crate::cpu::CPU_CAPACITY] = &state.running;
+    let _: &[Option<BlockWakeKey>; crate::cpu::CPU_CAPACITY] = &state.pending_block;
+    let _: &[Option<SuspendedContinuation>; crate::cpu::CPU_CAPACITY] = &state.suspended;
+}

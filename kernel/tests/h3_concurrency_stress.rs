@@ -8,7 +8,6 @@
 //! retain the seed and operation index needed to replay them.
 
 use std::fmt::{self, Display};
-use std::path::PathBuf;
 
 const CPUS: usize = 4;
 const THREAD_SLOTS: usize = 8;
@@ -562,39 +561,6 @@ fn h3c_deterministic_multicpu_lifetime_stress_rejects_stale_generations() {
         total_terminations > 10,
         "the schedule did not exercise terminal cleanup: {total_terminations}"
     );
-}
-
-#[test]
-fn h3c_scheduler_source_keeps_per_cpu_and_generation_contracts() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(root.join("src/task/scheduler.rs"))
-        .expect("read scheduler source for H3-C contract test");
-    let cpu_source = std::fs::read_to_string(root.join("src/cpu.rs"))
-        .expect("read canonical CPU identity source for H3-C contract test");
-
-    assert!(cpu_source.contains("CPU_CAPACITY: usize = 4"));
-
-    for required in [
-        "H2_SCHEDULER_CPU_CAPACITY: usize = crate::cpu::CPU_CAPACITY",
-        "running: [Option<RunningClaim>; H2_SCHEDULER_CPU_CAPACITY]",
-        "pending_block: [Option<BlockWakeKey>; H2_SCHEDULER_CPU_CAPACITY]",
-        "suspended: [Option<SuspendedContinuation>; H2_SCHEDULER_CPU_CAPACITY]",
-        "execution_generation: u64",
-        "fn wake(&self, key: BlockWakeKey)",
-        "SchedulerError::StaleBlockToken",
-        "SchedulerError::StaleExecutionClaim",
-        "fn retire_on(",
-        "fn complete_switch_on(",
-    ] {
-        assert!(
-            source.contains(required),
-            "H3-C scheduler contract omitted {required}"
-        );
-    }
-    assert!(source.contains("entry.thread == key.thread"));
-    assert!(source.contains("entry.token == key.token"));
-    assert!(source.contains("entry.block_cpu == Some(key.cpu)"));
-    assert!(!source.contains("static mut"));
 }
 
 // I2 extends the H3 model with the ownership edges that cannot be exercised
