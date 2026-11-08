@@ -112,7 +112,6 @@ const IPC_HOST_INTEGRATION_TESTS: &[&str] = &[
 ];
 const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
 const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
-const BUILD_TOOLS_CONFIG: &str = "tooling/build-tools.toml";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_SERIAL_BYTES: usize = 4 * 1024 * 1024;
@@ -142,8 +141,6 @@ Commands:
   guest-result <serial-log> --request <path> --exit-status <code>
                                      Classify one DWTEST1 terminal record and QEMU exit
   toolchain                          Report host tool availability
-  toolchain verify-build-tools --root <path> --clang-config <path>
-                                     Verify accepted host Clang/LLVM identities
   build                              Build Deepwyrm [not implemented]
   image                              Construct boot media [not implemented]
   inspect-image                      Inspect boot media [not implemented]
@@ -161,10 +158,6 @@ enum Action {
         exit_status: i32,
     },
     Toolchain,
-    VerifyBuildTools {
-        root: PathBuf,
-        clang_config: PathBuf,
-    },
     NotImplemented(String),
     UsageError(String),
 }
@@ -296,28 +289,6 @@ struct TrustedArtifact {
     sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BuildToolsIdentity {
-    clang_version: String,
-    clang_binary: String,
-    clang_sha256: String,
-    libclang_cpp: String,
-    libclang_cpp_sha256: String,
-    host_llvm: String,
-    host_llvm_sha256: String,
-    clang_config_sha256: String,
-    llvm_nm_binary: String,
-    llvm_nm_sha256: String,
-    llvm_objdump_binary: String,
-    llvm_objdump_sha256: String,
-    llvm_readelf_binary: String,
-    llvm_readelf_sha256: String,
-    system_tar_binary: String,
-    system_tar_sha256: String,
-    system_sha256sum_binary: String,
-    system_sha256sum_sha256: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuestTerminalStatus {
     Pass,
@@ -387,7 +358,6 @@ fn dispatch(action: Action) -> io::Result<u8> {
             exit_status,
         } => parse_guest_result_file(&serial_log, &request_path, exit_status),
         Action::Toolchain => print_toolchain_diagnostics(),
-        Action::VerifyBuildTools { root, clang_config } => verify_build_tools(&root, &clang_config),
         Action::NotImplemented(command) => {
             let mut stderr = io::stderr().lock();
             writeln!(

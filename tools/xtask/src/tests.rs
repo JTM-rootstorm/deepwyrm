@@ -113,20 +113,6 @@ fn available_commands_have_explicit_actions() {
                 Some("arch.entry".into()),
             )),
         ),
-        (
-            &[
-                "toolchain",
-                "verify-build-tools",
-                "--root",
-                "/opt/llvm-22",
-                "--clang-config",
-                "/etc/clang.cfg",
-            ][..],
-            Action::VerifyBuildTools {
-                root: "/opt/llvm-22".into(),
-                clang_config: "/etc/clang.cfg".into(),
-            },
-        ),
     ] {
         assert_eq!(parse(&strings(args)), expected);
     }
@@ -440,15 +426,6 @@ fn dw0g_primordial_selectors_have_stable_runnable_identities() {
         );
         fs::remove_file(request_path).unwrap();
     }
-}
-
-#[test]
-fn build_tools_identity_is_host_neutral_and_fixed() {
-    let identity = load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG)).unwrap();
-    assert_eq!(identity.clang_version, "22.1.8");
-    assert_eq!(identity.clang_binary, "bin/clang-22");
-    assert_eq!(identity.libclang_cpp, "lib64/libclang-cpp.so.22.1");
-    assert_eq!(identity.host_llvm, "lib64/libLLVM.so.22.1");
 }
 
 #[test]
