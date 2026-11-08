@@ -2929,6 +2929,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unmeasured_production_build_admits_the_historical_seventeen_pages() {
+        assert_eq!(resolve_production_bootfs_pages(None), Ok("17".to_owned()));
+        assert_eq!(
+            resolve_production_bootfs_pages(Some("40".to_owned())),
+            Ok("40".to_owned())
+        );
+        for invalid in ["0", "017", "8193", "", "x"] {
+            assert!(
+                resolve_production_bootfs_pages(Some(invalid.to_owned())).is_err(),
+                "{invalid:?} was accepted as a bootfs ceiling"
+            );
+        }
+    }
+
+    #[test]
     fn kernel_assembler_disables_clang_default_configuration_before_target_selection() {
         let layout = Layout::parse(include_str!("arch/x86_64/layout.toml")).unwrap();
         let arguments = assembler_arguments(Path::new("entry.S"), Path::new("entry.o"), layout);

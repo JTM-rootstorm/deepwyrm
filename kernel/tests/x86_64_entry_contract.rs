@@ -1009,6 +1009,9 @@ fn production_entry_dispatches_primordial_runtime_and_keeps_test_hooks_feature_g
     assert!(!kernel.contains("#[cfg(not(feature = \"test-support\"))]\n        loop {"));
 }
 
+/// Text test: the mapping paths and every selector's PRIMORDIAL_BOOTFS_MAX_PAGES arm are
+/// target-only primordial.rs code that no host build compiles, and build.rs's rerun directive
+/// is only an output line of its `main`.
 #[test]
 fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidates() {
     let primordial =
@@ -1056,11 +1059,9 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
         )
     );
     assert!(primordial.contains("env!(\"DEEPWYRM_BOOTFS_MAX_PAGES\")"));
+    // The unmeasured default itself is host-tested on
+    // `resolve_production_bootfs_pages` in build.rs.
     let build = fs::read_to_string(kernel_root().join("build.rs")).expect("kernel build script");
-    assert!(
-        build.contains("const HISTORICAL_WAVE4_PAGES: &str = \"17\";"),
-        "an unmeasured production build must still admit the historical 17 pages"
-    );
     assert!(
         build.contains("cargo:rerun-if-env-changed=DEEPWYRM_BOOTFS_MAX_PAGES"),
         "a changed measurement must rebuild the kernel"
