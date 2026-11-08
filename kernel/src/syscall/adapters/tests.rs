@@ -419,88 +419,57 @@ fn atomic_wake_zero_count_preserves_address_key_output_and_dispatch_order() {
 fn atomic_wake_validation_failures_release_pins_without_wake_or_copyout() {
     use std::cell::RefCell;
 
-    let out_woken = BASE + 0x80;
+    // A zero count is not a shortcut: the address pin, key, output range and
+    // output preflight are validated exactly as for a nonzero count.
+    for count in [0_u32, 1] {
+        let out_woken = BASE + 0x80;
 
-    let mut user = FakeUserMemory::new();
-    user.bytes[FakeUserMemory::offset(out_woken, 4)..FakeUserMemory::offset(out_woken, 4) + 4]
-        .fill(0xa5);
-    let trace = RefCell::new(std::vec::Vec::new());
-    assert_eq!(
-        atomic_wake_with(
-            &mut user,
-            DwUserAddress(BASE + 0x40),
-            1,
-            DwUserAddress(out_woken),
-            |_, _| {
-                trace.borrow_mut().push("pin");
-                Err::<u32, _>(DW_STATUS_BAD_ADDRESS)
-            },
-            |_, _| {
-                trace.borrow_mut().push("key");
-                Ok(0_u32)
-            },
-            |_, _| trace.borrow_mut().push("release"),
-            |_, _| {
-                trace.borrow_mut().push("wake");
-                Ok(1)
-            },
-        ),
-        DW_STATUS_BAD_ADDRESS
-    );
-    assert_eq!(&*trace.borrow(), &["pin"]);
-    assert_eq!(
-        &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
-        &[0xa5; 4]
-    );
-
-    let trace = RefCell::new(std::vec::Vec::new());
-    assert_eq!(
-        atomic_wake_with(
-            &mut user,
-            DwUserAddress(BASE + 0x40),
-            1,
-            DwUserAddress(out_woken),
-            |_, _| {
-                trace.borrow_mut().push("pin");
-                Ok(0x11_u32)
-            },
-            |_, _| {
-                trace.borrow_mut().push("key");
-                Err::<u32, _>(DW_STATUS_BAD_ADDRESS)
-            },
-            |_, pin| {
-                trace.borrow_mut().push("release");
-                assert_eq!(pin, 0x11);
-            },
-            |_, _| {
-                trace.borrow_mut().push("wake");
-                Ok(1)
-            },
-        ),
-        DW_STATUS_BAD_ADDRESS
-    );
-    assert_eq!(&*trace.borrow(), &["pin", "key", "release"]);
-    assert_eq!(
-        &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
-        &[0xa5; 4]
-    );
-
-    for denied_output in [DwUserAddress(out_woken + 1), DwUserAddress(out_woken)] {
-        user.deny_write_at = (denied_output == DwUserAddress(out_woken)).then_some(out_woken);
+        let mut user = FakeUserMemory::new();
+        user.bytes[FakeUserMemory::offset(out_woken, 4)..FakeUserMemory::offset(out_woken, 4) + 4]
+            .fill(0xa5);
         let trace = RefCell::new(std::vec::Vec::new());
         assert_eq!(
             atomic_wake_with(
                 &mut user,
                 DwUserAddress(BASE + 0x40),
-                1,
-                denied_output,
+                count,
+                DwUserAddress(out_woken),
+                |_, _| {
+                    trace.borrow_mut().push("pin");
+                    Err::<u32, _>(DW_STATUS_BAD_ADDRESS)
+                },
+                |_, _| {
+                    trace.borrow_mut().push("key");
+                    Ok(0_u32)
+                },
+                |_, _| trace.borrow_mut().push("release"),
+                |_, _| {
+                    trace.borrow_mut().push("wake");
+                    Ok(1)
+                },
+            ),
+            DW_STATUS_BAD_ADDRESS
+        );
+        assert_eq!(&*trace.borrow(), &["pin"]);
+        assert_eq!(
+            &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
+            &[0xa5; 4]
+        );
+
+        let trace = RefCell::new(std::vec::Vec::new());
+        assert_eq!(
+            atomic_wake_with(
+                &mut user,
+                DwUserAddress(BASE + 0x40),
+                count,
+                DwUserAddress(out_woken),
                 |_, _| {
                     trace.borrow_mut().push("pin");
                     Ok(0x11_u32)
                 },
                 |_, _| {
                     trace.borrow_mut().push("key");
-                    Ok(0x22_u32)
+                    Err::<u32, _>(DW_STATUS_BAD_ADDRESS)
                 },
                 |_, pin| {
                     trace.borrow_mut().push("release");
@@ -518,7 +487,42 @@ fn atomic_wake_validation_failures_release_pins_without_wake_or_copyout() {
             &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
             &[0xa5; 4]
         );
-        assert_eq!(user.owned_outputs, 0);
+
+        for denied_output in [DwUserAddress(out_woken + 1), DwUserAddress(out_woken)] {
+            user.deny_write_at = (denied_output == DwUserAddress(out_woken)).then_some(out_woken);
+            let trace = RefCell::new(std::vec::Vec::new());
+            assert_eq!(
+                atomic_wake_with(
+                    &mut user,
+                    DwUserAddress(BASE + 0x40),
+                    count,
+                    denied_output,
+                    |_, _| {
+                        trace.borrow_mut().push("pin");
+                        Ok(0x11_u32)
+                    },
+                    |_, _| {
+                        trace.borrow_mut().push("key");
+                        Ok(0x22_u32)
+                    },
+                    |_, pin| {
+                        trace.borrow_mut().push("release");
+                        assert_eq!(pin, 0x11);
+                    },
+                    |_, _| {
+                        trace.borrow_mut().push("wake");
+                        Ok(1)
+                    },
+                ),
+                DW_STATUS_BAD_ADDRESS
+            );
+            assert_eq!(&*trace.borrow(), &["pin", "key", "release"]);
+            assert_eq!(
+                &user.bytes[FakeUserMemory::offset(out_woken, 4)..][..4],
+                &[0xa5; 4]
+            );
+            assert_eq!(user.owned_outputs, 0);
+        }
     }
 }
 

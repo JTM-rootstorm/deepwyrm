@@ -2427,36 +2427,25 @@ fn dw1c1_terminal_handoff_executes_every_root_switch_outside_the_runtime_guard()
     // generation against that carrier.
 }
 
+/// Text test: F9's syscall dispatcher is target-only `test_support` code
+/// (`deepwyrm_f9_guest`), so no host test can observe which wake transaction
+/// it calls. The zero-count validation order itself is host-tested on
+/// `atomic_wake_with` in `syscall/adapters/tests.rs`; this pins only that
+/// F9's `handle` delegates to that transaction.
 #[test]
-fn f9_zero_count_wake_still_validates_address_key_and_output_before_dispatch() {
+fn f9_atomic_wake_delegates_to_the_host_tested_transaction() {
     let runtime = source("src/arch/x86_64/mm/activation/test_support/f9.rs");
-    let adapters = source("src/syscall/adapters.rs");
-    let wake = adapters
-        .split_once("pub(crate) fn atomic_wake_with")
-        .expect("generic atomic wake transaction")
+    let handle = runtime
+        .split_once(
+            "    fn handle(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {",
+        )
+        .expect("F9 syscall dispatcher")
         .1
-        .split_once("pub(crate) fn clock_get")
-        .expect("generic atomic wake transaction terminator")
+        .split_once("\n    }\n")
+        .expect("F9 syscall dispatcher terminator")
         .0;
-    let address_pin = wake.find("pin_address(user, address)").unwrap();
-    let key = wake.find("resolve_key(address, &pin)").unwrap();
-    let output_range = wake.find("user_range(").unwrap();
-    let output_pin = wake
-        .find("user.preflight_owned_output(output_range)")
-        .unwrap();
-    let dispatch = wake.find("wake(key, count)").unwrap();
     assert!(
-        address_pin < key
-            && key < output_range
-            && output_range < output_pin
-            && output_pin < dispatch
-    );
-    assert!(
-        !wake[..dispatch].contains("count == 0"),
-        "count zero must not bypass address/key/output validation"
-    );
-    assert!(
-        runtime.contains("crate::syscall::atomic_wake_with("),
+        handle.contains("crate::syscall::atomic_wake_with("),
         "F9 target runtime must use the host-tested atomic wake transaction"
     );
 }
