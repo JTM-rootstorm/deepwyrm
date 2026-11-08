@@ -1247,27 +1247,7 @@ fn g5_terminal_completion_drains_all_primordial_authority_before_capacity_proof(
 }
 
 #[test]
-fn e7_user_contract_uses_generated_syscall_veneer_and_generated_abi_values() {
-    let source = fs::read_to_string(kernel_root().join("tests/userspace/e7_task_smoke.S"))
-        .expect("read E7 userspace source");
-    let veneer = fs::read_to_string(kernel_root().join("../abi/generated/syscall_veneer_x86_64.S"))
-        .expect("read generated syscall veneer");
-    let linker = fs::read_to_string(kernel_root().join("tests/userspace/e7_user.ld"))
-        .expect("read E7 userspace linker script");
-
-    assert!(source.contains("callq dw_syscall6"));
-    assert!(
-        !source
-            .lines()
-            .any(|line| line.trim_start().starts_with("syscall"))
-    );
-    assert!(veneer.contains(".globl dw_syscall6"));
-    assert!(veneer.lines().any(|line| line.trim() == "syscall"));
-    assert!(linker.contains("ENTRY(_start)"));
-    assert!(linker.contains("FLAGS(5)"));
-    assert!(!linker.contains("FLAGS(7)"));
-    assert!(linker.contains("SIZEOF(.text) <= 4096"));
-
+fn e7_user_constants_match_the_generated_abi() {
     assert_eq!(kernel_build::E7_USER_ENTRY, 0x4000_0000);
     assert_eq!(kernel_build::E7_USER_DATA, 0x4000_1000);
     assert_eq!(kernel_build::E7_USER_STACK_BOTTOM, 0x5000_0000);

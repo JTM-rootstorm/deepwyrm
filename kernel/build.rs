@@ -670,7 +670,241 @@ pub(crate) fn build_e7_user_artifact(
     if !status.success() {
         return Err(format!("E7 userspace link failed with {status}"));
     }
+    let linked = fs::read(elf).map_err(|error| format!("{}: {error}", elf.display()))?;
+    verify_e7_user_elf(&linked)
+}
+
+/// Checks the linked E7 userspace ELF, which is parsed, never executed, and
+/// treated as hostile: every read is bounds-checked and every offset sum is
+/// checked, and anything unexpected is an error.
+///
+/// It holds what the E7 contract needs of the linked program: a static
+/// x86_64 executable entered at `_start` = `E7_USER_ENTRY`, one read+execute
+/// (never writable) load segment that fits one base page, and every SYSCALL
+/// instruction encoding (`0f 05`) in that segment inside the generated
+/// `dw_syscall6` veneer, so the user body reaches the kernel only through it.
+/// The byte scan does not decode instructions, so a `0f 05` pair inside
+/// another instruction outside the veneer also fails: closed, not open.
+fn verify_e7_user_elf(elf: &[u8]) -> Result<(), String> {
+    const PT_LOAD: u32 = 1;
+    const PT_GNU_STACK: u32 = 0x6474_e551;
+    const PF_X: u32 = 1;
+    const PF_R: u32 = 4;
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_STRTAB: u32 = 3;
+    const BASE_PAGE: u64 = 4096;
+
+    let image = ElfImage::new(elf, "E7 userspace ELF")?;
+    let header = image.bytes(0, 64)?;
+    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 || header[6] != 1 {
+        return Err("E7 userspace ELF is not a version-1 little-endian ELF64".into());
+    }
+    if image.u16(16)? != 2 || image.u16(18)? != 62 {
+        return Err("E7 userspace ELF is not a static x86_64 executable".into());
+    }
+    let entry = image.u64(24)?;
+    let program_headers = image.u64(32)?;
+    let section_headers = image.u64(40)?;
+    if image.u16(54)? != 56 || image.u16(58)? != 64 {
+        return Err("E7 userspace ELF has unexpected header entry sizes".into());
+    }
+    let program_count = u64::from(image.u16(56)?);
+    let section_count = u64::from(image.u16(60)?);
+
+    let mut load = None;
+    for index in 0..program_count {
+        let at = image.entry(program_headers, index, 56)?;
+        let kind = image.u32(at)?;
+        let flags = image.u32(at + 4)?;
+        match kind {
+            PT_LOAD if load.is_none() => {
+                if flags != PF_R | PF_X {
+                    return Err(format!(
+                        "E7 userspace load segment flags are {flags:#x}, not read+execute"
+                    ));
+                }
+                let offset = image.u64(at + 8)?;
+                let address = image.u64(at + 16)?;
+                let file_size = image.u64(at + 32)?;
+                let memory_size = image.u64(at + 40)?;
+                if file_size != memory_size || memory_size == 0 || memory_size > BASE_PAGE {
+                    return Err(format!(
+                        "E7 userspace load segment is {file_size} file and {memory_size} memory bytes, not 1..={BASE_PAGE} file-backed bytes"
+                    ));
+                }
+                image.bytes(offset, file_size)?;
+                load = Some((offset, address, file_size));
+            }
+            PT_LOAD => return Err("E7 userspace ELF has more than one load segment".into()),
+            PT_GNU_STACK if flags & PF_X == 0 => {}
+            other => {
+                return Err(format!(
+                    "E7 userspace ELF has unexpected program header type {other:#x} flags {flags:#x}"
+                ));
+            }
+        }
+    }
+    let (offset, address, size) =
+        load.ok_or_else(|| "E7 userspace ELF has no load segment".to_owned())?;
+    let end = address
+        .checked_add(size)
+        .ok_or_else(|| "E7 userspace load segment wraps".to_owned())?;
+
+    let mut symbol_table = None;
+    for index in 0..section_count {
+        let at = image.entry(section_headers, index, 64)?;
+        if image.u32(at + 4)? == SHT_SYMTAB {
+            if symbol_table.is_some() {
+                return Err("E7 userspace ELF has more than one symbol table".into());
+            }
+            symbol_table = Some(at);
+        }
+    }
+    let symbol_table =
+        symbol_table.ok_or_else(|| "E7 userspace ELF has no symbol table".to_owned())?;
+    let symbols_offset = image.u64(symbol_table + 24)?;
+    let symbols_size = image.u64(symbol_table + 32)?;
+    if image.u64(symbol_table + 56)? != 24 || symbols_size % 24 != 0 {
+        return Err("E7 userspace symbol table has an unexpected entry size".into());
+    }
+    let strings = image.entry(
+        section_headers,
+        u64::from(image.u32(symbol_table + 40)?),
+        64,
+    )?;
+    if image.u32(strings + 4)? != SHT_STRTAB {
+        return Err("E7 userspace symbol table does not link a string table".into());
+    }
+    let strings = image.bytes(image.u64(strings + 24)?, image.u64(strings + 32)?)?;
+    image.bytes(symbols_offset, symbols_size)?;
+
+    let mut start = None;
+    let mut veneer = None;
+    for index in 0..symbols_size / 24 {
+        let at = image.entry(symbols_offset, index, 24)?;
+        let name_offset = usize::try_from(image.u32(at)?)
+            .map_err(|_| "E7 userspace symbol name offset does not fit".to_owned())?;
+        let name = strings
+            .get(name_offset..)
+            .and_then(|tail| tail.split(|byte| *byte == 0).next())
+            .ok_or_else(|| "E7 userspace symbol name is out of bounds".to_owned())?;
+        let section = image.u16(at + 6)?;
+        let value = image.u64(at + 8)?;
+        let symbol_size = image.u64(at + 16)?;
+        let slot = match name {
+            b"_start" => &mut start,
+            b"dw_syscall6" => &mut veneer,
+            _ => continue,
+        };
+        if slot.is_some() || section == 0 {
+            return Err(format!(
+                "E7 userspace symbol {} is duplicated or undefined",
+                String::from_utf8_lossy(name)
+            ));
+        }
+        *slot = Some((value, symbol_size));
+    }
+    let (start, _) = start.ok_or_else(|| "E7 userspace ELF omits _start".to_owned())?;
+    let (veneer, veneer_size) =
+        veneer.ok_or_else(|| "E7 userspace ELF omits the dw_syscall6 veneer".to_owned())?;
+    if entry != start || entry != E7_USER_ENTRY {
+        return Err(format!(
+            "E7 userspace entry {entry:#x} is not _start {start:#x} at {E7_USER_ENTRY:#x}"
+        ));
+    }
+    let veneer_end = veneer
+        .checked_add(veneer_size)
+        .ok_or_else(|| "E7 userspace veneer wraps".to_owned())?;
+    if veneer_size == 0 || veneer < address || veneer_end > end {
+        return Err("E7 userspace veneer lies outside the load segment".into());
+    }
+
+    let text = image.bytes(offset, size)?;
+    let mut veneer_syscalls = 0_usize;
+    for (index, pair) in text.windows(2).enumerate() {
+        if pair != [0x0f, 0x05] {
+            continue;
+        }
+        let at = u64::try_from(index)
+            .ok()
+            .and_then(|index| address.checked_add(index))
+            .ok_or_else(|| "E7 userspace text address wraps".to_owned())?;
+        if at < veneer
+            || at
+                .checked_add(2)
+                .is_none_or(|pair_end| pair_end > veneer_end)
+        {
+            return Err(format!(
+                "E7 userspace SYSCALL encoding at {at:#x} lies outside the dw_syscall6 veneer"
+            ));
+        }
+        veneer_syscalls += 1;
+    }
+    if veneer_syscalls != 1 {
+        return Err(format!(
+            "E7 userspace veneer holds {veneer_syscalls} SYSCALL encodings, not one"
+        ));
+    }
     Ok(())
+}
+
+/// Bounds-checked little-endian reads over an untrusted ELF image. Field
+/// offsets are added only to an offset `entry` has proven lies inside the
+/// image with the whole entry after it, so those sums cannot overflow.
+struct ElfImage<'a> {
+    bytes: &'a [u8],
+    label: &'static str,
+}
+
+impl<'a> ElfImage<'a> {
+    fn new(bytes: &'a [u8], label: &'static str) -> Result<Self, String> {
+        Ok(Self { bytes, label })
+    }
+
+    fn bytes(&self, offset: u64, length: u64) -> Result<&'a [u8], String> {
+        let start = usize::try_from(offset).ok();
+        let end = offset
+            .checked_add(length)
+            .and_then(|end| usize::try_from(end).ok());
+        match (start, end) {
+            (Some(start), Some(end)) => self.bytes.get(start..end),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            format!(
+                "{} is truncated: {length} bytes at {offset:#x} exceed its {} bytes",
+                self.label,
+                self.bytes.len()
+            )
+        })
+    }
+
+    /// The offset of entry `index` of `size` bytes in a table at `base`.
+    fn entry(&self, base: u64, index: u64, size: u64) -> Result<u64, String> {
+        let at = index
+            .checked_mul(size)
+            .and_then(|delta| base.checked_add(delta))
+            .ok_or_else(|| format!("{} table offset overflows", self.label))?;
+        self.bytes(at, size)?;
+        Ok(at)
+    }
+
+    fn u16(&self, offset: u64) -> Result<u16, String> {
+        let bytes = self.bytes(offset, 2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&self, offset: u64) -> Result<u32, String> {
+        let bytes = self.bytes(offset, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn u64(&self, offset: u64) -> Result<u64, String> {
+        let bytes = self.bytes(offset, 8)?;
+        let mut word = [0_u8; 8];
+        word.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(word))
+    }
 }
 
 #[allow(
@@ -2962,6 +3196,113 @@ mod tests {
             position("--no-default-config") < position(&format!("--target={KERNEL_TARGET}")),
             "Clang default configuration must be disabled before target selection"
         );
+    }
+
+    /// A minimal E7-shaped ELF: one load segment at `E7_USER_ENTRY` holding
+    /// `text`, with `_start` at its start and `dw_syscall6` at
+    /// `veneer_offset` for `veneer_size` bytes.
+    fn e7_elf(text: &[u8], flags: u32, veneer_offset: u64, veneer_size: u64) -> Vec<u8> {
+        let text_offset = 64 + 56;
+        let strings: &[u8] = b"\0_start\0dw_syscall6\0";
+        let strings_offset = text_offset + text.len();
+        let symbols_offset = strings_offset + strings.len();
+        let sections_offset = symbols_offset + 3 * 24;
+        let mut elf = vec![0_u8; sections_offset + 3 * 64];
+        let put = |elf: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            elf[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        put(&mut elf, 0, b"\x7fELF\x02\x01\x01");
+        put(&mut elf, 16, &2_u16.to_le_bytes());
+        put(&mut elf, 18, &62_u16.to_le_bytes());
+        put(&mut elf, 20, &1_u32.to_le_bytes());
+        put(&mut elf, 24, &E7_USER_ENTRY.to_le_bytes());
+        put(&mut elf, 32, &64_u64.to_le_bytes());
+        put(&mut elf, 40, &(sections_offset as u64).to_le_bytes());
+        put(&mut elf, 52, &64_u16.to_le_bytes());
+        put(&mut elf, 54, &56_u16.to_le_bytes());
+        put(&mut elf, 56, &1_u16.to_le_bytes());
+        put(&mut elf, 58, &64_u16.to_le_bytes());
+        put(&mut elf, 60, &3_u16.to_le_bytes());
+        // The load segment.
+        put(&mut elf, 64, &1_u32.to_le_bytes());
+        put(&mut elf, 68, &flags.to_le_bytes());
+        put(&mut elf, 72, &(text_offset as u64).to_le_bytes());
+        put(&mut elf, 80, &E7_USER_ENTRY.to_le_bytes());
+        put(&mut elf, 96, &(text.len() as u64).to_le_bytes());
+        put(&mut elf, 104, &(text.len() as u64).to_le_bytes());
+        put(&mut elf, text_offset, text);
+        put(&mut elf, strings_offset, strings);
+        // Symbols 1 and 2: `_start` and `dw_syscall6`, both defined.
+        for (index, name, value, size) in [
+            (1, 1_u32, E7_USER_ENTRY, 0),
+            (2, 8, E7_USER_ENTRY + veneer_offset, veneer_size),
+        ] {
+            let at = symbols_offset + index * 24;
+            put(&mut elf, at, &name.to_le_bytes());
+            put(&mut elf, at + 6, &1_u16.to_le_bytes());
+            put(&mut elf, at + 8, &value.to_le_bytes());
+            put(&mut elf, at + 16, &size.to_le_bytes());
+        }
+        // Section 1 is the symbol table, linked to section 2's strings.
+        let at = sections_offset + 64;
+        put(&mut elf, at + 4, &2_u32.to_le_bytes());
+        put(&mut elf, at + 24, &(symbols_offset as u64).to_le_bytes());
+        put(&mut elf, at + 32, &(3 * 24_u64).to_le_bytes());
+        put(&mut elf, at + 40, &2_u32.to_le_bytes());
+        put(&mut elf, at + 56, &24_u64.to_le_bytes());
+        let at = sections_offset + 2 * 64;
+        put(&mut elf, at + 4, &3_u32.to_le_bytes());
+        put(&mut elf, at + 24, &(strings_offset as u64).to_le_bytes());
+        put(&mut elf, at + 32, &(strings.len() as u64).to_le_bytes());
+        elf
+    }
+
+    /// `_start` calls the veneer, which owns the only SYSCALL.
+    fn e7_text() -> Vec<u8> {
+        let mut text = vec![0x90; 16];
+        text.extend_from_slice(&[0x48, 0x89, 0xf8, 0x0f, 0x05, 0xc3]);
+        text
+    }
+
+    #[test]
+    fn the_e7_elf_check_accepts_a_veneer_owned_syscall() {
+        assert_eq!(verify_e7_user_elf(&e7_elf(&e7_text(), 5, 16, 6)), Ok(()));
+    }
+
+    #[test]
+    fn the_e7_elf_check_rejects_what_the_contract_forbids() {
+        let mut raw = e7_text();
+        raw[4..6].copy_from_slice(&[0x0f, 0x05]);
+        for (label, elf) in [
+            ("raw SYSCALL in _start", e7_elf(&raw, 5, 16, 6)),
+            ("writable text", e7_elf(&e7_text(), 7, 16, 6)),
+            ("read-only text", e7_elf(&e7_text(), 4, 16, 6)),
+            (
+                "veneer symbol short of its SYSCALL",
+                e7_elf(&e7_text(), 5, 0, 3),
+            ),
+            ("veneer past the segment", e7_elf(&e7_text(), 5, 16, 64)),
+            ("text over one page", e7_elf(&[0x90; 4097], 5, 0, 1)),
+        ] {
+            assert!(verify_e7_user_elf(&elf).is_err(), "{label} was accepted");
+        }
+        let mut moved = e7_elf(&e7_text(), 5, 16, 6);
+        moved[24..32].copy_from_slice(&(E7_USER_ENTRY + 1).to_le_bytes());
+        assert!(
+            verify_e7_user_elf(&moved).is_err(),
+            "moved entry was accepted"
+        );
+    }
+
+    #[test]
+    fn the_e7_elf_check_fails_closed_on_every_truncation() {
+        let elf = e7_elf(&e7_text(), 5, 16, 6);
+        for length in 0..elf.len() {
+            assert!(
+                verify_e7_user_elf(&elf[..length]).is_err(),
+                "a {length}-byte prefix was accepted"
+            );
+        }
     }
 
     #[test]
