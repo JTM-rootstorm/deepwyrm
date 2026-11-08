@@ -88,6 +88,15 @@ mod address_region;
 use address_region::address_region_object_status;
 #[cfg(test)]
 use address_region::address_transaction_status;
+// Every address-region implementation item the facade could duplicate is
+// imported by name, so a second definition here is E0255 rather than a silent
+// shadow: the crate-private entry points through the re-export below, and the
+// private release helper through this binding.
+#[allow(
+    unused_imports,
+    reason = "binds the name so a facade duplicate of the helper cannot compile"
+)]
+use address_region::queue_mapping_releases;
 #[allow(
     unused_imports,
     reason = "preserve the established crate-private adapter facade across the private module extraction"

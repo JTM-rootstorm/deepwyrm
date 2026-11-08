@@ -318,31 +318,6 @@ fn dw1c_token7_channel_flight_is_capacity_only_and_post_authority() {
     assert!(adapters.contains("Some(drained_peer)"));
 }
 
-#[test]
-fn address_region_adapter_source_contract_tracks_the_private_module() {
-    let facade = source("src/syscall/adapters.rs");
-    let address_region = source("src/syscall/adapters/address_region.rs");
-
-    assert!(facade.contains("mod address_region;"));
-    assert!(facade.contains("pub(crate) use address_region::{"));
-    for marker in [
-        "fn queue_mapping_releases",
-        "pub(crate) fn decode_map_args",
-        "pub(crate) fn address_region_map_prepared_model",
-        "pub(crate) fn address_region_unmap_prepared",
-        "pub(crate) fn address_region_protect_prepared",
-    ] {
-        assert!(
-            address_region.contains(marker),
-            "private address-region adapter module is missing {marker}"
-        );
-        assert!(
-            !facade.contains(marker),
-            "address-region implementation marker remains duplicated in the facade: {marker}"
-        );
-    }
-}
-
 /// Text test: the post-acknowledgement carrier continuation is target-only primordial.rs code.
 #[test]
 fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {

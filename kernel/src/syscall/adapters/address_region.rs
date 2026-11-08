@@ -80,7 +80,7 @@ impl<const OBJECTS: usize> Drop for HeldReleases<OBJECTS> {
     }
 }
 
-fn queue_mapping_releases<const OBJECTS: usize>(
+pub(super) fn queue_mapping_releases<const OBJECTS: usize>(
     cleanup: &mut CleanupQueue<OBJECTS>,
     releases: crate::memory::object::MappingFinalReleases<OBJECTS>,
 ) {
