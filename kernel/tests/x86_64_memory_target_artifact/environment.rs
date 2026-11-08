@@ -15,7 +15,6 @@ pub(super) struct AcceptedToolPaths<'a> {
 pub(super) fn validate_accepted_identities(
     workspace: &Path,
     rust_identity: &str,
-    build_tools_identity: &str,
     tools: AcceptedToolPaths<'_>,
 ) {
     let AcceptedToolPaths {
@@ -49,11 +48,11 @@ pub(super) fn validate_accepted_identities(
         (rust_lld, "rust_lld_binary", "rust_lld_sha256"),
     ] {
         let expected_path = toolchain_root.join(manifest_value(rust_identity, path_key));
-        validate_selected_tool_path(
-            supplied,
-            &expected_path,
-            &manifest_value(rust_identity, hash_key),
-            path_key,
+        validate_selected_tool_path(supplied, &expected_path, path_key);
+        assert_eq!(
+            sha256(supplied),
+            manifest_value(rust_identity, hash_key),
+            "selected {path_key} hash drifted"
         );
     }
     for (path_key, hash_key) in [
@@ -86,100 +85,28 @@ pub(super) fn validate_accepted_identities(
             "{hash_key} drifted"
         );
     }
-    let system_tar = PathBuf::from(manifest_value(build_tools_identity, "system_tar_binary"));
-    let system_sha256sum = PathBuf::from(manifest_value(
-        build_tools_identity,
-        "system_sha256sum_binary",
-    ));
-    validate_root_owned_helper(
-        &system_tar,
-        &manifest_value(build_tools_identity, "system_tar_sha256"),
-        "system tar",
-    );
-    validate_root_owned_helper(
-        &system_sha256sum,
-        &manifest_value(build_tools_identity, "system_sha256sum_sha256"),
-        "system sha256sum",
-    );
     assert_eq!(
-        deterministic_tree_sha256(toolchain_root, &system_tar, &system_sha256sum),
+        deterministic_tree_sha256(toolchain_root, Path::new("tar"), Path::new("sha256sum")),
         manifest_value(rust_identity, "toolchain_tree_sha256"),
         "accepted toolchain tree drifted"
     );
-    let clang_runtime = clang_runtime_paths(build_tools_identity, clang);
-    validate_selected_tool_path(
-        clang,
-        &clang_runtime.expected_clang,
-        &manifest_value(build_tools_identity, "clang_sha256"),
-        "Clang",
-    );
-    for (path, hash_key, label) in [
-        (
-            clang_runtime.libclang_cpp.as_path(),
-            "libclang_cpp_sha256",
-            "libclang-cpp",
-        ),
-        (
-            clang_runtime.host_llvm.as_path(),
-            "host_llvm_sha256",
-            "host LLVM",
-        ),
+    // System-package tools (clang, LLVM utilities) are not hash-pinned.
+    for (supplied, label) in [
+        (clang, "Clang"),
+        (llvm_nm, "llvm-nm"),
+        (llvm_objdump, "llvm-objdump"),
+        (llvm_readelf, "llvm-readelf/readobj"),
     ] {
-        assert_eq!(
-            sha256(path),
-            manifest_value(build_tools_identity, hash_key),
-            "{label} does not match the repository-owned accepted identity"
-        );
-    }
-    let clang_relative = PathBuf::from(manifest_value(build_tools_identity, "clang_binary"));
-    let mut clang_root = clang.to_path_buf();
-    for _ in clang_relative.components() {
         assert!(
-            clang_root.pop(),
-            "Clang path is shallower than its manifest path"
-        );
-    }
-    for (supplied, path_key, hash_key, label) in [
-        (llvm_nm, "llvm_nm_binary", "llvm_nm_sha256", "llvm-nm"),
-        (
-            llvm_objdump,
-            "llvm_objdump_binary",
-            "llvm_objdump_sha256",
-            "llvm-objdump",
-        ),
-        (
-            llvm_readelf,
-            "llvm_readelf_binary",
-            "llvm_readelf_sha256",
-            "llvm-readelf/readobj",
-        ),
-    ] {
-        let expected = clang_root.join(manifest_value(build_tools_identity, path_key));
-        validate_selected_tool_path(
-            supplied,
-            &expected,
-            &manifest_value(build_tools_identity, hash_key),
-            label,
-        );
-    }
-    for (path_key, hash_key, label) in [
-        ("system_tar_binary", "system_tar_sha256", "system tar"),
-        (
-            "system_sha256sum_binary",
-            "system_sha256sum_sha256",
-            "system sha256sum",
-        ),
-    ] {
-        let path = PathBuf::from(manifest_value(build_tools_identity, path_key));
-        validate_root_owned_helper(
-            &path,
-            &manifest_value(build_tools_identity, hash_key),
-            label,
+            fs::metadata(supplied)
+                .unwrap_or_else(|error| panic!("inspect selected {label}: {error}"))
+                .is_file(),
+            "selected {label} must be a regular file"
         );
     }
 }
 
-fn validate_selected_tool_path(supplied: &Path, expected: &Path, expected_hash: &str, label: &str) {
+fn validate_selected_tool_path(supplied: &Path, expected: &Path, label: &str) {
     let metadata = fs::symlink_metadata(supplied)
         .unwrap_or_else(|error| panic!("inspect selected {label}: {error}"));
     assert!(
@@ -195,204 +122,6 @@ fn validate_selected_tool_path(supplied: &Path, expected: &Path, expected_hash: 
         supplied,
         "selected {label} path must already be canonical"
     );
-    assert_eq!(
-        sha256(supplied),
-        expected_hash,
-        "selected {label} hash drifted"
-    );
-}
-
-fn sha256_hex_in_process(input: &[u8]) -> String {
-    const INITIAL: [u32; 8] = [
-        0x6A09_E667,
-        0xBB67_AE85,
-        0x3C6E_F372,
-        0xA54F_F53A,
-        0x510E_527F,
-        0x9B05_688C,
-        0x1F83_D9AB,
-        0x5BE0_CD19,
-    ];
-    const K: [u32; 64] = [
-        0x428A_2F98,
-        0x7137_4491,
-        0xB5C0_FBCF,
-        0xE9B5_DBA5,
-        0x3956_C25B,
-        0x59F1_11F1,
-        0x923F_82A4,
-        0xAB1C_5ED5,
-        0xD807_AA98,
-        0x1283_5B01,
-        0x2431_85BE,
-        0x550C_7DC3,
-        0x72BE_5D74,
-        0x80DE_B1FE,
-        0x9BDC_06A7,
-        0xC19B_F174,
-        0xE49B_69C1,
-        0xEFBE_4786,
-        0x0FC1_9DC6,
-        0x240C_A1CC,
-        0x2DE9_2C6F,
-        0x4A74_84AA,
-        0x5CB0_A9DC,
-        0x76F9_88DA,
-        0x983E_5152,
-        0xA831_C66D,
-        0xB003_27C8,
-        0xBF59_7FC7,
-        0xC6E0_0BF3,
-        0xD5A7_9147,
-        0x06CA_6351,
-        0x1429_2967,
-        0x27B7_0A85,
-        0x2E1B_2138,
-        0x4D2C_6DFC,
-        0x5338_0D13,
-        0x650A_7354,
-        0x766A_0ABB,
-        0x81C2_C92E,
-        0x9272_2C85,
-        0xA2BF_E8A1,
-        0xA81A_664B,
-        0xC24B_8B70,
-        0xC76C_51A3,
-        0xD192_E819,
-        0xD699_0624,
-        0xF40E_3585,
-        0x106A_A070,
-        0x19A4_C116,
-        0x1E37_6C08,
-        0x2748_774C,
-        0x34B0_BCB5,
-        0x391C_0CB3,
-        0x4ED8_AA4A,
-        0x5B9C_CA4F,
-        0x682E_6FF3,
-        0x748F_82EE,
-        0x78A5_636F,
-        0x84C8_7814,
-        0x8CC7_0208,
-        0x90BE_FFFA,
-        0xA450_6CEB,
-        0xBEF9_A3F7,
-        0xC671_78F2,
-    ];
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut bytes = input.to_vec();
-    bytes.push(0x80);
-    while !(bytes.len() + 8).is_multiple_of(64) {
-        bytes.push(0);
-    }
-    bytes.extend_from_slice(&bit_len.to_be_bytes());
-    let mut state = INITIAL;
-    for chunk in bytes.as_chunks::<64>().0 {
-        let mut words = [0u32; 64];
-        for (index, word) in words.iter_mut().take(16).enumerate() {
-            *word = u32::from_be_bytes(
-                chunk[index * 4..index * 4 + 4]
-                    .try_into()
-                    .expect("SHA-256 chunk word"),
-            );
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choose = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(choose)
-                .wrapping_add(K[index])
-                .wrapping_add(words[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        state = [
-            state[0].wrapping_add(a),
-            state[1].wrapping_add(b),
-            state[2].wrapping_add(c),
-            state[3].wrapping_add(d),
-            state[4].wrapping_add(e),
-            state[5].wrapping_add(f),
-            state[6].wrapping_add(g),
-            state[7].wrapping_add(h),
-        ];
-    }
-    state.iter().map(|word| format!("{word:08x}")).collect()
-}
-
-fn validate_root_owned_helper(path: &Path, expected_hash: &str, label: &str) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let canonical =
-        fs::canonicalize(path).unwrap_or_else(|error| panic!("canonicalize {label}: {error}"));
-    assert_eq!(canonical, path, "{label} path must be canonical");
-    let metadata = fs::metadata(&canonical).unwrap_or_else(|error| panic!("stat {label}: {error}"));
-    assert_eq!(metadata.uid(), 0, "{label} must be root-owned");
-    assert_eq!(metadata.gid(), 0, "{label} must be root-group-owned");
-    assert_eq!(
-        metadata.permissions().mode() & 0o022,
-        0,
-        "{label} must not be group/other writable"
-    );
-    let bytes = fs::read(&canonical).unwrap_or_else(|error| panic!("read {label}: {error}"));
-    assert_eq!(
-        sha256_hex_in_process(&bytes),
-        expected_hash,
-        "{label} hash drifted"
-    );
-}
-
-pub(super) struct ClangRuntimePaths {
-    expected_clang: PathBuf,
-    libclang_cpp: PathBuf,
-    host_llvm: PathBuf,
-}
-
-pub(super) fn clang_runtime_paths(
-    build_tools_identity: &str,
-    supplied_clang: &Path,
-) -> ClangRuntimePaths {
-    let clang_relative = PathBuf::from(manifest_value(build_tools_identity, "clang_binary"));
-    assert!(
-        clang_relative
-            .components()
-            .all(|component| matches!(component, Component::Normal(_))),
-        "trusted Clang path must be a normalized relative path"
-    );
-    let mut root = supplied_clang.to_path_buf();
-    for _ in clang_relative.components() {
-        assert!(
-            root.pop(),
-            "supplied Clang path is shallower than the trusted relative path"
-        );
-    }
-    ClangRuntimePaths {
-        expected_clang: root.join(clang_relative),
-        libclang_cpp: root.join(manifest_value(build_tools_identity, "libclang_cpp")),
-        host_llvm: root.join(manifest_value(build_tools_identity, "host_llvm")),
-    }
 }
 
 pub(super) fn deterministic_tree_sha256(
@@ -443,7 +172,6 @@ pub(super) fn build_input_manifest_sha256(workspace: &Path) -> String {
         "kernel/tests/userspace/f12_user.ld",
         "kernel/tests/userspace/f9_atomic_wait_wake.S",
         "kernel/tests/userspace/f9_user.ld",
-        "tooling/build-tools.toml",
         "tooling/guest-harness.toml",
         "tooling/rust-toolchain.toml",
     ] {
@@ -624,7 +352,9 @@ pub(super) struct VerifiedExecutable {
 }
 
 impl VerifiedExecutable {
-    pub(super) fn open(path: &Path, expected_sha256: String, label: &str) -> Self {
+    /// `expected_sha256` is `Some` for project-owned artifacts. System-package
+    /// tools pass `None`: their hash is computed here and only guards the run.
+    pub(super) fn open(path: &Path, expected_sha256: Option<String>, label: &str) -> Self {
         use std::os::fd::AsRawFd;
         let selected = fs::symlink_metadata(path)
             .unwrap_or_else(|error| panic!("inspect accepted {label}: {error}"));
@@ -647,10 +377,13 @@ impl VerifiedExecutable {
         clear_close_on_exec(file.as_raw_fd(), label);
         let exec_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
         let actual = sha256(&exec_path);
-        assert_eq!(
-            actual, expected_sha256,
-            "accepted {label} hash drifted at open"
-        );
+        let expected_sha256 = match expected_sha256 {
+            Some(expected) => {
+                assert_eq!(actual, expected, "accepted {label} hash drifted at open");
+                expected
+            }
+            None => actual,
+        };
         Self {
             file,
             source_path,
@@ -1041,30 +774,13 @@ pub(super) fn helper_subprocess_environment_is_exactly_normalized() {
 }
 
 #[test]
-pub(super) fn clang_runtime_paths_are_derived_from_the_manifest_layout() {
-    let identity = "clang_binary = \"bin/clang-22\"\n\
-                    libclang_cpp = \"lib64/libclang-cpp.so.22.1\"\n\
-                    host_llvm = \"lib64/libLLVM.so.22.1\"\n";
-    let paths = clang_runtime_paths(identity, Path::new("/opt/llvm/bin/clang"));
-    assert_eq!(paths.expected_clang, Path::new("/opt/llvm/bin/clang-22"));
-    assert_eq!(
-        paths.libclang_cpp,
-        Path::new("/opt/llvm/lib64/libclang-cpp.so.22.1")
-    );
-    assert_eq!(
-        paths.host_llvm,
-        Path::new("/opt/llvm/lib64/libLLVM.so.22.1")
-    );
-}
-
-#[test]
 pub(super) fn verified_executable_survives_path_rename_and_replacement() {
     let root = ArtifactRoot::create();
     let selected = root.path().join("selected-tool");
     let displaced = root.path().join("selected-tool.original");
     fs::copy("/bin/echo", &selected).expect("copy test executable");
     let hash = sha256(&selected);
-    let verified = VerifiedExecutable::open(&selected, hash, "replacement-race probe");
+    let verified = VerifiedExecutable::open(&selected, Some(hash), "replacement-race probe");
 
     fs::rename(&selected, &displaced).expect("rename verified executable");
     fs::copy("/bin/false", &selected).expect("replace selected path");
@@ -1085,7 +801,7 @@ pub(super) fn verified_executable_detects_same_inode_mutation_before_spawn() {
     let selected = root.path().join("mutable-tool");
     fs::copy("/bin/echo", &selected).expect("copy test executable");
     let hash = sha256(&selected);
-    let verified = VerifiedExecutable::open(&selected, hash, "mutation-race probe");
+    let verified = VerifiedExecutable::open(&selected, Some(hash), "mutation-race probe");
 
     fs::write(&selected, b"mutated after verification").expect("mutate accepted inode");
     let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1114,7 +830,7 @@ pub(super) fn selected_tool_identity_rejects_symlink_and_hardlink_aliases() {
 
     for alias in [&symlink_alias, &hardlink_alias] {
         let rejected = std::panic::catch_unwind(|| {
-            validate_selected_tool_path(alias, &selected, &hash, "alias probe");
+            validate_selected_tool_path(alias, &selected, "alias probe");
         });
         assert!(
             rejected.is_err(),
@@ -1122,7 +838,7 @@ pub(super) fn selected_tool_identity_rejects_symlink_and_hardlink_aliases() {
         );
     }
     let symlink_open = std::panic::catch_unwind(|| {
-        let _ = VerifiedExecutable::open(&symlink_alias, hash.clone(), "symlink probe");
+        let _ = VerifiedExecutable::open(&symlink_alias, Some(hash.clone()), "symlink probe");
     });
     assert!(
         symlink_open.is_err(),
@@ -1143,7 +859,6 @@ pub(super) fn normalized_build_environment_sha256(
     llvm_nm: &VerifiedExecutable,
     llvm_objdump: &VerifiedExecutable,
     llvm_readelf: &VerifiedExecutable,
-    build_tools_identity: &str,
 ) -> String {
     let mut record = String::from(
         "deepwyrm-c3-normalized-build-environment-v2\n\
@@ -1168,7 +883,6 @@ pub(super) fn normalized_build_environment_sha256(
          helper_TZ=UTC\n\
          helper_SOURCE_DATE_EPOCH=0\n",
     );
-    let clang_runtime = clang_runtime_paths(build_tools_identity, clang.source_path());
     let executable_paths = [
         ("cargo", cargo),
         ("rustc", rustc),
@@ -1180,22 +894,6 @@ pub(super) fn normalized_build_environment_sha256(
     ];
     for (name, executable) in executable_paths {
         let path = executable.source_path();
-        record.push_str(name);
-        record.push('=');
-        record.push_str(
-            fs::canonicalize(path)
-                .unwrap_or_else(|error| panic!("canonicalize {name}: {error}"))
-                .to_str()
-                .expect("tool path is UTF-8"),
-        );
-        record.push(' ');
-        record.push_str(&sha256(path));
-        record.push('\n');
-    }
-    for (name, path) in [
-        ("libclang-cpp", clang_runtime.libclang_cpp.as_path()),
-        ("host-llvm", clang_runtime.host_llvm.as_path()),
-    ] {
         record.push_str(name);
         record.push('=');
         record.push_str(

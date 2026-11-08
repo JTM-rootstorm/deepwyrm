@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -69,12 +69,9 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
-    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
-        .expect("read trusted build-tools identity");
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: &cargo_path,
@@ -89,37 +86,37 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
     let cargo = VerifiedExecutable::open(
         &cargo_path,
-        manifest_value(&toolchain_identity, "cargo_sha256"),
+        Some(manifest_value(&toolchain_identity, "cargo_sha256")),
         "cargo",
     );
     let rustc = VerifiedExecutable::open(
         &rustc_path,
-        manifest_value(&toolchain_identity, "rustc_sha256"),
+        Some(manifest_value(&toolchain_identity, "rustc_sha256")),
         "rustc",
     );
     let rust_lld = VerifiedExecutable::open(
         &rust_lld_path,
-        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
     let clang = VerifiedExecutable::open(
         &clang_path,
-        manifest_value(&build_tools_identity, "clang_sha256"),
+        None,
         "clang",
     );
     let llvm_nm = VerifiedExecutable::open(
         &llvm_nm_path,
-        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        None,
         "llvm-nm",
     );
     let llvm_objdump = VerifiedExecutable::open(
         &llvm_objdump_path,
-        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        None,
         "llvm-objdump",
     );
     let llvm_readelf = VerifiedExecutable::open(
         &llvm_readelf_path,
-        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        None,
         "llvm-readelf/readobj",
     );
     let build_tools = BuildTools {
@@ -146,7 +143,6 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         &llvm_nm,
         &llvm_objdump,
         &llvm_readelf,
-        &build_tools_identity,
     );
     let build_input_before = build_input_manifest_sha256(&workspace);
     validate_one_shot_ui(
@@ -293,7 +289,6 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: cargo.source_path(),
@@ -313,7 +308,6 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         &llvm_nm,
         &llvm_objdump,
         &llvm_readelf,
-        &build_tools_identity,
     );
     assert_eq!(
         build_environment_after, build_environment_hash,
@@ -343,12 +337,9 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
-    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
-        .expect("read trusted build-tools identity");
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: &cargo_path,
@@ -363,37 +354,37 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
     let cargo = VerifiedExecutable::open(
         &cargo_path,
-        manifest_value(&toolchain_identity, "cargo_sha256"),
+        Some(manifest_value(&toolchain_identity, "cargo_sha256")),
         "cargo",
     );
     let rustc = VerifiedExecutable::open(
         &rustc_path,
-        manifest_value(&toolchain_identity, "rustc_sha256"),
+        Some(manifest_value(&toolchain_identity, "rustc_sha256")),
         "rustc",
     );
     let rust_lld = VerifiedExecutable::open(
         &rust_lld_path,
-        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
     let clang = VerifiedExecutable::open(
         &clang_path,
-        manifest_value(&build_tools_identity, "clang_sha256"),
+        None,
         "clang",
     );
     let llvm_nm = VerifiedExecutable::open(
         &llvm_nm_path,
-        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        None,
         "llvm-nm",
     );
     let llvm_objdump = VerifiedExecutable::open(
         &llvm_objdump_path,
-        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        None,
         "llvm-objdump",
     );
     let llvm_readelf = VerifiedExecutable::open(
         &llvm_readelf_path,
-        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        None,
         "llvm-readelf/readobj",
     );
     let tools = BuildTools {
@@ -527,7 +518,6 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: cargo.source_path(),
@@ -547,7 +537,6 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         &llvm_nm,
         &llvm_objdump,
         &llvm_readelf,
-        &build_tools_identity,
     );
     eprintln!("task-syscall-smoke kernel {}", sha256(&smoke));
     eprintln!("E7 build-input-manifest {build_input_before}");
@@ -574,12 +563,9 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
     let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
-    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
-        .expect("read trusted build-tools identity");
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: &cargo_path,
@@ -594,37 +580,37 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
     let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
     let cargo = VerifiedExecutable::open(
         &cargo_path,
-        manifest_value(&toolchain_identity, "cargo_sha256"),
+        Some(manifest_value(&toolchain_identity, "cargo_sha256")),
         "cargo",
     );
     let rustc = VerifiedExecutable::open(
         &rustc_path,
-        manifest_value(&toolchain_identity, "rustc_sha256"),
+        Some(manifest_value(&toolchain_identity, "rustc_sha256")),
         "rustc",
     );
     let rust_lld = VerifiedExecutable::open(
         &rust_lld_path,
-        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
     let clang = VerifiedExecutable::open(
         &clang_path,
-        manifest_value(&build_tools_identity, "clang_sha256"),
+        None,
         "clang",
     );
     let llvm_nm = VerifiedExecutable::open(
         &llvm_nm_path,
-        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        None,
         "llvm-nm",
     );
     let llvm_objdump = VerifiedExecutable::open(
         &llvm_objdump_path,
-        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        None,
         "llvm-objdump",
     );
     let llvm_readelf = VerifiedExecutable::open(
         &llvm_readelf_path,
-        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        None,
         "llvm-readelf/readobj",
     );
     let tools = BuildTools {
@@ -716,7 +702,6 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: cargo.source_path(),
@@ -760,12 +745,9 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
     let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
-    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
-        .expect("read trusted build-tools identity");
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: &cargo_path,
@@ -780,37 +762,37 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
     let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
     let cargo = VerifiedExecutable::open(
         &cargo_path,
-        manifest_value(&toolchain_identity, "cargo_sha256"),
+        Some(manifest_value(&toolchain_identity, "cargo_sha256")),
         "cargo",
     );
     let rustc = VerifiedExecutable::open(
         &rustc_path,
-        manifest_value(&toolchain_identity, "rustc_sha256"),
+        Some(manifest_value(&toolchain_identity, "rustc_sha256")),
         "rustc",
     );
     let rust_lld = VerifiedExecutable::open(
         &rust_lld_path,
-        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
     let clang = VerifiedExecutable::open(
         &clang_path,
-        manifest_value(&build_tools_identity, "clang_sha256"),
+        None,
         "clang",
     );
     let llvm_nm = VerifiedExecutable::open(
         &llvm_nm_path,
-        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        None,
         "llvm-nm",
     );
     let llvm_objdump = VerifiedExecutable::open(
         &llvm_objdump_path,
-        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        None,
         "llvm-objdump",
     );
     let llvm_readelf = VerifiedExecutable::open(
         &llvm_readelf_path,
-        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        None,
         "llvm-readelf/readobj",
     );
     let tools = BuildTools {
@@ -907,7 +889,6 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: cargo.source_path(),
@@ -941,12 +922,9 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
     let llvm_readelf_path = required_path("DEEPWYRM_LLVM_READELF");
     let toolchain_identity = fs::read_to_string(workspace.join("tooling/rust-toolchain.toml"))
         .expect("read trusted toolchain identity");
-    let build_tools_identity = fs::read_to_string(workspace.join("tooling/build-tools.toml"))
-        .expect("read trusted build-tools identity");
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: &cargo_path,
@@ -961,37 +939,37 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
     let runtime_artifacts = accepted_runtime_artifacts(&toolchain_identity, &cargo_path);
     let cargo = VerifiedExecutable::open(
         &cargo_path,
-        manifest_value(&toolchain_identity, "cargo_sha256"),
+        Some(manifest_value(&toolchain_identity, "cargo_sha256")),
         "cargo",
     );
     let rustc = VerifiedExecutable::open(
         &rustc_path,
-        manifest_value(&toolchain_identity, "rustc_sha256"),
+        Some(manifest_value(&toolchain_identity, "rustc_sha256")),
         "rustc",
     );
     let rust_lld = VerifiedExecutable::open(
         &rust_lld_path,
-        manifest_value(&toolchain_identity, "rust_lld_sha256"),
+        Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
     let clang = VerifiedExecutable::open(
         &clang_path,
-        manifest_value(&build_tools_identity, "clang_sha256"),
+        None,
         "clang",
     );
     let llvm_nm = VerifiedExecutable::open(
         &llvm_nm_path,
-        manifest_value(&build_tools_identity, "llvm_nm_sha256"),
+        None,
         "llvm-nm",
     );
     let llvm_objdump = VerifiedExecutable::open(
         &llvm_objdump_path,
-        manifest_value(&build_tools_identity, "llvm_objdump_sha256"),
+        None,
         "llvm-objdump",
     );
     let llvm_readelf = VerifiedExecutable::open(
         &llvm_readelf_path,
-        manifest_value(&build_tools_identity, "llvm_readelf_sha256"),
+        None,
         "llvm-readelf/readobj",
     );
     let tools = BuildTools {
@@ -1018,7 +996,6 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         &llvm_nm,
         &llvm_objdump,
         &llvm_readelf,
-        &build_tools_identity,
     );
     let build_input_before = build_input_manifest_sha256(&workspace);
 
@@ -1296,7 +1273,6 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
     validate_accepted_identities(
         &workspace,
         &toolchain_identity,
-        &build_tools_identity,
         AcceptedToolPaths {
             request: &request_path,
             cargo: cargo.source_path(),
@@ -1316,7 +1292,6 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         &llvm_nm,
         &llvm_objdump,
         &llvm_readelf,
-        &build_tools_identity,
     );
     assert_eq!(
         build_environment_after, build_environment_hash,

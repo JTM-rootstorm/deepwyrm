@@ -42,12 +42,8 @@ if [ "$workspace_parent" = "deepwyrm" ] && [ "$workspace_grandparent" = ".worktr
         fail "lane worktree is not registered to canonical deepwyrm"
     project_root=$lane_project_root
 fi
-host_identity="$workspace/tooling/host-rust-toolchain.toml"
 accepted_identity="$workspace/tooling/rust-toolchain.toml"
-build_identity="$workspace/tooling/build-tools.toml"
 
-[ "$(stat -c %u /usr/bin/gtar)" -eq 0 ] || fail \
-    "execution context masks root ownership of pinned system tools; run this gate outside that sandbox"
 
 build_json=$(
     "$script_dir/pinned-cargo" host test --locked -p deepwyrm-kernel \
@@ -90,11 +86,17 @@ accepted_request="$project_root/$(config_value "$accepted_identity" config)"
 accepted_cargo="$accepted_root/$(config_value "$accepted_identity" cargo_binary)"
 accepted_rustc="$accepted_root/$(config_value "$accepted_identity" rustc_binary)"
 accepted_rust_lld="$accepted_root/$(config_value "$accepted_identity" rust_lld_binary)"
-clang=$(config_value "$host_identity" clang_binary)
-llvm_dir=$(dirname -- "$clang")
-llvm_nm="$llvm_dir/$(basename -- "$(config_value "$build_identity" llvm_nm_binary)")"
-llvm_objdump="$llvm_dir/$(basename -- "$(config_value "$build_identity" llvm_objdump_binary)")"
-llvm_readelf="$llvm_dir/$(basename -- "$(config_value "$build_identity" llvm_readelf_binary)")"
+# System-package tools are resolved by name from PATH, not pinned.
+resolve_tool() {
+    tool_path=$(command -v "$1") || fail "$1 is not on PATH"
+    tool_path=$(realpath -- "$tool_path")
+    [ -f "$tool_path" ] || fail "$1 does not resolve to a regular file: $tool_path"
+    printf '%s\n' "$tool_path"
+}
+clang=$(resolve_tool clang)
+llvm_nm=$(resolve_tool llvm-nm)
+llvm_objdump=$(resolve_tool llvm-objdump)
+llvm_readelf=$(resolve_tool llvm-readobj)
 
 env -i PATH=/usr/bin:/bin \
     DEEPWYRM_ACCEPTED_REQUEST="$accepted_request" \

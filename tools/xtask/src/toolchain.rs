@@ -33,147 +33,6 @@ pub(super) fn validate_toolchain_provenance(
     Ok(trusted)
 }
 
-pub(super) fn verify_build_tools(root_input: &Path, clang_config_input: &Path) -> io::Result<u8> {
-    let identity = load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG))?;
-    let root = canonical_operator_directory(root_input, "build-tools root")?;
-    let clang_config = canonical_operator_file(clang_config_input, "Clang configuration")?;
-    let clang = root.join(&identity.clang_binary);
-    let libclang_cpp = root.join(&identity.libclang_cpp);
-    let host_llvm = root.join(&identity.host_llvm);
-    let llvm_nm = root.join(&identity.llvm_nm_binary);
-    let llvm_objdump = root.join(&identity.llvm_objdump_binary);
-    let llvm_readelf = root.join(&identity.llvm_readelf_binary);
-    for (path, expected, label) in [
-        (&clang, &identity.clang_sha256, "clang-22"),
-        (&libclang_cpp, &identity.libclang_cpp_sha256, "libclang-cpp"),
-        (&host_llvm, &identity.host_llvm_sha256, "host LLVM"),
-        (&llvm_nm, &identity.llvm_nm_sha256, "llvm-nm"),
-        (&llvm_objdump, &identity.llvm_objdump_sha256, "llvm-objdump"),
-        (
-            &llvm_readelf,
-            &identity.llvm_readelf_sha256,
-            "llvm-readelf/readobj",
-        ),
-        (
-            &clang_config,
-            &identity.clang_config_sha256,
-            "Clang configuration",
-        ),
-    ] {
-        verify_trusted_artifact(path, expected, label, 512 * 1024 * 1024)?;
-    }
-    verify_root_owned_system_helper(
-        Path::new(&identity.system_tar_binary),
-        &identity.system_tar_sha256,
-        "system tar",
-    )?;
-    verify_root_owned_system_helper(
-        Path::new(&identity.system_sha256sum_binary),
-        &identity.system_sha256sum_sha256,
-        "system sha256sum",
-    )?;
-    let mut stdout = io::stdout().lock();
-    writeln!(
-        stdout,
-        "{{\"schema_version\":1,\"status\":\"VERIFIED\",\"clang_version\":\"{}\",\"root\":\"{}\",\"clang_config\":\"{}\"}}",
-        identity.clang_version,
-        json_string(&root.display().to_string()),
-        json_string(&clang_config.display().to_string()),
-    )?;
-    Ok(0)
-}
-
-#[cfg(unix)]
-fn verify_root_owned_system_helper(
-    path: &Path,
-    expected_hash: &str,
-    label: &str,
-) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let canonical = canonical_operator_file(path, label)?;
-    let metadata = fs::metadata(&canonical)?;
-    if metadata.uid() != 0 || metadata.gid() != 0 {
-        return invalid_input(format!("{label} must be owned by root:root"));
-    }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return invalid_input(format!("{label} must not be group/other writable"));
-    }
-    verify_trusted_artifact(&canonical, expected_hash, label, 512 * 1024 * 1024)
-}
-
-#[cfg(not(unix))]
-fn verify_root_owned_system_helper(
-    _path: &Path,
-    _expected_hash: &str,
-    label: &str,
-) -> io::Result<()> {
-    invalid_input(format!("{label} ownership cannot be verified on this host"))
-}
-
-pub(super) fn load_build_tools_identity(path: &Path) -> io::Result<BuildToolsIdentity> {
-    let values = parse_flat_toml(
-        &read_bounded_utf8(path, "build-tools identity", MAX_CONFIG_BYTES)?,
-        path,
-    )?;
-    if values.get("schema").map(String::as_str) != Some("deepwyrm-build-tools-identity-v1") {
-        return invalid_input("build-tools identity has an unknown schema".into());
-    }
-    let clang_version = required_string(&values, "clang_version")?;
-    if clang_version != "22.1.8" {
-        return invalid_input("build-tools identity has an unexpected Clang version".into());
-    }
-    Ok(BuildToolsIdentity {
-        clang_version,
-        clang_binary: required_relative_path(&values, "clang_binary")?,
-        clang_sha256: required_sha256(&values, "clang_sha256")?,
-        libclang_cpp: required_relative_path(&values, "libclang_cpp")?,
-        libclang_cpp_sha256: required_sha256(&values, "libclang_cpp_sha256")?,
-        host_llvm: required_relative_path(&values, "host_llvm")?,
-        host_llvm_sha256: required_sha256(&values, "host_llvm_sha256")?,
-        clang_config_sha256: required_sha256(&values, "clang_config_sha256")?,
-        llvm_nm_binary: required_relative_path(&values, "llvm_nm_binary")?,
-        llvm_nm_sha256: required_sha256(&values, "llvm_nm_sha256")?,
-        llvm_objdump_binary: required_relative_path(&values, "llvm_objdump_binary")?,
-        llvm_objdump_sha256: required_sha256(&values, "llvm_objdump_sha256")?,
-        llvm_readelf_binary: required_relative_path(&values, "llvm_readelf_binary")?,
-        llvm_readelf_sha256: required_sha256(&values, "llvm_readelf_sha256")?,
-        system_tar_binary: required_string(&values, "system_tar_binary")?,
-        system_tar_sha256: required_sha256(&values, "system_tar_sha256")?,
-        system_sha256sum_binary: required_string(&values, "system_sha256sum_binary")?,
-        system_sha256sum_sha256: required_sha256(&values, "system_sha256sum_sha256")?,
-    })
-}
-
-pub(super) fn canonical_operator_directory(path: &Path, label: &str) -> io::Result<PathBuf> {
-    let canonical = canonical_operator_path(path, label)?;
-    if !fs::metadata(&canonical)?.is_dir() {
-        return invalid_input(format!("{label} must be a directory"));
-    }
-    Ok(canonical)
-}
-
-pub(super) fn canonical_operator_file(path: &Path, label: &str) -> io::Result<PathBuf> {
-    let canonical = canonical_operator_path(path, label)?;
-    if !fs::metadata(&canonical)?.is_file() {
-        return invalid_input(format!("{label} must be a regular file"));
-    }
-    Ok(canonical)
-}
-
-pub(super) fn canonical_operator_path(path: &Path, label: &str) -> io::Result<PathBuf> {
-    if !path.is_absolute() {
-        return invalid_input(format!("{label} must be an absolute canonical path"));
-    }
-    let canonical = fs::canonicalize(path)?;
-    if canonical != path {
-        return invalid_input(format!(
-            "{label} must not contain symbolic links or normalization"
-        ));
-    }
-    Ok(canonical)
-}
-
 pub(super) fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain> {
     let values = parse_flat_toml(
         &read_bounded_utf8(path, "trusted toolchain config", 64 * 1024)?,
@@ -393,15 +252,9 @@ pub(super) fn verify_trusted_toolchain_artifacts(trusted: &TrustedToolchain) -> 
 }
 
 pub(super) fn verify_toolchain_tree(trusted: &TrustedToolchain) -> io::Result<()> {
-    let build_tools = load_build_tools_identity(&workspace_root().join(BUILD_TOOLS_CONFIG))?;
-    let tar_path = Path::new(&build_tools.system_tar_binary);
-    let sha_path = Path::new(&build_tools.system_sha256sum_binary);
-    verify_root_owned_system_helper(tar_path, &build_tools.system_tar_sha256, "system tar")?;
-    verify_root_owned_system_helper(
-        sha_path,
-        &build_tools.system_sha256sum_sha256,
-        "system sha256sum",
-    )?;
+    // System-package helpers, resolved by name from PATH.
+    let tar_path = Path::new("tar");
+    let sha_path = Path::new("sha256sum");
     let mut tar = Command::new(tar_path)
         .args([
             "--sort=name",

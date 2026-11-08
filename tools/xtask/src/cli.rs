@@ -31,29 +31,11 @@ pub(super) fn parse(args: &[String]) -> Action {
         "test" => parse_test(&args[1..]),
         "guest-result" => parse_guest_result(&args[1..]),
         "toolchain" if args.len() == 1 => Action::Toolchain,
-        "toolchain" => parse_toolchain(&args[1..]),
+        "toolchain" => Action::UsageError("`toolchain` accepts no arguments".into()),
         "build" | "image" | "inspect-image" if args.len() == 1 => {
             Action::NotImplemented(command.into())
         }
         _ => Action::UsageError(format!("`{command}` does not accept those arguments")),
-    }
-}
-
-pub(super) fn parse_toolchain(args: &[String]) -> Action {
-    match args {
-        [subcommand, root_flag, root, config_flag, clang_config]
-            if subcommand == "verify-build-tools"
-                && root_flag == "--root"
-                && config_flag == "--clang-config" =>
-        {
-            Action::VerifyBuildTools {
-                root: root.into(),
-                clang_config: clang_config.into(),
-            }
-        }
-        _ => Action::UsageError(
-            "`toolchain verify-build-tools` requires `--root <path> --clang-config <path>`".into(),
-        ),
     }
 }
 
@@ -188,7 +170,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("toolchain") => write!(
             writer,
-            "Usage: cargo xtask toolchain [verify-build-tools --root <path> --clang-config <path>]\n\nThe verifier performs only identity checks; it never builds or executes Clang.\n"
+            "Usage: cargo xtask toolchain\n\nReports host tool availability.\n"
         ),
         Some(command @ ("format" | "check")) => write!(
             writer,
