@@ -1338,12 +1338,18 @@ fn validate_dw1e_e3b_full(value: Option<&str>, selected: bool) -> Result<bool, S
 /// validated exactly as the selector arms validate theirs.
 fn production_bootfs_pages() -> Result<String, String> {
     const NAME: &str = "DEEPWYRM_BOOTFS_MAX_PAGES";
+    resolve_production_bootfs_pages(env::var(NAME).ok())
+}
+
+/// The production ceiling for a `DEEPWYRM_BOOTFS_MAX_PAGES` value, or for its
+/// absence (`None`, which an unreadable value also is).
+fn resolve_production_bootfs_pages(value: Option<String>) -> Result<String, String> {
     // The Wave 4 archive's measured size, retained so a build with no producer
     // behaves exactly as it did before this revision.
     const HISTORICAL_WAVE4_PAGES: &str = "17";
-    match env::var(NAME) {
-        Err(_) => Ok(HISTORICAL_WAVE4_PAGES.to_owned()),
-        Ok(value) => {
+    match value {
+        None => Ok(HISTORICAL_WAVE4_PAGES.to_owned()),
+        Some(value) => {
             validate_production_bootfs_pages(&value)?;
             Ok(value)
         }
