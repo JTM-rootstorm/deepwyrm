@@ -99,26 +99,10 @@ fn production_and_six_memory_selector_artifacts_are_separated() {
         Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
-    let clang = VerifiedExecutable::open(
-        &clang_path,
-        None,
-        "clang",
-    );
-    let llvm_nm = VerifiedExecutable::open(
-        &llvm_nm_path,
-        None,
-        "llvm-nm",
-    );
-    let llvm_objdump = VerifiedExecutable::open(
-        &llvm_objdump_path,
-        None,
-        "llvm-objdump",
-    );
-    let llvm_readelf = VerifiedExecutable::open(
-        &llvm_readelf_path,
-        None,
-        "llvm-readelf/readobj",
-    );
+    let clang = VerifiedExecutable::open(&clang_path, None, "clang");
+    let llvm_nm = VerifiedExecutable::open(&llvm_nm_path, None, "llvm-nm");
+    let llvm_objdump = VerifiedExecutable::open(&llvm_objdump_path, None, "llvm-objdump");
+    let llvm_readelf = VerifiedExecutable::open(&llvm_readelf_path, None, "llvm-readelf/readobj");
     let build_tools = BuildTools {
         cargo: &cargo,
         rustc: &rustc,
@@ -367,26 +351,10 @@ fn e7_task_smoke_artifact_is_freestanding_and_separated() {
         Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
-    let clang = VerifiedExecutable::open(
-        &clang_path,
-        None,
-        "clang",
-    );
-    let llvm_nm = VerifiedExecutable::open(
-        &llvm_nm_path,
-        None,
-        "llvm-nm",
-    );
-    let llvm_objdump = VerifiedExecutable::open(
-        &llvm_objdump_path,
-        None,
-        "llvm-objdump",
-    );
-    let llvm_readelf = VerifiedExecutable::open(
-        &llvm_readelf_path,
-        None,
-        "llvm-readelf/readobj",
-    );
+    let clang = VerifiedExecutable::open(&clang_path, None, "clang");
+    let llvm_nm = VerifiedExecutable::open(&llvm_nm_path, None, "llvm-nm");
+    let llvm_objdump = VerifiedExecutable::open(&llvm_objdump_path, None, "llvm-objdump");
+    let llvm_readelf = VerifiedExecutable::open(&llvm_readelf_path, None, "llvm-readelf/readobj");
     let tools = BuildTools {
         cargo: &cargo,
         rustc: &rustc,
@@ -593,26 +561,10 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
         Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
-    let clang = VerifiedExecutable::open(
-        &clang_path,
-        None,
-        "clang",
-    );
-    let llvm_nm = VerifiedExecutable::open(
-        &llvm_nm_path,
-        None,
-        "llvm-nm",
-    );
-    let llvm_objdump = VerifiedExecutable::open(
-        &llvm_objdump_path,
-        None,
-        "llvm-objdump",
-    );
-    let llvm_readelf = VerifiedExecutable::open(
-        &llvm_readelf_path,
-        None,
-        "llvm-readelf/readobj",
-    );
+    let clang = VerifiedExecutable::open(&clang_path, None, "clang");
+    let llvm_nm = VerifiedExecutable::open(&llvm_nm_path, None, "llvm-nm");
+    let llvm_objdump = VerifiedExecutable::open(&llvm_objdump_path, None, "llvm-objdump");
+    let llvm_readelf = VerifiedExecutable::open(&llvm_readelf_path, None, "llvm-readelf/readobj");
     let tools = BuildTools {
         cargo: &cargo,
         rustc: &rustc,
@@ -775,26 +727,10 @@ fn run_wyr1e_external_interrupt_entry_stack_gate(wyr1e8: bool) {
         Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
-    let clang = VerifiedExecutable::open(
-        &clang_path,
-        None,
-        "clang",
-    );
-    let llvm_nm = VerifiedExecutable::open(
-        &llvm_nm_path,
-        None,
-        "llvm-nm",
-    );
-    let llvm_objdump = VerifiedExecutable::open(
-        &llvm_objdump_path,
-        None,
-        "llvm-objdump",
-    );
-    let llvm_readelf = VerifiedExecutable::open(
-        &llvm_readelf_path,
-        None,
-        "llvm-readelf/readobj",
-    );
+    let clang = VerifiedExecutable::open(&clang_path, None, "clang");
+    let llvm_nm = VerifiedExecutable::open(&llvm_nm_path, None, "llvm-nm");
+    let llvm_objdump = VerifiedExecutable::open(&llvm_objdump_path, None, "llvm-objdump");
+    let llvm_readelf = VerifiedExecutable::open(&llvm_readelf_path, None, "llvm-readelf/readobj");
     let tools = BuildTools {
         cargo: &cargo,
         rustc: &rustc,
@@ -952,26 +888,10 @@ fn implemented_f_and_g5_selector_artifacts_are_freestanding_and_separated() {
         Some(manifest_value(&toolchain_identity, "rust_lld_sha256")),
         "rust-lld",
     );
-    let clang = VerifiedExecutable::open(
-        &clang_path,
-        None,
-        "clang",
-    );
-    let llvm_nm = VerifiedExecutable::open(
-        &llvm_nm_path,
-        None,
-        "llvm-nm",
-    );
-    let llvm_objdump = VerifiedExecutable::open(
-        &llvm_objdump_path,
-        None,
-        "llvm-objdump",
-    );
-    let llvm_readelf = VerifiedExecutable::open(
-        &llvm_readelf_path,
-        None,
-        "llvm-readelf/readobj",
-    );
+    let clang = VerifiedExecutable::open(&clang_path, None, "clang");
+    let llvm_nm = VerifiedExecutable::open(&llvm_nm_path, None, "llvm-nm");
+    let llvm_objdump = VerifiedExecutable::open(&llvm_objdump_path, None, "llvm-objdump");
+    let llvm_readelf = VerifiedExecutable::open(&llvm_readelf_path, None, "llvm-readelf/readobj");
     let tools = BuildTools {
         cargo: &cargo,
         rustc: &rustc,
