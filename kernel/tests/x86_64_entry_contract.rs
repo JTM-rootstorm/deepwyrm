@@ -1407,18 +1407,18 @@ fn kernel_assembler_disables_clang_default_configuration_discovery() {
     let build_script =
         fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build script");
     let assembler = build_script
-        .split_once("pub(crate) fn assemble_source")
-        .expect("assembler helper")
+        .split_once("fn assembler_arguments(")
+        .expect("assembler argument list")
         .1
         .split_once("fn required_env")
-        .expect("assembler helper terminator")
+        .expect("assembler argument list terminator")
         .0;
     assert_eq!(
-        assembler.matches(".arg(\"--no-default-config\")").count(),
+        assembler.matches("\"--no-default-config\".into()").count(),
         1
     );
     assert!(
-        assembler.find(".arg(\"--no-default-config\")")
+        assembler.find("\"--no-default-config\".into()")
             < assembler.find("--target={KERNEL_TARGET}"),
         "Clang default configuration must be disabled before target selection"
     );

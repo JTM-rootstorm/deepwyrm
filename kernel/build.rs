@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1882,29 +1883,7 @@ fn validate_selector(value: &str) -> Result<(), String> {
 pub(crate) fn assemble_source(source: &Path, output: &Path, layout: Layout) -> Result<(), String> {
     let clang = env::var_os("DEEPWYRM_CLANG").unwrap_or_else(|| "clang".into());
     let status = Command::new(&clang)
-        .arg("--no-default-config")
-        .arg(format!("--target={KERNEL_TARGET}"))
-        .args([
-            "-ffreestanding",
-            "-fno-pic",
-            "-fno-stack-protector",
-            "-mno-red-zone",
-            "-mno-mmx",
-            "-mno-sse",
-            "-mno-sse2",
-        ])
-        .arg(format!(
-            "-DDW_KERNEL_BOOT_STACK_SIZE={}",
-            layout.kernel_boot_stack_size
-        ))
-        .arg(format!(
-            "-DDW_KERNEL_BOOT_STACK_ALIGNMENT={}",
-            layout.kernel_boot_stack_alignment
-        ))
-        .args(["-c"])
-        .arg(source)
-        .arg("-o")
-        .arg(output)
+        .args(assembler_arguments(source, output, layout))
         .status()
         .map_err(|error| format!("could not execute {:?}: {error}", clang))?;
     if !status.success() {
@@ -1915,6 +1894,45 @@ pub(crate) fn assemble_source(source: &Path, output: &Path, layout: Layout) -> R
         ));
     }
     Ok(())
+}
+
+/// The kernel assembler's exact Clang argument list, in order.
+fn assembler_arguments(source: &Path, output: &Path, layout: Layout) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = vec![
+        "--no-default-config".into(),
+        format!("--target={KERNEL_TARGET}").into(),
+    ];
+    arguments.extend(
+        [
+            "-ffreestanding",
+            "-fno-pic",
+            "-fno-stack-protector",
+            "-mno-red-zone",
+            "-mno-mmx",
+            "-mno-sse",
+            "-mno-sse2",
+        ]
+        .map(OsString::from),
+    );
+    arguments.push(
+        format!(
+            "-DDW_KERNEL_BOOT_STACK_SIZE={}",
+            layout.kernel_boot_stack_size
+        )
+        .into(),
+    );
+    arguments.push(
+        format!(
+            "-DDW_KERNEL_BOOT_STACK_ALIGNMENT={}",
+            layout.kernel_boot_stack_alignment
+        )
+        .into(),
+    );
+    arguments.push("-c".into());
+    arguments.push(source.into());
+    arguments.push("-o".into());
+    arguments.push(output.into());
+    arguments
 }
 
 fn required_env(name: &str) -> Result<String, String> {
