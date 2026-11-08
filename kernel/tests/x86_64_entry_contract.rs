@@ -1403,28 +1403,6 @@ fn e7_user_contract_uses_generated_syscall_veneer_and_generated_abi_values() {
 }
 
 #[test]
-fn kernel_assembler_disables_clang_default_configuration_discovery() {
-    let build_script =
-        fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build script");
-    let assembler = build_script
-        .split_once("fn assembler_arguments(")
-        .expect("assembler argument list")
-        .1
-        .split_once("fn required_env")
-        .expect("assembler argument list terminator")
-        .0;
-    assert_eq!(
-        assembler.matches("\"--no-default-config\".into()").count(),
-        1
-    );
-    assert!(
-        assembler.find("\"--no-default-config\".into()")
-            < assembler.find("--target={KERNEL_TARGET}"),
-        "Clang default configuration must be disabled before target selection"
-    );
-}
-
-#[test]
 fn linked_entry_and_rust_boundary_match_the_canonical_elf_policy() {
     let clang = host_tools::clang();
     let rustc = host_tools::rustc();

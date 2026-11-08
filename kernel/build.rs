@@ -2923,6 +2923,27 @@ mod tests {
     }
 
     #[test]
+    fn kernel_assembler_disables_clang_default_configuration_before_target_selection() {
+        let layout = Layout::parse(include_str!("arch/x86_64/layout.toml")).unwrap();
+        let arguments = assembler_arguments(Path::new("entry.S"), Path::new("entry.o"), layout);
+        let position = |wanted: &str| {
+            let mut matches = arguments
+                .iter()
+                .enumerate()
+                .filter(|(_, argument)| *argument == wanted);
+            let (index, _) = matches
+                .next()
+                .unwrap_or_else(|| panic!("assembler arguments omit {wanted}"));
+            assert!(matches.next().is_none(), "{wanted} is passed twice");
+            index
+        };
+        assert!(
+            position("--no-default-config") < position(&format!("--target={KERNEL_TARGET}")),
+            "Clang default configuration must be disabled before target selection"
+        );
+    }
+
+    #[test]
     fn f12_assembly_constants_are_derived_from_generated_abi() {
         let constants = f12_assembler_constants(GENERATED_ABI).unwrap();
         for expected in [
