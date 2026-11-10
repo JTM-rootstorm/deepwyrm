@@ -1111,30 +1111,3 @@ impl Drop for TemporaryDirectory {
     }
 }
 
-/// Returns the body of one `build.rs` function by brace matching.
-///
-/// These selector assertions used to match a single literal line, which made
-/// them break whenever a list grew and rustfmt rewrapped it — a formatting
-/// failure dressed up as a contract failure. Scoping the search to the
-/// function keeps the assertion about membership in *that* predicate while
-/// letting the text move.
-fn build_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
-    let start = source
-        .find(signature)
-        .unwrap_or_else(|| panic!("build.rs no longer defines `{signature}`"))
-        + signature.len();
-    let mut depth = 1usize;
-    for (offset, byte) in source[start..].bytes().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &source[start..start + offset];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("build.rs function `{signature}` is unterminated");
-}

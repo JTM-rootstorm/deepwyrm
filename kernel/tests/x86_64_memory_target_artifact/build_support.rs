@@ -20,7 +20,6 @@ pub(super) fn build_kernel(
         "x86_64-unknown-none",
     ]);
     if let Some(selector) = selector {
-        apply_selector_environment(&mut command, selector);
         command
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
             .args(["--features", "test-support"]);
@@ -100,7 +99,6 @@ pub(super) fn build_stack_kernel(
             "x86_64-unknown-none",
         ]);
     if let Some(selector) = selector {
-        apply_selector_environment(&mut command, selector);
         command
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
             .args(["--features", "test-support"]);
