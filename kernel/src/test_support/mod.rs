@@ -10,25 +10,18 @@
     all(deepwyrm_i1_evidence, deepwyrm_wrcap_relay),
     all(deepwyrm_i1_evidence, deepwyrm_wyr1_evidence),
     all(deepwyrm_wrcap_relay, deepwyrm_wyr1_evidence),
-    all(deepwyrm_i1_evidence, deepwyrm_dw1b_evidence),
-    all(deepwyrm_wrcap_relay, deepwyrm_dw1b_evidence),
-    all(deepwyrm_wyr1_evidence, deepwyrm_dw1b_evidence),
-    all(deepwyrm_dw1b_evidence, deepwyrm_dw1c_evidence),
     all(deepwyrm_wyr1b_evidence, deepwyrm_dw1c_evidence),
     all(deepwyrm_i1_evidence, deepwyrm_wyr1b_evidence),
     all(deepwyrm_wrcap_relay, deepwyrm_wyr1b_evidence),
     all(deepwyrm_wyr1_evidence, deepwyrm_wyr1b_evidence),
-    all(deepwyrm_dw1b_evidence, deepwyrm_wyr1b_evidence),
     all(deepwyrm_dw1d_evidence, deepwyrm_i1_evidence),
     all(deepwyrm_dw1d_evidence, deepwyrm_wrcap_relay),
     all(deepwyrm_dw1d_evidence, deepwyrm_wyr1_evidence),
-    all(deepwyrm_dw1d_evidence, deepwyrm_dw1b_evidence),
     all(deepwyrm_dw1d_evidence, deepwyrm_wyr1b_evidence),
     all(deepwyrm_dw1d_evidence, deepwyrm_dw1c_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_i1_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_wrcap_relay),
     all(deepwyrm_wyr1c_evidence, deepwyrm_wyr1_evidence),
-    all(deepwyrm_wyr1c_evidence, deepwyrm_dw1b_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_wyr1b_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_dw1c_evidence),
     all(deepwyrm_wyr1c_evidence, deepwyrm_dw1d_evidence),
@@ -38,7 +31,6 @@
             deepwyrm_i1_evidence,
             deepwyrm_wrcap_relay,
             deepwyrm_wyr1_evidence,
-            deepwyrm_dw1b_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
             deepwyrm_dw1d_evidence,
@@ -52,7 +44,6 @@
             deepwyrm_i1_evidence,
             deepwyrm_wrcap_relay,
             deepwyrm_wyr1_evidence,
-            deepwyrm_dw1b_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
             deepwyrm_dw1d_evidence,
@@ -63,30 +54,11 @@
 compile_error!("selector-specific terminal reporters are selector-exclusive");
 
 #[cfg(all(
-    deepwyrm_r1_evidence,
-    any(
-        deepwyrm_i1_evidence,
-        deepwyrm_wrcap_relay,
-        deepwyrm_wyr1_evidence,
-        deepwyrm_dw1b_evidence,
-        deepwyrm_wyr1b_evidence,
-        deepwyrm_dw1c_evidence,
-        deepwyrm_dw1d_evidence,
-        deepwyrm_wyr1c_evidence,
-        deepwyrm_dw1e_evidence,
-        deepwyrm_wyr1d_evidence,
-        deepwyrm_wyr1e_evidence
-    )
-))]
-compile_error!("selector-specific terminal reporters are selector-exclusive");
-
-#[cfg(all(
     deepwyrm_wyr1e_evidence,
     any(
         deepwyrm_i1_evidence,
         deepwyrm_wrcap_relay,
         deepwyrm_wyr1_evidence,
-        deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
@@ -97,8 +69,6 @@ compile_error!("selector-specific terminal reporters are selector-exclusive");
 ))]
 compile_error!("selector-specific terminal reporters are selector-exclusive");
 
-#[cfg(any(test, deepwyrm_dw1b_evidence))]
-mod dw1b_evidence;
 #[cfg(any(test, deepwyrm_dw1c_evidence))]
 mod dw1c_evidence;
 #[cfg(any(test, deepwyrm_dw1d_evidence))]
@@ -111,9 +81,6 @@ mod identity;
 #[cfg(all(deepwyrm_memory_guest, target_arch = "x86_64", target_os = "none"))]
 mod memory;
 mod protocol;
-/// Reset-card R1 relay for the dynamic-launch saturation probe.
-#[cfg(any(test, deepwyrm_r1_evidence))]
-mod r1_evidence;
 #[cfg(all(deepwyrm_e7_guest, target_arch = "x86_64", target_os = "none"))]
 mod task;
 mod transport;
@@ -154,8 +121,6 @@ pub use transport::{
 )]
 pub(crate) use wrcap::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction, WrcapFlushError};
 
-#[cfg(deepwyrm_dw1b_evidence)]
-pub(crate) use dw1b_evidence::DW1B_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_dw1c_evidence)]
 pub(crate) use dw1c_evidence::DW1C_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_dw1d_evidence)]
@@ -183,16 +148,6 @@ pub(crate) use dw1e_evidence::{
     Dw1eEvidencePartialPermit, Dw1eRawOperation, Dw1eTerminalArbiter, Dw1eTerminalClaim,
     EVENT_C1_RESPONSE,
 };
-#[cfg(deepwyrm_r1_evidence)]
-pub(crate) use r1_evidence::R1_EVIDENCE_RAW_SYSCALL;
-#[cfg(deepwyrm_r1_evidence)]
-pub(crate) use r1_evidence::{
-    R1_EVIDENCE, R1_EVIDENCE_RECORD_LEN, R1EvidenceError, R1EvidenceSubmit,
-};
-// The selector's resource ledger sizes the probe's report against this bound,
-// so export it rather than letting the two carry independent copies of 64.
-#[cfg(any(test, deepwyrm_r1_evidence))]
-pub(crate) use r1_evidence::R1_EVIDENCE_RECORD_CAPACITY;
 #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
 pub(crate) use wyr1_evidence::WYR1_EVIDENCE_RAW_SYSCALL;
 #[cfg(deepwyrm_wyr1b_evidence)]
@@ -218,12 +173,6 @@ pub(crate) use dw1c_evidence::{
     DW1C_ACTOR_COUNT, DW1C_ARM_BYTES, DW1C_ARM_TIMEOUT_SECONDS, DW1C_EVIDENCE, DW1C_PROGRESS_MASK,
     Dw1cActor, Dw1cEvidenceError, Dw1cEvidenceFlushPermit,
     decode_arm_entries as decode_dw1c_arm_entries,
-};
-
-#[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
-pub(crate) use dw1b_evidence::{
-    DW1B_EVIDENCE, Dw1bEvidenceError, Dw1bRawOperation, Dw1bSubjects, arm_thread_states_valid,
-    exact_single_thread,
 };
 
 #[cfg(all(
@@ -294,8 +243,6 @@ pub(crate) use evidence::{
     runtime_missing_mask as i1_runtime_missing_mask,
 };
 
-#[cfg(all(deepwyrm_dw1b_evidence, target_arch = "x86_64", target_os = "none"))]
-pub(crate) use x86_64::complete_dw1b_evidence;
 #[cfg(all(deepwyrm_dw1c_evidence, target_arch = "x86_64", target_os = "none"))]
 pub(crate) use x86_64::complete_dw1c_evidence;
 #[cfg(all(deepwyrm_dw1d_evidence, target_arch = "x86_64", target_os = "none"))]
@@ -307,8 +254,6 @@ pub(crate) use x86_64::complete_dw1d_evidence;
     target_os = "none"
 ))]
 pub(crate) use x86_64::complete_dw1e_evidence;
-#[cfg(all(deepwyrm_r1_evidence, target_arch = "x86_64", target_os = "none"))]
-pub(crate) use x86_64::complete_r1_evidence;
 #[cfg(all(
     any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay),
     target_arch = "x86_64",

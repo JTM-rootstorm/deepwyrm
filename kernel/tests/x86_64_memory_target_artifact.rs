@@ -25,14 +25,12 @@ const G5_PRIMORDIAL_SELECTORS: [&str; 3] = [
     "primordial-user-exception",
     "primordial-invalid-return",
 ];
-const WYR1_PRIMORDIAL_SELECTORS: [&str; 7] = [
+const WYR1_PRIMORDIAL_SELECTORS: [&str; 5] = [
     "permanent-supervisor-rrc",
-    "normal-preemption-up",
     "bootstrap-registry-launch",
     "normal-preemption-smp",
     "device-coordinator-restart",
     "interactive-wyrmsh",
-    "dynamic-launch-saturation",
 ];
 const OWNED_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config.toml";
 const LEGACY_WORKSPACE_CARGO_CONFIG: &str = ".cargo/config";
@@ -635,13 +633,6 @@ fn wyr1_primordial_selector_artifacts_fit_the_linked_boot_stack() {
                 &stack_disassembly,
                 linked_thread_kernel_stack_payload_bytes(&stack_symbols),
                 selector,
-            );
-        }
-        if selector == "dynamic-launch-saturation" {
-            validate_r1_thread_stack_margin(
-                &stack_sizes(&llvm_readelf, &stack_kernel),
-                &stack_disassembly,
-                linked_thread_kernel_stack_payload_bytes(&stack_symbols),
             );
         }
     }

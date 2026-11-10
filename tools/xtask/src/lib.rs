@@ -484,7 +484,7 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
 /// ones. A selector absent from this table is built with no extra environment,
 /// and if it turns out to need some, this gate fails and names it -- which is
 /// the correct outcome, not a gap.
-const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 12] = [
+const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 10] = [
     (
         "smp-runtime-acceptance",
         &[("DEEPWYRM_I1_EVIDENCE_NONCE", "0000000000000001")],
@@ -494,14 +494,6 @@ const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 12] = [
         &[
             ("DEEPWYRM_WYR1_EVIDENCE_NONCE", "0000000000000001"),
             ("DEEPWYRM_WYR1_EVIDENCE_SCENARIO", "normal"),
-        ],
-    ),
-    (
-        "normal-preemption-up",
-        &[
-            ("DEEPWYRM_DW1B_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "0000000000000001"),
-            ("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", "31"),
         ],
     ),
     (
@@ -541,13 +533,6 @@ const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 12] = [
     (
         "q35-com2-interrupt",
         &[("DEEPWYRM_DW1E_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-    (
-        "dynamic-launch-saturation",
-        &[
-            ("DEEPWYRM_R1_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_R1_BOOTFS_MAX_PAGES", "145"),
-        ],
     ),
     // DW1-F/WYR1-F's final closure selector reuses `interactive-wyrmsh`'s WRE1
     // transport, so it takes the same evidence-nonce variable. The E8 variant

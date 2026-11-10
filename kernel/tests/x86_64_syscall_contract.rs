@@ -924,11 +924,6 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         activation
             .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
     );
-    assert!(
-        activation.contains(
-            "#[cfg(deepwyrm_dw1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;"
-        )
-    );
     assert!(activation.contains(
         "#[cfg(deepwyrm_wyr1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
     ));
@@ -3267,7 +3262,7 @@ fn usercopy_under_t_is_confined_to_evidence_builds() {
         .match_indices("paging.evidence_usercopy_under_runtime_authority(")
         .map(|(at, _)| at)
         .collect();
-    assert_eq!(evidence_sites.len(), 8);
+    assert_eq!(evidence_sites.len(), 7);
     for at in evidence_sites {
         let function = primordial[..at]
             .rfind("    fn ")
@@ -3298,7 +3293,6 @@ fn usercopy_under_t_is_confined_to_evidence_builds() {
         "deepwyrm_wyr1c_evidence",
         "deepwyrm_wyr1d_evidence",
         "deepwyrm_wyr1e_evidence",
-        "deepwyrm_r1_evidence",
         "deepwyrm_dw1c_evidence",
     ] {
         assert!(gate.contains(selector), "evidence gate omits {selector}");

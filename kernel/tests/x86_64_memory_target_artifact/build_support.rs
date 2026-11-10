@@ -253,12 +253,6 @@ fn apply_selector_environment(command: &mut Command, selector: &str) {
                 .env("DEEPWYRM_WYR1_EVIDENCE_NONCE", "A025000000000001")
                 .env("DEEPWYRM_WYR1_EVIDENCE_SCENARIO", "normal");
         }
-        "normal-preemption-up" => {
-            command
-                .env("DEEPWYRM_DW1B_EVIDENCE_NONCE", "D1B0A82600000001")
-                .env("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "5E4E054B5C244ACE")
-                .env("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", "31");
-        }
         "bootstrap-registry-launch" => {
             command
                 .env("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789ABCDEF")
@@ -275,15 +269,6 @@ fn apply_selector_environment(command: &mut Command, selector: &str) {
         }
         "interactive-wyrmsh" => {
             command.env("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", "E700000000000001");
-        }
-        "dynamic-launch-saturation" => {
-            // The gate's own page ceiling is deliberately the real product's
-            // measured 145 rather than a round number: the stack oracle reads
-            // the linked artifact, and the mapping journal this bound sizes is
-            // part of what primordial's frame has to hold.
-            command
-                .env("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000000001")
-                .env("DEEPWYRM_R1_BOOTFS_MAX_PAGES", "145");
         }
         _ => {}
     }

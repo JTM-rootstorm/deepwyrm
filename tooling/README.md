@@ -41,10 +41,9 @@ Selector-configured kernel unit tests are the only host use of `test-support`.
 They must name the selector and use an explicit library-only test shape:
 
 ```sh
-DEEPWYRM_GUEST_TEST_SELECTOR=normal-preemption-up \
-DEEPWYRM_DW1B_EVIDENCE_NONCE=D1B0A82600000001 \
-DEEPWYRM_DW1B_CHALLENGE_DIGEST=5E4E054B5C244ACE \
-DEEPWYRM_DW1B_BOOTFS_MAX_PAGES=31 \
+DEEPWYRM_GUEST_TEST_SELECTOR=bootstrap-registry-launch \
+DEEPWYRM_WYR1B_EVIDENCE_NONCE=D1B0A82700000001 \
+DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES=117 \
     tools/pinned-cargo host test --locked -p deepwyrm-kernel \
         --features test-support --lib <test-filter>
 ```

@@ -50,7 +50,6 @@ const READY_BYTES: [u8; 40] = [
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_r1_evidence,
 ))]
 const RESOURCE_READY_BYTES: [u8; 40] = [
     0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -739,7 +738,6 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_r1_evidence,
 ))]
 pub(crate) fn complete_resource_primordial_launch<B: PrimordialCompletionBackend>(
     backend: &mut B,
@@ -760,12 +758,7 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
     // application did instead of erasing it.
     let observation = PrimordialExitObservation::observe(&exit);
 
-    // Selector 34 reports quiescence last. Its permanent-supervisor product
-    // failed run 4 on a quiescence invariant that erased the supervised child's
-    // own terminal status, so for that selector alone the child-observable
-    // facts are reported first and the kernel-side invariant afterwards. Every
-    // other selector keeps the established quiescence-first precedence.
-    #[cfg(not(deepwyrm_r1_evidence))]
+    // Quiescence is reported first, before the child-observable facts.
     quiescent.map_err(|error| PrimordialCompletionError::NotQuiescent(error, observation))?;
     let actual = ready.map_err(|error| PrimordialCompletionError::Receive(error, observation))?;
     if actual != expected_ready.len() || bytes != *expected_ready {
@@ -784,8 +777,6 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
             return Err(PrimordialCompletionError::AuthorizedTermination);
         }
     }
-    #[cfg(deepwyrm_r1_evidence)]
-    quiescent.map_err(|error| PrimordialCompletionError::NotQuiescent(error, observation))?;
     Ok(())
 }
 
@@ -815,7 +806,6 @@ pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBacken
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
     deepwyrm_dw1e_evidence,
-    deepwyrm_r1_evidence,
 ))]
 pub(crate) fn validate_resource_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,

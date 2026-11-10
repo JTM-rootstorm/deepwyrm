@@ -233,14 +233,6 @@ impl crate::arch::x86_64::syscall::UserReturnMappingValidation for FrameRuntime 
 impl NativeSyscallFrameRuntime for FrameRuntime {
     type QuantumExpiry = super::NoQuantumExpiry;
 
-    #[cfg(deepwyrm_dw1b_evidence)]
-    fn intercept_dw1b_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("host frame fixture must not intercept selector-26 evidence")
-    }
-
     #[cfg(deepwyrm_wyr1b_evidence)]
     fn intercept_wyr1b_evidence_raw(
         &mut self,
@@ -373,14 +365,6 @@ impl NativeSyscallHandler for SuspendingRuntime {
 )]
 impl NativeSyscallFrameRuntime for SuspendingRuntime {
     type QuantumExpiry = super::NoQuantumExpiry;
-
-    #[cfg(deepwyrm_dw1b_evidence)]
-    fn intercept_dw1b_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("suspending host fixture must not intercept selector-26 evidence")
-    }
 
     #[cfg(deepwyrm_wyr1b_evidence)]
     fn intercept_wyr1b_evidence_raw(

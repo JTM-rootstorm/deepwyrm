@@ -27,8 +27,6 @@ pub(crate) use f_services::{
 pub(crate) use adapters::atomic_wake_with;
 #[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::copy_dw1c_evidence_input;
-#[cfg(all(deepwyrm_r1_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::copy_r1_evidence_input;
 #[cfg(all(
     any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay),
     target_os = "none",

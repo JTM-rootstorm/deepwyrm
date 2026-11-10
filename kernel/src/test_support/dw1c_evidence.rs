@@ -2429,10 +2429,7 @@ mod tests {
             1
         );
         for completion in source.split("complete_primordial_launch(self);").skip(1) {
-            let hook = completion
-                .split("#[cfg(all(feature = \"test-support\", deepwyrm_dw1b_evidence))]")
-                .next()
-                .unwrap();
+            let hook = completion;
             let normal = hook.find("if completion.is_err()").unwrap();
             let time = hook.find("crate::time::monotonic_now()").unwrap();
             let snapshot = hook.find(".dw1c_final_scheduler_snapshot()").unwrap();

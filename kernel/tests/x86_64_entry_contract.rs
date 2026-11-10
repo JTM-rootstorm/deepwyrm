@@ -236,7 +236,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("smp-runtime-stress", 22),
         ("smp-runtime-acceptance", 23),
         ("native-userspace-capability", 24),
-        ("normal-preemption-up", 26),
         ("bootstrap-registry-launch", 27),
         ("normal-preemption-smp", 28),
         ("device-coordinator-restart", 29),
@@ -268,64 +267,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         kernel_build::select_guest_test(false, None, false, ""),
         Ok(None)
     );
-}
-
-#[test]
-fn selector26_private_evidence_surface_is_isolated_and_terminally_ordered() {
-    let root = kernel_root();
-    let build = fs::read_to_string(root.join("build.rs")).expect("read kernel build");
-    let support =
-        fs::read_to_string(root.join("src/test_support/mod.rs")).expect("read test support");
-    let evidence = fs::read_to_string(root.join("src/test_support/dw1b_evidence.rs"))
-        .expect("read selector-26 evidence");
-    let terminal =
-        fs::read_to_string(root.join("src/test_support/x86_64.rs")).expect("read terminal support");
-    let debug = fs::read_to_string(root.join("src/debug/mod.rs")).expect("read debug support");
-    let primordial = fs::read_to_string(root.join("src/arch/x86_64/mm/activation/primordial.rs"))
-        .expect("read primordial runtime");
-    let syscall =
-        fs::read_to_string(root.join("src/syscall/mod.rs")).expect("read syscall exports");
-    let adapters =
-        fs::read_to_string(root.join("src/syscall/adapters.rs")).expect("read syscall adapters");
-    let public_abi = fs::read_to_string(root.join("../abi/generated/deepwyrm_abi.rs"))
-        .expect("read generated ABI");
-
-    assert!(build.contains("selector == \"normal-preemption-up\""));
-    assert!(build.contains("cargo:rustc-cfg=deepwyrm_dw1b_evidence"));
-    assert!(support.contains("#[cfg(any(test, deepwyrm_dw1b_evidence))]\nmod dw1b_evidence;"));
-    assert!(evidence.contains("pub(crate) const DW1B_EVIDENCE_RAW_SYSCALL: u32 = 0xffff_ff1a;"));
-    assert!(!public_abi.contains("FFFF_FF1A"));
-    assert!(!public_abi.contains("ffff_ff1a"));
-    assert!(debug.contains("deepwyrm_dw1b_evidence"));
-    assert!(debug.contains("fn write_bounded_test_evidence_record"));
-
-    let completion = terminal
-        .find("pub(crate) fn complete_dw1b_evidence")
-        .expect("selector-26 terminal exists");
-    let evidence_write = terminal[completion..]
-        .find("write_evidence(permit.record())")
-        .expect("DWPRE1 evidence write exists");
-    let pass = terminal[completion..]
-        .find("completion_record(CompletionOutcome::Pass, 0)")
-        .expect("selector-26 PASS exists");
-    assert!(evidence_write < pass, "DWPRE1 must precede PASS DWTEST1");
-
-    assert!(
-        primordial
-            .contains("self.core.evidence_init_process != Some(self.own.scheduled().process)")
-    );
-    assert!(primordial.contains("process_target_for_dw1b_evidence"));
-    assert!(primordial.contains("exact_single_thread("));
-    assert!(primordial.contains("Dw1bRawOperation::decode(arguments.as_array())"));
-    assert!(primordial.contains(".progress(self.own.scheduled().process, exchange_count, digest)"));
-    assert!(primordial.contains("g5_probe.accepts_completion(&completion)"));
-    assert!(primordial.contains("complete_dw1b_evidence(permit)"));
-    // D1 commit 7c: the committed-child observer rides the prepared F10
-    // transaction the facade runs; the selector-gated observer export it
-    // replaces, and the dw1b cfg it carried in syscall/mod.rs, are gone.
-    assert!(syscall.contains("process_create_with_root_prepared"));
-    assert!(adapters.contains("pub(crate) fn process_create_with_root_prepared<"));
-    assert!(primordial.contains("committed_child = Some(_child);"));
 }
 
 #[test]
@@ -1083,9 +1024,6 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     );
     assert!(primordial.contains(
         "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 128;"
-    ));
-    assert!(primordial.contains(
-        "#[cfg(deepwyrm_dw1b_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_dw1b_bootfs_pages();"
     ));
     assert!(primordial.contains("const PRIMORDIAL_STACK_MAPPING_PAGES: usize ="));
     assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize ="));

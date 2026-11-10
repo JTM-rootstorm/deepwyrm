@@ -40,7 +40,6 @@ mod address_space;
         target_arch = "x86_64",
         any(
             deepwyrm_wyr1_evidence,
-            deepwyrm_dw1b_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
             deepwyrm_dw1d_evidence,
@@ -81,7 +80,6 @@ mod handle_capacity;
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
             deepwyrm_dw1e_evidence,
-            deepwyrm_r1_evidence,
         )
     )
 ))]
@@ -124,12 +122,6 @@ mod tlb_mailbox;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
-// Not target-gated like the other geometry modules: `LIVE_ADDRESS_SPACE_CAPACITY`
-// below is compiled in every lane, so the ledger must resolve wherever the
-// selector's cfg is set. Matches `test_support`'s own `r1_evidence` gate.
-#[cfg(any(test, deepwyrm_r1_evidence))]
-#[path = "activation/r1_resource_geometry.rs"]
-mod r1_resource_geometry;
 #[cfg(any(test, all(target_os = "none", deepwyrm_wyr1d_evidence)))]
 #[path = "activation/wyr1d_wait_geometry.rs"]
 mod wyr1d_wait_geometry;
@@ -214,14 +206,12 @@ const _: () = {
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
-    deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1e_evidence,
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_r1_evidence,
     deepwyrm_production_product,
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
@@ -230,12 +220,6 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // bindings and Process identities cannot drift apart.
 #[cfg(deepwyrm_production_product)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;
-// Selector 34 keeps four residents, every hog up to the scenario's eight-hog
-// ceiling, and one progress child live together, plus the retiring primordial
-// root. Matched to the selector's lifetime-identity pool so root bindings and
-// Process identities cannot drift apart.
-#[cfg(deepwyrm_r1_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = r1_resource_geometry::SELECTED.identities;
 // Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
 // live together. The controller tears each worker down before starting the
 // next case, so the relay artifact needs exactly one additional binding.
@@ -245,10 +229,6 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
 // the one-shot primordial retirement completes.
 #[cfg(deepwyrm_wyr1_evidence)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
-// Selector 26 keeps primordial, init0, hog, progress, and hello roots live for
-// its one-CPU independent-progress workload.
-#[cfg(deepwyrm_dw1b_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 5;
 // Selector 27 keeps the permanent controller, registry, gate actors, and one
 // launched job generation live in addition to the retiring primordial root.
 #[cfg(deepwyrm_wyr1b_evidence)]
@@ -2259,7 +2239,6 @@ mod live_sessions {
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_r1_evidence,
             deepwyrm_dw1c_evidence,
         ))]
         pub(crate) fn evidence_usercopy_under_runtime_authority(

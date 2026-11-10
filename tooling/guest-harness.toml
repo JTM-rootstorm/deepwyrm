@@ -154,9 +154,11 @@ state = "implemented"
 
 # DW1-B's CPU0-only normal-preemption gate. Its kernel-authored DWPRE1 summary
 # remains test-build-only and precedes the canonical DWTEST1 terminal.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.normal-preemption-up]
 id = 26
-state = "implemented"
+state = "reserved"
 
 # WYR1-B's separate bootstrap-registry and supervisor launch/job gate. It is a
 # distinct product/evidence contract and does not extend selector 25.
@@ -205,9 +207,11 @@ state = "implemented"
 # inherits no interactive-shell, recovery, or output-pressure geometry; the
 # kernel validates bounded R1SP transport and permanent-reporter custody only,
 # and the probe's step meanings stay in Wyrmroot and the host decoder.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.dynamic-launch-saturation]
 id = 34
-state = "implemented"
+state = "reserved"
 
 # The DW1-F/WYR1-F final closure selector, frozen by
 # DW1_WYR1_FINAL_CLOSURE_CONTRACT.md section 4. Id 34 was proposed by the master

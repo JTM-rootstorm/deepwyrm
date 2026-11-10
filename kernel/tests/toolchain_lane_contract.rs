@@ -149,7 +149,7 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
 
     let output = rejected_with_env(
         &["host", "test", "-p", "deepwyrm-kernel", "--lib"],
-        &[("DEEPWYRM_GUEST_TEST_SELECTOR", "normal-preemption-up")],
+        &[("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch")],
     );
     assert_eq!(output.status.code(), Some(2));
     assert!(
@@ -160,7 +160,7 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
     for lane in ["host", "target"] {
         let output = rejected_with_env(
             &[lane, "check", "-p", "deepwyrm-kernel"],
-            &[("DEEPWYRM_GUEST_TEST_ID", "26")],
+            &[("DEEPWYRM_GUEST_TEST_ID", "27")],
         );
         assert_eq!(output.status.code(), Some(2));
         assert!(
@@ -173,10 +173,9 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
 #[test]
 fn host_selector_tests_require_an_explicit_library_only_shape() {
     let selector_environment = [
-        ("DEEPWYRM_GUEST_TEST_SELECTOR", "normal-preemption-up"),
-        ("DEEPWYRM_DW1B_EVIDENCE_NONCE", "D1B0A82600000001"),
-        ("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "5E4E054B5C244ACE"),
-        ("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", "31"),
+        ("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch"),
+        ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "D1B0A82700000001"),
+        ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "31"),
     ];
     for arguments in [
         vec![
@@ -200,57 +199,6 @@ fn host_selector_tests_require_an_explicit_library_only_shape() {
         assert_eq!(output.status.code(), Some(2), "arguments: {arguments:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("host test-support is restricted")
-        );
-    }
-}
-
-#[test]
-fn selector_26_environment_is_validated_before_cargo_admission() {
-    let output = rejected_with_env(
-        &[
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-            "--lib",
-        ],
-        &[
-            ("DEEPWYRM_GUEST_TEST_SELECTOR", "normal-preemption-up"),
-            ("DEEPWYRM_DW1B_EVIDENCE_NONCE", "D1B0A82600000001"),
-            ("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "5E4E054B5C24_4ACE"),
-            ("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", "31"),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "DEEPWYRM_DW1B_CHALLENGE_DIGEST must be exactly 16 uppercase hexadecimal digits"
-    ));
-
-    for invalid_pages in ["01", "8193"] {
-        let output = rejected_with_env(
-            &[
-                "host",
-                "test",
-                "-p",
-                "deepwyrm-kernel",
-                "--features",
-                "test-support",
-                "--lib",
-            ],
-            &[
-                ("DEEPWYRM_GUEST_TEST_SELECTOR", "normal-preemption-up"),
-                ("DEEPWYRM_DW1B_EVIDENCE_NONCE", "D1B0A82600000001"),
-                ("DEEPWYRM_DW1B_CHALLENGE_DIGEST", "5E4E054B5C244ACE"),
-                ("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES", invalid_pages),
-            ],
-        );
-        assert_eq!(output.status.code(), Some(2), "pages={invalid_pages}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("DEEPWYRM_DW1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192"),
-            "pages={invalid_pages}"
         );
     }
 }
@@ -300,83 +248,6 @@ fn selector_27_environment_is_validated_before_cargo_admission() {
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192")
-    );
-}
-
-#[test]
-fn selector_34_environment_is_validated_before_cargo_admission() {
-    // Card R1's mapping journal is sized from this ceiling, so an absent or
-    // malformed page count must be refused before Cargo admission rather than
-    // producing a kernel whose journal is too small for the archive it maps.
-    for (pages, expected) in [
-        (
-            None,
-            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
-        ),
-        (
-            Some("not-pages"),
-            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
-        ),
-        (
-            Some("0"),
-            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
-        ),
-        (
-            Some("0145"),
-            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
-        ),
-        (
-            Some("8193"),
-            "DEEPWYRM_R1_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192",
-        ),
-    ] {
-        let mut environment = vec![
-            ("DEEPWYRM_GUEST_TEST_SELECTOR", "dynamic-launch-saturation"),
-            ("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000000001"),
-        ];
-        if let Some(pages) = pages {
-            environment.push(("DEEPWYRM_R1_BOOTFS_MAX_PAGES", pages));
-        }
-        let output = rejected_with_env(
-            &[
-                "host",
-                "test",
-                "-p",
-                "deepwyrm-kernel",
-                "--features",
-                "test-support",
-                "--lib",
-            ],
-            &environment,
-        );
-        assert_eq!(output.status.code(), Some(2), "pages={pages:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "pages={pages:?}"
-        );
-    }
-
-    // The nonce remains validated alongside it.
-    let output = rejected_with_env(
-        &[
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-            "--lib",
-        ],
-        &[
-            ("DEEPWYRM_GUEST_TEST_SELECTOR", "dynamic-launch-saturation"),
-            ("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000abcdef"),
-            ("DEEPWYRM_R1_BOOTFS_MAX_PAGES", "145"),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("DEEPWYRM_R1_EVIDENCE_NONCE must be exactly 16 uppercase hexadecimal digits")
     );
 }
 

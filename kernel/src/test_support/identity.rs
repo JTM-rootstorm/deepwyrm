@@ -36,7 +36,6 @@ pub(crate) enum BuildGuestTest {
     SmpRuntimeAcceptance,
     NativeUserspaceCapability,
     PermanentSupervisorRrc,
-    NormalPreemptionUp,
     BootstrapRegistryLaunch,
     NormalPreemptionSmp,
     DeviceCoordinatorRestart,
@@ -44,7 +43,6 @@ pub(crate) enum BuildGuestTest {
     Q35Com2Interrupt,
     NativeConsoleStreams,
     InteractiveWyrmsh,
-    DynamicLaunchSaturation,
     /// DW1-F/WYR1-F's final closure selector. It reuses `InteractiveWyrmsh`'s
     /// WRE1 transport and DW1-E platform admission; the kernel's obligation for
     /// both is identical, and the difference is entirely Wyrmroot's.
@@ -113,7 +111,6 @@ impl BuildGuestTest {
             Self::SmpRuntimeAcceptance => 23,
             Self::NativeUserspaceCapability => 24,
             Self::PermanentSupervisorRrc => 25,
-            Self::NormalPreemptionUp => 26,
             Self::BootstrapRegistryLaunch => 27,
             Self::NormalPreemptionSmp => 28,
             Self::DeviceCoordinatorRestart => 29,
@@ -121,7 +118,6 @@ impl BuildGuestTest {
             Self::Q35Com2Interrupt => 31,
             Self::NativeConsoleStreams => 32,
             Self::InteractiveWyrmsh => 33,
-            Self::DynamicLaunchSaturation => 34,
             Self::Dw1Wyr1InteractiveClosure => 35,
         }
     }
@@ -160,7 +156,6 @@ impl BuildGuestTest {
                 | Self::SmpRuntimeAcceptance
                 | Self::NativeUserspaceCapability
                 | Self::PermanentSupervisorRrc
-                | Self::NormalPreemptionUp
                 | Self::BootstrapRegistryLaunch
                 | Self::NormalPreemptionSmp
                 | Self::DeviceCoordinatorRestart
@@ -168,7 +163,6 @@ impl BuildGuestTest {
                 | Self::Q35Com2Interrupt
                 | Self::NativeConsoleStreams
                 | Self::InteractiveWyrmsh
-                | Self::DynamicLaunchSaturation
                 | Self::Dw1Wyr1InteractiveClosure
         )
     }
@@ -279,8 +273,6 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::NativeUserspaceCapability
     } else if string_equals(value, "permanent-supervisor-rrc") {
         BuildGuestTest::PermanentSupervisorRrc
-    } else if string_equals(value, "normal-preemption-up") {
-        BuildGuestTest::NormalPreemptionUp
     } else if string_equals(value, "bootstrap-registry-launch") {
         BuildGuestTest::BootstrapRegistryLaunch
     } else if string_equals(value, "normal-preemption-smp") {
@@ -295,8 +287,6 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::NativeConsoleStreams
     } else if string_equals(value, "interactive-wyrmsh") {
         BuildGuestTest::InteractiveWyrmsh
-    } else if string_equals(value, "dynamic-launch-saturation") {
-        BuildGuestTest::DynamicLaunchSaturation
     } else if string_equals(value, "dw1-wyr1-interactive-closure") {
         BuildGuestTest::Dw1Wyr1InteractiveClosure
     } else {

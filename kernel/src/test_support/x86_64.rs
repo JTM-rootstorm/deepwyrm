@@ -13,7 +13,6 @@ use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
     deepwyrm_i1_evidence,
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
-    deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
@@ -21,14 +20,12 @@ use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_r1_evidence,
 ))]
 use crate::debug::TestSerialTransaction;
 #[cfg(any(
     deepwyrm_i1_evidence,
     deepwyrm_wrcap_relay,
     deepwyrm_wyr1_evidence,
-    deepwyrm_dw1b_evidence,
     deepwyrm_wyr1b_evidence,
     deepwyrm_dw1c_evidence,
     deepwyrm_dw1d_evidence,
@@ -36,7 +33,6 @@ use crate::debug::TestSerialTransaction;
     deepwyrm_wyr1c_evidence,
     deepwyrm_wyr1d_evidence,
     deepwyrm_wyr1e_evidence,
-    deepwyrm_r1_evidence,
 ))]
 use crate::debug::begin_test_serial_transaction;
 use crate::debug::emit_early_raw_record;
@@ -57,8 +53,6 @@ use super::Wyr1cEvidenceFlushError;
 use super::Wyr1dEvidenceFlushError;
 #[cfg(deepwyrm_wyr1e_evidence)]
 use super::Wyr1eEvidenceFlushError;
-#[cfg(deepwyrm_dw1b_evidence)]
-use super::dw1b_evidence::Dw1bEvidenceFlushPermit;
 #[cfg(deepwyrm_i1_evidence)]
 use super::{EvidenceFlushError, I1_EVIDENCE};
 #[cfg(deepwyrm_wrcap_relay)]
@@ -120,10 +114,6 @@ static WYR1D_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 const WYR1E_TERMINAL_SUCCESS: u8 = 1;
 #[cfg(deepwyrm_wyr1e_evidence)]
 static WYR1E_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
-#[cfg(deepwyrm_r1_evidence)]
-const R1_TERMINAL_SUCCESS: u8 = 1;
-#[cfg(deepwyrm_r1_evidence)]
-static R1_TERMINAL_OWNER: AtomicU8 = AtomicU8::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -172,7 +162,6 @@ struct QemuCompletionTransport {
         deepwyrm_i1_evidence,
         deepwyrm_wrcap_relay,
         deepwyrm_wyr1_evidence,
-        deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
@@ -180,7 +169,6 @@ struct QemuCompletionTransport {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_r1_evidence,
     ))]
     transaction: Option<TestSerialTransaction>,
 }
@@ -205,7 +193,6 @@ impl QemuCompletionTransport {
                 deepwyrm_i1_evidence,
                 deepwyrm_wrcap_relay,
                 deepwyrm_wyr1_evidence,
-                deepwyrm_dw1b_evidence,
                 deepwyrm_wyr1b_evidence,
                 deepwyrm_dw1c_evidence,
                 deepwyrm_dw1d_evidence,
@@ -213,7 +200,6 @@ impl QemuCompletionTransport {
                 deepwyrm_wyr1c_evidence,
                 deepwyrm_wyr1d_evidence,
                 deepwyrm_wyr1e_evidence,
-                deepwyrm_r1_evidence,
             ))]
             transaction: None,
         }
@@ -231,7 +217,6 @@ impl CompletionTransport for QemuCompletionTransport {
             deepwyrm_i1_evidence,
             deepwyrm_wrcap_relay,
             deepwyrm_wyr1_evidence,
-            deepwyrm_dw1b_evidence,
             deepwyrm_wyr1b_evidence,
             deepwyrm_dw1c_evidence,
             deepwyrm_dw1d_evidence,
@@ -239,7 +224,6 @@ impl CompletionTransport for QemuCompletionTransport {
             deepwyrm_wyr1c_evidence,
             deepwyrm_wyr1d_evidence,
             deepwyrm_wyr1e_evidence,
-            deepwyrm_r1_evidence,
         ))]
         if let Some(transaction) = self.transaction.as_mut() {
             return transaction
@@ -262,24 +246,6 @@ impl CompletionTransport for QemuCompletionTransport {
     fn halt(&mut self) -> ! {
         halt_after_completion()
     }
-}
-
-/// Flush selector 26's fixed evidence record and append its PASS terminal in
-/// one exclusive serial transaction before issuing debug-exit.
-#[cfg(deepwyrm_dw1b_evidence)]
-pub(crate) fn complete_dw1b_evidence(permit: Dw1bEvidenceFlushPermit) -> ! {
-    let mut transport = unsafe { QemuCompletionTransport::new() };
-    let Ok(mut transaction) = begin_test_serial_transaction() else {
-        halt_after_completion()
-    };
-    if transaction.write_evidence(permit.record()).is_err() {
-        halt_after_completion()
-    }
-    transport.transaction = Some(transaction);
-    complete(
-        &mut transport,
-        completion_record(CompletionOutcome::Pass, 0),
-    )
 }
 
 /// Flush selector-25's preserved transcript and append its PASS terminal in
@@ -569,69 +535,6 @@ pub(crate) fn complete_wyr1e_evidence(
     )
 }
 
-/// Reset-card-R1 terminal certificate. The sole terminal owner flushes the
-/// bounded `R1SP` transcript over the COM1 test transaction and then completes,
-/// which is how the probe's per-step outcomes reach the host: card R1's product
-/// omits the userspace UART driver and consoled, not the kernel's own COM1
-/// diagnostic path.
-#[cfg(deepwyrm_r1_evidence)]
-pub(crate) fn complete_r1_evidence(permit: super::r1_evidence::R1EvidenceFlushPermit<'_>) -> ! {
-    use super::r1_evidence::R1EvidenceFlushError;
-
-    if !claim_r1_terminal(R1_TERMINAL_SUCCESS) {
-        halt_after_completion()
-    }
-    // SAFETY: this function exists only in the centrally selected
-    // `dynamic-launch-saturation` QEMU test image. Its verified handoff profile
-    // supplies `isa-debug-exit`; it is not a production or physical image.
-    let mut transport = unsafe { QemuCompletionTransport::new() };
-    let Ok(transaction) = begin_test_serial_transaction() else {
-        halt_after_completion()
-    };
-    transport.transaction = Some(transaction);
-    // Read the probe's own verdict before the flush consumes the permit. A
-    // transcript that arrives intact proves the transport worked; it says
-    // nothing about whether the scenario succeeded, and those are not the same
-    // certificate. Run 12 emitted `DWTEST1|01|` over a terminal record whose
-    // outcome word was 9, because this path reported transport integrity as a
-    // pass.
-    let Ok(declared_failure) = permit.declared_failure() else {
-        halt_after_completion()
-    };
-    if permit
-        .flush(|record| {
-            transport
-                .transaction
-                .as_mut()
-                .expect("R1SP owns serial transaction")
-                .write_evidence(record)
-                .map_err(|_| R1EvidenceFlushError::Transport)
-        })
-        .is_err()
-    {
-        // An incomplete or refused transcript must not be reported as a pass:
-        // halt without a completion record so the run reads as a timeout rather
-        // than a false certificate.
-        halt_after_completion()
-    }
-    // The transcript is emitted either way: a failing run's records are the
-    // evidence, and withholding them would leave the host with a bare status.
-    let record = match declared_failure {
-        None => completion_record(CompletionOutcome::Pass, 0),
-        Some(ordinal) => {
-            completion_record(CompletionOutcome::Fail, 0x3411_0000 | (ordinal & 0xffff))
-        }
-    };
-    complete(&mut transport, record)
-}
-
-#[cfg(deepwyrm_r1_evidence)]
-fn claim_r1_terminal(owner: u8) -> bool {
-    R1_TERMINAL_OWNER
-        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
 #[cfg(deepwyrm_dw1c_evidence)]
 fn claim_dw1c_terminal(owner: u8) -> bool {
     super::dw1c_evidence::claim_dw1c_terminal_on(&DW1C_TERMINAL_OWNER, owner)
@@ -718,32 +621,6 @@ fn complete_wyr1c_failure_terminal(outcome: CompletionOutcome, detail: u32) -> !
     if !claim_wyr1c_terminal(2) {
         halt_after_completion()
     }
-    let mut transport = unsafe { QemuCompletionTransport::new() };
-    let Ok(transaction) = begin_test_serial_transaction() else {
-        halt_after_completion()
-    };
-    transport.transaction = Some(transaction);
-    complete(&mut transport, completion_record(outcome, detail))
-}
-
-/// Selector 34's kernel-side failure terminal.
-///
-/// Its value is the contention, not the record. `complete_r1_evidence` claims
-/// `R1_TERMINAL_OWNER` with `R1_TERMINAL_SUCCESS` before flushing the `R1SP`
-/// transcript; this claims the same cell as owner 2. Whichever arrives first
-/// emits, and the loser halts without a record, so the guest cannot report both a
-/// generic `DWTEST1` failure and an evidence terminal for one run. Selector 34
-/// previously routed failures through `complete_known_outcome`, which claims
-/// nothing, and so had no structural guard against exactly that.
-#[cfg(deepwyrm_r1_evidence)]
-fn complete_r1_failure_terminal(outcome: CompletionOutcome, detail: u32) -> ! {
-    debug_assert!(outcome != CompletionOutcome::Pass);
-    if !claim_r1_terminal(2) {
-        halt_after_completion()
-    }
-    // SAFETY: this function exists only in the centrally selected
-    // `dynamic-launch-saturation` QEMU test image. Its verified handoff profile
-    // supplies `isa-debug-exit`; it is not a production or physical image.
     let mut transport = unsafe { QemuCompletionTransport::new() };
     let Ok(transaction) = begin_test_serial_transaction() else {
         halt_after_completion()
@@ -919,30 +796,13 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         let _ = detail;
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, 0x2510_ffff)
     }
-    #[cfg(deepwyrm_dw1b_evidence)]
-    {
-        let _ = detail;
-        complete_known_outcome(CompletionOutcome::Fail, 0x2610_ffff)
-    }
     #[cfg(deepwyrm_wyr1b_evidence)]
     {
         let _ = detail;
         complete_wyr1b_evidence_kernel_terminal(CompletionOutcome::Fail, 0x2710_ffff)
     }
-    // Selector 34 must never pass through this path. Its only legitimate pass is
-    // `complete_r1_evidence`, which builds the record directly after flushing a
-    // complete `R1SP` transcript; anything reaching here has produced no evidence,
-    // and a PASS without evidence is a false certificate -- strictly worse for a
-    // diagnostic card than any failure. Every sibling live-supervisor selector is
-    // converted the same way, and selector 34 was simply absent from the list.
-    #[cfg(deepwyrm_r1_evidence)]
-    {
-        let _ = detail;
-        complete_r1_failure_terminal(CompletionOutcome::Fail, 0x3410_ffff)
-    }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
-        deepwyrm_dw1b_evidence,
         deepwyrm_wyr1b_evidence,
         deepwyrm_dw1c_evidence,
         deepwyrm_dw1d_evidence,
@@ -950,7 +810,6 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_r1_evidence,
     )))]
     complete_known_outcome(CompletionOutcome::Pass, detail)
 }
@@ -985,10 +844,6 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Fail, detail)
     }
-    #[cfg(deepwyrm_r1_evidence)]
-    {
-        complete_r1_failure_terminal(CompletionOutcome::Fail, detail)
-    }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1c_evidence,
@@ -997,7 +852,6 @@ pub(crate) fn complete_fail(detail: u32) -> ! {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_r1_evidence,
     )))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]
@@ -1037,10 +891,6 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
     {
         complete_wyr1_evidence_kernel_terminal(CompletionOutcome::Panic, detail)
     }
-    #[cfg(deepwyrm_r1_evidence)]
-    {
-        complete_r1_failure_terminal(CompletionOutcome::Panic, detail)
-    }
     #[cfg(not(any(
         deepwyrm_wyr1_evidence,
         deepwyrm_dw1c_evidence,
@@ -1049,7 +899,6 @@ pub(crate) fn complete_panic(detail: u32) -> ! {
         deepwyrm_wyr1c_evidence,
         deepwyrm_wyr1d_evidence,
         deepwyrm_wyr1e_evidence,
-        deepwyrm_r1_evidence,
     )))]
     {
         #[cfg(deepwyrm_wyr1b_evidence)]

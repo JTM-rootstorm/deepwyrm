@@ -96,9 +96,6 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_I1_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1_EVIDENCE_SCENARIO");
-    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_EVIDENCE_NONCE");
-    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_CHALLENGE_DIGEST");
-    println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1B_BOOTFS_MAX_PAGES");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1B_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_DW1C_EVIDENCE_NONCE");
@@ -113,8 +110,6 @@ fn run() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E7_EVIDENCE_NONCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE");
     println!("cargo:rerun-if-env-changed=DEEPWYRM_WYR1E8_EVIDENCE_NONCE");
-    println!("cargo:rerun-if-env-changed=DEEPWYRM_R1_EVIDENCE_NONCE");
-    println!("cargo:rerun-if-env-changed=DEEPWYRM_R1_BOOTFS_MAX_PAGES");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_c3_one_shot_ui)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_memory_guest)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_e7_guest)");
@@ -124,14 +119,12 @@ fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wrcap_relay)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1_evidence)");
-    println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1b_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_dw1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1c_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1d_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e_evidence)");
-    println!("cargo:rustc-check-cfg=cfg(deepwyrm_r1_evidence)");
     println!("cargo:rustc-check-cfg=cfg(deepwyrm_wyr1e8_evidence)");
     // Selected by the F closure selector, `dw1-wyr1-interactive-closure`,
     // unless E8 evidence is also requested (F3A.7k). Wires
@@ -277,13 +270,6 @@ fn run() -> Result<(), String> {
     if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
         .ok()
         .as_deref()
-        .is_some_and(is_dw1b_evidence_selector)
-    {
-        println!("cargo:rustc-cfg=deepwyrm_dw1b_evidence");
-    }
-    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
-        .ok()
-        .as_deref()
         .is_some_and(is_wyr1b_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wyr1b_evidence");
@@ -329,13 +315,6 @@ fn run() -> Result<(), String> {
         .is_some_and(is_wyr1e_evidence_selector)
     {
         println!("cargo:rustc-cfg=deepwyrm_wyr1e_evidence");
-    }
-    if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
-        .ok()
-        .as_deref()
-        .is_some_and(is_r1_evidence_selector)
-    {
-        println!("cargo:rustc-cfg=deepwyrm_r1_evidence");
     }
 
     if required_env("TARGET")? != KERNEL_TARGET {
@@ -474,10 +453,6 @@ fn is_wyr1_evidence_selector(selector: &str) -> bool {
     selector == "permanent-supervisor-rrc"
 }
 
-fn is_dw1b_evidence_selector(selector: &str) -> bool {
-    selector == "normal-preemption-up"
-}
-
 fn is_wyr1b_evidence_selector(selector: &str) -> bool {
     selector == "bootstrap-registry-launch"
 }
@@ -514,12 +489,6 @@ const WYR1F_CLOSURE_SELECTOR: &str = "dw1-wyr1-interactive-closure";
 /// decoder, exactly as it does for the selector this one follows.
 fn is_wyr1e_evidence_selector(selector: &str) -> bool {
     matches!(selector, "interactive-wyrmsh" | WYR1F_CLOSURE_SELECTOR)
-}
-
-/// Reset card R1's dynamic-launch saturation probe. Deliberately a selector of
-/// its own: it must not inherit any interactive-shell or recovery geometry.
-fn is_r1_evidence_selector(selector: &str) -> bool {
-    selector == "dynamic-launch-saturation"
 }
 
 /// Selectors that supply their own synthetic interrupt platform.
@@ -1376,14 +1345,6 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
             println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_NONCE={nonce}");
             println!("cargo:rustc-env=DEEPWYRM_WYR1_EVIDENCE_SCENARIO={scenario}");
         }
-        if is_dw1b_evidence_selector(&selector) {
-            let nonce = required_dw1b_hex("DEEPWYRM_DW1B_EVIDENCE_NONCE")?;
-            let digest = required_dw1b_hex("DEEPWYRM_DW1B_CHALLENGE_DIGEST")?;
-            let bootfs_pages = required_dw1b_bootfs_pages()?;
-            println!("cargo:rustc-env=DEEPWYRM_DW1B_EVIDENCE_NONCE={nonce}");
-            println!("cargo:rustc-env=DEEPWYRM_DW1B_CHALLENGE_DIGEST={digest}");
-            println!("cargo:rustc-env=DEEPWYRM_DW1B_BOOTFS_MAX_PAGES={bootfs_pages}");
-        }
         if is_wyr1b_evidence_selector(&selector) {
             let nonce = required_wyr1b_hex("DEEPWYRM_WYR1B_EVIDENCE_NONCE")?;
             let bootfs_pages = required_wyr1b_bootfs_pages()?;
@@ -1415,12 +1376,6 @@ fn configure_guest_test(harness_path: &Path) -> Result<(), String> {
         if is_wyr1d_evidence_selector(&selector) {
             let nonce = required_wyr1d_hex("DEEPWYRM_WYR1D_EVIDENCE_NONCE")?;
             println!("cargo:rustc-env=DEEPWYRM_WYR1D_EVIDENCE_NONCE={nonce}");
-        }
-        if is_r1_evidence_selector(&selector) {
-            let nonce = required_r1_hex("DEEPWYRM_R1_EVIDENCE_NONCE")?;
-            let bootfs_pages = required_r1_bootfs_pages()?;
-            println!("cargo:rustc-env=DEEPWYRM_R1_EVIDENCE_NONCE={nonce}");
-            println!("cargo:rustc-env=DEEPWYRM_R1_BOOTFS_MAX_PAGES={bootfs_pages}");
         }
         if is_wyr1e_evidence_selector(&selector) {
             if wyr1e8 {
@@ -1496,12 +1451,6 @@ fn validate_wyr1e8_evidence(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
-fn required_dw1b_hex(name: &str) -> Result<String, String> {
-    let value = env::var(name).map_err(|_| format!("normal-preemption-up requires {name}"))?;
-    validate_upper_nonzero_hex_nonce(&value, name)?;
-    Ok(value)
-}
-
 fn required_dw1e_hex(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("q35-com2-interrupt requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
@@ -1517,12 +1466,6 @@ fn required_wyr1d_hex(name: &str) -> Result<String, String> {
 fn required_wyr1e_hex(name: &str) -> Result<String, String> {
     let value = env::var(name)
         .map_err(|_| format!("the WRE1 interactive-shell selectors require {name}"))?;
-    validate_upper_nonzero_hex_nonce(&value, name)?;
-    Ok(value)
-}
-
-fn required_r1_hex(name: &str) -> Result<String, String> {
-    let value = env::var(name).map_err(|_| format!("dynamic-launch-saturation requires {name}"))?;
     validate_upper_nonzero_hex_nonce(&value, name)?;
     Ok(value)
 }
@@ -1597,44 +1540,6 @@ fn validate_production_bootfs_pages(value: &str) -> Result<usize, String> {
         .map_err(|_| format!("{NAME} must be canonical decimal"))?;
     if pages == 0 || pages > 8192 || pages.to_string() != value {
         return Err(format!("{NAME} must be canonical decimal in 1..=8192"));
-    }
-    Ok(pages)
-}
-
-fn required_r1_bootfs_pages() -> Result<String, String> {
-    let name = "DEEPWYRM_R1_BOOTFS_MAX_PAGES";
-    let value = env::var(name)
-        .map_err(|_| format!("dynamic-launch-saturation requires measured {name}"))?;
-    validate_r1_bootfs_pages(&value)?;
-    Ok(value)
-}
-
-fn validate_r1_bootfs_pages(value: &str) -> Result<usize, String> {
-    let name = "DEEPWYRM_R1_BOOTFS_MAX_PAGES";
-    let pages = value
-        .parse::<usize>()
-        .map_err(|_| format!("{name} must be canonical decimal"))?;
-    if pages == 0 || pages > 8192 || pages.to_string() != value {
-        return Err(format!("{name} must be canonical decimal in 1..=8192"));
-    }
-    Ok(pages)
-}
-
-fn required_dw1b_bootfs_pages() -> Result<String, String> {
-    let name = "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES";
-    let value =
-        env::var(name).map_err(|_| format!("normal-preemption-up requires measured {name}"))?;
-    validate_dw1b_bootfs_pages(&value)?;
-    Ok(value)
-}
-
-fn validate_dw1b_bootfs_pages(value: &str) -> Result<usize, String> {
-    let name = "DEEPWYRM_DW1B_BOOTFS_MAX_PAGES";
-    let pages = value
-        .parse::<usize>()
-        .map_err(|_| format!("{name} must be canonical decimal"))?;
-    if pages == 0 || pages > 8192 || pages.to_string() != value {
-        return Err(format!("{name} must be canonical decimal in 1..=8192"));
     }
     Ok(pages)
 }
@@ -2895,34 +2800,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dw1b_selector_and_build_owned_hex_are_exact() {
-        assert!(is_dw1b_evidence_selector("normal-preemption-up"));
-        assert!(!is_dw1b_evidence_selector("permanent-supervisor-rrc"));
-        for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
-            assert!(validate_upper_nonzero_hex_nonce(valid, "DW1B").is_ok());
-        }
-        for invalid in [
-            "0000000000000000",
-            "0123456789abcdef",
-            "0123456789ABCDE",
-            "G123456789ABCDEF",
-        ] {
-            assert!(validate_upper_nonzero_hex_nonce(invalid, "DW1B").is_err());
-        }
-        let manifest = include_str!("../tooling/guest-harness.toml");
-        assert_eq!(
-            select_guest_test(true, Some("normal-preemption-up"), false, manifest),
-            Ok(Some(26))
-        );
-        for (value, pages) in [("1", 1), ("42", 42), ("8192", 8192)] {
-            assert_eq!(validate_dw1b_bootfs_pages(value), Ok(pages));
-        }
-        for invalid in ["", "0", "01", "+1", "8193", "not-pages"] {
-            assert!(validate_dw1b_bootfs_pages(invalid).is_err());
-        }
-    }
-
     /// F3A.6y. Production's ceiling is now measured when a producer measured
     /// it, and the historical Wave 4 value otherwise.
     ///
@@ -2943,22 +2820,6 @@ mod tests {
                 validate_production_bootfs_pages(invalid).is_err(),
                 "{invalid:?} must be refused"
             );
-        }
-    }
-
-    #[test]
-    fn r1_selector_bootfs_bound_is_exact_and_measured() {
-        assert!(is_r1_evidence_selector("dynamic-launch-saturation"));
-        assert!(!is_r1_evidence_selector("normal-preemption-smp"));
-        // 145 is card R1's real measured archive; the bound must accept it and
-        // the whole 1..=8192 range Deepwyrm's const parser asserts.
-        for (value, pages) in [("1", 1), ("145", 145), ("8192", 8192)] {
-            assert_eq!(validate_r1_bootfs_pages(value), Ok(pages));
-        }
-        // A non-canonical or out-of-range count must fail the build rather than
-        // compile a journal that cannot map the archive it is sized for.
-        for invalid in ["", "0", "0145", "+145", "8193", "not-pages"] {
-            assert!(validate_r1_bootfs_pages(invalid).is_err());
         }
     }
 
@@ -2993,7 +2854,6 @@ mod tests {
     #[test]
     fn dw1c_selector_and_three_build_owned_bindings_are_exact() {
         assert!(is_dw1c_evidence_selector("normal-preemption-smp"));
-        assert!(!is_dw1c_evidence_selector("normal-preemption-up"));
         for valid in ["0000000000000001", "0123456789ABCDEF", "FFFFFFFFFFFFFFFF"] {
             assert!(validate_upper_nonzero_hex_nonce(valid, "DW1C").is_ok());
         }
@@ -3100,11 +2960,6 @@ mod tests {
     fn wyr1f_closure_selector_is_implemented_at_35_and_reuses_the_wre1_transport() {
         let manifest = include_str!("../tooling/guest-harness.toml");
         assert_eq!(WYR1F_CLOSURE_SELECTOR, "dw1-wyr1-interactive-closure");
-        // Id 34 stayed where it was; the plan's proposed 34 was not taken over.
-        assert_eq!(
-            select_guest_test(true, Some("dynamic-launch-saturation"), false, manifest),
-            Ok(Some(34))
-        );
         assert_eq!(
             select_guest_test(true, Some(WYR1F_CLOSURE_SELECTOR), false, manifest),
             Ok(Some(35))
@@ -3116,7 +2971,6 @@ mod tests {
         assert!(is_dw1e_platform_selector(WYR1F_CLOSURE_SELECTOR));
         assert!(!is_dw1e_evidence_selector(WYR1F_CLOSURE_SELECTOR));
         assert!(!is_wyr1d_evidence_selector(WYR1F_CLOSURE_SELECTOR));
-        assert!(!is_r1_evidence_selector(WYR1F_CLOSURE_SELECTOR));
         assert!(!is_wyr1_evidence_selector(WYR1F_CLOSURE_SELECTOR));
         // It supplies no synthetic interrupt platform, so F1A.2's production
         // q35 bring-up applies to it unchanged.

@@ -250,13 +250,13 @@ fn no_class_member_can_emit_a_pass_record_through_the_primordial_path() {
 fn the_gate_detects_a_removed_member() {
     // A gate that cannot fail is worth nothing, so this exercises the comparison
     // itself on a source that is missing a member.
-    let doctored = PRIMORDIAL.replacen("    deepwyrm_r1_evidence,\n", "", usize::MAX);
+    let doctored = PRIMORDIAL.replacen("    deepwyrm_wyr1c_evidence,\n", "", usize::MAX);
     let lists = cfg_lists_for(&doctored, "retiring_wyr1_primordial");
     assert!(!lists.is_empty(), "the doctored source still has the sites");
     assert!(
         !lists
             .iter()
-            .any(|list| list.contains(&"deepwyrm_r1_evidence")),
+            .any(|list| list.contains(&"deepwyrm_wyr1c_evidence")),
         "removing the member from every list should leave it absent"
     );
 }

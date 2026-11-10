@@ -93,11 +93,6 @@ fn implemented_central_selectors_have_exact_kernel_identities() {
             25,
         ),
         (
-            "normal-preemption-up",
-            BuildGuestTest::NormalPreemptionUp,
-            26,
-        ),
-        (
             "bootstrap-registry-launch",
             BuildGuestTest::BootstrapRegistryLaunch,
             27,
@@ -164,7 +159,6 @@ fn only_expected_invalid_opcode_is_classified_as_fail() {
         (BuildGuestTest::PrimordialInvalidReturn, 6),
         (BuildGuestTest::NativeUserspaceCapability, 6),
         (BuildGuestTest::PermanentSupervisorRrc, 6),
-        (BuildGuestTest::NormalPreemptionUp, 6),
         (BuildGuestTest::DeviceResourceInterruptSynthetic, 6),
         (BuildGuestTest::Q35Com2Interrupt, 6),
         (BuildGuestTest::NativeConsoleStreams, 6),
