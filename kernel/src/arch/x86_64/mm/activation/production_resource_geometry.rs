@@ -161,12 +161,11 @@ const ADDED_EXIT_WAITS: usize = (LIVE_SHELL_JOBS + REPLACEMENT_GENERATIONS) * 2;
 pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
-// Reconciled against the built archive, 2026-09-16 (`f1b/normal-01`,
-// `artifacts/bootfs.img`): the six role executables, five bootstrap
-// configuration entries -- launch policy, `rrc-a-v1`, `wyr1-a-gate-v1`, the
-// WYR1-C device manifest and `wyr1-c-gate-v1` -- and `bin/hello`. No extra
-// kernel object is made per entry.
-pub(super) const BOOTFS_ENTRY_PEAK: usize = 6 + 5 + 1;
+// The product archive (`wyrmroot_bootfs::product`) holds eight executables --
+// six roles, `bin/hello` and `bin/cpu-hog` -- and four bootstrap entries:
+// launch policy, `rrc-a-v1`, the device manifest and the product marker. No
+// extra kernel object is made per entry.
+pub(super) const BOOTFS_ENTRY_PEAK: usize = 8 + 4;
 pub(super) const BOOTFS_ENTRY_CAPACITY: usize = 4096;
 
 /// The production product produces no evidence records. The collector is
