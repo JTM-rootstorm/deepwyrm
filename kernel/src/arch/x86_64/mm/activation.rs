@@ -32,24 +32,7 @@ use super::super::{
 mod address_space;
 // The selector-local bootfs measurement `primordial.rs` uses, host-compiled
 // under `test` so its test runs (S2K-0).
-#[cfg(any(
-    test,
-    all(
-        deepwyrm_integrated,
-        target_os = "none",
-        target_arch = "x86_64",
-        any(
-            deepwyrm_wyr1_evidence,
-            deepwyrm_wyr1b_evidence,
-            deepwyrm_dw1c_evidence,
-            deepwyrm_dw1d_evidence,
-            deepwyrm_wyr1c_evidence,
-            deepwyrm_wyr1d_evidence,
-            deepwyrm_wyr1e_evidence,
-            all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)),
-        )
-    )
-))]
+#[cfg(any(test, all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64", all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))))]
 #[path = "activation/bootfs_capacity.rs"]
 mod bootfs_capacity;
 #[path = "activation/graph.rs"]
@@ -67,22 +50,7 @@ mod primordial;
 mod handle_capacity;
 // The primordial carrier's move-only root-switch transactions, host-compiled
 // under `test` and generic over `RootSwitchTarget` (S2K-2).
-#[cfg(any(
-    test,
-    all(
-        deepwyrm_integrated,
-        target_os = "none",
-        target_arch = "x86_64",
-        any(
-            deepwyrm_wyr1_evidence,
-            deepwyrm_wyr1b_evidence,
-            deepwyrm_wyr1c_evidence,
-            deepwyrm_wyr1d_evidence,
-            deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1e_evidence,
-        )
-    )
-))]
+#[cfg(test)]
 #[path = "activation/primordial_diagnostic.rs"]
 mod primordial_diagnostic;
 #[cfg(any(
@@ -122,23 +90,6 @@ mod tlb_mailbox;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
-#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1d_evidence)))]
-#[path = "activation/wyr1d_wait_geometry.rs"]
-mod wyr1d_wait_geometry;
-#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e8_evidence)))]
-#[path = "activation/wyr1e8_resource_geometry.rs"]
-mod wyr1e8_resource_geometry;
-#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1e_evidence)))]
-#[path = "activation/wyr1e_wait_geometry.rs"]
-mod wyr1e_wait_geometry;
-// Test-support ledger for the WYR1-F fairness leg (F3A.6p), separate from
-// `production_resource_geometry`'s frozen single-live-job production demand.
-// Selected by the F closure selector since F3A.7k (see `build.rs`), and
-// compiled in the host lane so its own tests run where every other geometry
-// model's do.
-#[cfg(any(test, all(target_os = "none", deepwyrm_wyr1f_fairness_evidence)))]
-#[path = "activation/wyr1f_fairness_resource_geometry.rs"]
-mod wyr1f_fairness_resource_geometry;
 // Compiled in the host lane as well so the ledger's own tests and the
 // bootstrap-era negative case run where every other geometry model's do; the
 // production arm itself is target-only.
@@ -189,29 +140,17 @@ const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2;
 // Keep bounded production headroom for overlapping blocked outputs and atomic
 // words rather than making the real kernel depend on selector-local capacity.
 const E5_USER_PIN_CAPACITY: usize = 32;
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 const DW1C_RETAINED_RECEIVE_PINS: usize = 10;
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 const DW1C_CHANNEL_CREATE_OUTPUT_PINS: usize = 2;
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 const DW1C_LIVE_USER_PIN_FLOOR: usize =
     DW1C_RETAINED_RECEIVE_PINS + DW1C_CHANNEL_CREATE_OUTPUT_PINS;
-#[cfg(deepwyrm_dw1c_evidence)]
-const _: () = {
-    assert!(DW1C_RETAINED_RECEIVE_PINS == crate::test_support::DW1C_ACTOR_COUNT);
-    assert!(E5_USER_PIN_CAPACITY >= DW1C_LIVE_USER_PIN_FLOOR);
-};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[cfg(not(any(
     deepwyrm_i2_stress,
     deepwyrm_wrcap_relay,
-    deepwyrm_wyr1_evidence,
-    deepwyrm_wyr1b_evidence,
-    deepwyrm_dw1c_evidence,
-    deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
     deepwyrm_production_product,
 )))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
@@ -225,47 +164,6 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTE
 // next case, so the relay artifact needs exactly one additional binding.
 #[cfg(deepwyrm_wrcap_relay)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
-// Selector 25 keeps primordial, init, registryd, and devmgr roots live until
-// the one-shot primordial retirement completes.
-#[cfg(deepwyrm_wyr1_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
-// Selector 27 keeps the permanent controller, registry, gate actors, and one
-// launched job generation live in addition to the retiring primordial root.
-#[cfg(deepwyrm_wyr1b_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
-// Selector 29 reuses the bounded eight-Process permanent-controller geometry
-// while adding resource-domain ownership and restart evidence.
-#[cfg(deepwyrm_wyr1c_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
-// Selector 32 extends the same permanent-controller service graph through
-// production UART, console, and bounded replacement generations.
-#[cfg(deepwyrm_wyr1d_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
-// Selector 33 retains the E6 product plus the selected shell and bounded job
-// actor generations under the permanent controller.
-#[cfg(all(
-    deepwyrm_wyr1e_evidence,
-    not(deepwyrm_wyr1e8_evidence),
-    not(deepwyrm_wyr1f_fairness_evidence)
-))]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 16;
-// The F closure selector's concurrent-hog leg (F3A.7k).
-#[cfg(deepwyrm_wyr1f_fairness_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = wyr1f_fairness_resource_geometry::SELECTED.identities;
-// E8 retains every replaced product generation and runs six concurrent hogs.
-// The selector-local 64-root geometry covers the enumerated 30-identity
-// lifetime floor with useful recovery and cleanup headroom.
-#[cfg(deepwyrm_wyr1e8_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 64;
-// Selector 31 extends selector 29's permanent resource-domain service graph
-// with one bounded raw-stream probe and therefore needs the same eight-root
-// functional headroom as its eight-Process runtime geometry.
-#[cfg(deepwyrm_dw1e_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;
-// Selector 28 keeps primordial, the controller, and all ten workload actors
-// resident through READY, ARM, remote termination, and final observation.
-#[cfg(deepwyrm_dw1c_evidence)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 12;
 // Selector 22 keeps bootstrap, init0, the controller, and multiple stress
 // descendants live together. This is a bounded test-artifact capacity, not a
 // production policy or a new ABI limit.
@@ -2221,27 +2119,6 @@ mod live_sessions {
         /// its usercopy goes through the guard-free session.
         #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
         pub(crate) fn current_process_address_space(
-            &mut self,
-            active_root: &ActiveRootSelection,
-            process: crate::task::ProcessKey,
-        ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-            self.build_live_session(active_root.usercopy_root(), process)
-        }
-
-        /// The one usercopy the primordial runtime still makes under the runtime
-        /// authority: an evidence product's supervisor reading its fixed-size
-        /// evidence record (D1 commit 9). Compiled only into evidence builds, so
-        /// no production build can copy under T.
-        #[cfg(any(
-            deepwyrm_wyr1_evidence,
-            deepwyrm_wyr1f_supervisor_relay,
-            deepwyrm_wyr1b_evidence,
-            deepwyrm_wyr1c_evidence,
-            deepwyrm_wyr1d_evidence,
-            deepwyrm_wyr1e_evidence,
-            deepwyrm_dw1c_evidence,
-        ))]
-        pub(crate) fn evidence_usercopy_under_runtime_authority(
             &mut self,
             active_root: &ActiveRootSelection,
             process: crate::task::ProcessKey,

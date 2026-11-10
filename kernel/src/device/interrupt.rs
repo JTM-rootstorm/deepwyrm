@@ -81,7 +81,7 @@ pub(crate) struct InterruptDelivery {
 }
 
 impl InterruptDelivery {
-    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    #[cfg(test)]
     pub(crate) const fn binding_for_evidence(self) -> InterruptBinding {
         self.binding
     }
@@ -465,24 +465,9 @@ enum InterruptFinalizationState {
 
 pub(crate) struct InterruptFinalization {
     state: InterruptFinalizationState,
-    #[cfg(deepwyrm_dw1d_evidence)]
-    binding: InterruptBinding,
-    #[cfg(deepwyrm_dw1d_evidence)]
-    parent_descriptor: DeviceResourceDescriptor,
 }
 
 impl InterruptFinalization {
-    #[cfg(deepwyrm_dw1d_evidence)]
-    pub(crate) const fn dw1d_identity(&self) -> (ObjectId, InterruptBinding, u64) {
-        let InterruptFinalizationState::Ready { final_release, .. } = &self.state else {
-            panic!("selector-30 synthetic finalization cannot be deferred");
-        };
-        (
-            final_release.id(),
-            self.binding,
-            self.parent_descriptor.lease_generation,
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -752,32 +737,6 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
         })
     }
 
-    /// Returns the exact live source binding after ordinary handle validation.
-    /// The selector-private D6 trigger consumes this only to inject the one
-    /// already-authorized synthetic source; it cannot select an arbitrary IRQ.
-    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
-    pub(crate) fn binding_for_resolved(
-        &self,
-        resolved: &ResolvedHandle,
-    ) -> Result<InterruptBinding, InterruptError> {
-        if resolved.object_type() != DW_OBJECT_TYPE_INTERRUPT {
-            return Err(InterruptError::InvalidObject);
-        }
-        self.interrupts
-            .lock()
-            .iter()
-            .flatten()
-            .find(|interrupt| {
-                interrupt.object == resolved.object_id()
-                    && !matches!(
-                        interrupt.state,
-                        InterruptState::Creating | InterruptState::Finalizing
-                    )
-            })
-            .map(|interrupt| interrupt.binding)
-            .ok_or(InterruptError::InvalidObject)
-    }
-
     #[cfg(test)]
     pub(crate) fn binding(&self, key: InterruptKey) -> InterruptBinding {
         self.interrupts
@@ -789,31 +748,16 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
             .binding
     }
 
-    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
+    #[cfg(test)]
     pub(crate) fn live_count(&self) -> usize {
         self.interrupts.lock().iter().flatten().count()
-    }
-
-    #[cfg(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
-    pub(crate) fn pending_for_binding(&self, binding: InterruptBinding) -> bool {
-        self.interrupts
-            .lock()
-            .iter()
-            .flatten()
-            .find(|interrupt| interrupt.binding == binding)
-            .is_some_and(|interrupt| {
-                matches!(
-                    interrupt.state,
-                    InterruptState::Pending { .. } | InterruptState::AckPrepared { .. }
-                )
-            })
     }
 
     /// Selector-31 terminal admission is a positive exact-state check: a
     /// missing, Creating, Finalizing, Pending, or AckPrepared record is never
     /// quiescent. Only the current live binding in `Armed` may cross the
     /// terminal materialization boundary.
-    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    #[cfg(test)]
     pub(crate) fn terminal_quiescent_for_binding(&self, binding: InterruptBinding) -> bool {
         self.interrupts
             .lock()
@@ -998,33 +942,21 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
                     .replace(final_release)
                     .is_none()
             );
-            #[cfg(deepwyrm_dw1d_evidence)]
-            let parent_descriptor = interrupt.parent_descriptor;
             drop(interrupts);
             platform.stage_retirement_retry(binding);
             return Ok(InterruptFinalization {
                 state: InterruptFinalizationState::Deferred,
-                #[cfg(deepwyrm_dw1d_evidence)]
-                binding,
-                #[cfg(deepwyrm_dw1d_evidence)]
-                parent_descriptor,
             });
         }
 
         let finalized_interrupt =
             take_finalized_interrupt(&self.interrupts, final_release.id(), binding);
         let parent = finalized_interrupt.parent;
-        #[cfg(deepwyrm_dw1d_evidence)]
-        let parent_descriptor = finalized_interrupt.parent_descriptor;
         Ok(InterruptFinalization {
             state: InterruptFinalizationState::Ready {
                 final_release,
                 parent,
             },
-            #[cfg(deepwyrm_dw1d_evidence)]
-            binding,
-            #[cfg(deepwyrm_dw1d_evidence)]
-            parent_descriptor,
         })
     }
 
@@ -1057,17 +989,11 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
             .pending_final_release
             .expect("ready deferred Interrupt retained its exact final release");
         let parent = finalized_interrupt.parent;
-        #[cfg(deepwyrm_dw1d_evidence)]
-        let parent_descriptor = finalized_interrupt.parent_descriptor;
         Some(InterruptFinalization {
             state: InterruptFinalizationState::Ready {
                 final_release,
                 parent,
             },
-            #[cfg(deepwyrm_dw1d_evidence)]
-            binding,
-            #[cfg(deepwyrm_dw1d_evidence)]
-            parent_descriptor,
         })
     }
 
@@ -1102,17 +1028,11 @@ impl<const INTERRUPTS: usize> InterruptFinalizer for InterruptAuthority<INTERRUP
             .pending_final_release
             .expect("ready exact deferred Interrupt retained its final release");
         let parent = finalized_interrupt.parent;
-        #[cfg(deepwyrm_dw1d_evidence)]
-        let parent_descriptor = finalized_interrupt.parent_descriptor;
         Some(InterruptFinalization {
             state: InterruptFinalizationState::Ready {
                 final_release,
                 parent,
             },
-            #[cfg(deepwyrm_dw1d_evidence)]
-            binding,
-            #[cfg(deepwyrm_dw1d_evidence)]
-            parent_descriptor,
         })
     }
 }
@@ -1210,7 +1130,7 @@ impl InterruptAckTransaction {
         Ok(release)
     }
 
-    #[cfg(any(test, deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))]
+    #[cfg(test)]
     pub(crate) const fn binding_for_evidence(&self) -> Option<InterruptBinding> {
         match self.operation {
             InterruptAckOperation::Coalesced { binding } => Some(binding),
@@ -1340,10 +1260,6 @@ pub(crate) fn interrupt_create<
     interrupts.commit_armed(key, binding);
     let committed = platform.commit_source(source_reservation);
     assert_eq!(committed, binding, "platform commit changed exact binding");
-    #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-    crate::test_support::DW1E_EVIDENCE
-        .observe_committed(key.object_id(), binding, parent_descriptor.lease_generation)
-        .unwrap_or_else(|error| panic!("selector-31 commit observation failed: {error:?}"));
     let published = destination
         .try_publish_reference(table, reference, requested_rights)
         .unwrap_or_else(|failure| {

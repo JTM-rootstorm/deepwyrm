@@ -484,106 +484,18 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
 /// ones. A selector absent from this table is built with no extra environment,
 /// and if it turns out to need some, this gate fails and names it -- which is
 /// the correct outcome, not a gap.
-const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 10] = [
-    (
-        "smp-runtime-acceptance",
-        &[("DEEPWYRM_I1_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-    (
-        "permanent-supervisor-rrc",
-        &[
-            ("DEEPWYRM_WYR1_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_WYR1_EVIDENCE_SCENARIO", "normal"),
-        ],
-    ),
-    (
-        "bootstrap-registry-launch",
-        &[
-            ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "117"),
-        ],
-    ),
-    (
-        "normal-preemption-smp",
-        &[
-            ("DEEPWYRM_DW1C_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_DW1C_PROGRESS_DIGEST", "0000000000000001"),
-            ("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", "53"),
-        ],
-    ),
-    (
-        "device-resource-interrupt-synthetic",
-        &[
-            ("DEEPWYRM_DW1D_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_DW1D_EVIDENCE_CHALLENGE", "0000000000000001"),
-        ],
-    ),
-    (
-        "device-coordinator-restart",
-        &[("DEEPWYRM_WYR1C_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-    (
-        "native-console-streams",
-        &[("DEEPWYRM_WYR1D_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-    (
-        "interactive-wyrmsh",
-        &[("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-    (
-        "q35-com2-interrupt",
-        &[("DEEPWYRM_DW1E_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-    // DW1-F/WYR1-F's final closure selector reuses `interactive-wyrmsh`'s WRE1
-    // transport, so it takes the same evidence-nonce variable. The E8 variant
-    // of that transport belongs to selector 33 alone.
-    (
-        "dw1-wyr1-interactive-closure",
-        &[("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", "0000000000000001")],
-    ),
-];
+const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 1] = [(
+    "smp-runtime-acceptance",
+    &[("DEEPWYRM_I1_EVIDENCE_NONCE", "0000000000000001")],
+)];
 
 /// The no-selector production kernel. `None` means the selector environment
 /// variable is removed rather than set, which is the shape a product build of
 /// the uninstrumented kernel actually has.
 const PRODUCTION_KERNEL_ROW: (Option<&str>, &[(&str, &str)]) = (None, &[]);
 
-/// `(label, selector, environment)`: see `SELECTOR_VARIANTS`.
-type SelectorVariant = (
-    &'static str,
-    &'static str,
-    &'static [(&'static str, &'static str)],
-);
-
-/// Second configurations of an existing selector rather than selectors of their
-/// own, so the manifest does not list them: `(label, selector, environment)`.
-/// Each row's environment is complete; `SELECTOR_ENVIRONMENTS` is not merged in.
-///
-/// - E8 evidence swaps selector 33's E7 nonce for its own and links the
-///   sixty-four-stack arena (`deepwyrm_wyr1e8_evidence`).
-/// - E3B-full is selector 31's private full-path cfg
-///   (`deepwyrm_dw1e_e3b_full`), which `build.rs` emits only for that selector.
-const SELECTOR_VARIANTS: [SelectorVariant; 2] = [
-    (
-        "interactive-wyrmsh+wyr1e8",
-        "interactive-wyrmsh",
-        &[
-            ("DEEPWYRM_WYR1E8_EVIDENCE", "1"),
-            ("DEEPWYRM_WYR1E8_EVIDENCE_NONCE", "E800000000000001"),
-        ],
-    ),
-    (
-        "q35-com2-interrupt+e3b-full",
-        "q35-com2-interrupt",
-        &[
-            ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "0000000000000001"),
-            ("DEEPWYRM_DW1E_E3B_FULL", "1"),
-        ],
-    ),
-];
-
 /// One selector build configuration: every implemented selector with its
-/// `SELECTOR_ENVIRONMENTS` row, then every `SELECTOR_VARIANTS` row.
+/// `SELECTOR_ENVIRONMENTS` row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectorBuild<'a> {
     label: &'a str,
@@ -603,15 +515,6 @@ fn selector_builds(selectors: &[String]) -> Vec<SelectorBuild<'_>> {
                 .find(|(name, _)| name == selector)
                 .map_or(&[][..], |(_, environment)| environment),
         })
-        .chain(
-            SELECTOR_VARIANTS
-                .iter()
-                .map(|(label, selector, environment)| SelectorBuild {
-                    label,
-                    selector,
-                    environment,
-                }),
-        )
         .collect()
 }
 
@@ -621,12 +524,7 @@ fn clear_selector_environment(command: &mut Command) {
     command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
     let rows = SELECTOR_ENVIRONMENTS
         .iter()
-        .flat_map(|(_, environment)| environment.iter())
-        .chain(
-            SELECTOR_VARIANTS
-                .iter()
-                .flat_map(|(_, _, environment)| environment.iter()),
-        );
+        .flat_map(|(_, environment)| environment.iter());
     for (name, _) in rows {
         command.env_remove(name);
     }

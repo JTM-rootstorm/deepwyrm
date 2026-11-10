@@ -65,17 +65,17 @@ pub(crate) use terminal_handoff::{
     ExitedRootTeardown, TerminalHandoffRoute, exited_root_teardown, terminal_handoff_route,
 };
 
-#[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use scheduler::Dw1cFinalSchedulerSnapshot;
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use scheduler::{
     Dw1cContinuationDetachRequest, Dw1cSchedulerActorIdentity, Dw1cTerminalGate,
 };
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use scheduler::SchedulerMigrationRejectionReason;
 

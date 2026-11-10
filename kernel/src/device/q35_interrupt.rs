@@ -564,15 +564,6 @@ impl Q35InterruptPlatform {
                 _ => return Err(Q35ControllerError::RouteDrift),
             }
         };
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        if began_retirement {
-            crate::test_support::DW1E_EVIDENCE
-                .observe_retire_begin(binding)
-                .unwrap_or_else(|error| {
-                    panic!("selector-31 retirement-begin observation failed: {error:?}")
-                });
-        }
-        #[cfg(not(all(deepwyrm_dw1e_evidence, target_os = "none")))]
         let _ = began_retirement;
         Ok(())
     }
@@ -597,7 +588,7 @@ impl Q35InterruptPlatform {
     /// Selector-31's terminal-only U2 freeze. This is not U2 retirement or
     /// release: it masks the exact current route and serializes every live
     /// accounting source before replaying the saved U1 delivery.
-    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    #[cfg(test)]
     pub(crate) fn freeze_dw1e_terminal(
         &self,
         stale_u1: InterruptDelivery,
@@ -793,7 +784,7 @@ impl Q35InterruptPlatform {
         Ok(Q35TerminalFreeze::Complete(snapshot))
     }
 
-    #[cfg(any(test, deepwyrm_dw1e_evidence))]
+    #[cfg(test)]
     fn restore_terminal_masked(&self, generation: u64) {
         let mut source = self.source.lock();
         if source.terminal_freeze == Some(Q35TerminalFreezeState::Checking(generation)) {
@@ -936,25 +927,10 @@ impl Q35InterruptPlatform {
                 Some(_) => return Err(Q35ControllerError::RouteDrift),
             }
         };
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        if let Some(proof) = first_idle_proof {
-            crate::test_support::DW1E_EVIDENCE
-                .observe_route_masked(binding, proof.reads)
-                .unwrap_or_else(|error| {
-                    panic!("selector-31 route-mask observation failed: {error:?}")
-                });
-        }
-        #[cfg(not(all(deepwyrm_dw1e_evidence, target_os = "none")))]
         let _ = first_idle_proof;
         if self.source.lock().in_handler != 0 {
             return Ok(false);
         }
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        crate::test_support::DW1E_EVIDENCE
-            .observe_handler_quiescent(binding)
-            .unwrap_or_else(|error| {
-                panic!("selector-31 handler-quiescent observation failed: {error:?}")
-            });
         self.controller.revalidate_masked_idle()?;
         if !self.controller.current_cpu_is_bsp()? {
             let mut source = self.source.lock();
@@ -998,12 +974,6 @@ impl Q35InterruptPlatform {
             return Ok(false);
         }
         self.controller.revalidate_masked_idle()?;
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        crate::test_support::DW1E_EVIDENCE
-            .observe_lapic_clear(binding)
-            .unwrap_or_else(|error| {
-                panic!("selector-31 LAPIC-clear observation failed: {error:?}")
-            });
         let carrier_request = {
             let mut source = self.source.lock();
             if source.in_handler != 0
@@ -1066,10 +1036,6 @@ impl Q35InterruptPlatform {
             .release(binding.generation())
             .map_err(|_| Q35ControllerError::RouteDrift)?;
         Q35InterruptCounters::increment(&self.counters.final_releases);
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        crate::test_support::DW1E_EVIDENCE
-            .observe_released(binding)
-            .unwrap_or_else(|error| panic!("selector-31 release observation failed: {error:?}"));
         Ok(true)
     }
 }
@@ -1131,10 +1097,6 @@ impl InterruptPlatform for Q35InterruptPlatform {
             Q35InterruptCounters::increment(&self.counters.generation_replacements);
         }
         let binding = InterruptBinding::new_private(self.domain, source, generation);
-        #[cfg(all(deepwyrm_dw1e_evidence, target_os = "none"))]
-        crate::test_support::DW1E_EVIDENCE
-            .observe_reserved(binding)
-            .unwrap_or_else(|error| panic!("selector-31 reserve observation failed: {error:?}"));
         Ok(InterruptSourceReservation { binding })
     }
 

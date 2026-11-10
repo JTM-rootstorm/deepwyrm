@@ -352,11 +352,6 @@ pub(crate) fn validate_guest_selector_metadata(
             );
         }
     }
-    if request.selector == "normal-preemption-smp" && request.profile != "smp" {
-        return invalid_input(
-            "normal-preemption-smp requires the exact four-vCPU `smp` profile".into(),
-        );
-    }
     Ok(())
 }
 

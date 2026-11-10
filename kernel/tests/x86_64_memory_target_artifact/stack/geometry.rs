@@ -173,27 +173,6 @@ pub(crate) fn linked_boot_stack_payload_bytes(symbols: &str) -> usize {
         .expect("boot stack payload fits usize")
 }
 
-pub(crate) fn linked_privilege_entry_stack_payload_bytes(symbols: &str) -> usize {
-    let addresses = symbols
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let address = u64::from_str_radix(fields.next()?, 16).ok()?;
-            let _kind = fields.next()?;
-            Some((fields.next()?, address))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let address = |name: &str| {
-        *addresses
-            .get(name)
-            .unwrap_or_else(|| panic!("target artifact omitted privilege-entry symbol {name}"))
-    };
-    usize::try_from(
-        address("__dw_privilege_entry_stack_top") - address("__dw_privilege_entry_stack_bottom"),
-    )
-    .expect("privilege-entry stack payload fits usize")
-}
-
 pub(crate) fn linked_terminal_reaper_stack_payload_bytes(symbols: &str) -> usize {
     let addresses = symbols
         .lines()

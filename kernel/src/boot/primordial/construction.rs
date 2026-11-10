@@ -43,14 +43,7 @@ const READY_BYTES: [u8; 40] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-#[cfg(any(
-    test,
-    deepwyrm_dw1d_evidence,
-    deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-))]
+#[cfg(test)]
 const RESOURCE_READY_BYTES: [u8; 40] = [
     0x57, 0x52, 0x42, 0x50, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -731,14 +724,7 @@ pub(crate) fn complete_primordial_launch<B: PrimordialCompletionBackend>(
     complete_primordial_launch_with_ready(backend, &READY_BYTES)
 }
 
-#[cfg(any(
-    test,
-    deepwyrm_dw1d_evidence,
-    deepwyrm_dw1e_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-))]
+#[cfg(test)]
 pub(crate) fn complete_resource_primordial_launch<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
@@ -783,14 +769,7 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
 /// Selector-local split of the primordial completion contract. This validates
 /// the committed READY and structured zero exit without consuming the runtime
 /// authority that a live permanent-supervisor descendant still requires.
-#[cfg(any(
-    test,
-    deepwyrm_wyr1_evidence,
-    deepwyrm_wyr1b_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-))]
+#[cfg(test)]
 pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {
@@ -800,13 +779,7 @@ pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBacken
 /// Selector-local retirement validation for the four-capability resource
 /// primordial profile. This preserves the READY/exit split while requiring
 /// the same profile-aware READY accepted by the initial construction path.
-#[cfg(any(
-    test,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence,
-    deepwyrm_wyr1e_evidence,
-    deepwyrm_dw1e_evidence,
-))]
+#[cfg(test)]
 pub(crate) fn validate_resource_primordial_retirement_facts<B: PrimordialCompletionBackend>(
     backend: &mut B,
 ) -> Result<(), PrimordialCompletionError<B::Error>> {

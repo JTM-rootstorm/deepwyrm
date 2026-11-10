@@ -165,7 +165,7 @@ mod boot_grant;
 mod device_table;
 pub mod primordial;
 
-#[cfg(any(test, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 pub(crate) use boot_grant::BootResourceGrantState;
 pub(crate) use boot_grant::{
     BootResourceDescriptor, BootResourceGrantError, BootResourceGrants, MAX_BOOT_RESOURCE_GRANTS,

@@ -40,9 +40,8 @@ pub(super) const fn integration_bootfs_page_count(byte_len: usize) -> Option<usi
 mod tests {
     use super::*;
 
-    /// Selector 25's page ceiling: the `deepwyrm_wyr1_evidence` arm of
-    /// `PRIMORDIAL_BOOTFS_MAX_PAGES`, which is target-only and so cannot be
-    /// named here. The test was written against that arm.
+    /// A fixed 128-page ceiling (the retired selector 25's) to check the
+    /// measurement against a bound.
     const WYR1_BOOTFS_MAX_PAGES: usize = 128;
 
     #[test]

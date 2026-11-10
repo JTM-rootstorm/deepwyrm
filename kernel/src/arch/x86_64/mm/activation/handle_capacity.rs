@@ -25,13 +25,13 @@ pub(super) const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
 // trigger's Process and launch Channel while the replacement owner loader
 // holds its net Channel, Process+root, Thread, and resource-domain staging
 // duplicate.  That exact replacement-launch peak is twelve handles.
-#[cfg(any(test, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 pub(super) const D6_INITIAL_HANDLES: usize = INITIAL_BOOTSTRAP_HANDLES + 1;
-#[cfg(any(test, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 pub(super) const D6_RETAINED_TRIGGER_HANDLES: usize = 2;
-#[cfg(any(test, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 pub(super) const D6_RESOURCE_DOMAIN_DUPLICATE_HANDLES: usize = 1;
-#[cfg(any(test, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 pub(super) const D6_HANDLE_PEAK: usize = D6_INITIAL_HANDLES
     + D6_RETAINED_TRIGGER_HANDLES
     + CHANNEL_CREATE_REDUCE_NET_HANDLES

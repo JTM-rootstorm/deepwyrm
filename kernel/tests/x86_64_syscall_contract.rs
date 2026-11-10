@@ -229,10 +229,6 @@ fn i1_native_adapter_phases_revalidate_exact_identity_after_guard_free_work() {
 #[test]
 fn common_terminal_retry_paths_use_an_unconditionally_imported_status() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
-    assert!(
-        !primordial
-            .contains("#[cfg(deepwyrm_dw1c_evidence)]\nuse deepwyrm_abi::DW_STATUS_WOULD_BLOCK;")
-    );
     let abi_import = primordial
         .split_once("use deepwyrm_abi::{")
         .expect("common primordial ABI import")
@@ -626,7 +622,7 @@ fn i1_live_context_switch_acknowledges_from_the_destination_carrier() {
         .split_once("fn terminate_exception_with_remote_stops(")
         .expect("remote terminal exception path")
         .1
-        .split_once("fn intercept_wyr1_evidence_raw(")
+        .split_once("fn handle_q35_com2_interrupt(")
         .expect("remote terminal exception boundary")
         .0;
     let remote_switch = remote_terminal
@@ -916,28 +912,9 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
         )
     );
     assert!(
-        activation.contains(
-            "#[cfg(deepwyrm_wyr1_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
-        )
-    );
-    assert!(
         activation
             .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
     );
-    assert!(activation.contains(
-        "#[cfg(deepwyrm_wyr1b_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
-    ));
-    assert!(activation.contains(
-        "#[cfg(deepwyrm_wyr1d_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
-    ));
-    assert!(
-        activation.contains(
-            "#[cfg(deepwyrm_dw1e_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 8;"
-        )
-    );
-    assert!(runtime.contains(
-        "#[cfg(any(\n    deepwyrm_wyr1c_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_dw1e_evidence\n))]\nconst _: () = assert!(super::LIVE_ADDRESS_SPACE_CAPACITY >= USERSPACE_CHAIN_PROCESSES);"
-    ));
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
@@ -945,18 +922,8 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
     );
     assert!(runtime.contains("const USERSPACE_CHAIN_PROCESSES: usize = 3;"));
     assert!(
-        runtime.contains(
-            "#[cfg(deepwyrm_dw1d_evidence)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;"
-        )
-    );
-    assert!(
         runtime
             .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
-    );
-    assert!(
-        runtime.contains(
-            "#[cfg(deepwyrm_wyr1_evidence)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;"
-        )
     );
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst TASK_GROUPS: usize = 2;"));
     assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_OBJECTS: usize = 12;"));
@@ -977,9 +944,6 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             "const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();"
         )
     );
-    assert!(runtime.contains(
-        "#[cfg(deepwyrm_wyr1b_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_wyr1b_bootfs_pages();"
-    ));
     assert!(
         runtime.contains(
             "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;"
@@ -990,9 +954,6 @@ fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
             "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;"
         )
     );
-    assert!(runtime.contains(
-        "#[cfg(deepwyrm_wyr1_evidence)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 128;"
-    ));
 }
 
 #[test]
@@ -1057,70 +1018,6 @@ fn the_production_product_selects_its_own_resource_geometry() {
     let activation = source("src/arch/x86_64/mm/activation.rs");
     assert!(activation.contains(
         "#[cfg(deepwyrm_production_product)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;"
-    ));
-
-    // The instrumented half of the same reconciliation. Since F3A.7k the
-    // selector-35 siblings select the WYR1-F fairness ledger, and Wyrmroot's
-    // WYR1-F receipt records `kernel_resource_geometry = "wyr1f-fairness"` with
-    // a 64-handle, 192-entry, sixty-four-identity table. Wyrmroot cannot read
-    // these arms, so they are asserted here, and a change to them fails in
-    // this repository first. The arms name the ledger rather than literals,
-    // and the ledger holds the figures.
-    let squeezed: String = runtime.chars().filter(|c| !c.is_whitespace()).collect();
-    for (name, field) in [
-        ("USERSPACE_CHAIN_PROCESSES", "identities"),
-        ("TASK_GROUPS", "identities"),
-        ("HANDLES", "handles"),
-        ("REGISTRY_OBJECTS", "registry"),
-        ("MEMORY_OBJECTS", "memory"),
-        ("MEMORY_LEASES", "mappings"),
-        ("CHANNEL_PAIRS", "channel_pairs"),
-    ] {
-        assert!(
-            squeezed.contains(&format!(
-                "#[cfg(deepwyrm_wyr1f_fairness_evidence)]const{name}:usize=super::wyr1f_fairness_resource_geometry::SELECTED.{field};"
-            )),
-            "{name} does not select the fairness ledger"
-        );
-    }
-    let fairness = source("src/arch/x86_64/mm/activation/wyr1f_fairness_resource_geometry.rs");
-    for figure in ["handles: 64,", "identities: 64,", "registry: 192,"] {
-        assert!(
-            fairness.contains(figure),
-            "fairness ledger no longer says {figure}"
-        );
-    }
-    assert!(activation.contains(
-        "#[cfg(deepwyrm_wyr1f_fairness_evidence)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = wyr1f_fairness_resource_geometry::SELECTED.identities;"
-    ));
-    let build = source("build.rs");
-    assert!(build.contains("!wyr1e8 && selector == Some(WYR1F_CLOSURE_SELECTOR)"));
-    // Without the emission, selector 35 falls back to the thirty-two-handle
-    // arms and every gate still compiles.
-    // The same condition also guards the supervisor-evidence relay, so any
-    // guarded block may be the one that carries the emission.
-    assert!(
-        build
-            .match_indices("if wyr1f_fairness_selected(Some(selector.as_str()), wyr1e8) {")
-            .any(|(at, _)| build[at..].lines().nth(1).is_some_and(|line| {
-                line.trim() == "println!(\"cargo:rustc-cfg=deepwyrm_wyr1f_fairness_evidence\");"
-            })),
-        "the closure selector no longer emits the fairness cfg"
-    );
-}
-
-#[test]
-fn live_uart_selectors_provision_overlapping_control_and_temt_timers() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
-
-    assert!(runtime.contains(
-        "#[cfg(not(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n)))]\nconst TIMERS: usize = 1;"
-    ));
-    assert!(runtime.contains(
-        "#[cfg(any(\n    deepwyrm_i2_stress,\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n))]\nconst TIMERS: usize = 2;"
-    ));
-    assert!(runtime.contains(
-        "#[cfg(any(\n    deepwyrm_dw1e_evidence,\n    deepwyrm_wyr1d_evidence,\n    deepwyrm_wyr1e_evidence,\n    deepwyrm_production_product\n))]\nconst _: [(); 2] = [(); TIMERS];"
     ));
 }
 
@@ -1343,13 +1240,8 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
     let leave_root = handoff
         .find("if route == crate::task::TerminalHandoffRoute::LeaveRoot {")
         .expect("terminal handoff lost its leave-root route");
-    let first_retired_arm = handoff
-        .find("if retirement.retiring_wyr1_primordial")
-        .expect("terminal handoff lost its primordial arm");
-    assert!(leave_root < first_retired_arm);
     assert!(
-        handoff[leave_root..first_retired_arm]
-            .contains("TerminalKernelContinuation::FinishGenericChild(retirement)")
+        handoff[leave_root..].contains("TerminalKernelContinuation::FinishGenericChild(retirement)")
     );
     // The leave-root route itself may read the Process: whether it exited is
     // one of the teardown's conditions (rule 3), not the route.
@@ -1558,197 +1450,7 @@ fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
         .find("terminal_reaper_next_on(self.cpu())")
         .unwrap();
     assert!(primordial_unmap < next_selection);
-    // With no successor, a retiring WYR1 primordial enters the kernel root
-    // first and is retired only by that root switch's continuation.
-    let no_successor = terminal
-        .split_once("if retirement.retiring_wyr1_primordial {")
-        .expect("WYR1 no-successor branch")
-        .1
-        .split_once("\n        }\n")
-        .expect("WYR1 no-successor branch end")
-        .0;
-    assert!(no_successor.contains("self.prepare_terminal_kernel_root_switch()"));
-    assert!(no_successor.contains("TerminalKernelContinuation::RetireWyr1Primordial(retirement)"));
-    let retire = terminal
-        .split_once("TerminalKernelContinuation::RetireWyr1Primordial(mut retirement) =>")
-        .expect("WYR1 primordial kernel-root continuation")
-        .1
-        .split_once("TerminalKernelContinuation::RetireWyr1Child")
-        .expect("WYR1 primordial kernel-root continuation end")
-        .0;
-    assert!(retire.contains("self.finish_quiesced_process_root_retirement("));
-    assert!(!retire.contains("self.unmap_primordial_userspace("));
-    assert!(!retire.contains("self.finish_inactive_process_teardown("));
     assert!(!terminal.contains("terminal idle safe-root"));
-}
-
-/// Text test: the terminal handoff is target-only primordial.rs code until the D2 terminal engine.
-#[test]
-fn wyr1_terminal_child_after_primordial_retirement_uses_its_current_root() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
-    // The live terminal path (re-anchored by S2K-3.1, as above).
-    let terminal = runtime
-        .split_once("fn prepare_terminal_retirement_state(")
-        .expect("terminal handoff")
-        .1
-        .split_once("fn reserve_runtime_phase")
-        .expect("terminal handoff terminator")
-        .0;
-    let retired_child = terminal
-        .split_once(
-            "if retirement.retired_process != self.core.primordial_process && primordial_retired {",
-        )
-        .expect("WYR1 retired-primordial child branch")
-        .1
-        .split_once("\n        if retirement.retired_process != self.core.primordial_process {")
-        .expect("legacy retained-primordial child branch")
-        .0;
-    let retirement_fact = terminal
-        .split_once("let primordial_retired = match")
-        .expect("WYR1 primordial retirement fact")
-        .1
-        .split_once(
-            "if retirement.retired_process != self.core.primordial_process && primordial_retired {",
-        )
-        .expect("WYR1 retired-primordial child branch")
-        .0;
-    let unmap = retired_child.find("self.unmap_current_userspace(").unwrap();
-    let kernel_root = retired_child
-        .find("self.prepare_terminal_kernel_root_switch()")
-        .unwrap();
-    let reporter_guard = retired_child.find("if retiring_reporter {").unwrap();
-    let reporter_info = retired_child
-        .find(".process_info(retirement.retired_process)")
-        .unwrap();
-    let reporter_failure = retired_child
-        .find("crate::test_support::complete_fail(detail)")
-        .unwrap();
-    // The root is retired, and the CPU idles, only in the kernel-root
-    // switch's continuation, after the CR3 switch the facade executes.
-    let continuation = terminal
-        .split_once("TerminalKernelContinuation::RetireWyr1Child {\n                retirement,")
-        .expect("WYR1 child kernel-root continuation")
-        .1
-        .split_once("TerminalKernelContinuation::EnterPrimordialPublisher")
-        .expect("WYR1 child kernel-root continuation end")
-        .0;
-    let retirement = continuation
-        .find("self.finish_quiesced_process_root_retirement(")
-        .unwrap();
-    let idle = continuation
-        .find("self.owned.physically_executing.record_idle()")
-        .unwrap();
-
-    assert!(reporter_guard < reporter_info);
-    assert!(reporter_info < reporter_failure);
-    assert!(reporter_failure < unmap);
-    assert!(retired_child.contains("if info.application_code == 0"));
-    assert!(retired_child.contains("supervisor_evidence_detail(0xd014)"));
-    assert!(retired_child.contains("TerminalKernelContinuation::RetireWyr1Child {"));
-    assert!(runtime.contains("return 0x2510_0000 | case;"));
-    assert!(runtime.contains("return 0x2710_0000 | case;"));
-    assert!(unmap < kernel_root);
-    assert!(retirement < idle);
-    assert!(
-        retirement_fact.contains("Ok(None) | Err(crate::task::TaskError::InvalidTask) => true")
-    );
-    assert!(retirement_fact.contains("Ok(Some(_)) => false"));
-    assert!(retirement_fact.contains("supervisor_evidence_detail(0xd00d)"));
-    assert!(!retired_child.contains("prepare_process_root_selection("));
-    assert!(!retired_child.contains("self.core.primordial_address_space"));
-}
-
-/// Text test: the completion-failure details are emitted only on the target-only terminal path.
-#[test]
-fn wyr1_primordial_completion_failures_have_variant_specific_details() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
-    let diagnostic = source("src/arch/x86_64/mm/activation/primordial_diagnostic.rs");
-    // The live terminal path (re-anchored by S2K-3.1 off the carrier's
-    // never-reached copy, which alone formatted the detail call over lines).
-    let terminal = runtime
-        .split_once("fn prepare_terminal_retirement_state(")
-        .expect("terminal handoff")
-        .1
-        .split_once("fn reserve_runtime_phase")
-        .expect("terminal handoff extent")
-        .0;
-
-    assert!(terminal.contains(
-        "if retiring_wyr1_primordial && let Err(error) = validate_primordial_retirement_facts(self)"
-    ));
-    assert!(terminal.contains("let terminal_info = self.core.g5_probe.terminal_info;"));
-    assert!(terminal.contains("complete_fail(primordial_completion_detail(error, terminal_info))"));
-    assert!(!terminal.contains("supervisor_evidence_detail(0xd001)"));
-
-    for mapping in [
-        "PrimordialCompletionError::MalformedReady(_) => 0xd200",
-        "PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff)",
-        "PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff)",
-        "PrimordialCompletionError::UnhandledException => 0xd500",
-        "PrimordialCompletionError::AuthorizedTermination => 0xd600",
-        "PrimordialCompletionError::NotQuiescent(code, _) => 0xd700 | (code & 0xff)",
-    ] {
-        assert!(
-            runtime.contains(mapping),
-            "missing completion detail mapping {mapping}"
-        );
-    }
-    for mapping in [
-        "ChannelError::Capacity => 0x7100_0011",
-        "ChannelError::InvalidArgument => 0x7100_0012",
-        "ChannelError::InvalidEndpoint => 0x7100_0013",
-        "ChannelError::StalePair => 0x7100_0014",
-        "ChannelError::WouldBlock => 0x7100_0015",
-        "ChannelError::PeerClosed => 0x7100_0016",
-        "ChannelError::BufferTooSmall => 0x7100_0017",
-        "ChannelError::AccessDenied => 0x7100_0018",
-        "ChannelError::FinalizationMismatch => 0x7100_0019",
-    ] {
-        assert!(
-            runtime.contains(mapping),
-            "missing Channel mapping {mapping}"
-        );
-    }
-    assert!(runtime.contains("0xe000"));
-    assert!(runtime.contains("primordial_receive_failure_tag(code) << 8"));
-    assert!(runtime.contains("primordial_terminal_summary(terminal_info)"));
-    assert!(diagnostic.contains("application_code == 0xaf01_0002"));
-    assert!(diagnostic.contains("application_code & 0xffff_0000 == 0xaf11_0000"));
-    assert!(diagnostic.contains("0x20 | (application_code & 0x1f)"));
-    let b400_terminal = diagnostic
-        .find("application_code & 0xff00_0000 == 0xb400_0000")
-        .expect("B400 structured terminal summary");
-    let generic_bootstrap = diagnostic
-        .find("application_code & 0xf000_0000 == 0xb000_0000")
-        .expect("generic bootstrap summary");
-    assert!(b400_terminal < generic_bootstrap);
-    assert!(diagnostic.contains("let reason = (application_code >> 18) & 0x0f;"));
-    assert!(diagnostic.contains("let exception_type = (application_code >> 14) & 0x0f;"));
-    assert!(diagnostic.contains("(reason << 4) | exception_type"));
-    assert!(diagnostic.contains("0x80 | (application_code & 0x3f)"));
-    let terminal_summary = diagnostic
-        .split_once("pub(super) fn primordial_terminal_summary(")
-        .expect("primordial terminal summary")
-        .1
-        .split_once("#[cfg(test)]")
-        .expect("terminal summary extent")
-        .0;
-    let gp = terminal_summary
-        .find("info.exception_type == DW_EXCEPTION_GENERAL_PROTECTION")
-        .expect("GP detail summary");
-    let other_exception = terminal_summary
-        .find("info.exception_type.0 > 0x0f")
-        .expect("other exception summary");
-    assert!(gp < other_exception);
-    assert!(terminal_summary.contains("let detail = if info.detail > 0x1f"));
-    assert!(terminal_summary.contains("0xc0 | detail"));
-    assert!(terminal_summary.contains("info.exception_type.0 > 0x0f"));
-    assert!(terminal_summary.contains("0xe0 | exception_type"));
-    assert!(terminal_summary.contains("return 0xfc;"));
-    assert!(terminal_summary.contains("0xfd"));
-    assert!(terminal_summary.contains("return 0xff;"));
-    assert!(!terminal_summary.contains("        0xfe\n"));
-    assert!(runtime.contains("primordial_completion_case(error, terminal_info)"));
 }
 
 #[test]
@@ -2066,7 +1768,6 @@ fn dw1c1_ap_carriers_cross_generation_bound_scheduler_admission_before_dispatch(
 
     assert!(live.contains("bind_running_native_runtime_carrier_for_slot"));
     assert!(primordial.contains("prepare_runtime_carrier_admission(facades, live_cpu_count)"));
-    assert!(primordial.contains("#[cfg(deepwyrm_dw1c_evidence)]\n    assert_eq!("));
     assert!(primordial.contains("for cpu_index in 1..live_cpu_count {"));
     assert!(primordial.contains("normalize_bootstrap_carrier(facades)"));
     assert!(primordial.contains("publish_ap_carrier_ready"));
@@ -3246,61 +2947,6 @@ fn terminal_paging_work_uses_sessions_without_usercopy() {
             "the pin-settlement session exposes {usercopy}"
         );
     }
-}
-
-/// Text test (D1 commit 9): the only usercopy the primordial runtime still
-/// makes under the runtime authority is an evidence supervisor reading its
-/// record, through a constructor compiled only into evidence builds. The
-/// guest runtimes' `current_process_address_space` (no T there) is compiled
-/// only into guest builds.
-#[test]
-fn usercopy_under_t_is_confined_to_evidence_builds() {
-    let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
-    let activation = source("src/arch/x86_64/mm/activation.rs");
-    assert!(!primordial.contains("current_process_address_space"));
-    let evidence_sites: Vec<usize> = primordial
-        .match_indices("paging.evidence_usercopy_under_runtime_authority(")
-        .map(|(at, _)| at)
-        .collect();
-    assert_eq!(evidence_sites.len(), 7);
-    for at in evidence_sites {
-        let function = primordial[..at]
-            .rfind("    fn ")
-            .expect("evidence intercept");
-        let header = &primordial[function..at];
-        assert!(
-            header.starts_with("    fn intercept_") && header.contains("_evidence_raw("),
-            "an evidence copy outside an evidence intercept"
-        );
-        let attributes = &primordial[primordial[..function].rfind("\n\n").unwrap()..function];
-        assert!(
-            attributes.contains("#[cfg("),
-            "an evidence intercept without its build gate"
-        );
-    }
-    assert!(activation.contains(
-        "        #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]\n        pub(crate) fn current_process_address_space("
-    ));
-    let evidence = activation
-        .split_once("    pub(crate) fn evidence_usercopy_under_runtime_authority(")
-        .expect("evidence constructor")
-        .0;
-    let gate = &evidence[evidence.rfind("    #[cfg(any(").expect("evidence gate")..];
-    for selector in [
-        "deepwyrm_wyr1_evidence",
-        "deepwyrm_wyr1f_supervisor_relay",
-        "deepwyrm_wyr1b_evidence",
-        "deepwyrm_wyr1c_evidence",
-        "deepwyrm_wyr1d_evidence",
-        "deepwyrm_wyr1e_evidence",
-        "deepwyrm_dw1c_evidence",
-    ] {
-        assert!(gate.contains(selector), "evidence gate omits {selector}");
-    }
-    assert!(
-        !gate.contains("not("),
-        "the evidence gate widens past its builds"
-    );
 }
 
 /// Text test (D1 commit 9): the live process session has one builder,

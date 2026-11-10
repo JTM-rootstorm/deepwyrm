@@ -1274,45 +1274,29 @@ fn direct_call_stack_path_accepts_only_the_complete_local_relative_jump_table_id
     assert!(failed.is_err());
 }
 
-#[path = "stack/dw1c.rs"]
-mod dw1c;
 #[path = "stack/e7.rs"]
 mod e7;
 #[path = "stack/f12.rs"]
 mod f12;
 #[path = "stack/f9.rs"]
 mod f9;
-#[path = "stack/family_g.rs"]
-mod family_g;
 #[path = "stack/geometry.rs"]
 mod geometry;
 #[path = "stack/ist.rs"]
 mod ist;
-#[path = "stack/primordial.rs"]
-mod primordial;
 #[path = "stack/production.rs"]
 mod production;
 #[path = "stack/selector.rs"]
 mod selector;
-#[path = "stack/wyr1e.rs"]
-mod wyr1e;
-#[path = "stack/wyr1e_thread.rs"]
-mod wyr1e_thread;
 
-pub(super) use dw1c::validate_dw1c_stack_margins;
 pub(super) use e7::validate_e7_stack_margin;
 pub(super) use f9::validate_f9_stack_context_evidence;
 pub(super) use f12::validate_f12_stack_context_evidence;
-pub(super) use family_g::validate_family_g_facade_stack_margin;
 pub(super) use geometry::linked_boot_stack_payload_bytes;
-pub(super) use geometry::linked_privilege_entry_stack_payload_bytes;
 pub(super) use geometry::linked_terminal_reaper_stack_payload_bytes;
 pub(super) use geometry::linked_thread_kernel_stack_payload_bytes;
 pub(super) use geometry::linked_thread_kernel_stack_payload_bytes_for_threads;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry;
 pub(super) use geometry::validate_kernel_stack_artifact_geometry_for_threads;
-pub(super) use primordial::validate_primordial_boot_stack_margin;
 pub(super) use production::validate_production_ist_stack_margin;
 pub(super) use selector::validate_selector_stack_margin;
-pub(super) use wyr1e::validate_wyr1e_privilege_entry_stack_margin;
-pub(super) use wyr1e_thread::validate_wyr1e8_thread_stack_margin;

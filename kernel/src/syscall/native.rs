@@ -932,11 +932,6 @@ pub(crate) enum NativeIdleSuspendPoll<'owner> {
     Continue,
     ResumeCurrent,
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
-    #[cfg(deepwyrm_dw1c_evidence)]
-    Detach {
-        plan: crate::arch::x86_64::context::KernelSwitchPlan<'owner>,
-        request: crate::task::Dw1cContinuationDetachRequest,
-    },
 }
 
 #[must_use = "a resumed syscall either owns a live current Thread or must service the published rendezvous"]
@@ -1107,82 +1102,6 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
         panic!("native runtime does not admit syscall-return preemption resume")
     }
-    /// Selector-25-only interception of one raw ID deliberately absent from
-    /// native ABI decode. Production and every other selector compile neither
-    /// this method nor its call site, so the ID remains NOT_SUPPORTED there.
-    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
-    fn intercept_wyr1_evidence_raw(
-        &mut self,
-        arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult;
-
-    /// Selector-27-only interception of the private WRB1 relay operation.
-    /// This raw ID is deliberately absent from native ABI decode.
-    #[cfg(deepwyrm_wyr1b_evidence)]
-    fn intercept_wyr1b_evidence_raw(
-        &mut self,
-        arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult;
-
-    /// Selector-28-only private ARM/PROGRESS/WORKLOAD_COMPLETE operation.
-    /// It is intentionally absent from generated ABI decode.
-    #[cfg(deepwyrm_dw1c_evidence)]
-    fn intercept_dw1c_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("native runtime does not admit selector-28 evidence")
-    }
-
-    /// Selector-30-only private synthetic D6 authority protocol. It is not
-    /// part of generated ABI decode and exists only in the selected test build.
-    #[cfg(deepwyrm_dw1d_evidence)]
-    fn intercept_dw1d_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("native runtime does not admit selector-30 evidence")
-    }
-
-    /// Selector-31-only private q35 COM2 evidence protocol. It is absent from
-    /// generated ABI decode and preserves the six-u64 raw-call boundary.
-    #[cfg(deepwyrm_dw1e_evidence)]
-    fn intercept_dw1e_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("native runtime does not admit selector-31 evidence")
-    }
-
-    /// Selector-29-only private WRC6 device-coordinator restart evidence.
-    /// This operation is deliberately absent from generated ABI decode.
-    #[cfg(deepwyrm_wyr1c_evidence)]
-    fn intercept_wyr1c_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("native runtime does not admit selector-29 evidence")
-    }
-
-    /// Selector-32-only private WRD1 native-console evidence relay. This
-    /// operation is deliberately absent from generated ABI decode.
-    #[cfg(deepwyrm_wyr1d_evidence)]
-    fn intercept_wyr1d_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("native runtime does not admit selector-32 evidence")
-    }
-
-    /// Selector-33-only private WRE1 interactive-shell evidence relay. This
-    /// operation is deliberately absent from generated ABI decode.
-    #[cfg(deepwyrm_wyr1e_evidence)]
-    fn intercept_wyr1e_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("native runtime does not admit selector-33 evidence")
-    }
 
     fn authorize_return(
         &mut self,
@@ -1314,62 +1233,6 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
     frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     current_binding_generation: u64,
 ) -> SyscallControl {
-    #[cfg(any(
-        deepwyrm_wyr1_evidence,
-        deepwyrm_wyr1b_evidence,
-        deepwyrm_dw1c_evidence,
-        deepwyrm_dw1d_evidence,
-        deepwyrm_dw1e_evidence,
-        deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence,
-        deepwyrm_wyr1e_evidence,
-    ))]
-    let result = match frame.request() {
-        #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
-        Some((id, arguments)) if id.0 == crate::test_support::WYR1_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_wyr1_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_wyr1b_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::WYR1B_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_wyr1b_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_dw1c_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::DW1C_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_dw1c_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_dw1d_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::DW1D_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_dw1d_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_dw1e_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::DW1E_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_dw1e_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_wyr1c_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::WYR1C_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_wyr1c_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_wyr1d_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::WYR1D_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_wyr1d_evidence_raw(arguments)
-        }
-        #[cfg(deepwyrm_wyr1e_evidence)]
-        Some((id, arguments)) if id.0 == crate::test_support::WYR1E_EVIDENCE_RAW_SYSCALL => {
-            runtime.intercept_wyr1e_evidence_raw(arguments)
-        }
-        Some((id, arguments)) => dispatch_native(runtime, id, arguments),
-        None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
-    };
-    #[cfg(not(any(
-        deepwyrm_wyr1_evidence,
-        deepwyrm_wyr1b_evidence,
-        deepwyrm_dw1c_evidence,
-        deepwyrm_dw1d_evidence,
-        deepwyrm_dw1e_evidence,
-        deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence,
-        deepwyrm_wyr1e_evidence,
-    )))]
     let result = match frame.request() {
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),

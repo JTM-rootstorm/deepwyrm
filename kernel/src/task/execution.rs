@@ -420,8 +420,6 @@ pub(crate) struct RetiredExitPins<const THREADS: usize> {
 #[must_use = "current execution resources must be reclaimed after switching to a terminal stack"]
 pub(crate) struct DeferredCurrentExecutionResources {
     thread: ThreadKey,
-    #[cfg(deepwyrm_dw1c_evidence)]
-    execution_generation: u64,
     resources: Option<ThreadExecutionResources>,
     process_pin: Option<crate::object::InternalRef>,
     thread_pin: Option<crate::object::InternalRef>,
@@ -443,11 +441,6 @@ impl DeferredCurrentExecutionResources {
     /// reclaim consumes the pin.
     pub(crate) const fn exits_process(&self) -> bool {
         self.process_pin.is_some()
-    }
-
-    #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) const fn execution_generation(&self) -> u64 {
-        self.execution_generation
     }
 }
 
@@ -713,34 +706,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         cpu: SchedulerCpuId,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         let dispatch = self.scheduler.schedule_next_on_with_migration(cpu)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(migration) = dispatch
-            .migration()
-            .filter(|migration| crate::test_support::DW1C_EVIDENCE.tracks_thread(migration.thread))
-        {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_steal_migration_claim(
-                    migration.source.index() as u8,
-                    migration.target.index() as u8,
-                    migration.thread,
-                    migration.execution_generation,
-                    migration.generation,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 STEAL_MIGRATE observation failed: {error:?}")
-                });
-        }
         let decision = dispatch.decision();
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(claim) = self
-            .scheduler
-            .running_claim_on(cpu)
-            .filter(|claim| crate::test_support::DW1C_EVIDENCE.tracks_thread(claim.thread()))
-        {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_running_claim(cpu.index() as u8, claim.thread(), claim.generation())
-                .unwrap_or_else(|error| panic!("selector-28 RUN observation failed: {error:?}"));
-        }
         Ok(decision)
     }
 
@@ -748,12 +714,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.runnable_start_generation(thread)
     }
 
-    #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) fn current_execution_generation(&self, thread: ThreadKey) -> Option<u64> {
-        self.scheduler.current_execution_generation(thread)
-    }
-
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn install_dw1c_scheduler_fixture(
         &self,
         reporter: super::SchedulerExecutionClaim,
@@ -762,14 +723,14 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.install_dw1c_fixture(reporter, actors)
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn stage_dw1c_arm_retry_wake(&self, actors: [super::Dw1cSchedulerActorIdentity; 8]) {
         if let Some(target) = self.scheduler.stage_dw1c_arm_retry_detach(actors) {
             super::notify_runnable_work(Some(target));
         }
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_continuation_detach_request_on(
         &self,
         cpu: SchedulerCpuId,
@@ -779,7 +740,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             .dw1c_continuation_detach_request_on(cpu, suspended)
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn complete_dw1c_continuation_detach(
         &self,
         request: super::Dw1cContinuationDetachRequest,
@@ -787,82 +748,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.complete_dw1c_continuation_detach(request)
     }
 
-    /// Builds the physical switch from a blocked actor continuation to this
-    /// CPU's private detached idle carrier.  The actor continuation is saved
-    /// in its ordinary execution slot and remains scheduler-owned until the
-    /// destination entry acknowledges arrival.
-    #[cfg(deepwyrm_dw1c_evidence)]
-    #[allow(
-        unsafe_code,
-        reason = "the exact scheduler request and lifetime-branded execution owner authenticate the physical blocked-continuation switch"
-    )]
-    pub(crate) unsafe fn prepare_dw1c_continuation_detach_on<
-        'owner,
-        const GROUPS: usize,
-        const PROCESSES: usize,
-        const THREADS: usize,
-        const HANDLES: usize,
-    >(
-        &'owner self,
-        tasks: &super::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-        request: super::Dw1cContinuationDetachRequest,
-        idle_stack: crate::memory::kernel_stack::KernelStackBounds,
-        detached_idle_entry: u64,
-    ) -> Result<crate::arch::x86_64::context::KernelSwitchPlan<'owner>, ExecutionSwitchError> {
-        let cpu = request.cpu();
-        if self
-            .scheduler
-            .dw1c_continuation_detach_request_on(cpu, request.thread())
-            != Some(request)
-        {
-            return Err(ExecutionSwitchError::WrongSchedulerState);
-        }
-        let (stack_id, context_id) = tasks
-            .thread_execution_resources(request.thread())
-            .map_err(ExecutionSwitchError::Task)?
-            .ok_or(ExecutionSwitchError::Resource(
-                ExecutionResourceError::StaleId,
-            ))?;
-        self.contexts
-            .load(context_id)
-            .map_err(ExecutionSwitchError::Resource)?;
-        let current_rsp_out = self
-            .continuations
-            .save_ptr(context_id)
-            .map_err(ExecutionSwitchError::Resource)?;
-        let current_stack = self
-            .stacks
-            .bounds(stack_id)
-            .map_err(ExecutionSwitchError::Resource)?;
-        let initial = unsafe {
-            crate::arch::x86_64::context::prepare_initial_kernel_continuation(
-                idle_stack,
-                detached_idle_entry,
-            )
-        }
-        .map_err(ExecutionSwitchError::InitialContext)?;
-        unsafe {
-            crate::arch::x86_64::context::KernelSwitchPlan::new_initial(
-                self,
-                current_rsp_out,
-                current_stack,
-                initial,
-            )
-        }
-        .map_err(ExecutionSwitchError::Context)
-    }
-
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> super::Dw1cTerminalGate {
         self.scheduler.dw1c_terminal_gate(thread)
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_token2_relay_ready(&self) -> bool {
         self.scheduler.dw1c_token2_relay_ready()
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_final_scheduler_snapshot(
         &self,
     ) -> Result<super::Dw1cFinalSchedulerSnapshot, SchedulerError> {
@@ -894,15 +790,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<(), super::CarrierAdmissionError> {
         self.scheduler
             .commit_bootstrap_schedulable(ticket, resources)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        crate::test_support::DW1C_EVIDENCE
-            .observe_cpu_ready_payload(
-                ticket.cpu().index() as u8,
-                ((ticket.cpu().index() as u64 + 1) << 32) | u64::from(resources.local_apic_id),
-                ticket.online_generation(),
-                ticket.admission_generation(),
-            )
-            .unwrap_or_else(|error| panic!("selector-28 CPU admission failed: {error:?}"));
         Ok(())
     }
 
@@ -932,15 +819,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<(), super::CarrierAdmissionError> {
         self.scheduler
             .commit_ap_schedulable(ticket, resources, enable_idle_wake)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        crate::test_support::DW1C_EVIDENCE
-            .observe_cpu_ready_payload(
-                ticket.cpu().index() as u8,
-                ((ticket.cpu().index() as u64 + 1) << 32) | u64::from(resources.local_apic_id),
-                ticket.online_generation(),
-                ticket.admission_generation(),
-            )
-            .unwrap_or_else(|error| panic!("selector-28 AP admission failed: {error:?}"));
         Ok(())
     }
 
@@ -987,8 +865,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         let decision = self.scheduler.yield_current(thread)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
         Ok(decision)
     }
 
@@ -998,8 +874,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         thread: ThreadKey,
     ) -> Result<super::ScheduleDecision, SchedulerError> {
         let decision = self.scheduler.yield_current_on(cpu, thread)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
         Ok(decision)
     }
 
@@ -1016,78 +890,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         ticket: super::SchedulerQuantumTicket,
     ) -> Result<bool, SchedulerError> {
         let published = self.scheduler.publish_quantum_expiry(ticket)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if published && crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_quantum_claim(
-                    ticket.cpu().index() as u8,
-                    ticket.thread(),
-                    ticket.execution_generation(),
-                    ticket.source_arm_generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 QUANTUM observation failed: {error:?}")
-                });
-            self.scheduler
-                .acknowledge_dw1c_quantum_observation(ticket)
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 QUANTUM acknowledgement failed: {error:?}")
-                });
-        }
         Ok(published)
-    }
-
-    #[cfg(deepwyrm_dw1c_evidence)]
-    fn observe_consumed_published_expiry(&self, ticket: Option<super::SchedulerQuantumTicket>) {
-        let Some(ticket) = ticket else {
-            return;
-        };
-        if !crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
-            return;
-        }
-        crate::test_support::DW1C_EVIDENCE
-            .observe_consumed_quantum_claim(
-                ticket.cpu().index() as u8,
-                ticket.thread(),
-                ticket.execution_generation(),
-                ticket.source_arm_generation(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("selector-28 consumed QUANTUM observation failed: {error:?}")
-            });
-    }
-
-    #[cfg(deepwyrm_dw1c_evidence)]
-    fn observe_retained_current_published_expiry(&self, ticket: super::SchedulerQuantumTicket) {
-        crate::test_support::DW1C_EVIDENCE
-            .observe_retained_current_quantum_claim(
-                ticket.cpu().index() as u8,
-                ticket.thread(),
-                ticket.execution_generation(),
-                ticket.source_arm_generation(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("selector-28 retained-current QUANTUM observation failed: {error:?}")
-            });
-    }
-
-    #[cfg(deepwyrm_dw1c_evidence)]
-    fn observe_terminal_after_expiry_ticket(&self, ticket: super::SchedulerQuantumTicket) {
-        if !crate::test_support::DW1C_EVIDENCE.tracks_thread(ticket.thread()) {
-            return;
-        }
-        let absent_after_commit = self.scheduler.terminal_ticket_generation_absent(ticket);
-        crate::test_support::DW1C_EVIDENCE
-            .observe_terminal_preemption_claim(
-                ticket.cpu().index() as u8,
-                ticket.thread(),
-                ticket.execution_generation(),
-                ticket.source_arm_generation(),
-                absent_after_commit,
-            )
-            .unwrap_or_else(|error| {
-                panic!("selector-28 terminal preemption observation failed: {error:?}")
-            });
     }
 
     pub(crate) fn has_reschedule_request_on(&self, cpu: SchedulerCpuId) -> bool {
@@ -1106,13 +909,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         cpu: SchedulerCpuId,
     ) -> Result<super::SchedulerPreemptionDecision, SchedulerError> {
         let decision = self.scheduler.preempt_current_on(cpu)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let super::SchedulerPreemptionDecision::RetainCurrent {
-            consumed_published_expiry,
-        } = decision
-        {
-            self.observe_retained_current_published_expiry(consumed_published_expiry);
-        }
         Ok(decision)
     }
 
@@ -1139,34 +935,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         let dispatch = self
             .scheduler
             .schedule_from_idle_on_with_migration(cpu, suspended)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(migration) = dispatch
-            .migration()
-            .filter(|migration| crate::test_support::DW1C_EVIDENCE.tracks_thread(migration.thread))
-        {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_steal_migration_claim(
-                    migration.source.index() as u8,
-                    migration.target.index() as u8,
-                    migration.thread,
-                    migration.execution_generation,
-                    migration.generation,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 STEAL_MIGRATE observation failed: {error:?}")
-                });
-        }
         let decision = dispatch.decision();
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(claim) = self
-            .scheduler
-            .running_claim_on(cpu)
-            .filter(|claim| crate::test_support::DW1C_EVIDENCE.tracks_thread(claim.thread()))
-        {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_running_claim(cpu.index() as u8, claim.thread(), claim.generation())
-                .unwrap_or_else(|error| panic!("selector-28 RUN observation failed: {error:?}"));
-        }
         Ok(decision)
     }
 
@@ -1205,8 +974,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         reservation: BlockReservation,
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
         let decision = self.scheduler.commit_block(reservation)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
         Ok(decision)
     }
 
@@ -1216,8 +983,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         reservation: BlockReservation,
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
         let decision = self.scheduler.commit_block_on(cpu, reservation)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
         Ok(decision)
     }
 
@@ -1232,14 +997,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
         let wake = reservation.wake_key();
         let decision = self.scheduler.commit_block_on(cpu, reservation)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        self.observe_consumed_published_expiry(decision.consumed_published_expiry);
-        #[cfg(deepwyrm_dw1c_evidence)]
-        crate::test_support::DW1C_EVIDENCE
-            .observe_bound_wait_claim(wake.thread(), wake.execution_generation())
-            .unwrap_or_else(|error| {
-                panic!("selector-28 pre-ARM wait observation failed: {error:?}")
-            });
         if self
             .blocked_operations
             .winner(wake)
@@ -1275,36 +1032,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         let completed = self
             .scheduler
             .complete_switch_on_with_runnable_publication(claim)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if completed.involuntary_preemption()
-            && crate::test_support::DW1C_EVIDENCE.tracks_thread(claim.thread())
-        {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_preemption_claim(
-                    claim.cpu().index() as u8,
-                    claim.thread(),
-                    claim.generation(),
-                    completed.generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 PREEMPT observation failed: {error:?}")
-                });
-        }
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(incoming) = completed
-            .incoming_claim()
-            .filter(|incoming| crate::test_support::DW1C_EVIDENCE.tracks_thread(incoming.thread()))
-        {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_running_claim(
-                    incoming.cpu().index() as u8,
-                    incoming.thread(),
-                    incoming.generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 incoming RUN observation failed: {error:?}")
-                });
-        }
         Ok(completed.runnable_publication())
     }
 
@@ -1320,10 +1047,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         claim: SchedulerExecutionClaim,
     ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
         let stopped = self.scheduler.stop_running_claim_on(claim)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(ticket) = stopped.consumed_published_expiry {
-            self.observe_terminal_after_expiry_ticket(ticket);
-        }
         Ok(stopped.cancelled_quantum)
     }
 
@@ -1332,10 +1055,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         claim: SchedulerExecutionClaim,
     ) -> Result<Option<super::SchedulerQuantumTicket>, SchedulerError> {
         let retired = self.scheduler.retire_unentered_running_claim_on(claim)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if let Some(ticket) = retired.consumed_published_expiry {
-            self.observe_terminal_after_expiry_ticket(ticket);
-        }
         Ok(retired.cancelled_quantum)
     }
 
@@ -1415,52 +1134,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
         let requester = super::scheduler_requester_cpu();
-        #[cfg(deepwyrm_dw1c_evidence)]
-        let token6 = crate::test_support::DW1C_EVIDENCE.tracks_token6_thread(key.thread());
-        #[cfg(deepwyrm_dw1c_evidence)]
-        let (publication, migration_rejection) = if token6 {
-            let (publication, rejection) = self.scheduler.wake_with_migration_rejection_on(
-                requester,
-                key,
-                super::SchedulerMigrationRejectionReason::ExecutionPinned,
-            )?;
-            (publication, Some(rejection))
-        } else {
-            (self.scheduler.wake_on(requester, key)?, None)
-        };
-        #[cfg(not(deepwyrm_dw1c_evidence))]
         let publication = self.scheduler.wake_on(requester, key)?;
-        #[cfg(deepwyrm_dw1c_evidence)]
-        let actor_token = if crate::test_support::DW1C_EVIDENCE.tracks_thread(key.thread()) {
-            crate::test_support::DW1C_EVIDENCE
-                .observe_remote_wake_claim(
-                    publication.source().index() as u8,
-                    publication.target().index() as u8,
-                    key.thread(),
-                    key.execution_generation(),
-                    publication.generation(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 REMOTE_WAKE observation failed: {error:?}")
-                })
-        } else {
-            None
-        };
-        #[cfg(deepwyrm_dw1c_evidence)]
-        if actor_token == Some(6) {
-            let rejection = migration_rejection
-                .expect("token-6 wake atomically returns its migration rejection");
-            crate::test_support::DW1C_EVIDENCE
-                .observe_migration_rejection_claim(
-                    rejection.cpu.index() as u8,
-                    rejection.thread,
-                    rejection.execution_generation,
-                    rejection.reason.code(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 MIGRATION_REJECT observation failed: {error:?}")
-                });
-        }
         super::notify_runnable_work(publication.wake_affinity());
         Ok(())
     }
@@ -1730,12 +1404,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                     continue;
                 };
                 let thread = ThreadKey::from_object_id(pin.id());
-                #[cfg(deepwyrm_dw1c_evidence)]
-                let deferred_execution_generation = (defer_current == Some(thread)).then(|| {
-                    self.scheduler
-                        .current_execution_generation(thread)
-                        .expect("physical terminal current lost its exact execution generation")
-                });
                 if (defer_current == Some(thread)) != deferred_pass {
                     continue;
                 }
@@ -1785,10 +1453,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                         .unwrap_or_else(|error| {
                             panic!("terminal thread was not removable from scheduler: {error:?}")
                         });
-                    #[cfg(deepwyrm_dw1c_evidence)]
-                    if let Some(ticket) = decision.consumed_published_expiry {
-                        self.observe_terminal_after_expiry_ticket(ticket);
-                    }
                     if defer_current == Some(thread) {
                         assert!(
                             deferred.is_none(),
@@ -1806,9 +1470,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                         if defer_current == Some(thread) {
                             deferred = Some(DeferredCurrentExecutionResources {
                                 thread,
-                                #[cfg(deepwyrm_dw1c_evidence)]
-                                execution_generation: deferred_execution_generation
-                                    .expect("deferred current generation disappeared"),
                                 resources: Some(resources),
                                 process_pin: None,
                                 thread_pin: Some(pin),
@@ -1831,9 +1492,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
                         );
                         deferred = Some(DeferredCurrentExecutionResources {
                             thread,
-                            #[cfg(deepwyrm_dw1c_evidence)]
-                            execution_generation: deferred_execution_generation
-                                .expect("deferred current generation disappeared"),
                             resources: Some(resources),
                             process_pin: None,
                             thread_pin: Some(pin),
@@ -2415,10 +2073,6 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
         tasks
             .start_thread(self.thread)
             .unwrap_or_else(|error| panic!("prepared Thread task publication diverged: {error:?}"));
-        #[cfg(deepwyrm_dw1c_evidence)]
-        let process = tasks
-            .thread_process(self.thread)
-            .unwrap_or_else(|error| panic!("selector-28 started Thread lost Process: {error:?}"));
         let publication = self
             .execution
             .scheduler
@@ -2434,19 +2088,6 @@ impl<const CAPACITY: usize> PreparedThreadStart<'_, CAPACITY> {
                     failure.error()
                 )
             });
-        #[cfg(deepwyrm_dw1c_evidence)]
-        {
-            let generation = self
-                .execution
-                .scheduler
-                .runnable_start_generation(self.thread)
-                .unwrap_or_else(|| panic!("selector-28 START omitted Runnable generation"));
-            crate::test_support::DW1C_EVIDENCE
-                .observe_thread_start(process, self.thread, generation)
-                .unwrap_or_else(|error| {
-                    panic!("selector-28 Thread START observation failed: {error:?}")
-                });
-        }
         super::notify_runnable_work(publication.wake_affinity());
         self.completed = true;
     }

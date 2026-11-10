@@ -148,18 +148,11 @@ pub(super) const REGISTRY_PEAK: usize = LIVE_PROCESSES * 3 // Process, Thread, r
     + INTERRUPTS
     + TIMER_PEAK;
 
-// Not re-derived. `wyr1e_wait_geometry` already models this exact six-role
-// interactive graph, and its non-E8 arm is 12 + 3 + 4 + 6 + 7 + 7 = 39: the
+// The six-role interactive graph's waits: 12 + 3 + 4 + 6 + 7 + 7 = 39, the
 // controller's resident supervision set, the registry, device, console, shell
-// and job sets. An independent enumeration here first reached 32, which is not
-// a smaller graph -- it is the same graph with rows missed. Two decompositions
-// of one topology disagreeing means the lower one is wrong, so this takes the
-// established model rather than competing with it.
-//
-// Reconcile here if that ledger's arm moves. The two cannot be linked by a
-// `const` because `wyr1e_wait_geometry` compiles only under the selector that
-// needs it, which is the same reason selector 34's ledger restates E8's
-// figures instead of importing them.
+// and job sets. Taken from the retired selector-33 wait ledger (deepwyrm
+// history before selector retirement), where an independent enumeration first
+// reached 32 by missing rows.
 pub(super) const INTERACTIVE_GRAPH_WAITS: usize = 12 + 3 + 4 + 6 + 7 + 7;
 /// What this product adds to that graph: an exit wait apiece for the live job
 /// and the replacement generation, each owning a Channel and a Process
@@ -294,7 +287,6 @@ mod tests {
         // Production links the ordinary arena. Only the E8 and F-closure
         // fairness builds link sixty-four stacks (`kernel_stack.rs`), and this
         // module is compiled into their host tests too.
-        #[cfg(not(any(deepwyrm_wyr1e8_evidence, deepwyrm_wyr1f_fairness_evidence)))]
         assert_eq!(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT, 16);
     }
 

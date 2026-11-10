@@ -148,9 +148,11 @@ state = "implemented"
 # WYR1-A's test-support-only permanent-supervisor/RRC evidence collector.
 # The raw submission trap remains outside the public ABI and exists only in
 # the selector-specialized kernel artifact.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.permanent-supervisor-rrc]
 id = 25
-state = "implemented"
+state = "reserved"
 
 # DW1-B's CPU0-only normal-preemption gate. Its kernel-authored DWPRE1 summary
 # remains test-build-only and precedes the canonical DWTEST1 terminal.
@@ -162,46 +164,60 @@ state = "reserved"
 
 # WYR1-B's separate bootstrap-registry and supervisor launch/job gate. It is a
 # distinct product/evidence contract and does not extend selector 25.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.bootstrap-registry-launch]
 id = 27
-state = "implemented"
+state = "reserved"
 
 # DW1-C's selector-specialized four-vCPU normal-preemption gate.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.normal-preemption-smp]
 id = 28
-state = "implemented"
+state = "reserved"
 
 # WYR1-C's selector-29 device-coordinator restart evidence relay. The
 # userspace controller owns device identity and lifecycle joins; Deepwyrm
 # validates only the private bounded transcript and reporter custody.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.device-coordinator-restart]
 id = 29
-state = "implemented"
+state = "reserved"
 
 # DW1-D's selector-local ring-3 DeviceResource/Interrupt proof. The private
 # raw trigger protocol is compiled only for this selector and is not native ABI.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.device-resource-interrupt-synthetic]
 id = 30
-state = "implemented"
+state = "reserved"
 
 # DW1-E's q35 COM2 physical interrupt route and selector-private E3 evidence
 # collector. E3A makes the identity runnable without claiming final acceptance.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.q35-com2-interrupt]
 id = 31
-state = "implemented"
+state = "reserved"
 
 # WYR1-D's native serial-stream/consoled acceptance product. The paired D0
 # contract reserves this identity; no Deepwyrm dispatch exists at E0/D0.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.native-console-streams]
 id = 32
-state = "implemented"
+state = "reserved"
 
 # WYR1-E's selector-private interactive shell certificate relay. The kernel
 # validates bounded WRE1 transport and reporter custody only; application
 # policy remains in Wyrmroot and the independent host decoder.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.interactive-wyrmsh]
 id = 33
-state = "implemented"
+state = "reserved"
 
 # Reset card R1A's dynamic-launch saturation probe. A selector of its own so it
 # inherits no interactive-shell, recovery, or output-pressure geometry; the
@@ -219,13 +235,8 @@ state = "reserved"
 # allocation. It carries the same bounded WRE1 transport and reporter custody as
 # interactive-wyrmsh; the normal/degraded scenario meaning stays in Wyrmroot's
 # retained gate configuration and the host decoder, not in the kernel.
-#
-# Implemented as of F1B.2: the instrumented Wyrmroot product that selects it
-# exists. `xtask wyr1f prepare --scenario normal-instrumented|degraded` builds
-# a kernel with this selector and an init carrying the `wyr1f-closure` feature,
-# which is the only build that contains the declared post-console failure
-# episode. The production product, `--scenario normal`, still uses the
-# uninstrumented no-selector kernel and selects no guest test at all.
+# Retired 2026-11-10 (closed; DEV_VELOCITY_PLAN selector step 1). The id stays
+# allocated so it is never reused.
 [guest_test.dw1-wyr1-interactive-closure]
 id = 35
-state = "implemented"
+state = "reserved"

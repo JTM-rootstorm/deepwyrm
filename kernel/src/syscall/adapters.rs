@@ -476,60 +476,6 @@ fn copy_input<U: UserPageAccess, const N: usize>(
     Ok(destination)
 }
 
-/// Selector-specialized fixed-size diagnostic input copy. This is kept behind
-/// the private test cfg so production adapters expose no additional surface.
-#[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
-pub(crate) fn copy_wyr1_evidence_input<U: UserPageAccess, const N: usize>(
-    user: &mut U,
-    address: DwUserAddress,
-) -> Result<[u8; N], DwStatus> {
-    copy_input(user, address, 1)
-}
-
-#[cfg(any(
-    deepwyrm_wyr1b_evidence,
-    deepwyrm_wyr1c_evidence,
-    deepwyrm_wyr1d_evidence
-))]
-pub(crate) fn copy_wyr1b_evidence_input<U: UserPageAccess, const N: usize>(
-    user: &mut U,
-    address: DwUserAddress,
-) -> Result<[u8; N], DwStatus> {
-    copy_input(user, address, 1)
-}
-
-#[cfg(deepwyrm_wyr1c_evidence)]
-pub(crate) fn copy_wyr1c_evidence_input<U: UserPageAccess, const N: usize>(
-    user: &mut U,
-    address: DwUserAddress,
-) -> Result<[u8; N], DwStatus> {
-    copy_input(user, address, 1)
-}
-
-#[cfg(deepwyrm_wyr1d_evidence)]
-pub(crate) fn copy_wyr1d_evidence_input<U: UserPageAccess, const N: usize>(
-    user: &mut U,
-    address: DwUserAddress,
-) -> Result<[u8; N], DwStatus> {
-    copy_input(user, address, 1)
-}
-
-#[cfg(deepwyrm_wyr1e_evidence)]
-pub(crate) fn copy_wyr1e_evidence_input<U: UserPageAccess, const N: usize>(
-    user: &mut U,
-    address: DwUserAddress,
-) -> Result<[u8; N], DwStatus> {
-    copy_input(user, address, 1)
-}
-
-#[cfg(deepwyrm_dw1c_evidence)]
-pub(crate) fn copy_dw1c_evidence_input<U: UserPageAccess, const N: usize>(
-    user: &mut U,
-    address: DwUserAddress,
-) -> Result<[u8; N], DwStatus> {
-    copy_input(user, address, 8)
-}
-
 pub(crate) fn abi_get_info<U: UserPageAccess>(
     user: &mut U,
     out_info: DwUserAddress,
@@ -1990,15 +1936,6 @@ fn device_resource_claim_under_operation<
         return Err(DW_STATUS_NO_RESOURCES);
     }
     grants.commit(reservation, key.object_id());
-    #[cfg(deepwyrm_dw1d_evidence)]
-    crate::test_support::DW1D_EVIDENCE
-        .observe_claim(
-            current_process,
-            descriptor.resource_id,
-            key.object_id(),
-            descriptor.lease_generation,
-        )
-        .unwrap_or_else(|error| panic!("selector-30 claim observation failed: {error:?}"));
     if fail_at == Some(DeviceResourceClaimCommitFailure::PostPublication) {
         let final_release = tasks
             .process_handles_mut_for_operation(operation, current_process)
@@ -2215,114 +2152,6 @@ pub(crate) fn interrupt_ack<
         Ok(Err(status)) => status,
         Err(error) => task_status(error),
     }
-}
-
-#[cfg(deepwyrm_dw1e_evidence)]
-pub(crate) fn interrupt_ack_dw1e<
-    const OBJECTS: usize,
-    const GROUPS: usize,
-    const PROCESSES: usize,
-    const THREADS: usize,
-    const HANDLES: usize,
-    const INTERRUPTS: usize,
->(
-    registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    interrupts: &InterruptAuthority<INTERRUPTS>,
-    platform: &dyn InterruptPlatform,
-    current_process: ProcessKey,
-    interrupt: DwHandle,
-    cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
-    let transaction = match process_handle_operation!(tasks, current_process, table, {
-        crate::device::prepare_interrupt_ack(table, registry, interrupts, interrupt)
-    }) {
-        Ok(Ok(transaction)) => transaction,
-        Ok(Err(status)) => return status,
-        Err(error) => return task_status(error),
-    };
-    let binding = transaction
-        .binding_for_evidence()
-        .expect("selector-31 ack retains its exact binding");
-    let release = match transaction.complete(registry, interrupts, platform) {
-        Ok(release) => release,
-        Err(status) => return status,
-    };
-    cleanup.push_optional(release);
-    crate::test_support::DW1E_EVIDENCE
-        .observe_ack(
-            current_process,
-            binding,
-            interrupts.pending_for_binding(binding),
-        )
-        .unwrap_or_else(|error| panic!("selector-31 ack observation failed: {error:?}"));
-    DW_STATUS_SUCCESS
-}
-
-#[cfg(deepwyrm_dw1d_evidence)]
-pub(crate) fn interrupt_ack_dw1d<
-    const OBJECTS: usize,
-    const GROUPS: usize,
-    const PROCESSES: usize,
-    const THREADS: usize,
-    const HANDLES: usize,
-    const INTERRUPTS: usize,
-    const SOURCES: usize,
-    const WAITERS: usize,
-    const EXECUTION: usize,
->(
-    registry: &mut ObjectRegistry<OBJECTS>,
-    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    interrupts: &InterruptAuthority<INTERRUPTS>,
-    platform: &crate::device::InterruptPlatformModel<SOURCES>,
-    waits: &WaitRegistry<WAITERS>,
-    execution: &ExecutionDomain<EXECUTION>,
-    current_process: ProcessKey,
-    interrupt: DwHandle,
-    cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
-    let transaction = match process_handle_operation!(tasks, current_process, table, {
-        crate::device::prepare_interrupt_ack(table, registry, interrupts, interrupt)
-    }) {
-        Ok(Ok(transaction)) => transaction,
-        Ok(Err(status)) => return status,
-        Err(error) => return task_status(error),
-    };
-    let binding = transaction
-        .binding_for_evidence()
-        .unwrap_or_else(|| panic!("selector-30 ack unexpectedly entered coalesced completion"));
-    let plan = crate::test_support::DW1D_EVIDENCE
-        .ack_prepared(current_process, binding)
-        .unwrap_or_else(|error| {
-            panic!("selector-30 ack preparation observation failed: {error:?}")
-        });
-    let mut race_wakes = WakeBatch::empty();
-    if let crate::test_support::Dw1dAckPlan::InjectRace(expected) = plan {
-        assert_eq!(expected, binding, "selector-30 race permit changed binding");
-        let delivery = platform.prepare_delivery(binding).unwrap_or_else(|error| {
-            panic!("selector-30 race delivery preparation failed: {error:?}")
-        });
-        let (accepted, wakes) = interrupts.deliver(delivery, waits);
-        crate::test_support::DW1D_EVIDENCE
-            .observe_race_injected(binding, accepted)
-            .unwrap_or_else(|error| {
-                panic!("selector-30 race injection observation failed: {error:?}")
-            });
-        race_wakes = wakes;
-    }
-    let release = transaction
-        .complete(registry, interrupts, platform)
-        .unwrap_or_else(|status| panic!("selector-30 public ack transaction failed: {status:?}"));
-    cleanup.push_optional(release);
-    complete_wait_wakes(registry, execution, race_wakes, cleanup);
-    crate::test_support::DW1D_EVIDENCE
-        .observe_ack_complete(
-            current_process,
-            binding,
-            interrupts.pending_for_binding(binding),
-        )
-        .unwrap_or_else(|error| panic!("selector-30 ack completion observation failed: {error:?}"));
-    DW_STATUS_SUCCESS
 }
 
 fn interrupt_create_status(error: InterruptCreateError) -> DwStatus {
@@ -3510,7 +3339,7 @@ pub(crate) fn channel_send_commit<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
-    #[cfg_attr(not(deepwyrm_dw1c_evidence), allow(unused_variables))] current_thread: Option<
+    #[allow(unused_variables)] current_thread: Option<
         ThreadKey,
     >,
     channel: DwHandle,
@@ -3590,22 +3419,8 @@ pub(crate) fn channel_send_commit<
     let send_reservation = match channels.reserve_send(endpoint, &staging[..byte_len]) {
         Ok(reservation) => reservation,
         Err(error) => {
-            #[cfg(deepwyrm_dw1c_evidence)]
-            let token7_full_send = error == ChannelError::WouldBlock
-                && current_thread.is_some_and(|thread| {
-                    crate::test_support::DW1C_EVIDENCE.tracks_token7_actor(current_process, thread)
-                });
             drop(prepared);
             release_lookup_pin(registry, pin, cleanup);
-            #[cfg(deepwyrm_dw1c_evidence)]
-            if token7_full_send {
-                let thread = current_thread.expect("token-7 filter retained caller Thread");
-                crate::test_support::DW1C_EVIDENCE
-                    .observe_token7_full_send(current_process, thread, endpoint, peer_object)
-                    .unwrap_or_else(|error| {
-                        panic!("selector-28 token-7 full-send observation failed: {error:?}")
-                    });
-            }
             return channel_status(error);
         }
     };
@@ -4269,7 +4084,7 @@ fn complete_wait_wakes_with_channel_drain<
     execution: &ExecutionDomain<EXECUTION>,
     wakes: WakeBatch<WAITERS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
-    #[cfg_attr(not(deepwyrm_dw1c_evidence), allow(unused_variables))] drained_peer: Option<
+    #[allow(unused_variables)] drained_peer: Option<
         ChannelEndpointKey,
     >,
 ) {
@@ -4290,23 +4105,6 @@ fn complete_wait_wakes_with_channel_drain<
         {
             Ok(true) => match execution.wake(wake.wake_key()) {
                 Ok(()) => {
-                    #[cfg(deepwyrm_dw1c_evidence)]
-                    if let Some(peer) = drained_peer.filter(|_| {
-                        crate::test_support::DW1C_EVIDENCE
-                            .tracks_token7_thread(wake.wake_key().thread())
-                    }) {
-                        crate::test_support::DW1C_EVIDENCE
-                            .observe_token7_peer_drain_wake(
-                                wake.wake_key().thread(),
-                                wake.wake_key().execution_generation(),
-                                peer,
-                                wake.wake_key().token(),
-                                wake.observed().0,
-                            )
-                            .unwrap_or_else(|error| {
-                                panic!("selector-28 token-7 wake observation failed: {error:?}")
-                            });
-                    }
                 }
                 Err(SchedulerError::StaleBlockToken) => {}
                 Err(error) => {
@@ -4720,31 +4518,10 @@ pub(crate) unsafe fn poll_wait_idle_suspend<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
-        #[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
-        IdleScheduleDecision::Detach(request) => {
-            let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
-                .map_err(|_| WaitSuspendError::InvalidDecision)?
-                .get(request.cpu().index())
-                .map(|layout| layout.ap_bootstrap)
-                .ok_or(WaitSuspendError::InvalidDecision)?;
-            let plan = unsafe {
-                execution.prepare_dw1c_continuation_detach_on(
-                    tasks,
-                    request,
-                    idle_stack,
-                    crate::arch::x86_64::syscall::detached_idle_entry_rip(),
-                )
-            }
-            .map_err(WaitSuspendError::Switch)?;
-            Ok(NativeIdleSuspendPoll::Detach { plan, request })
-        }
         // The live detach needs the linked per-CPU stacks and the detached
         // idle entry, which exist only in the freestanding kernel. A host test
         // build under the DW1-C evidence cfg has the variant but not those.
-        #[cfg(all(
-            any(test, deepwyrm_dw1c_evidence),
-            not(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))
-        ))]
+        #[cfg(test)]
         IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
@@ -4789,31 +4566,10 @@ pub(crate) unsafe fn poll_wait_idle_suspend_on<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
-        #[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
-        IdleScheduleDecision::Detach(request) => {
-            let idle_stack = crate::arch::x86_64::linked_runtime_cpu_stack_layout()
-                .map_err(|_| WaitSuspendError::InvalidDecision)?
-                .get(cpu.index())
-                .map(|layout| layout.ap_bootstrap)
-                .ok_or(WaitSuspendError::InvalidDecision)?;
-            let plan = unsafe {
-                execution.prepare_dw1c_continuation_detach_on(
-                    tasks,
-                    request,
-                    idle_stack,
-                    crate::arch::x86_64::syscall::detached_idle_entry_rip(),
-                )
-            }
-            .map_err(WaitSuspendError::Switch)?;
-            Ok(NativeIdleSuspendPoll::Detach { plan, request })
-        }
         // The live detach needs the linked per-CPU stacks and the detached
         // idle entry, which exist only in the freestanding kernel. A host test
         // build under the DW1-C evidence cfg has the variant but not those.
-        #[cfg(all(
-            any(test, deepwyrm_dw1c_evidence),
-            not(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))
-        ))]
+        #[cfg(test)]
         IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
@@ -6055,19 +5811,12 @@ pub(crate) fn thread_create<
         Ok(pin) => pin,
         Err(status) => return status,
     };
-    #[cfg(deepwyrm_dw1c_evidence)]
-    let target_process = ProcessKey::from_object_id(process_pin.id());
     let created = tasks.create_thread(registry, &process_pin);
     release_lookup_pin(registry, process_pin, cleanup);
     let (key, reference) = match created {
         Ok(created) => created,
         Err(error) => return task_create_status(error),
     };
-    #[cfg(deepwyrm_dw1c_evidence)]
-    crate::test_support::DW1C_EVIDENCE
-        .observe_thread_create(target_process, key)
-        .unwrap_or_else(|error| panic!("selector-28 Thread CREATE observation failed: {error:?}"));
-    #[cfg(not(deepwyrm_dw1c_evidence))]
     let _ = key;
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
@@ -6708,10 +6457,6 @@ pub(crate) fn prepare_process_exit<
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> Result<PreparedProcessTermination<THREADS>, DwStatus> {
     validate_running_caller(tasks, execution, current_process, current_thread)?;
-    #[cfg(deepwyrm_dw1c_evidence)]
-    let terminal_thread_generation = execution
-        .current_execution_generation(current_thread)
-        .unwrap_or_else(|| panic!("selector-28 exiting Thread has no exact execution claim"));
     let pins = match tasks.exit_process(current_process, current_thread, code) {
         Ok(pins) => pins,
         Err(TaskError::OperationsInFlight) => {
@@ -6732,15 +6477,6 @@ pub(crate) fn prepare_process_exit<
     };
     drain_exited_process_handles_staged(registry, tasks, current_process, cleanup)
         .unwrap_or_else(|error| panic!("exiting Process could not drain its handles: {error:?}"));
-    #[cfg(deepwyrm_dw1c_evidence)]
-    crate::test_support::DW1C_EVIDENCE
-        .observe_process_exit(
-            current_process,
-            current_thread,
-            terminal_thread_generation,
-            code,
-        )
-        .unwrap_or_else(|error| panic!("selector-28 Process EXIT observation failed: {error:?}"));
     let pre_retired =
         PreRetiredTerminalThreads::new(execution.quiesce_terminal_threads(pins.thread_keys()));
     Ok(PreparedProcessTermination {

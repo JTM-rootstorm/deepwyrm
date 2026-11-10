@@ -382,27 +382,6 @@ fn dw0f_selectors_distinguish_implemented_and_reserved_identities() {
 }
 
 #[test]
-fn dw1c_selector_28_requires_the_exact_smp_profile() {
-    let config = workspace_root().join(HARNESS_CONFIG);
-    let request_path = temp_file(
-        &request("guest-test", "normal-preemption-smp")
-            .replace("test_id = 1", "test_id = 28")
-            .replace("profile = \"default\"", "profile = \"smp\"")
-            .replace("timeout_seconds = 120", "timeout_seconds = 180"),
-    );
-    let parsed = load_harness_request(&request_path).unwrap();
-    validate_guest_selector_metadata(&config, &parsed).unwrap();
-    fs::remove_file(request_path).unwrap();
-
-    let request_path = temp_file(
-        &request("guest-test", "normal-preemption-smp").replace("test_id = 1", "test_id = 28"),
-    );
-    let parsed = load_harness_request(&request_path).unwrap();
-    assert!(validate_guest_selector_metadata(&config, &parsed).is_err());
-    fs::remove_file(request_path).unwrap();
-}
-
-#[test]
 fn dw0g_primordial_selectors_have_stable_runnable_identities() {
     let config = workspace_root().join(HARNESS_CONFIG);
     for (selector, test_id) in [
@@ -891,11 +870,11 @@ fn the_selector_gate_reads_implemented_selectors_and_skips_reserved_ones() {
     let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
     let selectors = implemented_guest_selectors(&manifest);
     assert!(
-        selectors.len() > 20,
+        selectors.len() > 15,
         "the manifest lists {} implemented selectors, which is too few to be a real parse",
         selectors.len()
     );
-    for implemented in ["ipc-blocking-smoke", "interactive-wyrmsh", "memory-mapping"] {
+    for implemented in ["ipc-blocking-smoke", "native-userspace-capability", "memory-mapping"] {
         assert!(
             selectors.iter().any(|selector| selector == implemented),
             "{implemented} is implemented and must be gated"
@@ -922,20 +901,14 @@ fn every_selector_environment_names_a_selector_that_exists() {
             "{selector} has an environment row but is not an implemented selector"
         );
     }
-    for (label, selector, _) in SELECTOR_VARIANTS {
-        assert!(
-            selectors.iter().any(|known| known == selector),
-            "variant {label} names {selector}, which is not an implemented selector"
-        );
-    }
 }
 
 #[test]
-fn selector_builds_are_every_selector_once_then_every_variant() {
+fn selector_builds_are_every_selector_once() {
     let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
     let selectors = implemented_guest_selectors(&manifest);
     let builds = selector_builds(&selectors);
-    assert_eq!(builds.len(), selectors.len() + SELECTOR_VARIANTS.len());
+    assert_eq!(builds.len(), selectors.len());
     for (build, selector) in builds.iter().zip(&selectors) {
         assert_eq!(
             (build.label, build.selector),
@@ -950,16 +923,6 @@ fn selector_builds_are_every_selector_once_then_every_variant() {
         labels.len(),
         builds.len(),
         "selector build labels must be unique"
-    );
-    let e8 = builds
-        .iter()
-        .find(|build| build.label == "interactive-wyrmsh+wyr1e8")
-        .unwrap();
-    assert!(
-        !e8.environment
-            .iter()
-            .any(|(name, _)| *name == "DEEPWYRM_WYR1E7_EVIDENCE_NONCE"),
-        "build.rs rejects the E7 nonce in an E8 build"
     );
 }
 

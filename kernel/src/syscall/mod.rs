@@ -25,22 +25,6 @@ pub(crate) use f_services::{
 
 #[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::atomic_wake_with;
-#[cfg(all(deepwyrm_dw1c_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::copy_dw1c_evidence_input;
-#[cfg(all(
-    any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
-pub(crate) use adapters::copy_wyr1_evidence_input;
-#[cfg(all(deepwyrm_wyr1b_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::copy_wyr1b_evidence_input;
-#[cfg(all(deepwyrm_wyr1c_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::copy_wyr1c_evidence_input;
-#[cfg(all(deepwyrm_wyr1d_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::copy_wyr1d_evidence_input;
-#[cfg(all(deepwyrm_wyr1e_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::copy_wyr1e_evidence_input;
 #[allow(
     unused_imports,
     reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"
@@ -54,17 +38,8 @@ pub(crate) use adapters::{
 
 #[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
 pub(crate) use adapters::clock_get;
-#[cfg(all(
-    deepwyrm_integrated,
-    target_os = "none",
-    target_arch = "x86_64",
-    not(any(deepwyrm_dw1d_evidence, deepwyrm_dw1e_evidence))
-))]
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::interrupt_ack;
-#[cfg(all(deepwyrm_dw1d_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::interrupt_ack_dw1d;
-#[cfg(all(deepwyrm_dw1e_evidence, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::interrupt_ack_dw1e;
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -109,24 +84,7 @@ pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 pub(crate) use adapters::{complete_deferred_current_reclaim_on, process_exit_on};
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
-#[cfg(all(
-    deepwyrm_integrated,
-    target_os = "none",
-    target_arch = "x86_64",
-    not(any(
-        deepwyrm_dw1d_evidence,
-        deepwyrm_dw1e_evidence,
-        deepwyrm_wyr1c_evidence,
-        deepwyrm_wyr1d_evidence,
-        deepwyrm_wyr1e_evidence,
-        // F2A.3: the WYR1-F production product is newer than this arm. Its
-        // primordial calls `object_get_info_v1_with_device_objects`, imported
-        // unconditionally above, so re-exporting the two older adapters here
-        // left the production build with two unused imports -- the only
-        // warnings-denied failure the production target row had.
-        deepwyrm_production_product,
-    ))
-))]
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64", not(deepwyrm_production_product)))]
 pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};
 
 use deepwyrm_abi::{

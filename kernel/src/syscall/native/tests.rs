@@ -233,22 +233,6 @@ impl crate::arch::x86_64::syscall::UserReturnMappingValidation for FrameRuntime 
 impl NativeSyscallFrameRuntime for FrameRuntime {
     type QuantumExpiry = super::NoQuantumExpiry;
 
-    #[cfg(deepwyrm_wyr1b_evidence)]
-    fn intercept_wyr1b_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("host frame fixture must not intercept selector-27 evidence")
-    }
-
-    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
-    fn intercept_wyr1_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("host frame fixture must not intercept selector-25 evidence")
-    }
-
     fn authorize_return(
         &mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
@@ -365,22 +349,6 @@ impl NativeSyscallHandler for SuspendingRuntime {
 )]
 impl NativeSyscallFrameRuntime for SuspendingRuntime {
     type QuantumExpiry = super::NoQuantumExpiry;
-
-    #[cfg(deepwyrm_wyr1b_evidence)]
-    fn intercept_wyr1b_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("suspending host fixture must not intercept selector-27 evidence")
-    }
-
-    #[cfg(any(deepwyrm_wyr1_evidence, deepwyrm_wyr1f_supervisor_relay))]
-    fn intercept_wyr1_evidence_raw(
-        &mut self,
-        _arguments: RawSyscallArguments,
-    ) -> NativeSyscallResult {
-        panic!("suspending host fixture must not intercept selector-25 evidence")
-    }
 
     fn authorize_return(
         &mut self,

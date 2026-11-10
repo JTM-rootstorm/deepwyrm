@@ -12,8 +12,6 @@ ASSERT(DEFINED(DW_KERNEL_BOOT_STACK_ALIGNMENT),
        "DW_KERNEL_BOOT_STACK_ALIGNMENT must come from layout.toml")
 ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_COUNT),
        "DW_KERNEL_THREAD_STACK_COUNT must come from task_layout.toml")
-ASSERT(DEFINED(DW_KERNEL_WYR1E8_STACK_LAYOUT),
-       "DW_KERNEL_WYR1E8_STACK_LAYOUT must come from the canonical build selector")
 ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_SIZE),
        "DW_KERNEL_THREAD_STACK_SIZE must come from task_layout.toml")
 ASSERT(DEFINED(DW_KERNEL_THREAD_STACK_GUARD_SIZE),
@@ -208,9 +206,8 @@ ASSERT((__dw_ist_region_end - __dw_ist_region_start) == 15 * DW_KERNEL_BASE_PAGE
 
 ASSERT((__dw_thread_kernel_stack_region_start & (DW_KERNEL_THREAD_STACK_ALIGNMENT - 1)) == 0,
        "thread kernel-stack region must satisfy its configured alignment")
-ASSERT((DW_KERNEL_WYR1E8_STACK_LAYOUT == 0 && DW_KERNEL_THREAD_STACK_COUNT == 16) ||
-       (DW_KERNEL_WYR1E8_STACK_LAYOUT == 1 && DW_KERNEL_THREAD_STACK_COUNT == 64),
-       "thread kernel-stack count must be 16 ordinarily or 64 only for WYR1-E8")
+ASSERT(DW_KERNEL_THREAD_STACK_COUNT == 16,
+       "thread kernel-stack count must be 16")
 ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 524288,
        "thread kernel-stack size must be the frozen E3 512 KiB for every product")
 ASSERT(DW_KERNEL_THREAD_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,

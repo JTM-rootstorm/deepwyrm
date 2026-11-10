@@ -35,18 +35,6 @@ pub(crate) enum BuildGuestTest {
     SmpRuntimeStress,
     SmpRuntimeAcceptance,
     NativeUserspaceCapability,
-    PermanentSupervisorRrc,
-    BootstrapRegistryLaunch,
-    NormalPreemptionSmp,
-    DeviceCoordinatorRestart,
-    DeviceResourceInterruptSynthetic,
-    Q35Com2Interrupt,
-    NativeConsoleStreams,
-    InteractiveWyrmsh,
-    /// DW1-F/WYR1-F's final closure selector. It reuses `InteractiveWyrmsh`'s
-    /// WRE1 transport and DW1-E platform admission; the kernel's obligation for
-    /// both is identical, and the difference is entirely Wyrmroot's.
-    Dw1Wyr1InteractiveClosure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,15 +98,6 @@ impl BuildGuestTest {
             Self::SmpRuntimeStress => 22,
             Self::SmpRuntimeAcceptance => 23,
             Self::NativeUserspaceCapability => 24,
-            Self::PermanentSupervisorRrc => 25,
-            Self::BootstrapRegistryLaunch => 27,
-            Self::NormalPreemptionSmp => 28,
-            Self::DeviceCoordinatorRestart => 29,
-            Self::DeviceResourceInterruptSynthetic => 30,
-            Self::Q35Com2Interrupt => 31,
-            Self::NativeConsoleStreams => 32,
-            Self::InteractiveWyrmsh => 33,
-            Self::Dw1Wyr1InteractiveClosure => 35,
         }
     }
 
@@ -155,15 +134,6 @@ impl BuildGuestTest {
                 | Self::SmpRuntimeStress
                 | Self::SmpRuntimeAcceptance
                 | Self::NativeUserspaceCapability
-                | Self::PermanentSupervisorRrc
-                | Self::BootstrapRegistryLaunch
-                | Self::NormalPreemptionSmp
-                | Self::DeviceCoordinatorRestart
-                | Self::DeviceResourceInterruptSynthetic
-                | Self::Q35Com2Interrupt
-                | Self::NativeConsoleStreams
-                | Self::InteractiveWyrmsh
-                | Self::Dw1Wyr1InteractiveClosure
         )
     }
 
@@ -271,24 +241,6 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::SmpRuntimeAcceptance
     } else if string_equals(value, "native-userspace-capability") {
         BuildGuestTest::NativeUserspaceCapability
-    } else if string_equals(value, "permanent-supervisor-rrc") {
-        BuildGuestTest::PermanentSupervisorRrc
-    } else if string_equals(value, "bootstrap-registry-launch") {
-        BuildGuestTest::BootstrapRegistryLaunch
-    } else if string_equals(value, "normal-preemption-smp") {
-        BuildGuestTest::NormalPreemptionSmp
-    } else if string_equals(value, "device-coordinator-restart") {
-        BuildGuestTest::DeviceCoordinatorRestart
-    } else if string_equals(value, "device-resource-interrupt-synthetic") {
-        BuildGuestTest::DeviceResourceInterruptSynthetic
-    } else if string_equals(value, "q35-com2-interrupt") {
-        BuildGuestTest::Q35Com2Interrupt
-    } else if string_equals(value, "native-console-streams") {
-        BuildGuestTest::NativeConsoleStreams
-    } else if string_equals(value, "interactive-wyrmsh") {
-        BuildGuestTest::InteractiveWyrmsh
-    } else if string_equals(value, "dw1-wyr1-interactive-closure") {
-        BuildGuestTest::Dw1Wyr1InteractiveClosure
     } else {
         panic!("unknown build-selected guest test")
     }

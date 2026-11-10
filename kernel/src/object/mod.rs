@@ -55,7 +55,7 @@ impl ObjectId {
     /// Stable registry-local identity word used only by fixed test evidence.
     /// Equality and authority checks continue to use the complete private
     /// domain-plus-raw identity; the selected D6 runtime has one registry.
-    #[cfg(any(test, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     pub(crate) const fn evidence_identity(self) -> u64 {
         self.raw
     }

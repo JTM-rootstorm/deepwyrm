@@ -149,7 +149,7 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
 
     let output = rejected_with_env(
         &["host", "test", "-p", "deepwyrm-kernel", "--lib"],
-        &[("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch")],
+        &[("DEEPWYRM_GUEST_TEST_SELECTOR", "primordial-bootstrap")],
     );
     assert_eq!(output.status.code(), Some(2));
     assert!(
@@ -160,7 +160,7 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
     for lane in ["host", "target"] {
         let output = rejected_with_env(
             &[lane, "check", "-p", "deepwyrm-kernel"],
-            &[("DEEPWYRM_GUEST_TEST_ID", "27")],
+            &[("DEEPWYRM_GUEST_TEST_ID", "18")],
         );
         assert_eq!(output.status.code(), Some(2));
         assert!(
@@ -173,9 +173,7 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
 #[test]
 fn host_selector_tests_require_an_explicit_library_only_shape() {
     let selector_environment = [
-        ("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch"),
-        ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "D1B0A82700000001"),
-        ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "31"),
+        ("DEEPWYRM_GUEST_TEST_SELECTOR", "primordial-bootstrap"),
     ];
     for arguments in [
         vec![
@@ -201,54 +199,6 @@ fn host_selector_tests_require_an_explicit_library_only_shape() {
             String::from_utf8_lossy(&output.stderr).contains("host test-support is restricted")
         );
     }
-}
-
-#[test]
-fn selector_27_environment_is_validated_before_cargo_admission() {
-    let output = rejected_with_env(
-        &[
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-            "--lib",
-        ],
-        &[
-            ("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch"),
-            ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789abcDEF"),
-            ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "64"),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains(
-            "DEEPWYRM_WYR1B_EVIDENCE_NONCE must be exactly 16 uppercase hexadecimal digits"
-        )
-    );
-
-    let output = rejected_with_env(
-        &[
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-            "--lib",
-        ],
-        &[
-            ("DEEPWYRM_GUEST_TEST_SELECTOR", "bootstrap-registry-launch"),
-            ("DEEPWYRM_WYR1B_EVIDENCE_NONCE", "0123456789ABCDEF"),
-            ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", "not-pages"),
-        ],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES must be canonical decimal in 1..=8192")
-    );
 }
 
 #[test]

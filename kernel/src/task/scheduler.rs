@@ -238,8 +238,6 @@ pub(crate) struct ScheduleDecision {
     pub(crate) previous: Option<ThreadKey>,
     pub(crate) current: Option<ThreadKey>,
     pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
-    #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) consumed_published_expiry: Option<SchedulerQuantumTicket>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,8 +249,6 @@ struct ClearedPreemption {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerTerminalStop {
     pub(crate) cancelled_quantum: Option<SchedulerQuantumTicket>,
-    #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) consumed_published_expiry: Option<SchedulerQuantumTicket>,
 }
 
 /// Scheduler-authoritative ownership published before an architecture wake.
@@ -379,7 +375,7 @@ impl SchedulerIdleDispatch {
 
 /// Selector-private migration exclusions use the same fixed reason ordering
 /// as the DW1-A contract. They are absent from ordinary production kernels.
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[allow(
     dead_code,
     reason = "the fixed rejection code set is validated across phased selector fixtures"
@@ -399,14 +395,14 @@ pub(crate) enum SchedulerMigrationRejectionReason {
     NotRevalidatable = 0x0a,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 impl SchedulerMigrationRejectionReason {
     pub(crate) const fn code(self) -> u8 {
         self as u8
     }
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerMigrationRejection {
     pub(crate) thread: ThreadKey,
@@ -417,7 +413,7 @@ pub(crate) struct SchedulerMigrationRejection {
 
 /// Selector-private identity used to install DW1-C's deterministic scheduler
 /// fixture from the already validated ARM table. This is not affinity ABI.
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Dw1cSchedulerActorIdentity {
     pub(crate) thread: ThreadKey,
@@ -428,7 +424,7 @@ pub(crate) struct Dw1cSchedulerActorIdentity {
 /// continuation on its ordinary detached idle carrier.  The exact execution
 /// generation prevents a late ARM retry from detaching a later run of the
 /// same Thread.
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Dw1cContinuationDetachRequest {
     cpu: SchedulerCpuId,
@@ -436,7 +432,7 @@ pub(crate) struct Dw1cContinuationDetachRequest {
     execution_generation: u64,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 impl Dw1cContinuationDetachRequest {
     pub(crate) const fn cpu(self) -> SchedulerCpuId {
         self.cpu
@@ -451,7 +447,7 @@ impl Dw1cContinuationDetachRequest {
     }
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Dw1cTerminalGate {
     NotFixture,
@@ -459,7 +455,7 @@ pub(crate) enum Dw1cTerminalGate {
     Ready,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct Dw1cSchedulerActor {
     thread: ThreadKey,
@@ -468,7 +464,7 @@ struct Dw1cSchedulerActor {
     lane_cpu: SchedulerCpuId,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct Dw1cSchedulerFixture {
     reporter_thread: ThreadKey,
@@ -481,7 +477,7 @@ struct Dw1cSchedulerFixture {
     token8_terminal_consumed: bool,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence))]
+#[cfg(test)]
 impl Dw1cSchedulerFixture {
     fn actor(&self, thread: ThreadKey) -> Option<(usize, Dw1cSchedulerActor)> {
         self.actors
@@ -555,7 +551,7 @@ pub(crate) enum IdleScheduleDecision {
     ContinueIdle,
     ResumeCurrent,
     Switch(ScheduleDecision),
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     Detach(Dw1cContinuationDetachRequest),
 }
 
@@ -591,7 +587,7 @@ struct QueueEntry {
     enqueue_generation: u64,
     migration_generation: u64,
     migration_eligibility_generation: u64,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     migration_exclusion: Option<SchedulerMigrationRejectionReason>,
     ready_at_ns: Option<u64>,
 }
@@ -687,7 +683,7 @@ pub(crate) struct SchedulerCounters {
 /// retained ownership and accounting invariant has been validated. They are
 /// scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens
 /// or actor execution generations.
-#[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Dw1cFinalSchedulerSnapshot {
     token: u64,
@@ -696,7 +692,7 @@ pub(crate) struct Dw1cFinalSchedulerSnapshot {
     accounting_mask: u8,
 }
 
-#[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+#[cfg(test)]
 impl Dw1cFinalSchedulerSnapshot {
     pub(crate) const fn token(self) -> u64 {
         self.token
@@ -884,9 +880,9 @@ struct SchedulerState<const CAPACITY: usize> {
     next_idle_generation: u64,
     next_wake_generation: u64,
     next_completed_switch_generation: u64,
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     next_final_snapshot_token: u64,
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     next_final_snapshot_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
@@ -903,15 +899,15 @@ struct SchedulerState<const CAPACITY: usize> {
     preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
     last_migration: Option<SchedulerMigrationRecord>,
     carrier_admission: CarrierAdmissionState,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     dw1c_fixture: Option<Dw1cSchedulerFixture>,
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     dw1c_continuation_detach: [Option<Dw1cContinuationDetachRequest>; H2_SCHEDULER_CPU_CAPACITY],
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     accounting_underflow_fault: bool,
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     time_regression_fault: bool,
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     terminal_retired: [Option<ThreadKey>; CAPACITY],
     #[cfg(test)]
     trace: SchedulerTrace,
@@ -929,9 +925,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_idle_generation: 1,
             next_wake_generation: 1,
             next_completed_switch_generation: 1,
-            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+            #[cfg(test)]
             next_final_snapshot_token: 1,
-            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+            #[cfg(test)]
             next_final_snapshot_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
@@ -948,15 +944,15 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             last_migration: None,
             carrier_admission: CarrierAdmissionState::new(),
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(test)]
             dw1c_fixture: None,
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(test)]
             dw1c_continuation_detach: [None; H2_SCHEDULER_CPU_CAPACITY],
-            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+            #[cfg(test)]
             accounting_underflow_fault: false,
-            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+            #[cfg(test)]
             time_regression_fault: false,
-            #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+            #[cfg(test)]
             terminal_retired: [None; CAPACITY],
             #[cfg(test)]
             trace: SchedulerTrace::new(),
@@ -978,13 +974,13 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         match error {
             SchedulerError::AccountingOverflow | SchedulerError::AccountingUnderflow => {
                 self.accounting.retain_faults_from(attempted);
-                #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+                #[cfg(test)]
                 if error == SchedulerError::AccountingUnderflow {
                     self.accounting_underflow_fault = true;
                 }
             }
             SchedulerError::TimeRegression => {
-                #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+                #[cfg(test)]
                 {
                     self.time_regression_fault = true;
                 }
@@ -996,48 +992,17 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     }
 
     fn reject_time_regression(&mut self) -> SchedulerError {
-        #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+        #[cfg(test)]
         {
             self.time_regression_fault = true;
         }
         SchedulerError::TimeRegression
     }
 
-    #[cfg(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
-    fn validate_terminal_retirement(&self, thread: ThreadKey) -> Result<(), SchedulerError> {
-        if self.terminal_retired.contains(&Some(thread)) {
-            // Scheduler-level models may legitimately reserve and retire the
-            // same generation-safe key more than once.  The terminal history
-            // is a sticky set used only to reject a retired identity that is
-            // live again at the final selector snapshot, so recording the
-            // same key is idempotent rather than a second terminal fact.
-            return Ok(());
-        }
-        if self.terminal_retired.iter().all(Option::is_some) {
-            return Err(SchedulerError::Capacity);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence)))]
     fn validate_terminal_retirement(&self, _thread: ThreadKey) -> Result<(), SchedulerError> {
         Ok(())
     }
 
-    #[cfg(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
-    fn record_terminal_retirement(&mut self, thread: ThreadKey) {
-        if self.terminal_retired.contains(&Some(thread)) {
-            return;
-        }
-        let slot = self
-            .terminal_retired
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .expect("validated terminal-retirement capacity disappeared");
-        *slot = Some(thread);
-    }
-
-    #[cfg(not(any(deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence)))]
     fn record_terminal_retirement(&mut self, _thread: ThreadKey) {}
 
     fn assert_invariants(&self) {
@@ -1232,23 +1197,23 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     ) -> bool {
         self.entry_migratable_without_external_exclusion(entry, victim, target)
             && {
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(test)]
                 {
                     self.dw1c_fixture
                         .and_then(|fixture| fixture.restricted_target(entry.thread))
                         .is_none()
                 }
-                #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+                #[cfg(not(test))]
                 {
                     true
                 }
             }
             && {
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(test)]
                 {
                     entry.migration_exclusion.is_none()
                 }
-                #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+                #[cfg(not(test))]
                 {
                     true
                 }
@@ -1290,7 +1255,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     /// Selector-private final revalidation shared by idle stealing and the
     /// explicit migration-attempt fixture.  It runs under the scheduler lock;
     /// a rejection exposes no partial move.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     fn selector_migration_attempt(
         &self,
         entry: QueueEntry,
@@ -1416,12 +1381,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             let victim = SchedulerCpuId::new(victim_index).expect("bounded scheduler CPU index");
             let Some(index) = self.queue[..self.len].iter().position(|entry| {
                 entry.is_some_and(|entry| {
-                    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                    #[cfg(test)]
                     {
                         self.selector_migration_attempt(entry, victim, target)
                             .is_ok()
                     }
-                    #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+                    #[cfg(not(test))]
                     {
                         self.entry_migratable(entry, victim, target)
                     }
@@ -1631,12 +1596,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             if self.quantum[cpu_index].is_some() && self.need_resched[cpu_index].is_some() {
                 return Err(SchedulerError::StaleQuantum);
             }
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(test)]
             let held_dw1c_expiry = self
                 .dw1c_fixture
                 .and_then(|fixture| fixture.held_token8_expiry)
                 .filter(|ticket| ticket.cpu == cpu);
-            #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+            #[cfg(not(test))]
             let held_dw1c_expiry: Option<SchedulerQuantumTicket> = None;
             if held_dw1c_expiry.is_some()
                 && (self.quantum[cpu_index].is_some() || self.need_resched[cpu_index].is_some())
@@ -1798,7 +1763,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// Installs selector 28's deterministic placement fixture after ARM has
     /// authenticated the exact reporter and actor table. No evidence observer
     /// is invoked while scheduler authority is held.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn install_dw1c_fixture(
         &self,
         reporter: SchedulerExecutionClaim,
@@ -1908,7 +1873,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// continuation after the remaining CPUs become quiescent.  Returning
     /// `WOULD_BLOCK` alone cannot wake that carrier, so the caller stages one
     /// ordinary affine idle-wake after dropping runtime authority.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn stage_dw1c_arm_retry_detach(
         &self,
         actors: [Dw1cSchedulerActorIdentity; 8],
@@ -1944,7 +1909,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
 
     /// Returns the exact selector-private detach request only while the named
     /// generation still owns this CPU's physically suspended continuation.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_continuation_detach_request_on(
         &self,
         cpu: SchedulerCpuId,
@@ -1963,7 +1928,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
 
     /// Clears only the request that has already completed its physical switch
     /// to the CPU-private detached idle carrier.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn complete_dw1c_continuation_detach(
         &self,
         request: Dw1cContinuationDetachRequest,
@@ -1980,7 +1945,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> Dw1cTerminalGate {
         let state = self.state.lock();
         let Some(fixture) = state.dw1c_fixture else {
@@ -2000,7 +1965,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// accepted the exact scheduler-published expiry. Publication and evidence
     /// observation intentionally occur on opposite sides of scheduler
     /// ownership, so holding the ticket alone is not yet a terminal permit.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn acknowledge_dw1c_quantum_observation(
         &self,
         ticket: SchedulerQuantumTicket,
@@ -2023,7 +1988,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_token2_relay_ready(&self) -> bool {
         let state = self.state.lock();
         let Some(fixture) = state.dw1c_fixture else {
@@ -2077,7 +2042,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             enqueue_generation: 0,
             migration_generation: 0,
             migration_eligibility_generation: 0,
-            #[cfg(any(test, deepwyrm_dw1c_evidence))]
+            #[cfg(test)]
             migration_exclusion: None,
             ready_at_ns: None,
         })?;
@@ -2312,8 +2277,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: None,
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum: None,
-                #[cfg(deepwyrm_dw1c_evidence)]
-                consumed_published_expiry: None,
             },
             migration: pending_migration.map(|pending| pending.record),
         })
@@ -2367,8 +2330,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(thread),
                 current: Some(thread),
                 cancelled_quantum: None,
-                #[cfg(deepwyrm_dw1c_evidence)]
-                consumed_published_expiry: None,
             });
         };
         let enqueue_generation = state.next_enqueue_generation;
@@ -2415,7 +2376,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns,
             })
@@ -2439,8 +2400,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: Some(thread),
             current: Some(next.thread),
             cancelled_quantum,
-            #[cfg(deepwyrm_dw1c_evidence)]
-            consumed_published_expiry: cleared_preemption.published_expiry,
         })
     }
 
@@ -2472,7 +2431,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
         let mut state = self.state.lock();
         let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         if state.dw1c_fixture.is_some_and(|fixture| {
             fixture.held_token8_expiry.is_some_and(|ticket| {
                 ticket.cpu == cpu
@@ -2524,7 +2483,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(error);
         }
         state.quantum[cpu_index] = None;
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         let hold_for_dw1c = state.dw1c_fixture.is_some_and(|fixture| {
             !fixture.token8_terminal_consumed
                 && fixture.token8_gate_claim.is_some_and(|claim| {
@@ -2533,7 +2492,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                         && ticket.execution_generation == claim.generation
                 })
         });
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         if hold_for_dw1c {
             let fixture = state
                 .dw1c_fixture
@@ -2553,7 +2512,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 }
             }
         }
-        #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+        #[cfg(not(test))]
         match state.need_resched[cpu_index] {
             None => state.need_resched[cpu_index] = Some(ticket),
             Some(current) if current == ticket => {}
@@ -2718,7 +2677,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns,
             })
@@ -2745,8 +2704,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(current.thread),
                 current: Some(next.thread),
                 cancelled_quantum: None,
-                #[cfg(deepwyrm_dw1c_evidence)]
-                consumed_published_expiry: None,
             },
             outgoing: SchedulerExecutionClaim {
                 domain: state.domain,
@@ -2903,7 +2860,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 enqueue_generation: 0,
                 migration_generation: 0,
                 migration_eligibility_generation: 0,
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns: None,
             })
@@ -2928,8 +2885,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: Some(reservation.key.thread),
             current: current.map(|claim| claim.thread),
             cancelled_quantum,
-            #[cfg(deepwyrm_dw1c_evidence)]
-            consumed_published_expiry: cleared_preemption.published_expiry,
         })
     }
 
@@ -2987,11 +2942,11 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(SchedulerError::StaleBlockToken);
         };
         let blocked = state.queue[index].expect("validated blocked scheduler entry remains queued");
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         let fixture_target = state
             .dw1c_fixture
             .and_then(|fixture| fixture.restricted_target(blocked.thread));
-        #[cfg(not(any(test, deepwyrm_dw1c_evidence)))]
+        #[cfg(not(test))]
         let fixture_target: Option<SchedulerCpuId> = None;
         let Some(target) = fixture_target.or_else(|| state.select_placement(blocked, requester))
         else {
@@ -3068,7 +3023,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// Performs selector 28's token-6 wake and deliberate migration rejection
     /// under one scheduler acquisition. The woken generation cannot dispatch
     /// between Runnable publication and the exact exclusion probe.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn wake_with_migration_rejection_on(
         &self,
         requester: SchedulerCpuId,
@@ -3199,7 +3154,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         {
             return Err(SchedulerError::ContinuationOwned);
         }
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         if let Some(request) = state.dw1c_continuation_detach[cpu_index]
             && request.thread == suspended_claim.thread
             && request.execution_generation == suspended_claim.generation
@@ -3294,8 +3249,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     previous: Some(suspended),
                     current: Some(next.thread),
                     cancelled_quantum: None,
-                    #[cfg(deepwyrm_dw1c_evidence)]
-                    consumed_published_expiry: None,
                 }),
                 migration: pending_migration.map(|pending| pending.record),
             })
@@ -3387,7 +3340,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: incoming.thread,
             generation: incoming.generation,
         });
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         if let Some(incoming) = incoming_claim
             && let Some(fixture) = state.dw1c_fixture.as_mut()
         {
@@ -3499,8 +3452,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(thread),
                 current: current.map(|claim| claim.thread),
                 cancelled_quantum,
-                #[cfg(deepwyrm_dw1c_evidence)]
-                consumed_published_expiry: cleared_preemption.published_expiry,
             });
         }
         if let Some(owner_cpu) = state
@@ -3580,8 +3531,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 previous: Some(thread),
                 current: state.running[cpu_index].map(|claim| claim.thread),
                 cancelled_quantum: None,
-                #[cfg(deepwyrm_dw1c_evidence)]
-                consumed_published_expiry: None,
             });
         }
         let Some(index) = state.queue[..state.len]
@@ -3615,8 +3564,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             previous: state.running[cpu_index].map(|claim| claim.thread),
             current: state.running[cpu_index].map(|claim| claim.thread),
             cancelled_quantum: None,
-            #[cfg(deepwyrm_dw1c_evidence)]
-            consumed_published_expiry: None,
         })
     }
 
@@ -3655,7 +3602,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
             state.pending_block[cpu_index] = None;
         }
-        #[cfg(any(test, deepwyrm_dw1c_evidence))]
+        #[cfg(test)]
         let held_dw1c_expiry = if let Some(fixture) = state.dw1c_fixture.as_mut() {
             if fixture.token8().thread == claim.thread && !fixture.token8_terminal_consumed {
                 if !fixture.token8_expiry_observed {
@@ -3687,7 +3634,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         } else {
             None
         };
-        #[cfg(all(test, not(deepwyrm_dw1c_evidence)))]
+        #[cfg(test)]
         let _ = held_dw1c_expiry;
         let cleared_preemption = state.clear_preemption_on(claim.cpu);
         state.running[cpu_index] = None;
@@ -3708,8 +3655,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.assert_invariants();
         Ok(SchedulerTerminalStop {
             cancelled_quantum: cleared_preemption.cancelled_quantum,
-            #[cfg(deepwyrm_dw1c_evidence)]
-            consumed_published_expiry: held_dw1c_expiry.or(cleared_preemption.published_expiry),
         })
     }
 
@@ -3756,8 +3701,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.assert_invariants();
         Ok(SchedulerTerminalStop {
             cancelled_quantum: cleared_preemption.cancelled_quantum,
-            #[cfg(deepwyrm_dw1c_evidence)]
-            consumed_published_expiry: cleared_preemption.published_expiry,
         })
     }
 
@@ -3855,7 +3798,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// Selector-private exact identity resolver used while ARM inspects a
     /// started actor. The scheduler lock joins Running, queued Runnable, and
     /// Blocked/suspended ownership without exposing this identity as ABI.
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn current_execution_generation(&self, thread: ThreadKey) -> Option<u64> {
         let state = self.state.lock();
         if let Some(claim) = state
@@ -3902,7 +3845,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     /// lock. No payload is returned, and no snapshot identity is consumed,
     /// unless the complete live state and every sticky diagnostic remain
     /// sound.
-    #[cfg(any(test, deepwyrm_dw1c_evidence, deepwyrm_dw1d_evidence))]
+    #[cfg(test)]
     pub(crate) fn dw1c_final_snapshot(&self) -> Result<Dw1cFinalSchedulerSnapshot, SchedulerError> {
         const ACCOUNTING_SOUND_MASK: u8 = 0x3f;
 
@@ -4045,7 +3988,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().last_migration
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn set_migration_exclusion(
         &self,
         thread: ThreadKey,
@@ -4073,7 +4016,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     /// Performs one selector-private migration attempt through the same locked
     /// candidate revalidation used by idle stealing.  A rejected attempt never
     /// changes queue placement, accounting, or migration generations.
@@ -4114,7 +4057,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    #[cfg(any(test, deepwyrm_dw1c_evidence))]
+    #[cfg(test)]
     pub(crate) fn clear_migration_exclusion(
         &self,
         thread: ThreadKey,
@@ -4294,21 +4237,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    /// Selector-private post-commit verification for a terminal race.  The
-    /// ticket was captured while retirement held the scheduler lock; this
-    /// check proves that exact execution is no longer Running or queued before
-    /// the observer is published outside scheduler authority.
-    #[cfg(deepwyrm_dw1c_evidence)]
-    pub(crate) fn terminal_ticket_generation_absent(&self, ticket: SchedulerQuantumTicket) -> bool {
-        let state = self.state.lock();
-        !state.running.iter().flatten().any(|claim| {
-            claim.thread == ticket.thread && claim.generation == ticket.execution_generation
-        }) && !state.queue[..state.len].iter().flatten().any(|entry| {
-            entry.thread == ticket.thread
-                && entry.started_execution_generation == ticket.execution_generation
-        })
-    }
-
     pub(crate) fn suspended_claim_on(
         &self,
         cpu: SchedulerCpuId,
@@ -4368,18 +4296,14 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     previous: Some(suspended),
                     current: None,
                     cancelled_quantum: None,
-                    #[cfg(deepwyrm_dw1c_evidence)]
-                    consumed_published_expiry: None,
                 }),
                 IdleScheduleDecision::ResumeCurrent => Ok(ScheduleDecision {
                     previous: Some(suspended),
                     current: Some(suspended),
                     cancelled_quantum: None,
-                    #[cfg(deepwyrm_dw1c_evidence)]
-                    consumed_published_expiry: None,
                 }),
                 IdleScheduleDecision::Switch(decision) => Ok(decision),
-                #[cfg(any(test, deepwyrm_dw1c_evidence))]
+                #[cfg(test)]
                 IdleScheduleDecision::Detach(_) => Err(SchedulerError::ContinuationOwned),
             };
         }
