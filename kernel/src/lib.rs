@@ -281,12 +281,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     let primordial_modules = boot_info
         .primordial_modules()
         .unwrap_or_else(|error| panic!("invalid primordial modules: {error:?}"));
-    #[cfg(feature = "test-support")]
-    let primordial_modules = test_support::BUILD_GUEST_TEST.is_primordial().then(|| {
-        boot_info
-            .primordial_modules()
-            .unwrap_or_else(|error| panic!("invalid primordial modules: {error:?}"))
-    });
 
     #[cfg(feature = "test-support")]
     match test_support::BUILD_GUEST_TEST {
@@ -300,7 +294,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         test if test.is_f9_userspace() => {}
         #[cfg(deepwyrm_f12_guest)]
         test if test.is_f12_userspace() => {}
-        test if test.is_primordial() => {}
         _ => unreachable!("all build-selected guest tests have explicit dispatch"),
     }
 
@@ -555,16 +548,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         active_paging
             .retire_ap_trampoline_mapping()
             .unwrap_or_else(|error| panic!("failed to retire the H1 AP trampoline: {error:?}"));
-        #[cfg(deepwyrm_i1_evidence)]
-        for entry in cpu_topology.entries() {
-            test_support::I1_EVIDENCE
-                .record(test_support::EvidenceEvent::cpu_online(
-                    u8::try_from(entry.logical_index())
-                        .unwrap_or_else(|_| panic!("I1 logical CPU does not fit evidence wire")),
-                    u32::from(entry.local_apic_id()),
-                ))
-                .unwrap_or_else(|error| panic!("I1 CPU-online evidence failed: {error:?}"));
-        }
         #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,
@@ -587,10 +570,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             test if test.is_f12_userspace() => {
                 active_paging.run_ipc_blocking_userspace_test(test_support::BUILD_GUEST_TEST)
             }
-            test if test.is_primordial() => active_paging.run_primordial(
-                primordial_modules.expect("primordial test selected its modules"),
-                boot_resource_grants,
-            ),
             _ => unreachable!("post-activation selector lacks an explicit runtime"),
         }
         #[cfg(not(feature = "test-support"))]

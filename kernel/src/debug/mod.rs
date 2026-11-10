@@ -758,61 +758,6 @@ pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
     write_bounded_raw_record(&mut serial, record)
 }
 
-/// Exclusive test-only COM1 transaction used to keep DWEVID1 or WRCAP1
-/// evidence and its following DWTEST1 terminal record indivisible against
-/// competing reporters.
-#[cfg(all(
-    feature = "test-support",
-    any(
-        deepwyrm_i1_evidence,
-        deepwyrm_wrcap_relay,
-    ),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
-pub(crate) struct TestSerialTransaction {
-    _guard: OutputGuard,
-    serial: Com1<X86PortIo>,
-}
-
-#[cfg(all(
-    feature = "test-support",
-    any(
-        deepwyrm_i1_evidence,
-        deepwyrm_wrcap_relay,
-    ),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
-pub(crate) fn begin_test_serial_transaction() -> Result<TestSerialTransaction, SerialError> {
-    Ok(TestSerialTransaction {
-        _guard: OutputGuard::acquire().ok_or(SerialError::Busy)?,
-        serial: Com1::new(X86PortIo),
-    })
-}
-
-#[cfg(all(
-    feature = "test-support",
-    any(
-        deepwyrm_i1_evidence,
-        deepwyrm_wrcap_relay,
-    ),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
-impl TestSerialTransaction {
-    pub(crate) fn write_evidence<const BYTES: usize>(
-        &mut self,
-        record: &[u8; BYTES],
-    ) -> Result<(), SerialError> {
-        write_bounded_test_evidence_record(&mut self.serial, record)
-    }
-
-    pub(crate) fn write_terminal(&mut self, record: &[u8]) -> Result<(), SerialError> {
-        write_bounded_raw_record(&mut self.serial, record)
-    }
-}
-
 #[cfg(any(test, feature = "test-support"))]
 fn write_bounded_raw_record<P: BytePortIo>(
     serial: &mut Com1<P>,
@@ -828,11 +773,7 @@ fn write_bounded_raw_record<P: BytePortIo>(
     Ok(())
 }
 
-#[cfg(any(
-    test,
-    deepwyrm_i1_evidence,
-    deepwyrm_wrcap_relay,
-))]
+#[cfg(test)]
 fn write_bounded_test_evidence_record<P: BytePortIo, const BYTES: usize>(
     serial: &mut Com1<P>,
     record: &[u8; BYTES],

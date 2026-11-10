@@ -172,9 +172,7 @@ fn selector_test_support_mismatches_fail_before_cargo_admission() {
 
 #[test]
 fn host_selector_tests_require_an_explicit_library_only_shape() {
-    let selector_environment = [
-        ("DEEPWYRM_GUEST_TEST_SELECTOR", "primordial-bootstrap"),
-    ];
+    let selector_environment = [("DEEPWYRM_GUEST_TEST_SELECTOR", "primordial-bootstrap")];
     for arguments in [
         vec![
             "host",

@@ -9,22 +9,8 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::arch::x86_64::exceptions::{EarlyException, ExceptionVector};
-#[cfg(any(
-    deepwyrm_i1_evidence,
-    deepwyrm_wrcap_relay,
-))]
-use crate::debug::TestSerialTransaction;
-#[cfg(any(
-    deepwyrm_i1_evidence,
-    deepwyrm_wrcap_relay,
-))]
-use crate::debug::begin_test_serial_transaction;
 use crate::debug::emit_early_raw_record;
 
-#[cfg(deepwyrm_i1_evidence)]
-use super::{EvidenceFlushError, I1_EVIDENCE};
-#[cfg(deepwyrm_wrcap_relay)]
-use super::{WRCAP_RELAY, WrcapFlushError};
 use super::{
     identity::{
         ExpectedPageFaultFacts, ExpectedPageFaultKind, completion_record, exception_outcome,
@@ -91,11 +77,6 @@ unsafe extern "sysv64" {
 /// that the QEMU-only I/O device is present on an arbitrary machine.
 struct QemuCompletionTransport {
     _private: (),
-    #[cfg(any(
-        deepwyrm_i1_evidence,
-        deepwyrm_wrcap_relay,
-    ))]
-    transaction: Option<TestSerialTransaction>,
 }
 
 impl QemuCompletionTransport {
@@ -112,14 +93,7 @@ impl QemuCompletionTransport {
         reason = "construction proves the test-only QEMU device precondition"
     )]
     const unsafe fn new() -> Self {
-        Self {
-            _private: (),
-            #[cfg(any(
-                deepwyrm_i1_evidence,
-                deepwyrm_wrcap_relay,
-            ))]
-            transaction: None,
-        }
+        Self { _private: () }
     }
 }
 
@@ -128,17 +102,6 @@ impl CompletionTransport for QemuCompletionTransport {
         &mut self,
         record: &[u8; COMPLETION_RECORD_LEN],
     ) -> Result<(), CompletionTransportError> {
-        // The host requires both the serial record and matching process status;
-        // a serial failure therefore becomes infrastructure failure, never PASS.
-        #[cfg(any(
-            deepwyrm_i1_evidence,
-            deepwyrm_wrcap_relay,
-        ))]
-        if let Some(transaction) = self.transaction.as_mut() {
-            return transaction
-                .write_terminal(record)
-                .map_err(|_| CompletionTransportError::Serial);
-        }
         emit_early_raw_record(record).map_err(|_| CompletionTransportError::Serial)
     }
 
@@ -164,16 +127,12 @@ pub(crate) fn complete_pass(detail: u32) -> ! {
 
 /// Emit the build-selected test's FAIL terminal record and stop.
 pub(crate) fn complete_fail(detail: u32) -> ! {
-    {
-        complete_known_outcome(CompletionOutcome::Fail, detail)
-    }
+    { complete_known_outcome(CompletionOutcome::Fail, detail) }
 }
 
 /// Emit the build-selected test's PANIC terminal record and stop.
 pub(crate) fn complete_panic(detail: u32) -> ! {
-    {
-        complete_known_outcome(CompletionOutcome::Panic, detail)
-    }
+    { complete_known_outcome(CompletionOutcome::Panic, detail) }
 }
 
 /// Classify an early exception for the selected guest test and stop.
@@ -332,101 +291,8 @@ pub(crate) fn trigger_expected_invalid_opcode() -> ! {
     reason = "compile-time test identity confines construction to the QEMU test image"
 )]
 fn complete_known_outcome(outcome: CompletionOutcome, detail: u32) -> ! {
-    // SAFETY: this function exists only in an x86_64-none `test-support` build
-    // whose compile-time selector was resolved by the central QEMU harness
-    // build path. Such artifacts are not production or physical-hardware images.
-    #[cfg(deepwyrm_i1_evidence)]
-    let permit = match I1_EVIDENCE.finalize_running_invariant() {
-        Ok(permit) => permit,
-        // A competing terminal path already owns the I1 transcript. It alone
-        // may write COM1 or debug-exit; losers simply stop.
-        Err(_) => halt_after_completion(),
-    };
-    #[cfg(deepwyrm_wrcap_relay)]
-    let permit = match WRCAP_RELAY.claim_reporter() {
-        Ok(permit) => permit,
-        // One reporter owns the WRCAP1 + DWTEST1 serial transaction. A
-        // competing terminal path must not append a second transcript.
-        Err(_) => halt_after_completion(),
-    };
     let mut transport = unsafe { QemuCompletionTransport::new() };
-    #[cfg(any(deepwyrm_i1_evidence, deepwyrm_wrcap_relay))]
-    let (outcome, detail) = match begin_test_serial_transaction() {
-        Ok(transaction) => {
-            transport.transaction = Some(transaction);
-            #[cfg(deepwyrm_i1_evidence)]
-            match permit.flush(|record| {
-                transport
-                    .transaction
-                    .as_mut()
-                    .expect("I1 reporter owns its serial transaction")
-                    .write_evidence(record)
-                    .map_err(|_| EvidenceFlushError::Transport)
-            }) {
-                Ok(()) => (outcome, detail),
-                Err(error) => (CompletionOutcome::Fail, evidence_failure_detail(error)),
-            }
-            #[cfg(deepwyrm_wrcap_relay)]
-            match permit.flush(|record| {
-                transport
-                    .transaction
-                    .as_mut()
-                    .expect("WRCAP1 reporter owns its serial transaction")
-                    .write_evidence(record)
-                    .map_err(|_| WrcapFlushError::Transport)
-            }) {
-                Ok(()) => (outcome, detail),
-                Err(error) => wrcap_flush_failure(outcome, detail, error),
-            }
-        }
-        Err(_) => halt_after_completion(),
-    };
     complete(&mut transport, completion_record(outcome, detail))
-}
-
-#[cfg(deepwyrm_wrcap_relay)]
-fn wrcap_flush_failure(
-    outcome: CompletionOutcome,
-    detail: u32,
-    error: WrcapFlushError,
-) -> (CompletionOutcome, u32) {
-    if outcome == CompletionOutcome::Pass {
-        (CompletionOutcome::Fail, wrcap_failure_detail(error))
-    } else {
-        // A missing transcript is a consequence when the primordial process
-        // failed before evidence publication. Preserve that first exact
-        // application or kernel failure instead of replacing it with the
-        // secondary incomplete-relay diagnosis.
-        (outcome, detail)
-    }
-}
-
-#[cfg(deepwyrm_wrcap_relay)]
-fn wrcap_failure_detail(error: WrcapFlushError) -> u32 {
-    match error {
-        WrcapFlushError::Incomplete => 0x240a_f001,
-        WrcapFlushError::Malformed => 0x240a_f002,
-        WrcapFlushError::OutOfOrder => 0x240a_f003,
-        WrcapFlushError::Extra => 0x240a_f004,
-        WrcapFlushError::Receive => 0x240a_f005,
-        WrcapFlushError::ReporterClaimed => 0x240a_f006,
-        WrcapFlushError::Busy => 0x240a_f007,
-        WrcapFlushError::Transport => 0x240a_f008,
-    }
-}
-
-#[cfg(deepwyrm_i1_evidence)]
-fn evidence_failure_detail(error: EvidenceFlushError) -> u32 {
-    match error {
-        EvidenceFlushError::NotFinalized => 0x4931_0001,
-        EvidenceFlushError::NotReady => 0x4931_0002,
-        EvidenceFlushError::Overflow => 0x4931_0003,
-        EvidenceFlushError::Malformed => 0x4931_0004,
-        EvidenceFlushError::Invariant => 0x4931_0500 | super::i1_runtime_missing_mask(),
-        EvidenceFlushError::FinalizationClosed => 0x4931_0006,
-        EvidenceFlushError::ReporterClaimed => 0x4931_0007,
-        EvidenceFlushError::Transport => 0x4931_0008,
-    }
 }
 
 /// Write one outcome-only value to QEMU's test exit device.

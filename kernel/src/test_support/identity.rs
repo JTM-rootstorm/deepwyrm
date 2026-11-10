@@ -28,13 +28,6 @@ pub(crate) enum BuildGuestTest {
     TaskUserException,
     IpcBlockingSmoke,
     AtomicWaitWake,
-    PrimordialBootstrap,
-    PrimordialBlockingCleanup,
-    PrimordialUserException,
-    PrimordialInvalidReturn,
-    SmpRuntimeStress,
-    SmpRuntimeAcceptance,
-    NativeUserspaceCapability,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,13 +84,6 @@ impl BuildGuestTest {
             Self::TaskUserException => 12,
             Self::IpcBlockingSmoke => 13,
             Self::AtomicWaitWake => 16,
-            Self::PrimordialBootstrap => 18,
-            Self::PrimordialBlockingCleanup => 19,
-            Self::PrimordialUserException => 20,
-            Self::PrimordialInvalidReturn => 21,
-            Self::SmpRuntimeStress => 22,
-            Self::SmpRuntimeAcceptance => 23,
-            Self::NativeUserspaceCapability => 24,
         }
     }
 
@@ -122,19 +108,6 @@ impl BuildGuestTest {
     )]
     pub(crate) const fn is_f12_userspace(self) -> bool {
         matches!(self, Self::IpcBlockingSmoke)
-    }
-
-    pub(crate) const fn is_primordial(self) -> bool {
-        matches!(
-            self,
-            Self::PrimordialBootstrap
-                | Self::PrimordialBlockingCleanup
-                | Self::PrimordialUserException
-                | Self::PrimordialInvalidReturn
-                | Self::SmpRuntimeStress
-                | Self::SmpRuntimeAcceptance
-                | Self::NativeUserspaceCapability
-        )
     }
 
     pub(crate) const fn is_memory_foundation(self) -> bool {
@@ -227,20 +200,6 @@ const fn parse_known_selector(value: &str) -> BuildGuestTest {
         BuildGuestTest::IpcBlockingSmoke
     } else if string_equals(value, "atomic-wait-wake") {
         BuildGuestTest::AtomicWaitWake
-    } else if string_equals(value, "primordial-bootstrap") {
-        BuildGuestTest::PrimordialBootstrap
-    } else if string_equals(value, "primordial-blocking-cleanup") {
-        BuildGuestTest::PrimordialBlockingCleanup
-    } else if string_equals(value, "primordial-user-exception") {
-        BuildGuestTest::PrimordialUserException
-    } else if string_equals(value, "primordial-invalid-return") {
-        BuildGuestTest::PrimordialInvalidReturn
-    } else if string_equals(value, "smp-runtime-stress") {
-        BuildGuestTest::SmpRuntimeStress
-    } else if string_equals(value, "smp-runtime-acceptance") {
-        BuildGuestTest::SmpRuntimeAcceptance
-    } else if string_equals(value, "native-userspace-capability") {
-        BuildGuestTest::NativeUserspaceCapability
     } else {
         panic!("unknown build-selected guest test")
     }

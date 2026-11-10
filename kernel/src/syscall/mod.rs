@@ -84,7 +84,12 @@ pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
 pub(crate) use adapters::{complete_deferred_current_reclaim_on, process_exit_on};
 #[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
 pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
-#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64", not(deepwyrm_production_product)))]
+#[cfg(all(
+    deepwyrm_integrated,
+    target_os = "none",
+    target_arch = "x86_64",
+    not(deepwyrm_production_product)
+))]
 pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};
 
 use deepwyrm_abi::{

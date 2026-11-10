@@ -382,32 +382,6 @@ fn dw0f_selectors_distinguish_implemented_and_reserved_identities() {
 }
 
 #[test]
-fn dw0g_primordial_selectors_have_stable_runnable_identities() {
-    let config = workspace_root().join(HARNESS_CONFIG);
-    for (selector, test_id) in [
-        ("primordial-bootstrap", 18),
-        ("primordial-blocking-cleanup", 19),
-        ("primordial-user-exception", 20),
-        ("primordial-invalid-return", 21),
-    ] {
-        let request_path = temp_file(
-            &request("guest-test", selector)
-                .replace("test_id = 1", &format!("test_id = {test_id}")),
-        );
-        let parsed = load_harness_request(&request_path).unwrap();
-        validate_guest_selector_metadata(&config, &parsed).unwrap();
-        assert_eq!(
-            guest_build_selection(HarnessKind::GuestTest, &parsed),
-            Some(GuestBuildSelection {
-                selector: selector.into(),
-                expected_test_id: test_id,
-            })
-        );
-        fs::remove_file(request_path).unwrap();
-    }
-}
-
-#[test]
 fn trusted_toolchain_binds_tree_and_internal_library_identities() {
     let trusted = load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG)).unwrap();
     assert_eq!(
@@ -870,11 +844,11 @@ fn the_selector_gate_reads_implemented_selectors_and_skips_reserved_ones() {
     let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
     let selectors = implemented_guest_selectors(&manifest);
     assert!(
-        selectors.len() > 15,
+        selectors.len() > 10,
         "the manifest lists {} implemented selectors, which is too few to be a real parse",
         selectors.len()
     );
-    for implemented in ["ipc-blocking-smoke", "native-userspace-capability", "memory-mapping"] {
+    for implemented in ["ipc-blocking-smoke", "atomic-wait-wake", "memory-mapping"] {
         assert!(
             selectors.iter().any(|selector| selector == implemented),
             "{implemented} is implemented and must be gated"
@@ -884,21 +858,6 @@ fn the_selector_gate_reads_implemented_selectors_and_skips_reserved_ones() {
         assert!(
             !selectors.iter().any(|selector| selector == reserved),
             "{reserved} is reserved and has no implementation to compile"
-        );
-    }
-}
-
-#[test]
-fn every_selector_environment_names_a_selector_that_exists() {
-    // A row whose selector was renamed would stop applying and leave that
-    // selector failing for a missing nonce, which reads as a broken selector
-    // rather than a stale table.
-    let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
-    let selectors = implemented_guest_selectors(&manifest);
-    for (selector, _) in SELECTOR_ENVIRONMENTS {
-        assert!(
-            selectors.iter().any(|known| known == selector),
-            "{selector} has an environment row but is not an implemented selector"
         );
     }
 }

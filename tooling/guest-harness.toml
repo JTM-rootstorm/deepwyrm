@@ -110,40 +110,54 @@ state = "reserved"
 
 # DW0-G production-path test builds. Unlike the synthetic F selectors, these
 # consume the loader-provided bootstrap and bootfs modules.
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.primordial-bootstrap]
 id = 18
-state = "implemented"
+state = "reserved"
 
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.primordial-blocking-cleanup]
 id = 19
-state = "implemented"
+state = "reserved"
 
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.primordial-user-exception]
 id = 20
-state = "implemented"
+state = "reserved"
 
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.primordial-invalid-return]
 id = 21
-state = "implemented"
+state = "reserved"
 
 # DW0-I2 bounded deterministic live stress. This reuses the production
 # primordial runtime and the canonical WYR0-H result transport.
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.smp-runtime-stress]
 id = 22
-state = "implemented"
+state = "reserved"
 
 # DW0-I1’s test-support-only SMP evidence collector.  This selector embeds a
 # build-owned nonce and has no production dispatch until the runtime lane wires
 # its semantic scenario hooks.
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.smp-runtime-acceptance]
 id = 23
-state = "implemented"
+state = "reserved"
 
 # WYR0-I's test-support-only primordial evidence relay. Wyrmroot remains the
 # sole source of WRCAP1 facts; the kernel only validates and relays them.
+# Retired 2026-11-10: its Wyrmroot product builder is gone, so it can no
+# longer run end to end. The id stays allocated so it is never reused.
 [guest_test.native-userspace-capability]
 id = 24
-state = "implemented"
+state = "reserved"
 
 # WYR1-A's test-support-only permanent-supervisor/RRC evidence collector.
 # The raw submission trap remains outside the public ABI and exists only in

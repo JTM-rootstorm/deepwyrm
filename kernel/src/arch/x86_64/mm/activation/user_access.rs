@@ -433,10 +433,6 @@ fn service_tlb_mailbox_on(cpu: crate::cpu::CpuIndex) {
     let _acknowledgement = coherency
         .acknowledge(cpu, request)
         .unwrap_or_else(|error| panic!("live TLB shootdown acknowledgement drifted: {error:?}"));
-    #[cfg(deepwyrm_i1_evidence)]
-    if _acknowledgement == crate::memory::address_region::ShootdownAcknowledgement::Recorded {
-        crate::test_support::observe_i1_tlb_ack(cpu, request);
-    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

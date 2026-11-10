@@ -64,123 +64,46 @@ use deepwyrm_abi::{
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const REGISTRY_OBJECTS: usize = 32;
 #[cfg(deepwyrm_production_product)]
 const REGISTRY_OBJECTS: usize = super::production_resource_geometry::SELECTED.registry;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const REGISTRY_OBJECTS: usize = 64;
-// Selector 24 adds one bounded child-loader object set plus the controller's
-// MemoryObject, Channel, Event, and Timer probes without taking I2's larger
-// multi-process stress budget.
-#[cfg(deepwyrm_wrcap_relay)]
-const REGISTRY_OBJECTS: usize = 48;
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const MEMORY_OBJECTS: usize = 10;
 #[cfg(deepwyrm_production_product)]
 const MEMORY_OBJECTS: usize = super::production_resource_geometry::SELECTED.memory;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const MEMORY_OBJECTS: usize = 24;
-// The selector-24 baseline owns eight bootfs/bootstrap/init0/controller
-// objects. A worker adds two ELF segments plus its stack; the shared-memory
-// case keeps one controller-owned probe object live at the same time.
-#[cfg(deepwyrm_wrcap_relay)]
-const MEMORY_OBJECTS: usize = 12;
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const MEMORY_LEASES: usize = 10;
 #[cfg(deepwyrm_production_product)]
 const MEMORY_LEASES: usize = super::production_resource_geometry::SELECTED.mappings;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const MEMORY_LEASES: usize = 24;
-// The shared-memory peak maps all twelve live objects and maps the probe once
-// more into the worker, so it needs one additional mapping lease.
-#[cfg(deepwyrm_wrcap_relay)]
-const MEMORY_LEASES: usize = 13;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
 // selector-24 controller adds exactly one temporary supervised child.
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
 #[cfg(deepwyrm_production_product)]
 const USERSPACE_CHAIN_PROCESSES: usize = super::production_resource_geometry::SELECTED.identities;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const USERSPACE_CHAIN_PROCESSES: usize = 6;
-#[cfg(deepwyrm_wrcap_relay)]
-const USERSPACE_CHAIN_PROCESSES: usize = 4;
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(deepwyrm_production_product)]
 const CHANNEL_PAIRS: usize = super::production_resource_geometry::SELECTED.channel_pairs;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const CHANNEL_PAIRS: usize = 8;
-#[cfg(deepwyrm_wrcap_relay)]
-const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 const CHANNEL_DEPTH: usize = 2;
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const WAITERS: usize = 4;
 #[cfg(deepwyrm_production_product)]
 const WAITERS: usize = super::production_resource_geometry::SELECTED.waits;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const WAITERS: usize = 12;
-// Bootstrap supervises init0 and init0 supervises the controller while the
-// controller supervises one worker. Each WAIT_ANY owns a Channel and Process
-// registration, for an exact selector-24 peak of six.
-#[cfg(deepwyrm_wrcap_relay)]
-const WAITERS: usize = 6;
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_production_product)]
 const TASK_GROUPS: usize = super::production_resource_geometry::SELECTED.identities;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const TASK_GROUPS: usize = 4;
-#[cfg(deepwyrm_wrcap_relay)]
-const TASK_GROUPS: usize = 2;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // The bootstrap handle deltas and peak live in `handle_capacity.rs`.
 use super::handle_capacity::{BOOTSTRAP_HANDLE_PEAK, INIT_MOVED_HANDLES};
-#[cfg(not(any(
-    deepwyrm_production_product,
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 #[cfg(deepwyrm_production_product)]
 const HANDLES: usize = super::production_resource_geometry::SELECTED.handles;
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const HANDLES: usize = 16;
-// Selector 24 retains the temporary child's TaskGroup handle while running the
-// ordinary loader transaction, one above the ten-handle bootstrap peak.
-#[cfg(deepwyrm_wrcap_relay)]
-const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK + 1;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -220,14 +143,8 @@ const _: () = {
         evidence: SELECTED.evidence,
     }));
 };
-#[cfg(not(deepwyrm_i2_stress))]
 const EVENTS: usize = 1;
-#[cfg(deepwyrm_i2_stress)]
-const EVENTS: usize = 2;
-#[cfg(not(any(
-    deepwyrm_i2_stress,
-    deepwyrm_production_product
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const TIMERS: usize = 1;
 // Selector 31 overlaps system-init's resident control-tick Timer with one
 // production UART driver's bounded TEMT-pacing Timer. Keep that exact
@@ -238,10 +155,7 @@ const TIMERS: usize = 1;
 // getting the one-Timer geometry because no cfg marked it. That is the same
 // silent inheritance the production ledger exists to stop, found by the
 // ledger's own `TIMER_PEAK` rather than by a boot.
-#[cfg(any(
-    deepwyrm_i2_stress,
-    deepwyrm_production_product
-))]
+#[cfg(deepwyrm_production_product)]
 const TIMERS: usize = 2;
 // A bounded mapping can cross one boundary at each non-root level. Keep two
 // candidates for PDPT, PD, and PT creation so the live publisher can construct
@@ -251,10 +165,6 @@ const TIMERS: usize = 2;
 // pages after init0 termination-race reconciliation. The ordinary Wave 4
 // bootfs is exactly 17 pages with its selector-specific init0 artifact.
 const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
-#[cfg(not(any(
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
 // F3A.6y. This was a literal 17 -- "the ordinary Wave 4 bootfs is exactly 17
 // pages", per the comment above, and true of the archive that was current when
 // it was written. The WYR1-F production archive is 203 pages, so the mapping
@@ -273,13 +183,6 @@ const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
 // and the historical Wave 4 value when nothing measured it, so a standalone
 // `cargo build` is unchanged.
 const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();
-// Selector 22: see `bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES`. The 32-page
-// guess this replaces surfaced a 39-page archive as an opaque NO_RESOURCES from
-// the bootstrap's bootfs mapping; the admission check in `enter` now names it.
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;
-#[cfg(deepwyrm_wrcap_relay)]
-const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;
 const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
     crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
 const _: () = assert!(crate::boot::primordial::construction::STACK_BYTES % 4096 == 0);
@@ -299,30 +202,16 @@ const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 // same bounded carrier set; a capacity drift is a compile-time error.
 const _: [(); crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = [(); crate::cpu::CPU_CAPACITY];
 const _: [(); PROCESSES] = [(); THREADS];
-#[cfg(all(
-    not(deepwyrm_i2_stress),
-    // WYR1-F production does the same: twenty-four enumerated pairs for the
-    // six-role spine with one replacement generation and one shell job, which
-    // is not the identity pool and must not be tied to it.
-    not(deepwyrm_production_product)
-))]
+#[cfg(not(deepwyrm_production_product))]
 const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
 const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
 const _: [(); PROCESSES] = [(); REGION_OBJECTS];
 const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
-#[cfg(not(any(
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-    deepwyrm_production_product,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const _: [(); 10] = [(); HANDLES];
 #[cfg(deepwyrm_production_product)]
 const _: [(); 48] = [(); HANDLES];
-#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-const _: [(); 16] = [(); HANDLES];
-#[cfg(deepwyrm_wrcap_relay)]
-const _: [(); 11] = [(); HANDLES];
 #[cfg(deepwyrm_production_product)]
 const _: [(); 2] = [(); TIMERS];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
@@ -331,10 +220,6 @@ const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 // it this is dead code in every selector build, and a selector that reaches the
 // const's arm without reaching this one is a compile error rather than a silent
 // mismatch.
-#[cfg(not(any(
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-)))]
 const fn parse_production_bootfs_pages() -> usize {
     let bytes = env!("DEEPWYRM_BOOTFS_MAX_PAGES").as_bytes();
     let mut value = 0_usize;
@@ -353,261 +238,6 @@ const fn parse_production_bootfs_pages() -> usize {
         "production bootfs page ceiling is out of range"
     );
     value
-}
-
-#[cfg(feature = "test-support")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum G5PrimordialExpectation {
-    Baseline,
-    BlockingCleanup,
-    UserException,
-    InvalidReturn,
-}
-
-#[cfg(feature = "test-support")]
-struct G5PrimordialProbe {
-    expectation: G5PrimordialExpectation,
-    valid: bool,
-    generic_prepared_idle: bool,
-    generic_poll_resumed: bool,
-    generic_resumed_timed_out: bool,
-    atomic_prepared_idle: bool,
-    atomic_poll_resumed: bool,
-    atomic_resumed_timed_out: bool,
-    terminal_oracle_passed: bool,
-    terminal_application_code: u32,
-    terminal_info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>,
-}
-
-#[cfg(feature = "test-support")]
-impl G5PrimordialProbe {
-    fn for_build() -> Self {
-        use crate::test_support::BuildGuestTest;
-
-        let expectation = match crate::test_support::BUILD_GUEST_TEST {
-            BuildGuestTest::PrimordialBootstrap => G5PrimordialExpectation::Baseline,
-            BuildGuestTest::SmpRuntimeStress => G5PrimordialExpectation::Baseline,
-            BuildGuestTest::SmpRuntimeAcceptance => G5PrimordialExpectation::Baseline,
-            BuildGuestTest::NativeUserspaceCapability => G5PrimordialExpectation::Baseline,
-            BuildGuestTest::PrimordialBlockingCleanup => G5PrimordialExpectation::BlockingCleanup,
-            BuildGuestTest::PrimordialUserException => G5PrimordialExpectation::UserException,
-            BuildGuestTest::PrimordialInvalidReturn => G5PrimordialExpectation::InvalidReturn,
-            BuildGuestTest::BootHandoffPass
-            | BuildGuestTest::ExceptionFailPath
-            | BuildGuestTest::PanicPath
-            | BuildGuestTest::MemoryMapping
-            | BuildGuestTest::MemoryUnmapping
-            | BuildGuestTest::MemoryPermissions
-            | BuildGuestTest::MemoryInvalidPointer
-            | BuildGuestTest::MemoryUserKernelIsolation
-            | BuildGuestTest::MemorySharedMemoryObject
-            | BuildGuestTest::TaskSyscallSmoke
-            | BuildGuestTest::TaskSyscallSanitize
-            | BuildGuestTest::TaskUserException
-            | BuildGuestTest::IpcBlockingSmoke
-            | BuildGuestTest::AtomicWaitWake => {
-                unreachable!("primordial runtime requires a primordial selector")
-            }
-        };
-        Self {
-            expectation,
-            valid: true,
-            generic_prepared_idle: false,
-            generic_poll_resumed: false,
-            generic_resumed_timed_out: false,
-            atomic_prepared_idle: false,
-            atomic_poll_resumed: false,
-            atomic_resumed_timed_out: false,
-            terminal_oracle_passed: false,
-            terminal_application_code: 0,
-            terminal_info: None,
-        }
-    }
-
-    fn observe_prepare(
-        &mut self,
-        owner: Result<FServiceOperationOwner, crate::syscall::FServiceOwnerError>,
-        idle_current: bool,
-    ) {
-        if self.expectation != G5PrimordialExpectation::BlockingCleanup {
-            return;
-        }
-        match owner {
-            Ok(FServiceOperationOwner::GenericWait) => {
-                let ordered = !self.generic_prepared_idle
-                    && !self.generic_poll_resumed
-                    && !self.generic_resumed_timed_out
-                    && !self.atomic_prepared_idle
-                    && !self.atomic_poll_resumed
-                    && !self.atomic_resumed_timed_out;
-                self.valid &= idle_current && ordered;
-                self.generic_prepared_idle = idle_current && ordered;
-            }
-            Ok(FServiceOperationOwner::AtomicWait) => {
-                let ordered = self.generic_prepared_idle
-                    && self.generic_poll_resumed
-                    && self.generic_resumed_timed_out
-                    && !self.atomic_prepared_idle
-                    && !self.atomic_poll_resumed
-                    && !self.atomic_resumed_timed_out;
-                self.valid &= idle_current && ordered;
-                self.atomic_prepared_idle = idle_current && ordered;
-            }
-            Err(_) => self.valid = false,
-        }
-    }
-
-    fn observe_poll(
-        &mut self,
-        owner: Result<FServiceOperationOwner, crate::syscall::FServiceOwnerError>,
-        resume_current: bool,
-        switched: bool,
-    ) {
-        if self.expectation != G5PrimordialExpectation::BlockingCleanup {
-            return;
-        }
-        match owner {
-            Ok(FServiceOperationOwner::GenericWait) => {
-                let ordered = self.generic_prepared_idle
-                    && !self.generic_poll_resumed
-                    && !self.generic_resumed_timed_out
-                    && !self.atomic_prepared_idle;
-                self.valid &= ordered && !switched;
-                if resume_current && ordered {
-                    self.generic_poll_resumed = true;
-                }
-            }
-            Ok(FServiceOperationOwner::AtomicWait) => {
-                let ordered = self.generic_resumed_timed_out
-                    && self.atomic_prepared_idle
-                    && !self.atomic_poll_resumed
-                    && !self.atomic_resumed_timed_out;
-                self.valid &= ordered && !switched;
-                if resume_current && ordered {
-                    self.atomic_poll_resumed = true;
-                }
-            }
-            Err(_) => self.valid = false,
-        }
-    }
-
-    fn observe_resume(
-        &mut self,
-        owner: Result<FServiceOperationOwner, crate::syscall::FServiceOwnerError>,
-        status: deepwyrm_abi::DwStatus,
-    ) {
-        if self.expectation != G5PrimordialExpectation::BlockingCleanup {
-            return;
-        }
-        match owner {
-            Ok(FServiceOperationOwner::GenericWait) => {
-                let ordered = self.generic_poll_resumed
-                    && !self.generic_resumed_timed_out
-                    && !self.atomic_prepared_idle;
-                self.valid &= ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
-                self.generic_resumed_timed_out =
-                    ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
-            }
-            Ok(FServiceOperationOwner::AtomicWait) => {
-                let ordered = self.generic_resumed_timed_out
-                    && self.atomic_poll_resumed
-                    && !self.atomic_resumed_timed_out;
-                self.valid &= ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
-                self.atomic_resumed_timed_out =
-                    ordered && status == deepwyrm_abi::DW_STATUS_TIMED_OUT;
-            }
-            Err(_) => self.valid = false,
-        }
-    }
-
-    fn observe_terminal(&mut self, info: deepwyrm_abi::DwTaskTerminationInfoV1) {
-        self.terminal_application_code = info.application_code;
-        self.terminal_info = Some(info);
-        let (exception_type, detail) = match self.expectation {
-            G5PrimordialExpectation::UserException => {
-                (deepwyrm_abi::DW_EXCEPTION_ILLEGAL_INSTRUCTION, 6)
-            }
-            G5PrimordialExpectation::InvalidReturn => {
-                (deepwyrm_abi::DW_EXCEPTION_GENERAL_PROTECTION, 1)
-            }
-            G5PrimordialExpectation::Baseline | G5PrimordialExpectation::BlockingCleanup => return,
-        };
-        self.terminal_oracle_passed = info
-            == deepwyrm_abi::DwTaskTerminationInfoV1 {
-                size: deepwyrm_abi::DW_TASK_TERMINATION_INFO_V1_SIZE,
-                version: 1,
-                state: deepwyrm_abi::DW_TASK_STATE_EXITED,
-                reason: deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION,
-                application_code: 0,
-                exception_type,
-                detail,
-                reserved0: 0,
-                fault_address: 0,
-                reserved: [0; 3],
-            };
-    }
-
-    fn accepts_completion(
-        &self,
-        completion: &Result<
-            (),
-            crate::boot::primordial::construction::PrimordialCompletionError<u32>,
-        >,
-    ) -> bool {
-        use crate::boot::primordial::construction::PrimordialCompletionError;
-
-        match self.expectation {
-            G5PrimordialExpectation::Baseline => completion == &Ok(()),
-            G5PrimordialExpectation::BlockingCleanup => {
-                self.valid
-                    && self.generic_prepared_idle
-                    && self.generic_poll_resumed
-                    && self.generic_resumed_timed_out
-                    && self.atomic_prepared_idle
-                    && self.atomic_poll_resumed
-                    && self.atomic_resumed_timed_out
-                    && completion == &Ok(())
-            }
-            G5PrimordialExpectation::UserException | G5PrimordialExpectation::InvalidReturn => {
-                self.terminal_oracle_passed
-                    && completion == &Err(PrimordialCompletionError::UnhandledException)
-            }
-        }
-    }
-
-    fn failure_detail(
-        &self,
-        completion: &Result<
-            (),
-            crate::boot::primordial::construction::PrimordialCompletionError<u32>,
-        >,
-    ) -> u32 {
-        if self.terminal_application_code != 0 {
-            return self.terminal_application_code;
-        }
-        match completion {
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::Receive(
-                detail,
-                _,
-            )) => *detail,
-            Err(
-                crate::boot::primordial::construction::PrimordialCompletionError::MalformedReady(_),
-            ) => 3,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::ObserveExit(
-                detail,
-            )) => *detail,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::NonzeroExit(
-                code,
-            )) => *code,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::UnhandledException) => 5,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::AuthorizedTermination) => 6,
-            Err(crate::boot::primordial::construction::PrimordialCompletionError::NotQuiescent(
-                detail,
-                _,
-            )) => *detail,
-            Ok(()) => 1,
-        }
-    }
 }
 
 type Registry = ObjectRegistry<REGISTRY_OBJECTS>;
@@ -876,11 +506,6 @@ fn await_remote_stop_permits(
             continue;
         };
         let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
-        #[cfg(deepwyrm_i1_evidence)]
-        crate::test_support::observe_i1_rendezvous_ack(
-            crate::cpu::CpuIndex::new(permit.target_cpu())
-                .unwrap_or_else(|| panic!("I1 stop permit names an invalid CPU")),
-        );
         permits[cpu_index] = Some(permit);
     }
     permits
@@ -3499,8 +3124,6 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     // They are drained only by a post-ack kernel-root continuation, the last
     // one outstanding when several CPUs are stopped at once.
     rendezvous_cleanup: StagedStopCleanup<REGISTRY_OBJECTS>,
-    #[cfg(feature = "test-support")]
-    g5_probe: G5PrimordialProbe,
 }
 
 /// Everything the runtime authority guards: the core authorities and every
@@ -3949,8 +3572,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cancelled_quantum = self.own.wait_control.pending_quantum_cancellation();
         self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
         let control = &mut self.own.wait_control;
-        #[cfg(deepwyrm_i1_evidence)]
-        let pending_wake = control.pending_wake_key();
         // SAFETY: [P-PLAN] forwarded: this `unsafe fn` has no `# Safety` section; its callers (the
         // `prepare_suspend` trait impls) supply the physically current `self.cpu()`, and the entry is
         // the fixed one.
@@ -3964,18 +3585,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         }
         .unwrap_or_else(|error| panic!("primordial suspend preparation drifted: {error:?}"));
-        #[cfg(deepwyrm_i1_evidence)]
-        if let Some(wake) = pending_wake {
-            crate::test_support::observe_i1_parent_blocked(self.cpu(), wake);
-        }
-        #[cfg(feature = "test-support")]
-        self.core.g5_probe.observe_prepare(
-            owner,
-            matches!(
-                &plan,
-                crate::syscall::native::NativeSuspendPlan::IdleCurrent
-            ),
-        );
         plan
     }
 
@@ -4126,18 +3735,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         }
         .unwrap_or_else(|error| panic!("primordial idle-suspend poll drifted: {error:?}"));
-        #[cfg(feature = "test-support")]
-        self.core.g5_probe.observe_poll(
-            owner,
-            matches!(
-                &poll,
-                crate::syscall::native::NativeIdleSuspendPoll::ResumeCurrent
-            ),
-            matches!(
-                &poll,
-                crate::syscall::native::NativeIdleSuspendPoll::Switch(_)
-            ),
-        );
         poll
     }
 
@@ -4147,10 +3744,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         crate::arch::x86_64::syscall::ValidatedUserReturn,
         crate::memory::kernel_stack::KernelStackBounds,
     ) {
-        #[cfg(deepwyrm_i1_evidence)]
-        if self.own.scheduled().process != self.core.primordial_process {
-            crate::test_support::observe_i1_descendant_running(self.cpu());
-        }
         let context = self
             .core
             .shared
@@ -4435,8 +4028,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
         }
 
-        PreparedTerminalStep::Final(self.finish_primordial_terminal_handoff(
-        ))
+        PreparedTerminalStep::Final(self.finish_primordial_terminal_handoff())
     }
 
     fn finish_terminal_successor(
@@ -4527,16 +4119,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn finish_primordial_terminal_handoff(
-        &mut self,
-    ) -> PreparedTerminalHandoff {
+    fn finish_primordial_terminal_handoff(&mut self) -> PreparedTerminalHandoff {
         let completion = complete_primordial_launch(self);
+        // Selector builds never run the primordial product.
         #[cfg(feature = "test-support")]
-        if self.core.g5_probe.accepts_completion(&completion) {
-            crate::test_support::complete_pass(0)
-        } else {
-            crate::test_support::complete_fail(self.core.g5_probe.failure_detail(&completion))
-        }
+        unreachable!("selector builds do not run the primordial product: {completion:?}");
         #[cfg(not(feature = "test-support"))]
         {
             let record = crate::boot::primordial::construction::completion_record(&completion);
@@ -5932,56 +5519,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.prove_registry_capacity().map_err(|_| 0x7000_0010_u32)
     }
-
-    /// Selector-24-only join between the Wyrmroot controller and the host
-    /// evidence parser. The kernel validates framing and preserves raw bytes;
-    /// it does not originate or interpret capability facts.
-    #[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
-    fn drain_wrcap_record(&mut self) {
-        use crate::test_support::{WRCAP_RECORD_LEN, WRCAP_RELAY, WrcapDrainAction};
-
-        let info = match self
-            .core
-            .shared
-            .channels
-            .peek_receive(self.core.channel_keys[0])
-        {
-            Ok(info) => info,
-            Err(ChannelError::WouldBlock) => return,
-            Err(_) => {
-                let _ = WRCAP_RELAY.reject_receive();
-                return;
-            }
-        };
-        match WRCAP_RELAY.drain_action(info.required_bytes, info.required_handles) {
-            WrcapDrainAction::Drain => {}
-            WrcapDrainAction::LeaveForReady => return,
-            WrcapDrainAction::Reject => {
-                let _ = WRCAP_RELAY.reject_receive();
-                return;
-            }
-        }
-
-        let mut record = [0_u8; WRCAP_RECORD_LEN];
-        let (bytes, wakes) = match self.core.shared.channels.receive_into(
-            self.core.channel_keys[0],
-            &mut record,
-            &self.core.shared.waits,
-        ) {
-            Ok(received) => received,
-            Err(_) => {
-                let _ = WRCAP_RELAY.reject_receive();
-                return;
-            }
-        };
-        crate::syscall::complete_wait_wakes(
-            &mut self.core.registry,
-            &self.core.shared.execution,
-            wakes,
-            &mut self.core.cleanup,
-        );
-        let _ = WRCAP_RELAY.record(&record[..bytes]);
-    }
 }
 
 const fn primordial_channel_receive_error(error: ChannelError) -> u32 {
@@ -6029,8 +5566,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialCompleti
             .tasks
             .process_info(self.own.scheduled().process)
             .map_err(|_| 0x7200_0001_u32)?;
-        #[cfg(feature = "test-support")]
-        self.core.g5_probe.observe_terminal(info);
         if info.state != DW_TASK_STATE_EXITED {
             return Err(0x7200_0002_u32);
         }
@@ -6304,8 +5839,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         frame.authorize_return(current_binding_generation, &mut mappings)?;
         drop(mappings);
         drop(paging);
-        #[cfg(all(feature = "test-support", deepwyrm_wrcap_relay))]
-        self.drain_wrcap_record();
         Ok(())
     }
 
@@ -6341,8 +5874,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|error| panic!("primordial suspended syscall resume drifted: {error:?}"));
         let status = resumed.status();
         self.absorb_service_cleanup();
-        #[cfg(feature = "test-support")]
-        self.core.g5_probe.observe_resume(owner, status);
         frame.set_status(status);
         let (output, pin) = settlement.into_parts();
         ResumeSettlement {
@@ -7318,10 +6849,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     match notification {
                         crate::arch::x86_64::rendezvous::MailboxNotification::None
                         | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {
-                            #[cfg(deepwyrm_i1_evidence)]
-                            crate::test_support::observe_i1_remote_wake_received(this.cpu);
-                        }
+                        crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
                         crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_) => {
                             panic!("kernel-root idle carrier received an unexpected stop request")
                         }
@@ -7611,13 +7139,6 @@ pub(super) fn enter(
         "bootstrap",
     );
     let bootfs = copy_module(&mut active, modules.bootfs(), &BOOTFS_BYTES, "bootfs");
-    #[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]
-    if !matches!(
-        bootfs_capacity::integration_bootfs_page_count(bootfs.len()),
-        Some(1..=PRIMORDIAL_BOOTFS_MAX_PAGES)
-    ) {
-        crate::test_support::complete_fail(0x2210_b001)
-    }
     let plan = crate::boot::primordial::parse_primordial_elf(bootstrap)
         .unwrap_or_else(|error| panic!("invalid primordial bootstrap ELF: {error:?}"));
 
@@ -7798,8 +7319,6 @@ pub(super) fn enter(
                                 root_owner: (Some(root_owner)),
                                 cleanup: (CleanupQueue::new()),
                                 rendezvous_cleanup: (StagedStopCleanup::new()),
-                                #[cfg(feature = "test-support")]
-                                g5_probe: (G5PrimordialProbe::for_build()),
                             }
                         );
                         init_fields!(
@@ -7956,16 +7475,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             != Some(SchedulerThreadState::Running)
         {
             panic!("primordial syscall arrived without its running Thread");
-        }
-        #[cfg(deepwyrm_i1_evidence)]
-        {
-            let claim = self
-                .core
-                .shared
-                .execution
-                .running_claim_on(self.cpu())
-                .unwrap_or_else(|| panic!("I1 syscall has no running execution claim"));
-            crate::test_support::observe_i1_cpl3_syscall(self.cpu(), claim.generation(), 1);
         }
         // This identity is deliberately detached from the carrier before any
         // usercopy or service dispatch.  The final check keeps a resumed
@@ -8483,8 +7992,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.core.spaces,
                 process,
                 &mut self.core.cleanup,
-                |_child| {
-                },
+                |_child| {},
             );
             (status, access.into_pending())
         };
@@ -8538,16 +8046,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             != Some(SchedulerThreadState::Running)
         {
             panic!("primordial syscall arrived without its running Thread");
-        }
-        #[cfg(deepwyrm_i1_evidence)]
-        {
-            let claim = self
-                .core
-                .shared
-                .execution
-                .running_claim_on(self.cpu())
-                .unwrap_or_else(|| panic!("I1 syscall has no running execution claim"));
-            crate::test_support::observe_i1_cpl3_syscall(self.cpu(), claim.generation(), 1);
         }
         let phase = self.reserve_runtime_phase();
         let root = self
@@ -8611,14 +8109,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 )
             }
             NativeSyscallRequest::HandleClose { handle } => {
-                #[cfg(deepwyrm_i1_evidence)]
-                let closed_process = self
-                    .core
-                    .tasks
-                    .process_handles(self.own.scheduled().process)
-                    .ok()
-                    .and_then(|handles| handles.process_target_for_evidence(handle))
-                    .map(crate::task::ProcessKey::from_object_id);
                 let status = crate::syscall::handle_close(
                     &mut self.core.registry,
                     &mut self.core.tasks,
@@ -8636,13 +8126,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             .tasks
                             .process_lifecycle(self.own.scheduled().process),
                     );
-                }
-                #[cfg(deepwyrm_i1_evidence)]
-                if status == DW_STATUS_SUCCESS
-                    && let Some(process) = closed_process
-                {
-                    crate::test_support::observe_i1_child_cleanup(process, self.cpu());
-                    crate::test_support::observe_i1_reclaim_allowed(self.cpu());
                 }
                 NativeSyscallResult::returning(status)
             }
@@ -9149,8 +8632,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn exit_process(&mut self, exit_code: u32) -> NativeSyscallResult {
         let phase = self.reserve_runtime_phase();
-        #[cfg(deepwyrm_i1_evidence)]
-        let exiting_claim = self.core.shared.execution.running_claim_on(self.cpu());
         let mut discarded: [Option<user_access::OwnedLiveUserOutput>; THREADS] =
             core::array::from_fn(|_| None);
         let mut atomic_pins: [Option<user_access::OwnedLiveAtomicU32>; THREADS] =
@@ -9189,16 +8670,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.install_deferred_current(
                 deferred.unwrap_or_else(|| panic!("primordial exit omitted deferred reclaim")),
             );
-            #[cfg(deepwyrm_i1_evidence)]
-            if self.own.scheduled().process != self.core.primordial_process {
-                let claim = exiting_claim
-                    .unwrap_or_else(|| panic!("I1 child exit omitted its execution claim"));
-                crate::test_support::observe_i1_child_exit(
-                    self.own.scheduled().process,
-                    self.cpu(),
-                    claim.generation(),
-                );
-            }
         } else {
             assert!(deferred.is_none());
         }
@@ -9265,8 +8736,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Err(()) => return ProcessTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
-        #[cfg(deepwyrm_i1_evidence)]
-        let exiting_claim = self.core.shared.execution.running_claim_on(self.cpu());
         let mut prepared = match self.prepare_process_exit_with_wait_cleanup(exit_code) {
             Ok(prepared) => prepared,
             Err(status) => {
@@ -9276,16 +8745,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ));
             }
         };
-        #[cfg(deepwyrm_i1_evidence)]
-        if self.own.scheduled().process != self.core.primordial_process {
-            let claim = exiting_claim
-                .unwrap_or_else(|| panic!("I1 child exit omitted its execution claim"));
-            crate::test_support::observe_i1_child_exit(
-                self.own.scheduled().process,
-                self.cpu(),
-                claim.generation(),
-            );
-        }
         assert_eq!(
             prepared.thread_keys(),
             inspected_threads,
@@ -9448,20 +8907,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 prepared,
                 core::array::from_fn(|_| None),
             ));
-        }
-        #[cfg(deepwyrm_i1_evidence)]
-        {
-            let mask = identities
-                .iter()
-                .enumerate()
-                .fold(0_u32, |mask, (cpu, identity)| {
-                    if identity.is_some() {
-                        mask | (1_u32 << cpu)
-                    } else {
-                        mask
-                    }
-                });
-            crate::test_support::observe_i1_rendezvous_targets(mask);
         }
         ProcessTerminationPreparation::Remote(PreparedRemoteProcessTermination {
             phase,

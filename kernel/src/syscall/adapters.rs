@@ -3339,9 +3339,7 @@ pub(crate) fn channel_send_commit<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     execution: &ExecutionDomain<EXECUTION>,
     current_process: ProcessKey,
-    #[allow(unused_variables)] current_thread: Option<
-        ThreadKey,
-    >,
+    #[allow(unused_variables)] current_thread: Option<ThreadKey>,
     channel: DwHandle,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
@@ -4084,9 +4082,7 @@ fn complete_wait_wakes_with_channel_drain<
     execution: &ExecutionDomain<EXECUTION>,
     wakes: WakeBatch<WAITERS>,
     cleanup: &mut CleanupQueue<OBJECTS>,
-    #[allow(unused_variables)] drained_peer: Option<
-        ChannelEndpointKey,
-    >,
+    #[allow(unused_variables)] drained_peer: Option<ChannelEndpointKey>,
 ) {
     let (wake_intents, wait_pins) = wakes.into_parts();
     for wake in wake_intents.into_iter().flatten() {
@@ -4104,8 +4100,7 @@ fn complete_wait_wakes_with_channel_drain<
             .try_claim_winner(wake.wake_key(), winner)
         {
             Ok(true) => match execution.wake(wake.wake_key()) {
-                Ok(()) => {
-                }
+                Ok(()) => {}
                 Err(SchedulerError::StaleBlockToken) => {}
                 Err(error) => {
                     panic!("waiter wake violated scheduler ownership: {error:?}")
@@ -4201,16 +4196,6 @@ impl NativeWaitControl {
     pub(crate) const fn new() -> Self {
         Self {
             state: NativeWaitControlState::Clear,
-        }
-    }
-
-    #[cfg(deepwyrm_i1_evidence)]
-    pub(crate) const fn pending_wake_key(&self) -> Option<BlockWakeKey> {
-        match self.state {
-            NativeWaitControlState::Pending(state)
-            | NativeWaitControlState::Idle(state)
-            | NativeWaitControlState::Resuming(state) => Some(state.wake_key()),
-            NativeWaitControlState::Clear => None,
         }
     }
 

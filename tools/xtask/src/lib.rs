@@ -475,32 +475,11 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
     Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8)
 }
 
-/// The compile-time environment a selector needs before it will build at all.
-///
-/// `kernel/build.rs` refuses a selector whose nonce, digest or page ceiling is
-/// absent, so a row here is what makes that selector compilable. The values are
-/// placeholders: this gate compiles and never links, boots or records, so any
-/// well-formed value answers the only question it asks. Real runs supply real
-/// ones. A selector absent from this table is built with no extra environment,
-/// and if it turns out to need some, this gate fails and names it -- which is
-/// the correct outcome, not a gap.
-const SELECTOR_ENVIRONMENTS: [(&str, &[(&str, &str)]); 1] = [(
-    "smp-runtime-acceptance",
-    &[("DEEPWYRM_I1_EVIDENCE_NONCE", "0000000000000001")],
-)];
-
-/// The no-selector production kernel. `None` means the selector environment
-/// variable is removed rather than set, which is the shape a product build of
-/// the uninstrumented kernel actually has.
-const PRODUCTION_KERNEL_ROW: (Option<&str>, &[(&str, &str)]) = (None, &[]);
-
-/// One selector build configuration: every implemented selector with its
-/// `SELECTOR_ENVIRONMENTS` row.
+/// One selector build configuration: every implemented selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectorBuild<'a> {
     label: &'a str,
     selector: &'a str,
-    environment: &'a [(&'static str, &'static str)],
 }
 
 /// The single list of selector build configurations every selector gate reads.
@@ -510,24 +489,8 @@ fn selector_builds(selectors: &[String]) -> Vec<SelectorBuild<'_>> {
         .map(|selector| SelectorBuild {
             label: selector,
             selector,
-            environment: SELECTOR_ENVIRONMENTS
-                .iter()
-                .find(|(name, _)| name == selector)
-                .map_or(&[][..], |(_, environment)| environment),
         })
         .collect()
-}
-
-/// Removes every variable a selector row can set, so a value left in the
-/// caller's shell cannot leak into a row that does not name it.
-fn clear_selector_environment(command: &mut Command) {
-    command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
-    let rows = SELECTOR_ENVIRONMENTS
-        .iter()
-        .flat_map(|(_, environment)| environment.iter());
-    for (name, _) in rows {
-        command.env_remove(name);
-    }
 }
 
 /// Reads the implemented selectors from the harness manifest, refusing an empty
@@ -598,20 +561,17 @@ fn run_selector_library_checks() -> io::Result<u8> {
     // anything noticing -- an uninstrumented kernel compiled fine, it just had
     // no interrupt-driven console. Check it first, because a production break
     // matters more than a selector break.
-    let rows = core::iter::once((None, PRODUCTION_KERNEL_ROW.1)).chain(
+    let rows = core::iter::once(None).chain(
         builds
             .iter()
-            .map(|build| (Some((build.label, build.selector)), build.environment)),
+            .map(|build| Some((build.label, build.selector))),
     );
-    for (selector, environment) in rows {
+    for selector in rows {
         let mut command = Command::new(&lane);
         command.current_dir(&workspace).env_remove("CARGO_HOME");
-        clear_selector_environment(&mut command);
+        command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
         if let Some((_, selector)) = selector {
             command.env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
-        }
-        for (name, value) in environment {
-            command.env(name, value);
         }
         let mut arguments = vec![
             "target",
@@ -642,9 +602,9 @@ fn run_selector_library_checks() -> io::Result<u8> {
     Ok(0)
 }
 
-/// Warnings-denied rustc over the production kernel: the exact
-/// `PRODUCTION_KERNEL_ROW` shape `run_selector_library_checks` checks first, on
-/// the target lane, with no selector and no `test-support`.
+/// Warnings-denied rustc over the production kernel: the no-selector row
+/// `run_selector_library_checks` checks first, on the target lane, with no
+/// selector and no `test-support`.
 ///
 /// Not Clippy. The accepted Wyrmroot toolchain ships `cargo` and `rustc` only
 /// (`tooling/rust-toolchain.toml`), so there is no `clippy-driver` that can see
@@ -710,11 +670,7 @@ fn run_selector_host_tests() -> io::Result<u8> {
         }
         let mut command = Command::new("cargo");
         command.current_dir(workspace_root());
-        clear_selector_environment(&mut command);
         command.env("DEEPWYRM_GUEST_TEST_SELECTOR", build.selector);
-        for (name, value) in build.environment {
-            command.env(name, value);
-        }
         let status = command
             .args([
                 "test",

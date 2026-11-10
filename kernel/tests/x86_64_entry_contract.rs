@@ -229,13 +229,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         ("task-syscall-smoke", 10),
         ("ipc-blocking-smoke", 13),
         ("atomic-wait-wake", 16),
-        ("primordial-bootstrap", 18),
-        ("primordial-blocking-cleanup", 19),
-        ("primordial-user-exception", 20),
-        ("primordial-invalid-return", 21),
-        ("smp-runtime-stress", 22),
-        ("smp-runtime-acceptance", 23),
-        ("native-userspace-capability", 24),
     ] {
         assert_eq!(
             kernel_build::select_guest_test(true, Some(selector), false, &harness),
@@ -249,6 +242,13 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         "ipc-transfer-rollback",
         "wait-deadline-timer",
         "process-create-bootstrap",
+        "primordial-bootstrap",
+        "primordial-blocking-cleanup",
+        "primordial-user-exception",
+        "primordial-invalid-return",
+        "smp-runtime-stress",
+        "smp-runtime-acceptance",
+        "native-userspace-capability",
         "permanent-supervisor-rrc",
         "bootstrap-registry-launch",
         "normal-preemption-smp",
@@ -272,73 +272,6 @@ fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
         kernel_build::select_guest_test(false, None, false, ""),
         Ok(None)
     );
-}
-
-#[test]
-fn i1_evidence_nonce_is_build_owned_and_strict() {
-    assert!(kernel_build::validate_i1_evidence_nonce("0123456789ABCDEF").is_ok());
-    for nonce in [
-        "0000000000000000",
-        "0123456789abcdef",
-        "0123456789ABCDE",
-        "0123456789ABCDEFF",
-        "0123456789ABCDEG",
-    ] {
-        assert!(kernel_build::validate_i1_evidence_nonce(nonce).is_err());
-    }
-}
-
-#[test]
-fn i1_evidence_has_one_terminal_com1_reporter() {
-    let evidence = fs::read_to_string(kernel_root().join("src/test_support/evidence.rs"))
-        .expect("read I1 evidence collector");
-    let terminal = fs::read_to_string(kernel_root().join("src/test_support/x86_64.rs"))
-        .expect("read terminal reporter");
-    assert!(evidence.contains("Workers have no serial-port API"));
-    assert!(!evidence.contains("emit_early_raw_record"));
-    assert!(terminal.contains("I1_EVIDENCE.finalize_running_invariant"));
-    assert!(terminal.contains("permit.flush"));
-    assert!(terminal.contains("begin_test_serial_transaction"));
-    assert!(terminal.contains(".write_evidence(record)"));
-    assert!(terminal.contains("emit_early_raw_record(record)"));
-}
-
-#[test]
-fn wrcap_relay_is_selector_only_bounded_and_precedes_terminal_completion() {
-    let build = fs::read_to_string(kernel_root().join("build.rs")).expect("read kernel build");
-    let relay = fs::read_to_string(kernel_root().join("src/test_support/wrcap.rs"))
-        .expect("read WRCAP1 relay");
-    let support = fs::read_to_string(kernel_root().join("src/test_support/mod.rs"))
-        .expect("read test-support boundary");
-    let primordial =
-        fs::read_to_string(kernel_root().join("src/arch/x86_64/mm/activation/primordial.rs"))
-            .expect("read primordial runtime");
-    let debug = fs::read_to_string(kernel_root().join("src/debug/tests.rs"))
-        .expect("read COM1 ordering tests");
-    let terminal = fs::read_to_string(kernel_root().join("src/test_support/x86_64.rs"))
-        .expect("read terminal reporter");
-
-    assert!(build.contains("cfg(deepwyrm_wrcap_relay)"));
-    assert!(build.contains("selector == \"native-userspace-capability\""));
-    assert!(support.contains(
-        "compile_error!(\"selector-specific terminal reporters are selector-exclusive\")"
-    ));
-    assert!(support.contains("#[cfg(any(test, deepwyrm_wrcap_relay))]\nmod wrcap;"));
-    assert!(relay.contains("const WRCAP_RECORD_COUNT: usize = 15;"));
-    assert!(relay.contains("const WRCAP_RECORD_KINDS: [u8; WRCAP_RECORD_COUNT]"));
-    assert!(relay.contains("let expected_kind = WRCAP_RECORD_KINDS[transcript.seen];"));
-    assert!(relay.contains("pub(crate) const WRCAP_RECORD_LEN: usize = 117;"));
-    assert!(relay.contains("transcript.records[index].copy_from_slice(record)"));
-    assert!(primordial.contains(
-        "#[cfg(all(feature = \"test-support\", deepwyrm_wrcap_relay))]\n    fn drain_wrcap_record"
-    ));
-    assert_eq!(primordial.matches("self.drain_wrcap_record();").count(), 1);
-    assert!(terminal.contains("WRCAP_RELAY.claim_reporter()"));
-    assert!(terminal.contains("WRCAP1 reporter owns its serial transaction"));
-    assert!(terminal.contains("wrcap_flush_failure(outcome, detail, error)"));
-    assert!(terminal.contains("if outcome == CompletionOutcome::Pass"));
-    assert!(terminal.contains("(outcome, detail)"));
-    assert!(debug.contains("one_com1_transaction_orders_fifteen_wrcap_records_before_dwtest1"));
 }
 
 #[test]
@@ -499,16 +432,6 @@ fn g3_primordial_mapping_failures_remain_recoverable_and_rollback_owned_candidat
     assert!(
         build.contains("cargo:rerun-if-env-changed=DEEPWYRM_BOOTFS_MAX_PAGES"),
         "a changed measurement must rebuild the kernel"
-    );
-    assert!(
-        primordial.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;"
-        )
-    );
-    assert!(
-        primordial.contains(
-            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;"
-        )
     );
     assert!(primordial.contains("const PRIMORDIAL_STACK_MAPPING_PAGES: usize ="));
     assert!(primordial.contains("const PRIMORDIAL_MAX_MAPPING_PAGES: usize ="));
@@ -1110,4 +1033,3 @@ impl Drop for TemporaryDirectory {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
-

@@ -467,8 +467,7 @@ pub(crate) struct InterruptFinalization {
     state: InterruptFinalizationState,
 }
 
-impl InterruptFinalization {
-}
+impl InterruptFinalization {}
 
 #[derive(Debug)]
 enum InterruptState {

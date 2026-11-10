@@ -30,11 +30,6 @@ use super::super::{
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 #[path = "activation/address_space.rs"]
 mod address_space;
-// The selector-local bootfs measurement `primordial.rs` uses, host-compiled
-// under `test` so its test runs (S2K-0).
-#[cfg(any(test, all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64", all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))))]
-#[path = "activation/bootfs_capacity.rs"]
-mod bootfs_capacity;
 #[path = "activation/graph.rs"]
 mod graph;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
@@ -148,27 +143,13 @@ const DW1C_CHANNEL_CREATE_OUTPUT_PINS: usize = 2;
 const DW1C_LIVE_USER_PIN_FLOOR: usize =
     DW1C_RETAINED_RECEIVE_PINS + DW1C_CHANNEL_CREATE_OUTPUT_PINS;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-#[cfg(not(any(
-    deepwyrm_i2_stress,
-    deepwyrm_wrcap_relay,
-    deepwyrm_production_product,
-)))]
+#[cfg(not(deepwyrm_production_product))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // WYR1-F production keeps the six resident roots, one replacement generation
 // and one shell job live together, matched to the same identity pool so root
 // bindings and Process identities cannot drift apart.
 #[cfg(deepwyrm_production_product)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;
-// Selector 24 keeps bootstrap, init0, the controller, and one bounded worker
-// live together. The controller tears each worker down before starting the
-// next case, so the relay artifact needs exactly one additional binding.
-#[cfg(deepwyrm_wrcap_relay)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;
-// Selector 22 keeps bootstrap, init0, the controller, and multiple stress
-// descendants live together. This is a bounded test-artifact capacity, not a
-// production policy or a new ABI limit.
-#[cfg(deepwyrm_i2_stress)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;
 const MAX_DEEP_TABLE_FRAMES: usize = 256;
 const ADDRESS_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 const HARDWARE_MUTABLE: u64 = ACCESSED | DIRTY;

@@ -88,8 +88,7 @@ pub(crate) struct DeviceResourceFinalization {
     grant: Option<DeviceResourceGrantLease>,
 }
 
-impl DeviceResourceFinalization {
-}
+impl DeviceResourceFinalization {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceResourceGrantLease {

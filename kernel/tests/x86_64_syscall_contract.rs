@@ -259,61 +259,6 @@ fn common_terminal_retry_paths_use_an_unconditionally_imported_status() {
     }
 }
 
-#[test]
-fn dw1c_token7_channel_flight_is_capacity_only_and_post_authority() {
-    let adapters = source("src/syscall/adapters.rs");
-    let send = adapters
-        .split_once("pub(crate) fn channel_send_from_thread<")
-        .expect("threaded Channel send adapter")
-        .1
-        .split_once("pub(crate) fn channel_receive<")
-        .expect("threaded Channel send extent")
-        .0;
-    let would_block = send
-        .find("error == ChannelError::WouldBlock")
-        .expect("token-7 requires capacity failure");
-    let release = send[would_block..]
-        .find("release_lookup_pin(registry, pin, cleanup);")
-        .map(|offset| would_block + offset)
-        .expect("Channel send releases lookup pin");
-    let observe = send[release..]
-        .find(".observe_token7_full_send(")
-        .map(|offset| release + offset)
-        .expect("token-7 full-send observer");
-    assert!(would_block < release && release < observe);
-    assert!(send.contains("tracks_token7_actor(current_process, thread)"));
-    assert!(!send[..observe].contains("ChannelError::PeerClosed"));
-
-    let wait = source("src/wait/engine.rs");
-    let exact = wait
-        .split_once("fn exact_writable_channel(&self)")
-        .expect("token-7 exact wait helper")
-        .1
-        .split_once("pub(crate) fn select_ready")
-        .expect("token-7 exact wait helper extent")
-        .0;
-    assert!(exact.contains("if self.len != 1"));
-    assert!(exact.contains("item.desired == DW_SIGNAL_WRITABLE"));
-    let commit = wait.find(".commit_published_block_on(cpu, block)").unwrap();
-    let block_observe = wait.find(".observe_token7_writable_block(").unwrap();
-    assert!(commit < block_observe);
-
-    let receive = adapters
-        .split_once("fn complete_wait_wakes_with_channel_drain<")
-        .expect("provenance-preserving wake helper")
-        .1;
-    let success = receive.find("Ok(()) => {").unwrap();
-    let wake_observe = receive.find(".observe_token7_peer_drain_wake(").unwrap();
-    let stale = receive
-        .find("Err(SchedulerError::StaleBlockToken) => {}")
-        .unwrap();
-    let prior_winner = receive
-        .find("Ok(false) | Err(crate::task::BlockedOperationError::StaleReservation)")
-        .unwrap();
-    assert!(success < wake_observe && wake_observe < stale && wake_observe < prior_winner);
-    assert!(adapters.contains("Some(drained_peer)"));
-}
-
 /// Text test: the post-acknowledgement carrier continuation is target-only primordial.rs code.
 #[test]
 fn i1_post_ack_carrier_never_reuses_a_retired_frame_for_late_holdsafe() {
@@ -897,66 +842,6 @@ fn i2_terminal_reclaim_handoff_is_owned_by_the_exact_physical_cpu() {
 }
 
 #[test]
-fn i2_live_selector_owns_bounded_test_only_runtime_capacity() {
-    let build = source("build.rs");
-    let activation = source("src/arch/x86_64/mm/activation.rs");
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
-
-    assert!(build.contains("cargo:rustc-check-cfg=cfg(deepwyrm_i2_stress)"));
-    assert!(build.contains("selector == \"smp-runtime-stress\""));
-    assert!(build.contains("cargo:rustc-cfg=deepwyrm_i2_stress"));
-    assert!(activation.contains("const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;"));
-    assert!(
-        activation.contains(
-            "#[cfg(deepwyrm_wrcap_relay)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 4;"
-        )
-    );
-    assert!(
-        activation
-            .contains("#[cfg(deepwyrm_i2_stress)]\nconst LIVE_ADDRESS_SPACE_CAPACITY: usize = 6;")
-    );
-    assert!(
-        runtime.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst USERSPACE_CHAIN_PROCESSES: usize = 6;"
-        )
-    );
-    assert!(runtime.contains("const USERSPACE_CHAIN_PROCESSES: usize = 3;"));
-    assert!(
-        runtime
-            .contains("#[cfg(deepwyrm_wrcap_relay)]\nconst USERSPACE_CHAIN_PROCESSES: usize = 4;")
-    );
-    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst TASK_GROUPS: usize = 2;"));
-    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_OBJECTS: usize = 12;"));
-    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst MEMORY_LEASES: usize = 13;"));
-    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst WAITERS: usize = 6;"));
-    assert!(runtime.contains(
-        "#[cfg(deepwyrm_wrcap_relay)]\nconst CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;"
-    ));
-    assert!(runtime.contains("#[cfg(deepwyrm_wrcap_relay)]\nconst REGISTRY_OBJECTS: usize = 48;"));
-    // F3A.6y. Production derives this from the producer's measured archive
-    // rather than pinning the Wave 4 literal; the other arms below still pin
-    // their own forms, which is what keeps this selector's ceiling distinct
-    // from production's derived value. Selector 22's ceiling is the named
-    // `bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES`, host-tested against the
-    // measured stage-7 archive.
-    assert!(
-        runtime.contains(
-            "const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();"
-        )
-    );
-    assert!(
-        runtime.contains(
-            "#[cfg(all(deepwyrm_i2_stress, not(deepwyrm_wrcap_relay)))]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = bootfs_capacity::I2_STRESS_BOOTFS_MAX_PAGES;"
-        )
-    );
-    assert!(
-        runtime.contains(
-            "#[cfg(deepwyrm_wrcap_relay)]\nconst PRIMORDIAL_BOOTFS_MAX_PAGES: usize = 39;"
-        )
-    );
-}
-
-#[test]
 fn the_production_product_selects_its_own_resource_geometry() {
     // DW1-F/WYR1-F F2A. Every capacity arm below used to key off an evidence
     // cfg, so the freestanding kernel that selects no guest test fell through
@@ -984,19 +869,28 @@ fn the_production_product_selects_its_own_resource_geometry() {
     // The bootstrap-era arm must exclude the production product, or both arms
     // apply and the build breaks -- which is the loud outcome, but the
     // exclusion is what makes the production arm reachable at all.
-    assert_eq!(
-        runtime
-            .matches("#[cfg(not(any(\n    deepwyrm_production_product,")
-            .count(),
-        8
-    );
-    // The ninth is the ten-handle drift guard, whose exclusion sits at the end
-    // of its list rather than the start.
-    assert_eq!(
-        runtime
-            .matches("    deepwyrm_production_product,\n)))]\nconst _: [(); 10] = [(); HANDLES];")
-            .count(),
-        1
+    for name in [
+        "REGISTRY_OBJECTS",
+        "MEMORY_OBJECTS",
+        "MEMORY_LEASES",
+        "USERSPACE_CHAIN_PROCESSES",
+        "CHANNEL_PAIRS",
+        "WAITERS",
+        "TASK_GROUPS",
+        "HANDLES",
+    ] {
+        assert!(
+            runtime.contains(&format!(
+                "#[cfg(not(deepwyrm_production_product))]\nconst {name}:"
+            )),
+            "missing bootstrap-era arm for {name}"
+        );
+    }
+    // The ten-handle drift guard is excluded the same way.
+    assert!(
+        runtime.contains(
+            "#[cfg(not(deepwyrm_production_product))]\nconst _: [(); 10] = [(); HANDLES];"
+        )
     );
     assert!(
         runtime.contains("#[cfg(deepwyrm_production_product)]\nconst _: [(); 48] = [(); HANDLES];")
@@ -1241,7 +1135,8 @@ fn i2_live_dispatch_covers_every_stress_payload_syscall_family() {
         .find("if route == crate::task::TerminalHandoffRoute::LeaveRoot {")
         .expect("terminal handoff lost its leave-root route");
     assert!(
-        handoff[leave_root..].contains("TerminalKernelContinuation::FinishGenericChild(retirement)")
+        handoff[leave_root..]
+            .contains("TerminalKernelContinuation::FinishGenericChild(retirement)")
     );
     // The leave-root route itself may read the Process: whether it exited is
     // one of the teardown's conditions (rule 3), not the route.
@@ -1373,12 +1268,11 @@ fn exited_root_teardown_sites_are_residency_aware() {
         "an exited-root teardown bypasses the residency-aware attempt"
     );
     assert!(attempt.contains("self.finish_inactive_process_teardown("));
-    // Three remote completions, two successor variants, the publisher path.
     assert_eq!(
         runtime
             .matches("self.attempt_exited_root_teardown(")
             .count(),
-        6
+        5
     );
     let handoff = runtime
         .split_once("fn prepare_terminal_handoff_detached(")
@@ -1424,35 +1318,6 @@ fn exited_root_teardown_sites_are_residency_aware() {
 }
 
 /// Text test: the terminal handoff is target-only primordial.rs code until the D2 terminal engine.
-#[test]
-fn i1_terminal_child_without_local_work_rejoins_the_idle_scheduler() {
-    let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
-
-    assert!(runtime.contains("enum PreparedTerminalHandoff"));
-    assert!(runtime.contains("if retirement.retired_process != self.core.primordial_process"));
-    assert!(runtime.contains("self.finish_inactive_process_teardown("));
-    assert!(runtime.contains("PreparedTerminalHandoff::IdleScheduler"));
-    assert!(runtime.contains("syscall::enter_bound_idle_scheduler(carrier.release())"));
-    // The live terminal path (S2K-3.1 re-anchored it off the carrier's
-    // never-reached copy): retirement state, the detached handoff and its
-    // continuations.
-    let terminal = runtime
-        .split_once("fn prepare_terminal_retirement_state(")
-        .expect("terminal handoff")
-        .1
-        .split_once("fn reserve_runtime_phase")
-        .expect("terminal handoff terminator")
-        .0;
-    let primordial_unmap = terminal
-        .find("self.unmap_primordial_userspace(&proof)")
-        .unwrap();
-    let next_selection = terminal
-        .find("terminal_reaper_next_on(self.cpu())")
-        .unwrap();
-    assert!(primordial_unmap < next_selection);
-    assert!(!terminal.contains("terminal idle safe-root"));
-}
-
 #[test]
 fn final_external_thread_completion_retires_pins_before_process_root_teardown() {
     let runtime = source("src/arch/x86_64/mm/activation/primordial.rs");
