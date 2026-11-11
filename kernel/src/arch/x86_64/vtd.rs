@@ -339,11 +339,16 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
             .map_err(VtdBootError::Unit)?;
         *slot = Some((registers, state.features()));
     }
-    if let Some(iommu) = crate::device::dma::live::LiveIommu::new(pool, units, context) {
-        crate::device::dma::live::install(iommu);
-    }
+    let dma_domains = match crate::device::dma::live::LiveIommu::new(pool, units, context) {
+        Some(iommu) => {
+            crate::device::dma::live::install(iommu);
+            true
+        }
+        None => false,
+    };
     Ok(VtdBootState::DefaultDeny {
         units: snapshot.units().len(),
+        dma_domains,
     })
 }
 
@@ -361,7 +366,12 @@ fn write_back_and_invalidate_caches() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VtdBootState {
     Absent,
-    DefaultDeny { units: usize },
+    /// `dma_domains` says whether every unit can give a function a 4-level
+    /// domain, so `dma_map` is available.
+    DefaultDeny {
+        units: usize,
+        dma_domains: bool,
+    },
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

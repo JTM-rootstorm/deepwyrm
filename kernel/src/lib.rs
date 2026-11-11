@@ -517,9 +517,12 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                     arch::x86_64::vtd::VtdBootState::Absent => {
                         "no DMA remapping hardware; device DMA is not admitted"
                     }
-                    arch::x86_64::vtd::VtdBootState::DefaultDeny { .. } => {
-                        "VT-d translation on; every device DMA is blocked"
-                    }
+                    arch::x86_64::vtd::VtdBootState::DefaultDeny {
+                        dma_domains: true, ..
+                    } => "VT-d translation on; every device DMA is blocked until dma_map",
+                    arch::x86_64::vtd::VtdBootState::DefaultDeny {
+                        dma_domains: false, ..
+                    } => "VT-d translation on; no 4-level domains, so device DMA stays blocked",
                 },
             );
             #[cfg(feature = "test-support")]
