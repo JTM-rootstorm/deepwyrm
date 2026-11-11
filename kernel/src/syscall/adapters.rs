@@ -8177,6 +8177,21 @@ pub(crate) fn memory_object_create_owned<
         Ok(output) => output,
         Err(_) => return DW_STATUS_BAD_ADDRESS,
     };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => {
+            // Any early backing stays with the access for the caller's
+            // rollback, as when the adapter never reaches its allocation.
+            access.discard_owned_output(output);
+            return status;
+        }
+    };
     let page_count = byte_len / u64::from(DW_BASE_PAGE_SIZE);
     let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
         Ok(creation) => creation,
@@ -8239,6 +8254,7 @@ pub(crate) fn memory_object_create_owned<
             failure.error()
         )
     });
+    charge_created(registry, reference.id(), charge);
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {

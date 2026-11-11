@@ -13891,3 +13891,79 @@ fn wait_limit_admits_items_up_to_the_limit() {
         Err(DW_STATUS_NO_RESOURCES)
     );
 }
+
+/// F4 DW1-F4-M1 rereview D1: the live MemoryObjectCreate path is charged. A
+/// group at its memory-object limit is refused, publishes nothing, and keeps
+/// the early backing for the caller's rollback.
+#[test]
+fn the_live_memory_object_create_path_is_limited() {
+    use deepwyrm_abi::{DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, _root, jobs, process, _) = limited_fixture();
+    let mut backing = TestBacking::new();
+    let mut memory = MemoryObjectAuthority::<4, 4>::new();
+    let rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0);
+    let mut cleanup = CleanupQueue::<32>::new();
+    let out = DwUserAddress(BASE + 0x100);
+    let range = output_range(out, 8, 8).unwrap();
+    let class = deepwyrm_abi::DW_TASK_GROUP_LIMIT_MEMORY_OBJECT;
+    let mut attempt =
+        |registry: &mut ObjectRegistry<32>, tasks: &mut Tasks, backing: &mut TestBacking| {
+            let early = backing.allocate_zeroed_backing(1);
+            let mut access = DeferredMemoryObjectAccess::new(
+                crate::memory::usercopy::DeferredUserOutput::new(Some(range)),
+                1,
+                Some(early),
+            );
+            let status = memory_object_create_owned(
+                &mut access,
+                registry,
+                &mut memory,
+                tasks,
+                process,
+                4096,
+                0,
+                rights,
+                out,
+                &mut cleanup,
+            );
+            let (output, unused) = access.into_parts();
+            let handle = output
+                .written()
+                .map(|bytes| DwHandle(u64::from_le_bytes(bytes.try_into().unwrap())));
+            (status, handle, unused)
+        };
+
+    tasks.lower_group_limit(jobs, class, 1).unwrap();
+    let (status, created, unused) = attempt(&mut registry, &mut tasks, &mut backing);
+    assert_eq!(status, DW_STATUS_SUCCESS);
+    assert!(unused.is_none());
+    let created = created.expect("handle written");
+    let handles = tasks.process_handle_count(process).unwrap();
+    let generations = registry.test_slot_generations();
+
+    let (status, written, unused) = attempt(&mut registry, &mut tasks, &mut backing);
+    assert_eq!(status, DW_STATUS_NO_RESOURCES);
+    assert!(written.is_none());
+    backing.rollback_object_backing(unused.expect("refused backing kept for rollback"));
+    assert_eq!(tasks.process_handle_count(process).unwrap(), handles);
+    assert_eq!(registry.test_slot_generations(), generations);
+
+    tasks.lower_group_limit(jobs, class, 0).unwrap();
+    let (status, _, unused) = attempt(&mut registry, &mut tasks, &mut backing);
+    assert_eq!(status, DW_STATUS_NO_RESOURCES);
+    backing.rollback_object_backing(unused.expect("refused backing kept for rollback"));
+
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, created, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    while let Some(release) = cleanup.pop() {
+        let finalization = memory.take_finalization(release).unwrap();
+        crate::memory::object::complete_memory_finalization(
+            &mut registry,
+            &mut backing.roles,
+            finalization,
+        );
+    }
+}
