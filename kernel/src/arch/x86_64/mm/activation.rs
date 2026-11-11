@@ -124,10 +124,13 @@ use super::private::{
 };
 
 const ENTRY_COUNT: usize = 512;
-// The permanent xAPIC and q35 IOAPIC controllers each receive a distinct
-// kernel-only UC/NX leaf.  These are stationary mappings, never a reusable
-// temporary window and never a userspace capability.
-const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2;
+// The permanent xAPIC and q35 IOAPIC controllers, and each VT-d remapping
+// unit, receive a distinct kernel-only UC/NX leaf.  These are stationary
+// mappings, never a reusable temporary window and never a userspace capability.
+// The unit count is `acpi::dmar::MAX_DMAR_UNITS`; a DMAR with more units is
+// refused at parse time, and running out of leaves stops the boot.
+const VTD_UNIT_MMIO_LEAF_COUNT: u64 = 8;
+const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2 + VTD_UNIT_MMIO_LEAF_COUNT;
 // Mapping-stability pins are a kernel-global resource shared by every live
 // Process address space.  A designated-VM trace proved that the former capacity
 // of eight rejected the ninth actor load after seven blocked receives retained

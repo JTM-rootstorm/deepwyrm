@@ -909,7 +909,7 @@ fn cpu0_cannot_journal_cpu1_scratch_leaf_or_control_entries() {
 }
 
 #[test]
-fn active_scratch_installs_two_uc_nx_mmio_leaves_without_consuming_window() {
+fn active_scratch_installs_every_uc_nx_mmio_leaf_then_refuses_without_consuming_window() {
     let fixture = graph_fixture();
     let mut target = fake_active_scratch(fixture.scratch_pt, None);
     let frame = FrameAddress::new(0xfee0_0000, fixture.capabilities.physical_limit()).unwrap();
@@ -934,6 +934,18 @@ fn active_scratch_installs_two_uc_nx_mmio_leaves_without_consuming_window() {
         target.io.memory.get(&second_leaf).copied(),
         Some(0xfec0_0000 | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE)
     );
+    // The remaining slots hold one VT-d unit each.
+    for slot in 2..PER_CPU_SCRATCH_MMIO_LEAF_COUNT {
+        let unit = FrameAddress::new(
+            0xfed9_0000 + slot * PAGE_SIZE,
+            fixture.capabilities.physical_limit(),
+        )
+        .unwrap();
+        assert_eq!(
+            target.install_mmio_frame(unit),
+            Ok(FIXTURE_SCRATCH + (slot + 2) * PAGE_SIZE)
+        );
+    }
     assert_eq!(
         target.install_mmio_frame(frame),
         Err(LiveActiveTargetError::Busy)
