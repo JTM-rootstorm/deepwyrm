@@ -198,8 +198,7 @@ impl<
         let interrupts = self.interrupts?;
         let platform = self.interrupt_platform?;
         let finalization = interrupts.retry_deferred_finalization(platform)?;
-        let parent = complete_interrupt_finalization(self.registry, finalization);
-        parent
+        complete_interrupt_finalization(self.registry, finalization)
     }
 
     pub(crate) fn retry_deferred_interrupt_exact(
@@ -209,8 +208,7 @@ impl<
         let interrupts = self.interrupts?;
         let platform = self.interrupt_platform?;
         let finalization = interrupts.retry_deferred_finalization_exact(platform, binding)?;
-        let parent = complete_interrupt_finalization(self.registry, finalization);
-        parent
+        complete_interrupt_finalization(self.registry, finalization)
     }
 
     fn finalize_one(

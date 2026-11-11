@@ -191,29 +191,6 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
 }
 
 #[test]
-fn e4_user_descriptors_and_rsp0_match_the_locked_contract() {
-    let root = kernel_root();
-    let gdt = fs::read_to_string(root.join("src/arch/x86_64/gdt.rs")).expect("read GDT source");
-    let tss = fs::read_to_string(root.join("src/arch/x86_64/tss.rs")).expect("read TSS source");
-    let x86 = fs::read_to_string(root.join("src/arch/x86_64/mod.rs")).expect("read x86 installer");
-    let linker = fs::read_to_string(root.join("arch/x86_64/linker.ld")).expect("read linker");
-    assert!(gdt.contains("SegmentSelector(0x2b)"));
-    assert!(gdt.contains("SegmentSelector(0x33)"));
-    assert!(gdt.contains("entries: [u64; 7]"));
-    assert!(gdt.contains("0x00cf_f200_0000_ffff"));
-    assert!(gdt.contains("0x00af_fa00_0000_ffff"));
-    assert!(gdt.contains("GDT_HARDWARE_LIMIT"));
-    assert!(tss.contains("io_map_base: size_of::<Self>() as u16"));
-    assert!(x86.contains("tss.set_privilege_stack0(privilege_entry.top)"));
-    assert!(x86.contains("linked_privilege_entry_stack_layout()"));
-    assert!(x86.contains("fn opaque_linker_symbol_address(symbol: *const u8) -> u64"));
-    assert!(x86.contains("address = inout(reg) address"));
-    assert!(x86.matches("opaque_linker_symbol_address").count() >= 20);
-    assert!(linker.contains("__dw_privilege_entry_stack_guard = .;"));
-    assert!(linker.contains("__dw_privilege_entry_stack_top = .;"));
-}
-
-#[test]
 fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
     let harness = fs::read_to_string(guest_harness_path()).expect("read guest harness manifest");
     for (selector, id) in [

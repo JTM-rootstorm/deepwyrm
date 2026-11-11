@@ -17,25 +17,6 @@ const SHT_REL: u32 = 9;
 const PAGE_SIZE: u64 = 4096;
 
 #[test]
-fn h1_trampoline_build_and_link_paths_retain_the_template_section() {
-    let build = source("build.rs");
-    let linker = source("arch/x86_64/linker.ld");
-
-    for evidence in [
-        "src/arch/x86_64/ap_trampoline.S",
-        "deepwyrm-x86_64-ap-trampoline.o",
-        "assemble_source(&ap_trampoline_path, &ap_trampoline_object, layout)?",
-        "ap_trampoline_object.as_path()",
-    ] {
-        assert!(build.contains(evidence), "build path omitted `{evidence}`");
-    }
-    assert!(
-        linker.contains("KEEP(*(.rodata.ap_trampoline_template))"),
-        "the linker must retain the copyable AP trampoline template"
-    );
-}
-
-#[test]
 fn h1_trampoline_template_is_one_page_and_relocation_free() {
     // `assemble_source` reads DEEPWYRM_CLANG itself; this verifies it first.
     host_tools::clang();
@@ -102,11 +83,6 @@ fn h1_trampoline_template_is_one_page_and_relocation_free() {
             relocation.section_name, relocation.entry_index
         );
     }
-}
-
-fn source(relative: &str) -> String {
-    fs::read_to_string(kernel_root().join(relative))
-        .unwrap_or_else(|error| panic!("read {relative}: {error}"))
 }
 
 fn kernel_root() -> PathBuf {

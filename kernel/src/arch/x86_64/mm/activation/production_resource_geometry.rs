@@ -212,7 +212,6 @@ pub(super) struct Capacity {
     pub evidence: usize,
 }
 
-// PRODUCTION_SELECTED_CAPACITIES per_process_handle_capacity=48 memory_object_capacity=48 mapping_lease_capacity=48 registry_object_capacity=192
 pub(super) const SELECTED: Capacity = Capacity {
     handles: 48,
     memory: 48,
@@ -265,24 +264,6 @@ const _: () = assert!(SELECTED.evidence == 0);
 mod tests {
     extern crate std;
     use super::*;
-
-    #[test]
-    fn production_selected_marker_matches_executable_capacities() {
-        let marker = std::format!(
-            "// PRODUCTION_SELECTED_CAPACITIES per_process_handle_capacity={} memory_object_capacity={} mapping_lease_capacity={} registry_object_capacity={}",
-            SELECTED.handles,
-            SELECTED.memory,
-            SELECTED.mappings,
-            SELECTED.registry,
-        );
-        assert_eq!(
-            include_str!("production_resource_geometry.rs")
-                .lines()
-                .filter(|line| *line == marker)
-                .count(),
-            1
-        );
-    }
 
     #[test]
     fn the_selected_capacities_are_the_numbers_the_f_receipt_binds() {

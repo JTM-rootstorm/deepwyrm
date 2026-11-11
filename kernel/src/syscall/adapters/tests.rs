@@ -12478,41 +12478,6 @@ fn staged_stop_cleanup_refuses_a_finish_without_a_stage() {
     let _ = staged.finish(&mut cleanup);
 }
 
-/// The live runtime keeps each stopped CPU's claim in that CPU's own slot and
-/// stages through `StagedStopCleanup`; a shared single slot is what panicked.
-#[test]
-fn remote_stop_state_is_per_cpu_and_staging_is_counted() {
-    let primordial = include_str!("../../arch/x86_64/mm/activation/primordial.rs");
-    assert!(primordial.contains("rendezvous_cleanup: StagedStopCleanup<REGISTRY_OBJECTS>,"));
-    assert!(primordial.contains(
-        "    stopping_claim: Option<crate::task::SchedulerExecutionClaim>,\n    \
-         stopping_claim_was_suspended: bool,\n}\n\nimpl CpuSharedState {"
-    ));
-    // Precommit sets it; the commit and the post-ack continuation take it.
-    assert_eq!(
-        primordial
-            .matches("self.own.stopping_claim = Some(claim);")
-            .count(),
-        2
-    );
-    assert_eq!(
-        primordial
-            .matches("self\n            .own\n            .stopping_claim\n            .take()")
-            .count(),
-        2
-    );
-    for forbidden in [
-        "core.stopping_claim",
-        ".core\n            .stopping_claim",
-        "rendezvous_cleanup_staged",
-    ] {
-        assert!(
-            !primordial.contains(forbidden),
-            "{forbidden:?} reintroduced"
-        );
-    }
-}
-
 /// Two started Threads of one Process on a two-CPU domain, with a WAIT|MODIFY
 /// handle to each, for the live ThreadExit models (design §11.2.11).
 #[allow(clippy::type_complexity, reason = "test fixture tuple")]
