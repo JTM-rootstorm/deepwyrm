@@ -13,17 +13,59 @@
 //! The save format is chosen once, by the bootstrap CPU, and every other CPU
 //! must arrive at the same one: XSAVE over x87, SSE and (when present) AVX, or
 //! FXSAVE where the CPU has no XSAVE. Wider components (AVX-512, AMX) are left
-//! out of XCR0, which keeps the save area within [`FP_AREA_BYTES`].
+//! out of XCR0, which keeps the save area within [`FP_AREA_BYTES`]. CPUs must
+//! also agree on MXCSR_MASK, since a Thread's MXCSR moves with it.
+//!
+//! The DS, ES, FS and GS selectors travel with the same state: user code can
+//! load them, so they are saved and restored per Thread too, and a fresh
+//! Thread starts with all four null.
 
 pub(crate) const CR0_MONITOR_COPROCESSOR: u64 = 1 << 1;
 pub(crate) const CR0_EMULATION: u64 = 1 << 2;
 pub(crate) const CR0_TASK_SWITCHED: u64 = 1 << 3;
 pub(crate) const CR0_NUMERIC_ERROR: u64 = 1 << 5;
 
+pub(crate) const CR4_DEBUGGING_EXTENSIONS: u64 = 1 << 3;
+pub(crate) const CR4_PAGE_SIZE_EXTENSIONS: u64 = 1 << 4;
+pub(crate) const CR4_PAE: u64 = 1 << 5;
+pub(crate) const CR4_MACHINE_CHECK: u64 = 1 << 6;
+pub(crate) const CR4_PGE: u64 = 1 << 7;
+pub(crate) const CR4_PCE: u64 = 1 << 8;
 pub(crate) const CR4_OSFXSR: u64 = 1 << 9;
 pub(crate) const CR4_OSXMMEXCPT: u64 = 1 << 10;
+pub(crate) const CR4_UMIP: u64 = 1 << 11;
+pub(crate) const CR4_LA57: u64 = 1 << 12;
+pub(crate) const CR4_VMXE: u64 = 1 << 13;
+pub(crate) const CR4_SMXE: u64 = 1 << 14;
 pub(crate) const CR4_FSGSBASE: u64 = 1 << 16;
+pub(crate) const CR4_PCIDE: u64 = 1 << 17;
 pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
+pub(crate) const CR4_SMEP: u64 = 1 << 20;
+pub(crate) const CR4_SMAP: u64 = 1 << 21;
+pub(crate) const CR4_PKE: u64 = 1 << 22;
+pub(crate) const CR4_CET: u64 = 1 << 23;
+pub(crate) const CR4_PKS: u64 = 1 << 24;
+
+/// The CR4 bits kept from firmware or the loader: paging and machine-check
+/// controls, supervisor protections, and VMX/SMX enables, which only CPL0
+/// instructions use (clearing them inside VMX or SMX operation would fault).
+/// Every other bit is cleared. That keeps firmware from handing user code a
+/// per-CPU register the kernel does not switch per Thread (PKRU through PKE,
+/// CET state, Key Locker, user interrupts, RDPMC through PCE) and from
+/// changing how kernel entry works (FRED, LASS, LAM). Application processors
+/// start from CR4 = PAE, so this also makes the bootstrap CPU match them.
+pub(crate) const CR4_KEPT: u64 = CR4_DEBUGGING_EXTENSIONS
+    | CR4_PAGE_SIZE_EXTENSIONS
+    | CR4_PAE
+    | CR4_MACHINE_CHECK
+    | CR4_PGE
+    | CR4_UMIP
+    | CR4_LA57
+    | CR4_VMXE
+    | CR4_SMXE
+    | CR4_PCIDE
+    | CR4_SMEP
+    | CR4_SMAP;
 
 pub(crate) const XCR0_X87: u64 = 1 << 0;
 pub(crate) const XCR0_SSE: u64 = 1 << 1;
@@ -60,6 +102,8 @@ pub(crate) enum FpPolicyError {
     AreaTooLarge,
     /// This CPU would choose a different save mode than the bootstrap CPU.
     ModeMismatch,
+    /// This CPU accepts different MXCSR bits than the bootstrap CPU.
+    MxcsrMaskMismatch,
 }
 
 /// The CPUID bits the save-mode decision reads.
@@ -104,13 +148,14 @@ pub(crate) const fn normalize_cr0_for_user_fp(cr0: u64) -> u64 {
     (cr0 | CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR) & !(CR0_EMULATION | CR0_TASK_SWITCHED)
 }
 
-/// CR4 for user FP: FXSAVE/SSE and SIMD exceptions on, OSXSAVE exactly when
-/// the mode uses XSAVE, and RD/WR{FS,GS}BASE kept off (user code must never
-/// write GS; the FS base changes only through `thread_set_fs_base`).
+/// CR4 for user FP: the [`CR4_KEPT`] bits as found, FXSAVE/SSE and SIMD
+/// exceptions on, OSXSAVE exactly when the mode uses XSAVE, and everything
+/// else off, including RD/WR{FS,GS}BASE (user code must never write GS; the
+/// FS base changes only through `thread_set_fs_base`) and PKE.
 pub(crate) const fn normalize_cr4_for_user_fp(cr4: u64, mode: FpSaveMode) -> u64 {
-    let base = (cr4 | CR4_OSFXSR | CR4_OSXMMEXCPT) & !CR4_FSGSBASE;
+    let base = (cr4 & CR4_KEPT) | CR4_OSFXSR | CR4_OSXMMEXCPT;
     match mode {
-        FpSaveMode::Fxsave => base & !CR4_OSXSAVE,
+        FpSaveMode::Fxsave => base,
         FpSaveMode::Xsave { .. } => base | CR4_OSXSAVE,
     }
 }
@@ -125,33 +170,77 @@ pub(crate) const fn cr4_enforces_user_fp(cr4: u64, mode: FpSaveMode) -> bool {
     cr4 == normalize_cr4_for_user_fp(cr4, mode)
 }
 
-/// One non-zero word per mode, so CPUs can agree through one atomic.
-pub(crate) const fn encode_mode(mode: FpSaveMode) -> u64 {
-    match mode {
-        FpSaveMode::Fxsave => 1 << 63,
-        FpSaveMode::Xsave { xcr0 } => xcr0 & !(1 << 63),
-    }
-}
+/// MXCSR_MASK when FXSAVE reports zero: every bit but DAZ.
+pub(crate) const DEFAULT_MXCSR_MASK: u32 = 0xffbf;
 
-pub(crate) const fn decode_mode(word: u64) -> Option<FpSaveMode> {
-    if word == 0 {
-        None
-    } else if word == 1 << 63 {
-        Some(FpSaveMode::Fxsave)
+/// The MXCSR bits user code may set on this CPU, from FXSAVE's MXCSR_MASK.
+pub(crate) const fn effective_mxcsr_mask(reported: u32) -> u32 {
+    if reported == 0 {
+        DEFAULT_MXCSR_MASK
     } else {
-        Some(FpSaveMode::Xsave { xcr0: word })
+        reported
     }
 }
 
-/// Checks this CPU's mode against the word another CPU already published.
+/// What every CPU must agree on before user code runs: the save format,
+/// and the MXCSR bits user code may set. A Thread may migrate, so a CPU
+/// that accepted fewer MXCSR bits would fault restoring another's state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FpPolicy {
+    pub(crate) mode: FpSaveMode,
+    pub(crate) mxcsr_mask: u32,
+}
+
+const POLICY_PUBLISHED: u64 = 1 << 63;
+const POLICY_FXSAVE: u64 = 1 << 62;
+
+/// One non-zero word per policy, so CPUs can agree through one atomic:
+/// bit 63 marks it published, bit 62 selects FXSAVE, bits 32..40 hold XCR0
+/// (only x87, SSE and AVX are ever enabled) and bits 0..32 the MXCSR mask.
+pub(crate) const fn encode_policy(policy: FpPolicy) -> u64 {
+    let mode = match policy.mode {
+        FpSaveMode::Fxsave => POLICY_FXSAVE,
+        FpSaveMode::Xsave { xcr0 } => (xcr0 & 0xff) << 32,
+    };
+    POLICY_PUBLISHED | mode | policy.mxcsr_mask as u64
+}
+
+pub(crate) const fn decode_policy(word: u64) -> Option<FpPolicy> {
+    if word & POLICY_PUBLISHED == 0 {
+        return None;
+    }
+    let mode = if word & POLICY_FXSAVE != 0 {
+        FpSaveMode::Fxsave
+    } else {
+        FpSaveMode::Xsave {
+            xcr0: (word >> 32) & 0xff,
+        }
+    };
+    Some(FpPolicy {
+        mode,
+        mxcsr_mask: word as u32,
+    })
+}
+
+/// Checks this CPU's policy against the word another CPU already published.
 pub(crate) const fn agrees_with_published(
     published: u64,
-    mode: FpSaveMode,
-) -> Result<FpSaveMode, FpPolicyError> {
-    if published == encode_mode(mode) {
-        Ok(mode)
-    } else {
+    policy: FpPolicy,
+) -> Result<FpPolicy, FpPolicyError> {
+    let Some(other) = decode_policy(published) else {
+        return Err(FpPolicyError::ModeMismatch);
+    };
+    let same_mode = match (other.mode, policy.mode) {
+        (FpSaveMode::Fxsave, FpSaveMode::Fxsave) => true,
+        (FpSaveMode::Xsave { xcr0: a }, FpSaveMode::Xsave { xcr0: b }) => a == b,
+        _ => false,
+    };
+    if !same_mode {
         Err(FpPolicyError::ModeMismatch)
+    } else if other.mxcsr_mask != policy.mxcsr_mask {
+        Err(FpPolicyError::MxcsrMaskMismatch)
+    } else {
+        Ok(policy)
     }
 }
 
@@ -191,19 +280,60 @@ impl FpArea {
     }
 }
 
+/// Selectors a fresh Thread starts with in DS, ES, FS and GS: null.
+pub(crate) const INITIAL_SELECTORS: [u16; 4] = [0; 4];
+
+/// Everything a suspended Thread keeps of its user register state that the
+/// syscall frame does not: FP/SIMD state, the FS base, and the DS, ES, FS
+/// and GS selectors, which user code may load and which would otherwise
+/// carry over to the next Thread on the CPU.
+#[derive(Clone)]
+#[repr(C, align(64))]
+pub(crate) struct SavedUserState {
+    pub(crate) fp: FpArea,
+    pub(crate) fs_base: u64,
+    /// DS, ES, FS, GS.
+    pub(crate) selectors: [u16; 4],
+}
+
+impl SavedUserState {
+    /// A save target: the FP area must start zeroed.
+    pub(crate) const fn for_save() -> Self {
+        Self {
+            fp: FpArea::zeroed(),
+            fs_base: 0,
+            selectors: [0; 4],
+        }
+    }
+
+    /// The state a Thread that has never run starts with.
+    pub(crate) const fn initial() -> Self {
+        Self {
+            fp: FpArea::initial(),
+            fs_base: 0,
+            selectors: INITIAL_SELECTORS,
+        }
+    }
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        CpuFpFeatures, FpArea, FpPolicyError, FpSaveMode, agrees_with_published, decode_mode,
-        encode_mode, plan_fp_mode, xsave_area_fits,
+        CpuFpFeatures, FpArea, FpPolicy, FpPolicyError, FpSaveMode, SavedUserState,
+        agrees_with_published, decode_policy, effective_mxcsr_mask, encode_policy, plan_fp_mode,
+        xsave_area_fits,
     };
 
     const IA32_FS_BASE: u32 = 0xc000_0100;
+    const IA32_GS_BASE: u32 = 0xc000_0101;
 
-    static FP_MODE: AtomicU64 = AtomicU64::new(0);
-    static INITIAL_AREA: FpArea = FpArea::initial();
+    static FP_POLICY: AtomicU64 = AtomicU64::new(0);
+    static INITIAL_STATE: SavedUserState = SavedUserState::initial();
+    /// What the x87 scrub before each restore loads; see
+    /// [`dw_x86_64_user_state_restore`].
+    static X87_SCRUB_WORD: u32 = 0;
 
     fn cpu_fp_features() -> CpuFpFeatures {
         use core::arch::x86_64::{__cpuid, __cpuid_count};
@@ -221,20 +351,41 @@ mod live {
         }
     }
 
-    /// Chooses this CPU's save mode and checks it against the one the first
-    /// CPU published. Reads CPUID only.
-    pub(crate) fn agree_on_fp_mode() -> Result<FpSaveMode, FpPolicyError> {
-        let mode = plan_fp_mode(cpu_fp_features())?;
-        let word = encode_mode(mode);
-        match FP_MODE.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Ok(mode),
-            Err(published) => agrees_with_published(published, mode),
+    /// The save mode this CPU's CPUID allows. Reads CPUID only.
+    pub(crate) fn plan_local_fp_mode() -> Result<FpSaveMode, FpPolicyError> {
+        plan_fp_mode(cpu_fp_features())
+    }
+
+    /// Reads this CPU's MXCSR_MASK and checks `mode` and the mask against the
+    /// policy the first CPU published, publishing it if this is the first.
+    ///
+    /// # Safety
+    ///
+    /// CPL0, with CR4.OSFXSR already set on this CPU.
+    #[allow(unsafe_code, reason = "FXSAVE is the only way to read MXCSR_MASK")]
+    pub(crate) unsafe fn agree_on_fp_policy(mode: FpSaveMode) -> Result<FpPolicy, FpPolicyError> {
+        let mut area = FpArea::zeroed();
+        // SAFETY: forwarded from this function's contract; `area` is a 64-byte-aligned local.
+        unsafe { dw_x86_64_user_state_probe(&mut area) };
+        let reported = u32::from_le_bytes([area.0[28], area.0[29], area.0[30], area.0[31]]);
+        let policy = FpPolicy {
+            mode,
+            mxcsr_mask: effective_mxcsr_mask(reported),
+        };
+        let word = encode_policy(policy);
+        match FP_POLICY.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(policy),
+            Err(published) => agrees_with_published(published, policy),
         }
     }
 
+    /// The save mode every CPU agreed on, once one CPU published it.
+    pub(crate) fn current_fp_mode() -> Option<FpSaveMode> {
+        decode_policy(FP_POLICY.load(Ordering::Acquire)).map(|policy| policy.mode)
+    }
+
     fn published_mode() -> FpSaveMode {
-        decode_mode(FP_MODE.load(Ordering::Acquire))
-            .unwrap_or_else(|| halt_forever())
+        current_fp_mode().unwrap_or_else(|| halt_forever())
     }
 
     #[allow(
@@ -275,19 +426,40 @@ mod live {
         xsave_area_fits(core::arch::x86_64::__cpuid_count(0xd, 0).ebx)
     }
 
-    /// Saves the running Thread's FP state into `area` and returns its FS base.
+    /// FXSAVEs this CPU's registers into `area`, for its MXCSR_MASK field.
+    /// Changes no register.
     ///
     /// # Safety
     ///
-    /// CPL0 on a CPU that installed the user FP policy; `area` is zeroed.
+    /// CPL0 with CR4.OSFXSR set.
+    #[allow(unsafe_code, reason = "FXSAVE into a local area to read MXCSR_MASK")]
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    pub(crate) unsafe extern "sysv64" fn dw_x86_64_user_state_probe(area: &mut FpArea) {
+        // SAFETY: [ASM] `area` is 64-byte-aligned and at least 512 bytes; FXSAVE only stores.
+        unsafe {
+            core::arch::asm!(
+                "fxsave64 [{}]",
+                in(reg) area.0.as_mut_ptr(),
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    /// Saves the running Thread's FP state, FS base and DS/ES/FS/GS
+    /// selectors into `state`.
+    ///
+    /// # Safety
+    ///
+    /// CPL0 on a CPU that installed the user FP policy; `state.fp` is zeroed.
     #[allow(
         unsafe_code,
-        reason = "XSAVE/FXSAVE and RDMSR of the user FS base at the context-switch boundary"
+        reason = "XSAVE/FXSAVE, RDMSR of the user FS base and selector reads at the context-switch boundary"
     )]
     #[inline(never)]
     #[unsafe(no_mangle)]
-    pub(crate) unsafe extern "sysv64" fn dw_x86_64_user_state_save(area: &mut FpArea) -> u64 {
-        let pointer = area.0.as_mut_ptr();
+    pub(crate) unsafe extern "sysv64" fn dw_x86_64_user_state_save(state: &mut SavedUserState) {
+        let pointer = state.fp.0.as_mut_ptr();
         match published_mode() {
             // SAFETY: [ASM] `pointer` is a 64-byte-aligned, writable area of `FP_AREA_BYTES`.
             FpSaveMode::Fxsave => unsafe {
@@ -316,44 +488,127 @@ mod live {
                 options(nomem, nostack, preserves_flags)
             );
         }
-        (u64::from(high) << 32) | u64::from(low)
+        state.fs_base = (u64::from(high) << 32) | u64::from(low);
+        let (ds, es, fs, gs): (u16, u16, u16, u16);
+        // SAFETY: [ASM] reading a segment register has no side effect.
+        unsafe {
+            core::arch::asm!(
+                "mov {ds:x}, ds",
+                "mov {es:x}, es",
+                "mov {fs:x}, fs",
+                "mov {gs:x}, gs",
+                ds = out(reg) ds,
+                es = out(reg) es,
+                fs = out(reg) fs,
+                gs = out(reg) gs,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        state.selectors = [ds, es, fs, gs];
     }
 
-    /// Restores FP state saved by [`dw_x86_64_user_state_save`] (or the
-    /// initial image) and the FS base.
+    /// Restores a state saved by [`dw_x86_64_user_state_save`], or the
+    /// initial state.
+    ///
+    /// Before the FP restore it runs FNCLEX, EMMS and an FILD of a fixed
+    /// kernel word. AMD CPUs without CPUID Fn8000_0008h:EBX[2] (XSaveErPtr)
+    /// restore the x87 FIP, FDP and FOP only when the saved FSW.ES is set, so
+    /// without the scrub a Thread would see the last x87 instruction and data
+    /// addresses of whichever Thread ran before it (CVE-2006-1056; Linux's
+    /// `X86_BUG_FXSAVE_LEAK`). After the scrub, such a CPU shows every Thread
+    /// the same fixed kernel addresses instead. Other CPUs restore all three
+    /// fields, so the scrub costs a few cycles and changes nothing; it runs
+    /// unconditionally so every boot exercises it.
     ///
     /// # Safety
     ///
-    /// CPL0 on a CPU that installed the user FP policy; `area` was written by
-    /// the save above on a CPU with the same mode, or is the initial image;
-    /// `fs_base` is lower-half canonical.
+    /// CPL0 on a CPU that installed the user FP policy, with IF clear;
+    /// `state` was written by the save above on a CPU under the same policy,
+    /// or is the initial state.
     #[allow(
         unsafe_code,
-        reason = "XRSTOR/FXRSTOR and WRMSR of the user FS base at the context-switch boundary"
+        reason = "selector loads, x87 scrub, XRSTOR/FXRSTOR and WRMSR of the user FS base at the context-switch boundary"
     )]
     #[inline(never)]
     #[unsafe(no_mangle)]
-    pub(crate) unsafe extern "sysv64" fn dw_x86_64_user_state_restore(area: &FpArea, fs_base: u64) {
-        let pointer = area.0.as_ptr();
+    pub(crate) unsafe extern "sysv64" fn dw_x86_64_user_state_restore(state: &SavedUserState) {
+        let [ds, es, fs, gs] = state.selectors;
+        // Selectors first: loading FS also loads an FS base, which the WRMSR below then replaces.
+        // SAFETY: [ASM] each value was read back from a Thread that loaded it at CPL3, so it is
+        // null or names a DPL3 data or readable code descriptor, and every CPU's GDT has the same
+        // non-system layout (`gdt::GlobalDescriptorTable::new`); loading it at CPL0 cannot fault.
+        // The initial selectors are null. DS and ES bases are ignored in 64-bit mode.
+        unsafe {
+            core::arch::asm!(
+                "mov ds, {ds:x}",
+                "mov es, {es:x}",
+                "mov fs, {fs:x}",
+                ds = in(reg) ds,
+                es = in(reg) es,
+                fs = in(reg) fs,
+                options(nostack, preserves_flags)
+            );
+        }
+        // Loading GS replaces the active GS base, which in the kernel is this CPU's entry record
+        // (or, for an unswapped CPL3 exception origin, the user's base of zero). Read it first and
+        // write it back, so the load is correct in either orientation. Skip it when GS already
+        // holds the value, which is the common case.
+        // SAFETY: [ASM] as above for the selector value; RDMSR/WRMSR of IA32_GS_BASE write back
+        // the exact value just read, which is canonical. IF is clear per the contract, so only an
+        // NMI can observe the brief window, and NMI is terminal.
+        unsafe {
+            core::arch::asm!(
+                "mov {current:x}, gs",
+                "cmp {current:x}, {gs:x}",
+                "je 2f",
+                "rdmsr",
+                "mov gs, {gs:x}",
+                "wrmsr",
+                "2:",
+                gs = in(reg) gs,
+                current = out(reg) _,
+                in("ecx") IA32_GS_BASE,
+                out("eax") _,
+                out("edx") _,
+                options(nostack)
+            );
+        }
+        let pointer = state.fp.0.as_ptr();
         match published_mode() {
-            // SAFETY: [ASM] `pointer` is a 64-byte-aligned area the save above wrote, or the
-            // initial image, whose MXCSR has no reserved bit set.
+            // SAFETY: [ASM] FNCLEX clears any pending x87 exception, so the next two cannot raise
+            // #MF; EMMS empties every tag, so the FILD cannot overflow the stack; loading a 32-bit
+            // integer is exact, so it raises nothing. `pointer` is a 64-byte-aligned area the save
+            // above wrote, or the initial image, and its MXCSR has only bits the agreed mask allows.
             FpSaveMode::Fxsave => unsafe {
-                core::arch::asm!("fxrstor64 [{}]", in(reg) pointer, options(nostack, preserves_flags));
+                core::arch::asm!(
+                    "fnclex",
+                    "emms",
+                    "fild dword ptr [rip + {scrub}]",
+                    "fxrstor64 [{area}]",
+                    area = in(reg) pointer,
+                    scrub = sym X87_SCRUB_WORD,
+                    options(nostack, preserves_flags)
+                );
             },
             // SAFETY: [ASM] as above; the header's reserved bytes are zero because every area
             // starts zeroed and XSAVE writes only XSTATE_BV.
             FpSaveMode::Xsave { xcr0 } => unsafe {
                 core::arch::asm!(
-                    "xrstor64 [{}]",
-                    in(reg) pointer,
+                    "fnclex",
+                    "emms",
+                    "fild dword ptr [rip + {scrub}]",
+                    "xrstor64 [{area}]",
+                    area = in(reg) pointer,
+                    scrub = sym X87_SCRUB_WORD,
                     in("eax") xcr0 as u32,
                     in("edx") (xcr0 >> 32) as u32,
                     options(nostack, preserves_flags)
                 );
             },
         }
-        // SAFETY: [ASM] the contract keeps `fs_base` canonical, so WRMSR cannot fault.
+        let fs_base = state.fs_base;
+        // SAFETY: [ASM] `fs_base` came from RDMSR or `thread_set_fs_base`, or is 0, so it is
+        // canonical and WRMSR cannot fault.
         unsafe {
             core::arch::asm!(
                 "wrmsr",
@@ -370,10 +625,11 @@ mod live {
     /// # Safety
     ///
     /// As for [`dw_x86_64_user_state_restore`].
-    #[allow(unsafe_code, reason = "loads the static initial image")]
+    #[allow(unsafe_code, reason = "loads the static initial state")]
     pub(crate) unsafe fn load_initial_user_state() {
-        // SAFETY: the initial image is valid for both restore forms; 0 is canonical.
-        unsafe { dw_x86_64_user_state_restore(&INITIAL_AREA, 0) }
+        // SAFETY: the initial state is valid for both restore forms, with null selectors and FS
+        // base 0.
+        unsafe { dw_x86_64_user_state_restore(&INITIAL_STATE) }
     }
 
     /// Sets the running Thread's FS base (`thread_set_fs_base`).
@@ -399,8 +655,8 @@ mod live {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
-    agree_on_fp_mode, dw_x86_64_user_state_restore, dw_x86_64_user_state_save, install_xcr0,
-    load_initial_user_state, write_current_fs_base,
+    agree_on_fp_policy, current_fp_mode, dw_x86_64_user_state_restore, dw_x86_64_user_state_save,
+    install_xcr0, load_initial_user_state, plan_local_fp_mode, write_current_fs_base,
 };
 
 #[cfg(test)]

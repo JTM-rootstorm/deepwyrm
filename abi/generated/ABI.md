@@ -278,6 +278,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_EXCEPTION_DIVIDE_ERROR` | `DwExceptionType` | `4` | Divide error exception. |
 | `DW_EXCEPTION_GENERAL_PROTECTION` | `DwExceptionType` | `5` | General protection exception. |
 | `DW_EXCEPTION_DEBUG_TRAP` | `DwExceptionType` | `6` | Debug trap exception. |
+| `DW_EXCEPTION_X87_FLOATING_POINT` | `DwExceptionType` | `7` | Unmasked x87 floating-point exception. |
+| `DW_EXCEPTION_SIMD_FLOATING_POINT` | `DwExceptionType` | `8` | Unmasked SSE/AVX floating-point exception. |
 | `DW_DMA_ACCESS_DEVICE_READ` | `u32` | `1` | dma_map access: the device may read the mapped pages. |
 | `DW_DMA_ACCESS_DEVICE_WRITE` | `u32` | `2` | dma_map access: the device may write the mapped pages. |
 | `DW_DMA_ACCESS_SUPPORTED_MASK` | `u32` | `3` | Every dma_map access bit this ABI defines. |

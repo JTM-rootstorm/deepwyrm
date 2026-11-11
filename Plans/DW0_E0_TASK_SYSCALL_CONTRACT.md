@@ -406,18 +406,32 @@ on 2026-11-10 (`TOOLCHAIN_LLVM_FORK_RULES.md` O4). This replaces E's
   the same one or its install fails: XSAVE with XCR0 = x87 | SSE, plus AVX when
   CPUID offers it (CR4.OSXSAVE set), or FXSAVE on a CPU without XSAVE (CR4.OSXSAVE
   clear). Wider components (AVX-512, AMX, PKRU) stay out of XCR0, so a save
-  area is at most 1 KiB. A CPU without FXSR, SSE and SSE2 does not boot.
+  area is at most 1 KiB. A CPU without FXSR, SSE and SSE2 does not boot. Every
+  CPU must also report the same MXCSR_MASK, since a migrating Thread's MXCSR
+  must restore anywhere.
+- **CR4.** Only the paging, machine-check, supervisor-protection (SMEP, SMAP,
+  UMIP) and VMX/SMX enable bits are kept from firmware; the FP bits above are
+  set and every other bit is cleared, so firmware cannot hand user code
+  per-CPU state the kernel does not switch (PKE/PKRU, CET, PKS, Key Locker,
+  user interrupts, RDPMC via PCE) or change kernel entry (FRED, LASS, LAM).
+  The syscall and switch boundaries recheck CR4 against this exact value.
 - **The kernel stays soft-float.** No kernel code touches FP/SIMD state except
-  the two save/restore functions (`arch/x86_64/user_state.rs`), so the FP
-  registers a CPU holds always belong to the user Thread that last ran there.
+  the save, restore and MXCSR_MASK probe functions (`arch/x86_64/user_state.rs`),
+  so the FP registers a CPU holds always belong to the user Thread that last ran
+  there. Before each restore the kernel runs FNCLEX, EMMS and an FILD of a fixed
+  kernel word: AMD CPUs without XSaveErPtr restore the x87 FIP, FDP and FOP only
+  when FSW.ES is set, so otherwise a Thread could read the previous Thread's last
+  x87 instruction and data addresses. On those CPUs every Thread with ES clear
+  sees the same fixed kernel addresses instead; other CPUs restore all three.
 - **Save point.** A Thread saves its FP state (into a 64-byte-aligned area in
-  its own kernel-stack frame) and its FS base immediately before
+  its own kernel-stack frame), its FS base and its DS, ES, FS and GS selectors
+  (which user code can load) immediately before
   `switch_kernel_context` switches away, and restores both when that frame
   resumes, on whatever CPU it resumes. Every switch between Threads goes
   through that function, so preemption, blocking and migration preserve the
   state. A Thread that has never run enters CPL3 with the architectural
-  initial FP state (FCW 0x037F, MXCSR 0x1F80, every register zero) and FS base 0,
-  so nothing leaks from the previous Thread on that CPU. Interrupts and
+  initial FP state (FCW 0x037F, MXCSR 0x1F80, every register zero), FS base 0
+  and null DS, ES, FS and GS, so nothing leaks from the previous Thread on that CPU. Interrupts and
   IPIs that do not switch Threads leave the registers alone.
 - **FS base.** `thread_set_fs_base(fs_base)` (0x00010024, phase DW2-T) sets the
   calling Thread's FS base to any lower-half canonical value
@@ -428,7 +442,9 @@ on 2026-11-10 (`TOOLCHAIN_LLVM_FORK_RULES.md` O4). This replaces E's
   only affects the Thread itself.
 - **Faults.** #NM cannot occur and stays process-fatal; unmasked x87 (#MF) and
   SIMD (#XM) exceptions are process-fatal like every other user exception
-  (§2.1).
+  (§2.1), and the termination record reports them as
+  `DW_EXCEPTION_X87_FLOATING_POINT` and `DW_EXCEPTION_SIMD_FLOATING_POINT`
+  (added 2026-11-11 after the D1/D2 security review).
 
 ## 7. Syscall adapters preserve D/C business boundaries
 Generated syscall IDs/register metadata are the dispatch source of truth. E does

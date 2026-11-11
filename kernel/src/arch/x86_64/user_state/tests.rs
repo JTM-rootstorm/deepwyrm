@@ -78,7 +78,8 @@ fn cr0_normalization_turns_on_native_fp_and_off_every_trap() {
     for value in [0, u64::MAX, 0x8005_003b, 0x8000_0011] {
         let normalized = normalize_cr0_for_user_fp(value);
         assert!(cr0_enforces_user_fp(normalized));
-        let touched = CR0_MONITOR_COPROCESSOR | CR0_EMULATION | CR0_TASK_SWITCHED | CR0_NUMERIC_ERROR;
+        let touched =
+            CR0_MONITOR_COPROCESSOR | CR0_EMULATION | CR0_TASK_SWITCHED | CR0_NUMERIC_ERROR;
         assert_eq!(normalized & !touched, value & !touched);
     }
     assert!(!cr0_enforces_user_fp(0x8005_0033 | CR0_TASK_SWITCHED));
@@ -87,21 +88,25 @@ fn cr0_normalization_turns_on_native_fp_and_off_every_trap() {
 }
 
 #[test]
-fn cr4_normalization_follows_the_mode_and_keeps_fsgsbase_off() {
+fn cr4_normalization_follows_the_mode_and_keeps_only_the_allowlist() {
     let xsave = FpSaveMode::Xsave { xcr0: 0x7 };
-    for value in [0, u64::MAX, 0x0000_06a0, CR4_FSGSBASE | CR4_OSXSAVE] {
+    for value in [
+        0,
+        u64::MAX,
+        0x0000_06a0,
+        CR4_FSGSBASE | CR4_OSXSAVE,
+        0x0034_06f8,
+    ] {
         let fx = normalize_cr4_for_user_fp(value, FpSaveMode::Fxsave);
-        assert_eq!(fx & (CR4_OSFXSR | CR4_OSXMMEXCPT), CR4_OSFXSR | CR4_OSXMMEXCPT);
-        assert_eq!(fx & (CR4_FSGSBASE | CR4_OSXSAVE), 0);
+        assert_eq!(fx, (value & CR4_KEPT) | CR4_OSFXSR | CR4_OSXMMEXCPT);
         assert!(cr4_enforces_user_fp(fx, FpSaveMode::Fxsave));
 
         let xs = normalize_cr4_for_user_fp(value, xsave);
-        assert_eq!(xs & CR4_OSXSAVE, CR4_OSXSAVE);
-        assert_eq!(xs & CR4_FSGSBASE, 0);
+        assert_eq!(
+            xs,
+            (value & CR4_KEPT) | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE
+        );
         assert!(cr4_enforces_user_fp(xs, xsave));
-
-        let touched = CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_FSGSBASE | CR4_OSXSAVE;
-        assert_eq!(xs & !touched, value & !touched);
     }
     assert!(!cr4_enforces_user_fp(CR4_OSFXSR | CR4_OSXMMEXCPT, xsave));
     assert!(!cr4_enforces_user_fp(
@@ -111,20 +116,64 @@ fn cr4_normalization_follows_the_mode_and_keeps_fsgsbase_off() {
 }
 
 #[test]
-fn modes_round_trip_through_their_shared_word() {
+fn cr4_normalization_clears_state_the_kernel_does_not_switch_per_thread() {
+    let firmware =
+        CR4_PAE | CR4_PGE | CR4_PKE | CR4_CET | CR4_PKS | CR4_PCE | (1 << 19) | (1 << 25);
+    let fx = normalize_cr4_for_user_fp(firmware, FpSaveMode::Fxsave);
+    assert_eq!(
+        fx & (CR4_PKE | CR4_CET | CR4_PKS | CR4_PCE | (1 << 19) | (1 << 25)),
+        0
+    );
+    assert!(!cr4_enforces_user_fp(fx | CR4_PKE, FpSaveMode::Fxsave));
+    // FRED (bit 32) would replace the IDT the kernel relies on.
+    assert_eq!(
+        normalize_cr4_for_user_fp(1 << 32, FpSaveMode::Fxsave) & (1 << 32),
+        0
+    );
+}
+
+#[test]
+fn cr4_normalization_never_changes_a_bit_whose_change_could_fault() {
+    // Paging-structure and VMX/SMX controls stay exactly as found.
+    let risky = CR4_PAE | CR4_LA57 | CR4_PCIDE | CR4_VMXE | CR4_SMXE;
+    for value in [0, risky, CR4_PAE | CR4_PCIDE] {
+        assert_eq!(
+            normalize_cr4_for_user_fp(value, FpSaveMode::Fxsave) & risky,
+            value & risky
+        );
+    }
+}
+
+#[test]
+fn policies_round_trip_through_their_shared_word() {
     for mode in [
         FpSaveMode::Fxsave,
         FpSaveMode::Xsave { xcr0: 0x3 },
         FpSaveMode::Xsave { xcr0: 0x7 },
     ] {
-        assert_ne!(encode_mode(mode), 0);
-        assert_eq!(decode_mode(encode_mode(mode)), Some(mode));
+        for mxcsr_mask in [DEFAULT_MXCSR_MASK, 0xffff, 0x0002_ffff] {
+            let policy = FpPolicy { mode, mxcsr_mask };
+            assert_ne!(encode_policy(policy), 0);
+            assert_eq!(decode_policy(encode_policy(policy)), Some(policy));
+        }
     }
-    assert_eq!(decode_mode(0), None);
+    assert_eq!(decode_policy(0), None);
     assert_ne!(
-        encode_mode(FpSaveMode::Fxsave),
-        encode_mode(FpSaveMode::Xsave { xcr0: 0x3 })
+        encode_policy(FpPolicy {
+            mode: FpSaveMode::Fxsave,
+            mxcsr_mask: 0xffff
+        }),
+        encode_policy(FpPolicy {
+            mode: FpSaveMode::Xsave { xcr0: 0x3 },
+            mxcsr_mask: 0xffff
+        })
     );
+}
+
+#[test]
+fn a_zero_mxcsr_mask_means_every_bit_but_daz() {
+    assert_eq!(effective_mxcsr_mask(0), 0xffbf);
+    assert_eq!(effective_mxcsr_mask(0xffff), 0xffff);
 }
 
 #[test]
@@ -162,15 +211,60 @@ fn the_initial_image_is_the_architectural_reset_state() {
 }
 
 #[test]
-fn every_cpu_must_choose_the_bootstrap_cpus_mode() {
-    let xsave = FpSaveMode::Xsave { xcr0: 0x7 };
-    assert_eq!(agrees_with_published(encode_mode(xsave), xsave), Ok(xsave));
+fn every_cpu_must_choose_the_bootstrap_cpus_mode_and_mxcsr_mask() {
+    let xsave = FpPolicy {
+        mode: FpSaveMode::Xsave { xcr0: 0x7 },
+        mxcsr_mask: 0xffff,
+    };
     assert_eq!(
-        agrees_with_published(encode_mode(FpSaveMode::Fxsave), xsave),
+        agrees_with_published(encode_policy(xsave), xsave),
+        Ok(xsave)
+    );
+    assert_eq!(
+        agrees_with_published(
+            encode_policy(FpPolicy {
+                mode: FpSaveMode::Fxsave,
+                ..xsave
+            }),
+            xsave
+        ),
         Err(FpPolicyError::ModeMismatch)
     );
     assert_eq!(
-        agrees_with_published(encode_mode(FpSaveMode::Xsave { xcr0: 0x3 }), xsave),
+        agrees_with_published(
+            encode_policy(FpPolicy {
+                mode: FpSaveMode::Xsave { xcr0: 0x3 },
+                ..xsave
+            }),
+            xsave
+        ),
         Err(FpPolicyError::ModeMismatch)
+    );
+    // A CPU without DAZ would fault restoring a Thread that set DAZ elsewhere.
+    assert_eq!(
+        agrees_with_published(
+            encode_policy(FpPolicy {
+                mxcsr_mask: DEFAULT_MXCSR_MASK,
+                ..xsave
+            }),
+            xsave
+        ),
+        Err(FpPolicyError::MxcsrMaskMismatch)
+    );
+}
+
+#[test]
+fn a_fresh_thread_starts_with_null_selectors_and_fs_base_zero() {
+    let state = SavedUserState::initial();
+    assert_eq!(state.selectors, [0; 4]);
+    assert_eq!(state.fs_base, 0);
+    assert!(state.fp.0[..] == FpArea::initial().0[..]);
+    assert_eq!(core::mem::align_of::<SavedUserState>(), 64);
+    assert!(
+        SavedUserState::for_save()
+            .fp
+            .0
+            .iter()
+            .all(|byte| *byte == 0)
     );
 }

@@ -13,13 +13,13 @@ use super::msr::{
     IA32_EFER, SyscallMsrAccess, SyscallMsrPlan, SyscallMsrPlanError, SyscallMsrProgramError,
     program_and_verify, verify,
 };
-use crate::arch::x86_64::user_state::{
-    CR4_FSGSBASE, CR4_OSFXSR, FpArea, FpPolicyError, FpSaveMode, cr0_enforces_user_fp,
-    cr4_enforces_user_fp, normalize_cr0_for_user_fp, normalize_cr4_for_user_fp,
-};
 use super::runtime_binding::{
     RuntimeCarrierClaimError, RuntimeCarrierClaims, RuntimeCarrierLifecycle,
     RuntimeCarrierLifecycles,
+};
+use crate::arch::x86_64::user_state::{
+    CR4_FSGSBASE, FpPolicyError, FpSaveMode, SavedUserState, cr0_enforces_user_fp,
+    cr4_enforces_user_fp, normalize_cr0_for_user_fp, normalize_cr4_for_user_fp,
 };
 
 // Safety notes (S2K). Each SAFETY comment on an unsafe block below cites one of these shared
@@ -449,8 +449,10 @@ unsafe fn enforce_live_user_fp_cr0() -> Result<(), SyscallInstallError> {
     Ok(())
 }
 
-/// CR0 still lets user code use FP/SIMD natively and CR4 still has FXSAVE/SSE
-/// on: the per-Thread save in `switch_kernel_context` depends on both.
+/// CR0 still lets user code use FP/SIMD natively and CR4 still holds exactly
+/// the agreed user FP policy (`normalize_cr4_for_user_fp`): the per-Thread
+/// save in `switch_kernel_context` depends on both, and a CR4 bit outside
+/// that policy (PKE, CET) would hand user code unswitched per-CPU state.
 #[allow(
     unsafe_code,
     reason = "IF-clear syscall and switch boundaries check that the user FP policy is still installed"
@@ -468,12 +470,14 @@ fn live_user_fp_is_enforced() -> bool {
             options(nomem, nostack, preserves_flags)
         );
     }
-    cr0_enforces_user_fp(cr0) && cr4 & CR4_OSFXSR != 0
+    cr0_enforces_user_fp(cr0)
+        && crate::arch::x86_64::user_state::current_fp_mode()
+            .is_some_and(|mode| cr4_enforces_user_fp(cr4, mode))
 }
 
 #[allow(
     unsafe_code,
-    reason = "CR4 normalization keeps FSGSBASE off (E4) and turns on the user FP state the save mode needs (D2)"
+    reason = "CR4 normalization keeps FSGSBASE off (E4), turns on the user FP state the save mode needs (D2) and clears every bit outside the kept set"
 )]
 unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError> {
     let before: u64;
@@ -487,9 +491,11 @@ unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError
     }
     let expected = normalize_cr4_for_user_fp(before, mode);
     if before != expected {
-        // SAFETY: [ASM] clears CR4.FSGSBASE and sets OSFXSR/OSXMMEXCPT, and OSXSAVE exactly when
-        // the CPU has XSAVE (`plan_fp_mode`), so the write cannot fault; no kernel code uses
-        // RD/WR{FS,GS}BASE or SSE.
+        // SAFETY: [ASM] keeps only the `CR4_KEPT` bits as found (so PAE, LA57, PCIDE, VMXE and SMXE,
+        // whose change could fault, never change), sets OSFXSR/OSXMMEXCPT, and OSXSAVE exactly
+        // when the CPU has XSAVE (`plan_fp_mode`). Every bit it clears may be cleared at any time
+        // outside VMX/SMX operation. No kernel code uses RD/WR{FS,GS}BASE, SSE, protection keys,
+        // CET, FRED, LASS or LAM.
         unsafe {
             core::arch::asm!(
                 "mov cr4, {}",
@@ -792,14 +798,18 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         if !cpu_supports_syscall() {
             return Err(SyscallInstallError::UnsupportedCpu);
         }
-        let fp_mode =
-            crate::arch::x86_64::user_state::agree_on_fp_mode().map_err(SyscallInstallError::FpMode)?;
+        let fp_mode = crate::arch::x86_64::user_state::plan_local_fp_mode()
+            .map_err(SyscallInstallError::FpMode)?;
         // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR0 write needs.
         unsafe { enforce_live_user_fp_cr0()? };
         // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR4 write needs.
         unsafe { normalize_live_cr4(fp_mode)? };
         // SAFETY: CPL0, and CR4.OSXSAVE is set for an XSAVE mode by the normalization above.
         unsafe { crate::arch::x86_64::user_state::install_xcr0(fp_mode) }
+            .map_err(SyscallInstallError::FpMode)?;
+        // SAFETY: CPL0, and CR4.OSFXSR is set by the normalization above. A CPU whose mode or
+        // MXCSR_MASK differs from the first CPU's fails its install here, before any user code.
+        unsafe { crate::arch::x86_64::user_state::agree_on_fp_policy(fp_mode) }
             .map_err(SyscallInstallError::FpMode)?;
         // SAFETY: this call won the slot's UNSTARTED->INSTALLING exchange above, so it is the
         // record's only writer; see `initialize_entry_state`.
@@ -2023,13 +2033,14 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     if !live_user_fp_is_enforced() {
         halt_forever();
     }
-    // The outgoing Thread's user FP state and FS base are still in this CPU's registers (the
-    // kernel is soft-float and never writes FS). They live in this frame while the Thread is
-    // suspended and come back when the frame resumes, on whichever CPU that is.
-    let mut fp = FpArea::zeroed();
-    // SAFETY: CPL0 on a CPU whose boundary installed the user FP policy (checked above); `fp` is
-    // zeroed.
-    let fs_base = unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_save(&mut fp) };
+    // The outgoing Thread's user FP state, FS base and DS/ES/FS/GS selectors are still in this
+    // CPU's registers (the kernel is soft-float and never writes FS or the selectors). They live
+    // in this frame while the Thread is suspended and come back when the frame resumes, on
+    // whichever CPU that is.
+    let mut saved = SavedUserState::for_save();
+    // SAFETY: CPL0 on a CPU whose boundary installed the user FP policy (checked above);
+    // `saved.fp` is zeroed.
+    unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_save(&mut saved) };
     // SAFETY: the plan came from a runtime `prepare_*` method whose `# Safety` the caller met, and
     // is consumed immediately; the assembly also rejects a save frame outside `current_stack` with
     // `ud2`.
@@ -2037,9 +2048,9 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     if !live_user_fp_is_enforced() {
         halt_forever();
     }
-    // SAFETY: this CPU installed the same save mode (`agree_on_fp_mode`); `fp` and `fs_base` are
-    // this Thread's own, saved above, and RDMSR returned a canonical FS base.
-    unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_restore(&fp, fs_base) };
+    // SAFETY: every CPU installed the same policy (`agree_on_fp_policy`), IF is clear on this
+    // path, and `saved` is this Thread's own state, saved above.
+    unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_restore(&saved) };
 }
 
 #[allow(
@@ -2182,11 +2193,13 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     // carrier (or, on the first-run path, from lower on the same stack) to the bound Thread stack
     // top and runs the ordinary pre-IRET gate there.
     // Only a Thread that has never run enters user mode here, so it starts from the initial FP
-    // state and FS base 0 rather than whatever the previous Thread on this CPU left.
+    // state, FS base 0 and null selectors rather than whatever the previous Thread on this CPU
+    // left.
     if !live_user_fp_is_enforced() {
         halt_forever();
     }
-    // SAFETY: CPL0 on a CPU whose boundary installed the user FP policy (checked above).
+    // SAFETY: CPL0 on a CPU whose boundary installed the user FP policy (checked above), in the
+    // IF-clear syscall runtime (it enables interrupts only inside `wait_for_suspend_interrupt`).
     unsafe { crate::arch::x86_64::user_state::load_initial_user_state() };
     // SAFETY: `state` is a `ValidatedUserReturn`, and the caller established the stack binding and
     // runtime ownership. The helper finishes every read of `*state` before its pivot and its first

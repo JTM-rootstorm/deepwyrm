@@ -75,6 +75,20 @@ fn native_mapping_is_classification_not_delivery() {
 }
 
 #[test]
+fn user_floating_point_faults_report_their_own_types() {
+    assert_eq!(
+        ExceptionVector::X87FloatingPoint.native_exception_type(),
+        Some(deepwyrm_abi::DW_EXCEPTION_X87_FLOATING_POINT)
+    );
+    assert_eq!(
+        ExceptionVector::SimdFloatingPoint.native_exception_type(),
+        Some(deepwyrm_abi::DW_EXCEPTION_SIMD_FLOATING_POINT)
+    );
+    assert!(!ExceptionVector::X87FloatingPoint.is_always_terminal());
+    assert!(!ExceptionVector::SimdFloatingPoint.is_always_terminal());
+}
+
+#[test]
 fn raw_context_has_the_e4_fixed_assembly_layout() {
     assert_eq!(core::mem::size_of::<RawExceptionContext>(), 184);
     assert_eq!(core::mem::align_of::<RawExceptionContext>(), 8);

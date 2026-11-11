@@ -567,53 +567,129 @@ pub(super) fn validate_f2_kernel_context_switch(disassembly: &str) {
 }
 
 /// The kernel stays soft-float (D2): FP/SIMD state instructions appear only
-/// in the two per-Thread user-state functions, and those use only the
-/// save/restore forms.
+/// in the per-Thread user-state functions, and each of those uses only its
+/// own forms: the save and probe store state, and the restore also runs the
+/// x87 pointer scrub (FNCLEX, EMMS, FILD) before loading it.
 pub(super) fn validate_fp_simd_unavailable(disassembly: &str) {
-    const USER_STATE_FUNCTIONS: &[&str] = &[
-        "dw_x86_64_user_state_save",
-        "dw_x86_64_user_state_restore",
+    const USER_STATE_FUNCTIONS: &[(&str, &[&str])] = &[
+        ("dw_x86_64_user_state_save", &["fxsave64", "xsave64"]),
+        ("dw_x86_64_user_state_probe", &["fxsave64"]),
+        (
+            "dw_x86_64_user_state_restore",
+            &["fnclex", "emms", "fild", "fxrstor64", "xrstor64"],
+        ),
     ];
-    const USER_STATE_MNEMONICS: &[&str] = &["fxsave64", "fxrstor64", "xsave64", "xrstor64"];
+    const FORBIDDEN_MNEMONICS: &[&str] = &[
+        "emms",
+        "f2xm1",
+        "fabs",
+        "fadd",
+        "fbld",
+        "fbstp",
+        "fchs",
+        "fclex",
+        "fcmov",
+        "fcom",
+        "fcos",
+        "fdecstp",
+        "fdiv",
+        "ffree",
+        "fiadd",
+        "ficom",
+        "fidiv",
+        "fild",
+        "fimul",
+        "fincstp",
+        "finit",
+        "fist",
+        "fisub",
+        "fld",
+        "fmul",
+        "fnclex",
+        "fninit",
+        "fnop",
+        "fnsave",
+        "fnst",
+        "fpatan",
+        "fprem",
+        "fptan",
+        "frndint",
+        "frstor",
+        "fsave",
+        "fscale",
+        "fsin",
+        "fsincos",
+        "fsqrt",
+        "fst",
+        "fsub",
+        "ftst",
+        "fucom",
+        "fwait",
+        "fxam",
+        "fxch",
+        "fxrstor",
+        "fxsave",
+        "fxtract",
+        "fyl2x",
+        "ldmxcsr",
+        "stmxcsr",
+        "xrstor",
+        "xsave",
+        "vzeroupper",
+        "vzeroall",
+        "vldmxcsr",
+        "vstmxcsr",
+        "kadd",
+        "kand",
+        "kmov",
+        "knot",
+        "kor",
+        "kshift",
+        "ktest",
+        "kunpck",
+        "kxnor",
+        "kxor",
+    ];
+    /// Splits an llvm-objdump line, `address: raw bytes<TAB>mnemonic<TAB>operands`,
+    /// into the instruction text after the bytes and its mnemonic.
+    fn mnemonic(line: &str) -> (String, String) {
+        let instruction = line
+            .split_once('\t')
+            .map_or("", |(_, rest)| rest)
+            .trim()
+            .to_ascii_lowercase();
+        let mnemonic = instruction
+            .split(|c: char| c == '\t' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        (instruction, mnemonic)
+    }
+    fn forbidden(mnemonic: &str) -> bool {
+        FORBIDDEN_MNEMONICS
+            .iter()
+            .any(|prefix| mnemonic.starts_with(prefix))
+    }
     let mut remainder = disassembly.to_owned();
-    for symbol in USER_STATE_FUNCTIONS {
+    for (symbol, allowed) in USER_STATE_FUNCTIONS {
         let body = function_body(disassembly, symbol);
         for line in body.lines() {
-            let instruction = line.rsplit('\t').next().unwrap_or("").trim().to_ascii_lowercase();
-            let mnemonic = instruction.split_whitespace().next().unwrap_or("");
+            let (instruction, mnemonic) = mnemonic(line);
             assert!(
-                !["xmm", "ymm", "zmm"].iter().any(|register| instruction.contains(register)),
+                !["xmm", "ymm", "zmm"]
+                    .iter()
+                    .any(|register| instruction.contains(register)),
                 "{symbol} names SIMD registers: {line}"
             );
-            if ["fx", "xsave", "xrstor", "ldmxcsr", "stmxcsr"]
-                .iter()
-                .any(|prefix| mnemonic.starts_with(prefix))
-            {
-                assert!(
-                    USER_STATE_MNEMONICS.contains(&mnemonic),
-                    "{symbol} uses an unexpected FP state form: {line}"
-                );
-            }
+            assert!(
+                !forbidden(&mnemonic) || allowed.contains(&mnemonic.as_str()),
+                "{symbol} uses an unexpected FP state form: {line}"
+            );
         }
         remainder = remainder.replacen(body, "", 1);
     }
-    let disassembly = remainder.as_str();
-    const FORBIDDEN_MNEMONICS: &[&str] = &[
-        "emms", "f2xm1", "fabs", "fadd", "fbld", "fbstp", "fchs", "fclex", "fcmov", "fcom", "fcos",
-        "fdecstp", "fdiv", "ffree", "fiadd", "ficom", "fidiv", "fild", "fimul", "fincstp", "finit",
-        "fist", "fisub", "fld", "fmul", "fnclex", "fninit", "fnop", "fnsave", "fnst", "fpatan",
-        "fprem", "fptan", "frndint", "frstor", "fsave", "fscale", "fsin", "fsincos", "fsqrt",
-        "fst", "fsub", "ftst", "fucom", "fwait", "fxam", "fxch", "fxrstor", "fxsave", "fxtract",
-        "fyl2x", "ldmxcsr", "stmxcsr", "xrstor", "xsave",
-    ];
-    for line in text_disassembly(disassembly).lines() {
-        let instruction = line
-            .rsplit('\t')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        let mnemonic = instruction.split_whitespace().next().unwrap_or("");
+    for line in text_disassembly(&remainder).lines() {
+        let (instruction, mnemonic) = mnemonic(line);
         assert!(
             !["xmm", "ymm", "zmm"]
                 .iter()
@@ -625,9 +701,7 @@ pub(super) fn validate_fp_simd_unavailable(disassembly: &str) {
             "E5 kernel text uses MMX register state while policy is unavailable: {line}"
         );
         assert!(
-            !FORBIDDEN_MNEMONICS
-                .iter()
-                .any(|prefix| mnemonic.starts_with(prefix)),
+            !forbidden(&mnemonic),
             "E5 kernel text uses FP/SIMD state while policy is unavailable: {line}"
         );
     }
@@ -748,4 +822,57 @@ pub(super) fn run_output(command: &mut Command, label: &str) -> Output {
     command
         .output()
         .unwrap_or_else(|error| panic!("failed to run {label}: {error}"))
+}
+
+#[cfg(test)]
+fn user_state_disassembly(extra: &str) -> String {
+    format!(
+        "Disassembly of section .text:\n\n\
+         0000 <root>:\n  0:\tcall\t0x10 <dw_x86_64_user_state_save>\n{extra}\n\
+         0010 <dw_x86_64_user_state_save>:\n 10:\txsave64\t[rdi]\n 14:\trdmsr\n 16:\tret\n\n\
+         0020 <dw_x86_64_user_state_probe>:\n 20:\tfxsave64\t[rdi]\n 24:\tret\n\n\
+         0030 <dw_x86_64_user_state_restore>:\n 30:\tfnclex\n 32:\temms\n \
+         34:\tfild\tdword ptr [rip + 0x100]\n 3a:\txrstor64\t[rdi]\n 3e:\twrmsr\n 40:\tret\n"
+    )
+}
+
+#[test]
+fn the_fp_oracle_accepts_the_user_state_functions_and_their_scrub() {
+    validate_fp_simd_unavailable(&user_state_disassembly(""));
+}
+
+#[test]
+fn the_fp_oracle_rejects_avx_forms_without_simd_register_operands() {
+    for instruction in [
+        "vzeroupper",
+        "vzeroall",
+        "vldmxcsr\tdword ptr [rax]",
+        "kmovw\tk1, eax",
+    ] {
+        let disassembly = user_state_disassembly(&format!("  5:\t{instruction}\n"));
+        let result = std::panic::catch_unwind(|| validate_fp_simd_unavailable(&disassembly));
+        assert!(result.is_err(), "{instruction} escaped the oracle");
+    }
+}
+
+#[test]
+fn the_fp_oracle_reads_the_mnemonic_of_an_instruction_with_operands() {
+    // llvm-objdump puts a tab between the mnemonic and its operands, after the raw bytes.
+    let line = "  5: dd 00                        \tfld\tqword ptr [rax]";
+    let disassembly = user_state_disassembly(&format!("{line}\n"));
+    let result = std::panic::catch_unwind(|| validate_fp_simd_unavailable(&disassembly));
+    assert!(
+        result.is_err(),
+        "an x87 load with a memory operand escaped the oracle"
+    );
+}
+
+#[test]
+fn the_fp_oracle_keeps_the_scrub_out_of_the_save() {
+    let disassembly = user_state_disassembly("").replace(
+        " 10:\txsave64\t[rdi]",
+        " 10:\tfild\tdword ptr [rip + 0x100]\n 12:\txsave64\t[rdi]",
+    );
+    let result = std::panic::catch_unwind(|| validate_fp_simd_unavailable(&disassembly));
+    assert!(result.is_err());
 }

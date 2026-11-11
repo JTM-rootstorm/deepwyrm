@@ -360,6 +360,18 @@ type = "DwExceptionType"
 value = 6
 doc = "Debug trap exception."
 
+[[constant]]
+name = "DW_EXCEPTION_X87_FLOATING_POINT"
+type = "DwExceptionType"
+value = 7
+doc = "Unmasked x87 floating-point exception."
+
+[[constant]]
+name = "DW_EXCEPTION_SIMD_FLOATING_POINT"
+type = "DwExceptionType"
+value = 8
+doc = "Unmasked SSE/AVX floating-point exception."
+
 [[record]]
 name = "DwAbiInfoV1"
 doc = "Kernel ABI and bounded implementation-limit discovery."

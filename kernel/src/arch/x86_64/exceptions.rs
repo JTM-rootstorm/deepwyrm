@@ -7,7 +7,8 @@
 use deepwyrm_abi::{
     DW_EXCEPTION_BREAKPOINT, DW_EXCEPTION_DEBUG_TRAP, DW_EXCEPTION_DIVIDE_ERROR,
     DW_EXCEPTION_GENERAL_PROTECTION, DW_EXCEPTION_ILLEGAL_INSTRUCTION, DW_EXCEPTION_NONE,
-    DW_EXCEPTION_PAGE_FAULT, DwExceptionType,
+    DW_EXCEPTION_PAGE_FAULT, DW_EXCEPTION_SIMD_FLOATING_POINT, DW_EXCEPTION_X87_FLOATING_POINT,
+    DwExceptionType,
 };
 
 use crate::arch::x86_64::gdt::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR};
@@ -147,6 +148,8 @@ impl ExceptionVector {
             Self::DivideError => Some(DW_EXCEPTION_DIVIDE_ERROR),
             Self::GeneralProtection => Some(DW_EXCEPTION_GENERAL_PROTECTION),
             Self::Debug => Some(DW_EXCEPTION_DEBUG_TRAP),
+            Self::X87FloatingPoint => Some(DW_EXCEPTION_X87_FLOATING_POINT),
+            Self::SimdFloatingPoint => Some(DW_EXCEPTION_SIMD_FLOATING_POINT),
             _ => None,
         }
     }

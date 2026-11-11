@@ -623,6 +623,10 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_EXCEPTION_GENERAL_PROTECTION ((DwExceptionType)(5))
 /* Debug trap exception. */
 #define DW_EXCEPTION_DEBUG_TRAP ((DwExceptionType)(6))
+/* Unmasked x87 floating-point exception. */
+#define DW_EXCEPTION_X87_FLOATING_POINT ((DwExceptionType)(7))
+/* Unmasked SSE/AVX floating-point exception. */
+#define DW_EXCEPTION_SIMD_FLOATING_POINT ((DwExceptionType)(8))
 /* dma_map access: the device may read the mapped pages. */
 #define DW_DMA_ACCESS_DEVICE_READ ((uint32_t)(1))
 /* dma_map access: the device may write the mapped pages. */

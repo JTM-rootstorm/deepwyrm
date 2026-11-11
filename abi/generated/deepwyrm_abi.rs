@@ -753,6 +753,12 @@ pub const DW_EXCEPTION_GENERAL_PROTECTION: DwExceptionType = DwExceptionType(5);
 /// Debug trap exception.
 pub const DW_EXCEPTION_DEBUG_TRAP: DwExceptionType = DwExceptionType(6);
 
+/// Unmasked x87 floating-point exception.
+pub const DW_EXCEPTION_X87_FLOATING_POINT: DwExceptionType = DwExceptionType(7);
+
+/// Unmasked SSE/AVX floating-point exception.
+pub const DW_EXCEPTION_SIMD_FLOATING_POINT: DwExceptionType = DwExceptionType(8);
+
 /// dma_map access: the device may read the mapped pages.
 pub const DW_DMA_ACCESS_DEVICE_READ: u32 = 1;
 
@@ -2004,6 +2010,8 @@ mod generated_layout_tests {
         assert_eq!(DW_EXCEPTION_DIVIDE_ERROR.0, 4);
         assert_eq!(DW_EXCEPTION_GENERAL_PROTECTION.0, 5);
         assert_eq!(DW_EXCEPTION_DEBUG_TRAP.0, 6);
+        assert_eq!(DW_EXCEPTION_X87_FLOATING_POINT.0, 7);
+        assert_eq!(DW_EXCEPTION_SIMD_FLOATING_POINT.0, 8);
         assert_eq!(DW_DMA_ACCESS_DEVICE_READ, 1);
         assert_eq!(DW_DMA_ACCESS_DEVICE_WRITE, 2);
         assert_eq!(DW_DMA_ACCESS_SUPPORTED_MASK, 3);
