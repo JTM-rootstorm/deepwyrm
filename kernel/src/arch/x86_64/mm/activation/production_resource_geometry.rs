@@ -41,7 +41,7 @@
 /// finalized generation releases its slot. Treating a lifetime census as a
 /// capacity is what selector 34's ledger records at `LIVE_IDENTITY_PEAK`, and
 /// what selector 33's `fits` still does.
-pub(super) const LIFETIME_IDENTITIES: [&str; 13] = [
+pub(super) const LIFETIME_IDENTITIES: [&str; 16] = [
     "primordial",
     "system-init",
     "registryd-1",
@@ -53,7 +53,10 @@ pub(super) const LIFETIME_IDENTITIES: [&str; 13] = [
     "consoled-2",
     "shell-1",
     "shell-2",
-    "shell-job",
+    "shell-job-1",
+    "shell-job-2",
+    "shell-job-3",
+    "shell-job-4",
     "driver-attempt-2",
 ];
 
@@ -74,10 +77,17 @@ pub(super) const BASELINE_MEMORY: usize = RESIDENT_IMAGES * RESIDENT_IMAGE_OBJEC
 /// is reaped, so exactly one role is doubled at the peak. Init's recovery is
 /// serialized per role, so this is one, not five.
 const REPLACEMENT_GENERATIONS: usize = 1;
-/// The foreground shell runs one job at a time. `ShellJobs` admits ordinary
-/// jobs and cannot launch another shell, so a second concurrent job is not a
-/// reachable state of this product.
-const LIVE_SHELL_JOBS: usize = 1;
+/// Concurrent shell jobs, foreground and background together, orphans
+/// included. Wyrmroot's init refuses a launch beyond this many (its
+/// `MAX_SHELL_JOBS`), so the bound is enforced, not assumed (F4 DW1-F4-M1).
+/// `spawn` made more than one job reachable; the earlier value of one was
+/// stale.
+const LIVE_SHELL_JOBS: usize = 4;
+/// The wait items one job may register itself. Wyrmroot limits each job's
+/// TaskGroup to this with `task_group_limit`, and to no objects of its own.
+const JOB_OWN_WAITS: usize = 1;
+/// Init holds each live job's Process, TaskGroup and launch Channel.
+const JOB_HELD_HANDLES: usize = 3;
 
 pub(super) const LIVE_PROCESSES: usize =
     RESIDENT_IMAGES + REPLACEMENT_GENERATIONS + LIVE_SHELL_JOBS;
@@ -107,8 +117,10 @@ const STREAM_JOB_LOADER_HANDLES: usize = 1 + 3 + 1 + 2 + 1;
 /// rights, holds the reduced handle it will MOVE, and retains the outgoing
 /// generation's Process until it is reaped.
 const REPLACEMENT_STAGING_HANDLES: usize = 3;
-pub(super) const HANDLE_PEAK: usize =
-    INIT_BASELINE_HANDLES + STREAM_JOB_LOADER_HANDLES + REPLACEMENT_STAGING_HANDLES;
+pub(super) const HANDLE_PEAK: usize = INIT_BASELINE_HANDLES
+    + STREAM_JOB_LOADER_HANDLES
+    + REPLACEMENT_STAGING_HANDLES
+    + LIVE_SHELL_JOBS * JOB_HELD_HANDLES;
 pub(super) const MEMORY_PEAK: usize = BASELINE_MEMORY
     + REPLACEMENT_GENERATIONS * RESIDENT_IMAGE_OBJECTS
     + LIVE_SHELL_JOBS * JOB_IMAGE_OBJECTS
@@ -158,7 +170,8 @@ pub(super) const INTERACTIVE_GRAPH_WAITS: usize = 12 + 3 + 4 + 6 + 7 + 7;
 /// and the replacement generation, each owning a Channel and a Process
 /// registration.
 const ADDED_EXIT_WAITS: usize = (LIVE_SHELL_JOBS + REPLACEMENT_GENERATIONS) * 2;
-pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS;
+pub(super) const WAIT_PEAK: usize =
+    INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS + LIVE_SHELL_JOBS * JOB_OWN_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
 // The product archive (`wyrmroot_bootfs::product`) holds eight executables --
@@ -199,15 +212,15 @@ pub(super) struct Capacity {
     pub evidence: usize,
 }
 
-// PRODUCTION_SELECTED_CAPACITIES per_process_handle_capacity=48 memory_object_capacity=48 mapping_lease_capacity=48 registry_object_capacity=160
+// PRODUCTION_SELECTED_CAPACITIES per_process_handle_capacity=48 memory_object_capacity=48 mapping_lease_capacity=48 registry_object_capacity=192
 pub(super) const SELECTED: Capacity = Capacity {
     handles: 48,
     memory: 48,
     mappings: 48,
     identities: 16,
-    registry: 160,
-    channel_pairs: 32,
-    waits: 48,
+    registry: 192,
+    channel_pairs: 40,
+    waits: 56,
     evidence: 0,
 };
 
@@ -282,7 +295,7 @@ mod tests {
         // figure.
         assert_eq!(SELECTED.identities, 16);
         assert_eq!(SELECTED.handles, 48);
-        assert_eq!(SELECTED.registry, 160);
+        assert_eq!(SELECTED.registry, 192);
         // Production links the ordinary arena. Only the E8 and F-closure
         // fairness builds link sixty-four stacks (`kernel_stack.rs`), and this
         // module is compiled into their host tests too.
@@ -293,18 +306,18 @@ mod tests {
     fn production_peaks_are_the_documented_arithmetic() {
         assert_eq!(INIT_BASELINE_HANDLES, 21);
         assert_eq!(STREAM_JOB_LOADER_HANDLES, 8);
-        assert_eq!(HANDLE_PEAK, 32);
+        assert_eq!(HANDLE_PEAK, 44);
         assert_eq!(BASELINE_MEMORY, 19);
-        assert_eq!(MEMORY_PEAK, 26);
-        assert_eq!(MAPPING_PEAK, 26);
-        assert_eq!(LIVE_PROCESSES, 8);
-        assert_eq!(LIVE_TASK_GROUPS, 11);
-        assert_eq!(LIVE_IDENTITY_PEAK, 11);
-        assert_eq!(CHANNEL_PAIR_PEAK, 24);
-        assert_eq!(CHANNEL_ENDPOINT_PEAK, 48);
-        assert_eq!(REGISTRY_PEAK, 113);
+        assert_eq!(MEMORY_PEAK, 35);
+        assert_eq!(MAPPING_PEAK, 35);
+        assert_eq!(LIVE_PROCESSES, 11);
+        assert_eq!(LIVE_TASK_GROUPS, 14);
+        assert_eq!(LIVE_IDENTITY_PEAK, 14);
+        assert_eq!(CHANNEL_PAIR_PEAK, 36);
+        assert_eq!(CHANNEL_ENDPOINT_PEAK, 72);
+        assert_eq!(REGISTRY_PEAK, 158);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
-        assert_eq!(WAIT_PEAK, 43);
+        assert_eq!(WAIT_PEAK, 53);
         assert_eq!(BOOTFS_ENTRY_PEAK, 12);
     }
 
@@ -333,7 +346,7 @@ mod tests {
 
     #[test]
     fn the_lifetime_census_is_not_used_as_a_capacity() {
-        // Thirteen lifetime identities, eleven simultaneous. The census is
+        // Sixteen lifetime identities, fourteen simultaneous. The census is
         // larger than every pool it could be mistaken for, which is why it is
         // absent from `fits`.
         assert!(LIFETIME_IDENTITIES.len() > LIVE_IDENTITY_PEAK);
