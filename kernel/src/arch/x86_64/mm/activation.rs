@@ -1744,6 +1744,30 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .install_mmio_frame(frame)
     }
 
+    /// Gives one admitted PCI memory BAR a permanent device-MMIO frame role
+    /// (storage K3). The early BSP is the only CPU running.
+    ///
+    /// # Safety
+    ///
+    /// `[base, base + size)` must be a BAR the boot PCI probe sized and
+    /// admitted: page-granular, below the physical limit, and clear of every
+    /// memory-map range that is not MMIO.
+    #[allow(
+        unsafe_code,
+        reason = "BAR provenance is the caller's boot-time PCI probe"
+    )]
+    pub(crate) unsafe fn import_device_mmio(
+        &mut self,
+        base: u64,
+        size: u64,
+    ) -> Result<crate::memory::frame_roles::ObjectBackingGrant, LiveActiveTargetError> {
+        let range = crate::memory::physical::PhysicalRange::new(base, size)
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.target.roles.import_device_mmio(range) }
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)
+    }
+
     /// Allocates one frame below `exclusive_ceiling`, zeroes it through the
     /// bootstrap scratch leaf, and retains it for a permanent architecture
     /// structure. The early BSP is the only CPU running.

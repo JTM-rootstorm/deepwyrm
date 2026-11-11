@@ -969,6 +969,39 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
+    /// Imports one admitted PCI memory BAR as typed device-register backing.
+    /// The role is permanent: BARs never move once the kernel has probed them.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have sized the BAR from the device with decoding off,
+    /// checked it lies below the physical limit, and checked it overlaps no
+    /// memory-map range other than MMIO.
+    #[allow(
+        unsafe_code,
+        reason = "BAR provenance is established by the boot-time PCI probe"
+    )]
+    pub(crate) unsafe fn import_device_mmio(
+        &mut self,
+        range: PhysicalRange,
+    ) -> Result<ObjectBackingGrant, FrameRoleError> {
+        if !range.physical_start().is_multiple_of(BASE_PAGE_SIZE)
+            || !range.byte_len().is_multiple_of(BASE_PAGE_SIZE)
+        {
+            return Err(FrameRoleError::Physical(
+                PhysicalMemoryError::InvalidPageRange,
+            ));
+        }
+        let pages = PageRange::cover(range, self.allocator.physical_limit())?;
+        let pages = self.validate_external_pages(pages)?;
+        let identity = self.insert_role(pages, FrameRole::ExternalDeviceMmio)?;
+        Ok(ObjectBackingGrant {
+            identity: BackingIdentity(identity),
+            range: pages,
+            kind: ObjectBackingKind::DeviceMmio,
+        })
+    }
+
     pub(crate) fn cancel_allocation(
         &mut self,
         grant: AllocationGrant,
@@ -1003,7 +1036,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 grant.range,
                 FrameRole::ObjectBacking(grant.kind),
             ),
-            ObjectBackingKind::ImmutableModule { .. } => Err(FrameRoleError::WrongRole),
+            ObjectBackingKind::ImmutableModule { .. } | ObjectBackingKind::DeviceMmio => {
+                Err(FrameRoleError::WrongRole)
+            }
         };
         if let Err(error) = result {
             return Err(GrantTransitionError::new(error, grant));
@@ -1052,7 +1087,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             FrameRole::ExternalImmutableModule { .. } if writable => {
                 Err(FrameRoleError::ReadOnlyBacking)
             }
-            FrameRole::ExternalImmutableModule { .. } => Ok(()),
+            FrameRole::ExternalImmutableModule { .. } | FrameRole::ExternalDeviceMmio => Ok(()),
             _ => Err(FrameRoleError::WrongRole),
         }
     }

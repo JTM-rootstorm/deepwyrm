@@ -62,6 +62,7 @@ pub enum DwKnownSyscall {
     InterruptAck,
     DevicePciConfigRead,
     DevicePciCommand,
+    DeviceMmioObjectCreate,
 }
 
 impl DwKnownSyscall {
@@ -105,6 +106,7 @@ impl DwKnownSyscall {
             0x00060011 => Some(Self::InterruptAck),
             0x00060020 => Some(Self::DevicePciConfigRead),
             0x00060021 => Some(Self::DevicePciCommand),
+            0x00060022 => Some(Self::DeviceMmioObjectCreate),
             _ => None,
         }
     }
@@ -149,6 +151,7 @@ impl DwKnownSyscall {
             Self::InterruptAck => DwSyscallId(0x00060011),
             Self::DevicePciConfigRead => DwSyscallId(0x00060020),
             Self::DevicePciCommand => DwSyscallId(0x00060021),
+            Self::DeviceMmioObjectCreate => DwSyscallId(0x00060022),
         }
     }
 
@@ -192,6 +195,7 @@ impl DwKnownSyscall {
             Self::InterruptAck => DwSyscallImplementationPhase::Dw1D,
             Self::DevicePciConfigRead => DwSyscallImplementationPhase::Dw2S,
             Self::DevicePciCommand => DwSyscallImplementationPhase::Dw2S,
+            Self::DeviceMmioObjectCreate => DwSyscallImplementationPhase::Dw2S,
         }
     }
 
@@ -235,6 +239,7 @@ impl DwKnownSyscall {
             Self::InterruptAck => 1,
             Self::DevicePciConfigRead => 4,
             Self::DevicePciCommand => 3,
+            Self::DeviceMmioObjectCreate => 4,
         }
     }
 }

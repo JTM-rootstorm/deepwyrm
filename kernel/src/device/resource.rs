@@ -333,6 +333,18 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
         Ok(descriptor)
     }
 
+    /// The boot resource ID of a live PCI_FUNCTION resource.
+    pub(crate) fn pci_resource_id_for_resolved(
+        &self,
+        resolved: &ResolvedHandle,
+    ) -> Result<u64, DeviceResourceError> {
+        let descriptor = self.descriptor_for_resolved(resolved)?;
+        if descriptor.kind != DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION {
+            return Err(DeviceResourceError::InvalidAccess);
+        }
+        Ok(descriptor.resource_id)
+    }
+
     /// The function a live PCI_FUNCTION resource names.
     fn pci_address_for_resolved(
         &self,

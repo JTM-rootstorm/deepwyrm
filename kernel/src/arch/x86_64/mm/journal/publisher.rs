@@ -556,6 +556,7 @@ fn page_descriptor<E>(
             readable: true,
             writable: mapping.protection().writable(),
             executable: mapping.protection().executable(),
+            uncached: backing.uncached(),
         },
     })
 }

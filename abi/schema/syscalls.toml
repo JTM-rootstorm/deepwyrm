@@ -892,6 +892,16 @@ arg1 = "memory_space|u32|in|NONE|NONE"
 arg2 = "bus_master|u32|in|NONE|NONE"
 
 [[syscall]]
+name = "device_mmio_object_create"
+number = 0x00060022
+phase = "DW2-S"
+doc = "Create a MemoryObject over one whole admitted memory BAR of a live PCI_FUNCTION DeviceResource, for mapping with address_region_map. Its protection ceiling is READ+WRITE, so it is never executable, and its pages are mapped strong-uncacheable. The object keeps the DeviceResource alive until it finalizes. A BAR slot that is not an admitted memory BAR is NOT_FOUND; a BAR another live object already covers is ALREADY_EXISTS; requested_rights must be nonzero, MEMORY_OBJECT-compatible, and exclude EXECUTE."
+arg0 = "resource|DwHandle|in|DEVICE_RESOURCE|MAP"
+arg1 = "bar|u32|in|NONE|NONE"
+arg2 = "requested_rights|DwRights|in|NONE|NONE"
+arg3 = "out_memory_object|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
 name = "interrupt_create"
 number = 0x00060010
 phase = "DW1-D"

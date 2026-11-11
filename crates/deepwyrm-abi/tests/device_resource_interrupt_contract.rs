@@ -26,7 +26,7 @@ fn d1_activates_only_the_reached_objects_rights_signals_and_feature_identity() {
     assert!(dw_rights_are_known(DW_RIGHT_RESOURCE));
 
     assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_TASK_GROUP.0, 0x7c0);
-    assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE.0, 0x3c3);
+    assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE.0, 0x3cb);
     assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT.0, 0x390);
     assert_eq!(
         DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT.0 & DW_RIGHT_DUPLICATE.0,

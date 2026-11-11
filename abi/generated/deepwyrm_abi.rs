@@ -395,7 +395,7 @@ pub const DW_OBJECT_COMPATIBLE_RIGHTS_TIMER: DwRights = DwRights(976);
 pub const DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT: DwRights = DwRights(912);
 
 /// Compatible rights for the DEVICE_RESOURCE object type.
-pub const DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE: DwRights = DwRights(963);
+pub const DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE: DwRights = DwRights(971);
 
 /// Returns the compatible-rights mask for one object type; sentinel, reserved, and unknown types return zero.
 pub const fn dw_object_compatible_rights(object_type: DwObjectType) -> DwRights {
@@ -866,6 +866,9 @@ pub const DW_SYSCALL_DEVICE_PCI_CONFIG_READ: DwSyscallId = DwSyscallId(0x0006002
 
 /// Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 1 values, preserving other bits and always clearing I/O-space decoding; bus mastering needs DMA remapping covering the function.
 pub const DW_SYSCALL_DEVICE_PCI_COMMAND: DwSyscallId = DwSyscallId(0x00060021);
+
+/// Create a MemoryObject over one whole admitted memory BAR of a live PCI_FUNCTION DeviceResource, for mapping with address_region_map. Its protection ceiling is READ+WRITE, so it is never executable, and its pages are mapped strong-uncacheable. The object keeps the DeviceResource alive until it finalizes. A BAR slot that is not an admitted memory BAR is NOT_FOUND; a BAR another live object already covers is ALREADY_EXISTS; requested_rights must be nonzero, MEMORY_OBJECT-compatible, and exclude EXECUTE.
+pub const DW_SYSCALL_DEVICE_MMIO_OBJECT_CREATE: DwSyscallId = DwSyscallId(0x00060022);
 
 /// One normalized physical memory-map entry.
 #[repr(C)]
@@ -1863,8 +1866,8 @@ mod generated_layout_tests {
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_TIMER).0, 976);
         assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT.0, 912);
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_INTERRUPT).0, 912);
-        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE.0, 963);
-        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_DEVICE_RESOURCE).0, 963);
+        assert_eq!(DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE.0, 971);
+        assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_DEVICE_RESOURCE).0, 971);
         assert_eq!(dw_object_compatible_rights(DW_OBJECT_TYPE_NONE).0, 0);
         assert!(dw_rights_are_known(DW_RIGHTS_KNOWN_MASK));
         assert!(dw_rights_are_compatible(DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_MAP));
@@ -2021,5 +2024,6 @@ mod generated_layout_tests {
         assert_eq!(DW_SYSCALL_INTERRUPT_ACK.0, 0x00060011);
         assert_eq!(DW_SYSCALL_DEVICE_PCI_CONFIG_READ.0, 0x00060020);
         assert_eq!(DW_SYSCALL_DEVICE_PCI_COMMAND.0, 0x00060021);
+        assert_eq!(DW_SYSCALL_DEVICE_MMIO_OBJECT_CREATE.0, 0x00060022);
     }
 }

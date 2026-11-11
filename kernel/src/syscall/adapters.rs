@@ -2326,6 +2326,159 @@ pub(crate) fn device_pci_command<
     }
 }
 
+/// `device_mmio_object_create` (storage K3): a MemoryObject over one whole
+/// admitted BAR, holding the DeviceResource's lookup pin until it finalizes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn device_mmio_object_create<
+    U: UserPageAccess,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    bar: u32,
+    requested_rights: DwRights,
+    out_memory_object: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    if requested_rights.0 == 0
+        || requested_rights.0 & deepwyrm_abi::DW_RIGHT_EXECUTE.0 != 0
+        || !deepwyrm_abi::dw_rights_are_known(requested_rights)
+        || !deepwyrm_abi::dw_rights_are_compatible(
+            deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+            requested_rights,
+        )
+    {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let output = match preflight_output(user, out_memory_object, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let resolved = match tasks.process_handles_mut(current_process) {
+        Ok(table) => match table.lookup(
+            registry,
+            resource,
+            crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE),
+            deepwyrm_abi::DW_RIGHT_MAP,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return handle_status(error),
+        },
+        Err(error) => return task_status(error),
+    };
+    let resource_id = resources.pci_resource_id_for_resolved(&resolved);
+    let parent = resolved.into_internal();
+    // Every failure below releases the lookup pin. The caller's handle still
+    // owns the resource, so the pin is never its last reference.
+    let fail = |registry: &mut ObjectRegistry<OBJECTS>, parent, status| match registry
+        .release_internal(parent)
+    {
+        Ok(None) => status,
+        Ok(Some(_)) => panic!("DeviceResource lookup pin became final while its handle lived"),
+        Err(failure) => panic!(
+            "DeviceResource lookup pin violated generic lifetime invariants: {:?}",
+            failure.error()
+        ),
+    };
+    let resource_id = match resource_id {
+        Ok(resource_id) => resource_id,
+        Err(_) => return fail(registry, parent, DW_STATUS_INVALID_ARGUMENT),
+    };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => return fail(registry, parent, status),
+    };
+    let backing = match crate::device::pci::PCI_FUNCTIONS.take_bar_backing(resource_id, bar) {
+        Ok(backing) => backing,
+        Err(crate::device::pci::BarBackingError::NotFound) => {
+            return fail(registry, parent, deepwyrm_abi::DW_STATUS_NOT_FOUND);
+        }
+        Err(crate::device::pci::BarBackingError::InUse) => {
+            return fail(registry, parent, deepwyrm_abi::DW_STATUS_ALREADY_EXISTS);
+        }
+    };
+    let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
+        Ok(creation) => creation,
+        Err(ObjectRegistryError::Capacity | ObjectRegistryError::ReferenceCountExhausted) => {
+            crate::device::pci::PCI_FUNCTIONS.return_bar_backing(backing);
+            return fail(registry, parent, DW_STATUS_NO_RESOURCES);
+        }
+        Err(error) => panic!("DeviceMmio generic creation failed unexpectedly: {error:?}"),
+    };
+    let binding = match memory.bind_device_mmio(creation, backing, parent) {
+        Ok(binding) => binding,
+        Err((error, parent)) => {
+            let status = memory_object_status(error.error());
+            let (creation, backing) = error.into_parts();
+            registry
+                .cancel_creation(creation)
+                .unwrap_or_else(|failure| {
+                    panic!("DeviceMmio bind rollback drifted: {:?}", failure.error())
+                });
+            crate::device::pci::PCI_FUNCTIONS.return_bar_backing(backing);
+            return fail(registry, parent, status);
+        }
+    };
+    let bound = registry
+        .finish_payload_binding(binding)
+        .unwrap_or_else(|failure| {
+            panic!(
+                "fresh DeviceMmio binding was rejected: {:?}",
+                failure.error()
+            )
+        });
+    let reference = registry.bound_into_handle(bound).unwrap_or_else(|failure| {
+        panic!(
+            "fresh DeviceMmio object could not become a handle: {:?}",
+            failure.error()
+        )
+    });
+    charge_created(registry, reference.id(), charge);
+    // From here a failure releases the fresh object's only reference, and its
+    // finalization returns the BAR grant and the DeviceResource pin.
+    let handle = match tasks.process_handles_mut(current_process) {
+        Ok(table) => {
+            match install_created_handle(table, registry, reference, requested_rights, cleanup) {
+                Ok(handle) => handle,
+                Err(status) => return status,
+            }
+        }
+        Err(error) => {
+            cleanup.push_optional(
+                registry
+                    .release_handle(reference)
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "DeviceMmio publication rollback drifted: {:?}",
+                            failure.error()
+                        )
+                    }),
+            );
+            return task_status(error);
+        }
+    };
+    output.commit(&encode_handle(handle));
+    DW_STATUS_SUCCESS
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn interrupt_create<
     U: UserPageAccess,

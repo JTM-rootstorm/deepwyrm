@@ -194,6 +194,12 @@ pub(crate) enum NativeSyscallRequest {
         memory_space: u32,
         bus_master: u32,
     },
+    DeviceMmioObjectCreate {
+        resource: DwHandle,
+        bar: u32,
+        requested_rights: DwRights,
+        out_memory_object: DwUserAddress,
+    },
     InterruptCreate {
         resource: DwHandle,
         requested_rights: DwRights,
@@ -403,6 +409,12 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
             resource: DwHandle(a[0]),
             memory_space: u32_arg(a[1])?,
             bus_master: u32_arg(a[2])?,
+        },
+        DwKnownSyscall::DeviceMmioObjectCreate => NativeSyscallRequest::DeviceMmioObjectCreate {
+            resource: DwHandle(a[0]),
+            bar: u32_arg(a[1])?,
+            requested_rights: DwRights(a[2]),
+            out_memory_object: DwUserAddress(a[3]),
         },
         DwKnownSyscall::InterruptCreate => NativeSyscallRequest::InterruptCreate {
             resource: DwHandle(a[0]),
@@ -779,6 +791,15 @@ pub(crate) trait NativeSyscallServices {
     ) -> NativeSyscallResult {
         unsupported_f()
     }
+    fn device_mmio_object_create(
+        &mut self,
+        _resource: DwHandle,
+        _bar: u32,
+        _requested_rights: DwRights,
+        _out_memory_object: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
     fn interrupt_create(
         &mut self,
         _resource: DwHandle,
@@ -986,6 +1007,12 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 memory_space,
                 bus_master,
             } => self.device_pci_command(resource, memory_space, bus_master),
+            NativeSyscallRequest::DeviceMmioObjectCreate {
+                resource,
+                bar,
+                requested_rights,
+                out_memory_object,
+            } => self.device_mmio_object_create(resource, bar, requested_rights, out_memory_object),
             NativeSyscallRequest::InterruptCreate {
                 resource,
                 requested_rights,

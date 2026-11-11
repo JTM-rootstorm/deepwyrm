@@ -253,6 +253,9 @@ pub struct MappingPermissions {
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
+    /// Device registers: PCD|PWT with PAT clear, which the boot PAT check
+    /// guarantees selects strong uncacheable (PA3 = UC).
+    pub uncached: bool,
 }
 
 impl MappingPermissions {
@@ -261,24 +264,28 @@ impl MappingPermissions {
         readable: true,
         writable: false,
         executable: false,
+        uncached: false,
     };
     pub const USER_READ_WRITE: Self = Self {
         user: true,
         readable: true,
         writable: true,
         executable: false,
+        uncached: false,
     };
     pub const KERNEL_READ_EXECUTE: Self = Self {
         user: false,
         readable: true,
         writable: false,
         executable: true,
+        uncached: false,
     };
     pub const KERNEL_READ_WRITE: Self = Self {
         user: false,
         readable: true,
         writable: true,
         executable: false,
+        uncached: false,
     };
 }
 
@@ -904,7 +911,7 @@ fn validate_mapping(page: VirtualPage, permissions: MappingPermissions) -> Resul
     if permissions.writable && permissions.executable {
         return Err(PolicyError::WritableExecutable);
     }
-    if !permissions.readable {
+    if !permissions.readable || (permissions.uncached && permissions.executable) {
         return Err(PolicyError::UnsupportedPermission);
     }
     Ok(())
@@ -923,6 +930,11 @@ fn leaf_entry(frame: FrameAddress, permissions: MappingPermissions) -> u64 {
             0
         } else {
             NO_EXECUTE
+        }
+        | if permissions.uncached {
+            WRITE_THROUGH | CACHE_DISABLE
+        } else {
+            0
         }
 }
 

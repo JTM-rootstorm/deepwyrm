@@ -12,6 +12,7 @@ pub(crate) mod frame_roles {
     pub(crate) enum ObjectBackingKind {
         AllocatorOwned,
         ImmutableModule { module_index: u32 },
+        DeviceMmio,
     }
 
     #[derive(Debug, Eq, PartialEq)]

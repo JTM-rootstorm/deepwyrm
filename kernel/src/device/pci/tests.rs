@@ -358,3 +358,76 @@ fn bus_mastering_is_refused_without_dma_remapping_but_can_be_cleared() {
     set_command(&mut space, address, true, false, false).unwrap();
     assert_eq!(space.command(), u32::from(COMMAND_MEMORY_SPACE));
 }
+
+fn probed_virtio_blk() -> PciFunction {
+    let mut function = Function::virtio_blk();
+    probe(&mut function, ADDRESS, VIRTIO_BLK, LIMIT, |_, _| false).unwrap()
+}
+
+#[test]
+fn an_admitted_bar_backing_is_lent_once_and_taken_back() {
+    let table = PciProbeTable::new();
+    assert!(table.record(7, Ok(probed_virtio_blk())));
+    let grant = crate::memory::frame_roles::synthetic_device_mmio_backing(0xc0_0000_0000, 4);
+    table.install_bar_backing(7, 4, grant).unwrap();
+
+    let lent = table.take_bar_backing(7, 4).unwrap();
+    assert_eq!(lent.physical_start(), 0xc0_0000_0000);
+    assert_eq!(table.take_bar_backing(7, 4), Err(BarBackingError::InUse));
+    table.return_bar_backing(lent);
+    let again = table.take_bar_backing(7, 4).unwrap();
+    assert_eq!(again.byte_len(), 0x4000);
+}
+
+#[test]
+fn only_admitted_memory_bars_of_recorded_functions_have_backing() {
+    let table = PciProbeTable::new();
+    assert!(table.record(7, Ok(probed_virtio_blk())));
+    assert!(table.record(8, Err(PciProbeError::Absent)));
+    // BAR1 is admitted but was given no backing; BAR5 is BAR4's upper half;
+    // there is no BAR 6; resource 9 was never recorded.
+    for (resource, bar) in [(7, 1), (7, 5), (7, 6), (7, u32::MAX), (8, 4), (9, 4)] {
+        assert_eq!(
+            table.take_bar_backing(resource, bar),
+            Err(BarBackingError::NotFound),
+            "resource {resource} BAR {bar}"
+        );
+    }
+}
+
+#[test]
+fn a_backing_must_match_its_admitted_bar_exactly_and_only_once() {
+    let table = PciProbeTable::new();
+    assert!(table.record(7, Ok(probed_virtio_blk())));
+    assert!(table.record(8, Err(PciProbeError::Absent)));
+    let synthetic = crate::memory::frame_roles::synthetic_device_mmio_backing;
+    // Wrong base, wrong size, a non-memory slot, and a failed probe.
+    assert!(
+        table
+            .install_bar_backing(7, 4, synthetic(0xc0_0000_1000, 4))
+            .is_err()
+    );
+    assert!(
+        table
+            .install_bar_backing(7, 4, synthetic(0xc0_0000_0000, 2))
+            .is_err()
+    );
+    assert!(
+        table
+            .install_bar_backing(7, 5, synthetic(0xc0_0000_0000, 4))
+            .is_err()
+    );
+    assert!(
+        table
+            .install_bar_backing(8, 4, synthetic(0xc0_0000_0000, 4))
+            .is_err()
+    );
+    table
+        .install_bar_backing(7, 4, synthetic(0xc0_0000_0000, 4))
+        .unwrap();
+    assert!(
+        table
+            .install_bar_backing(7, 4, synthetic(0xc0_0000_0000, 4))
+            .is_err()
+    );
+}

@@ -73,3 +73,29 @@ pub(crate) fn synthetic_immutable_module_backing(
     unsafe { roles.import_immutable_module(range, module_index) }
         .expect("test immutable module role commits")
 }
+
+#[cfg(test)]
+#[allow(
+    unsafe_code,
+    reason = "the synthetic model helper supplies BAR provenance without physical access"
+)]
+pub(crate) fn synthetic_device_mmio_backing(
+    physical_start: u64,
+    page_count: u64,
+) -> ObjectBackingGrant {
+    use super::super::physical::PhysicalAddressLimit;
+
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).expect("test physical limit is valid");
+    let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 1, limit)
+        .expect("test allocator range is valid");
+    let allocator = PhysicalFrameAllocator::<1>::from_candidates(&[candidate], limit, [])
+        .expect("test allocator initializes");
+    let mut roles =
+        FrameRoleManager::<1, 1>::new(allocator).expect("test role manager initializes");
+    let byte_len = page_count
+        .checked_mul(BASE_PAGE_SIZE)
+        .expect("test BAR length is valid");
+    let range = PhysicalRange::new(physical_start, byte_len).expect("test BAR range is valid");
+    // SAFETY: a metadata-only host model with a synthetic BAR.
+    unsafe { roles.import_device_mmio(range) }.expect("test device-MMIO role commits")
+}

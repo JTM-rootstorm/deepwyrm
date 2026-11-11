@@ -60,13 +60,15 @@ New syscalls in the device family:
 |---|---:|---|---|
 | `device_pci_config_read` | `0x00060020` | `DEVICE_RESOURCE:READ` | width 1, 2 or 4 at an aligned offset < 256 |
 | `device_pci_command` | `0x00060021` | `DEVICE_RESOURCE:WRITE` | sets the memory-space and bus-master bits to the two given booleans (each 0 or 1); every other command bit is preserved; I/O-space decoding is always cleared. Setting bus mastering fails with `DW_STATUS_NOT_SUPPORTED` unless a VT-d unit with INCLUDE_PCI_ALL is in default deny, since without one the device could reach any physical address; clearing it always succeeds |
-| `device_mmio_map` | `0x00060022` | `DEVICE_RESOURCE:MAP` | maps `[offset, offset+length)` of BAR `bar` (page-aligned, inside the BAR) into an AddressRegion the caller can map into, with read/write rights only, uncached, never executable |
+| `device_mmio_object_create` | `0x00060022` | `DEVICE_RESOURCE:MAP` | creates a MemoryObject over one whole admitted memory BAR; the caller maps it with the ordinary `address_region_map`. Its ceiling is read/write, so it is never executable, and its pages map strong-uncacheable. Requested rights exclude EXECUTE. A slot that is not an admitted memory BAR is `NOT_FOUND`; a BAR another live object covers is `ALREADY_EXISTS` |
 | `dma_map` | `0x00060023` | `DEVICE_RESOURCE:MODIFY` plus `MEMORY_OBJECT:READ` (and `WRITE` for a device-writable mapping) | maps pages of a MemoryObject into the function's IOMMU domain; returns the IOVA |
 | `dma_unmap` | `0x00060024` | `DEVICE_RESOURCE:MODIFY` | removes a mapping by IOVA and length, then invalidates the IOTLB before returning |
 
-`device_mmio_map` installs a mapping whose backing is a new `ObjectBackingKind::DeviceMmio` range: frames outside the allocator, like the existing immutable-module backing, mapped with PCD|PWT. It holds a reference on the DeviceResource, so the BAR cannot be handed to a new lease while it is mapped.
+At boot, after K1 admits a BAR, the kernel gives its pages a permanent `ExternalDeviceMmio` frame role (outside the allocator, like immutable modules) and keeps the backing grant in the PCI probe table. `device_mmio_object_create` lends that grant to one `DeviceMmio` MemoryObject, which also holds a reference on the DeviceResource. When the object finalizes (its last handle and mapping gone), the grant returns to the table and only then is the DeviceResource reference released, so a new lease never sees a BAR an older object still names. Leaves for these objects carry PCD|PWT with PAT clear, which selects the boot PAT's PA3 (UC).
 
-`device_mmio_map` uses the existing generic `MAP` right (0x8), which `object_rights.toml` adds to `DEVICE_RESOURCE`'s admitted rights. A driver that should only read config space can be handed a resource without it.
+This replaces the earlier `device_mmio_map(resource, bar, offset, length, region, …)` design (2026-11-11): returning a MemoryObject reuses the whole map, protect, unmap and lease path instead of a second mapping path, and needs no runtime frame-role changes.
+
+`device_mmio_object_create` uses the existing generic `MAP` right (0x8), which `object_rights.toml` adds to `DEVICE_RESOURCE`'s admitted rights. A driver that should only read config space can be handed a resource without it.
 
 ## 5. IOMMU domains (K4)
 

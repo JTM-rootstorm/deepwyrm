@@ -1153,3 +1153,106 @@ fn empty_replacements_and_sentinels_never_enter_lease_transitions() {
     assert!(error.into_final_releases().is_empty());
     assert_eq!(authority.active_lease_count(), 0);
 }
+
+/// A DeviceResource object whose only reference is the returned pin.
+fn device_resource_pin(registry: &mut ObjectRegistry<2>) -> InternalRef {
+    let creation = registry
+        .create(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE)
+        .unwrap();
+    registry.creation_into_internal(creation).unwrap()
+}
+
+#[test]
+fn device_mmio_objects_are_whole_bar_uncached_and_never_executable() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let parent = device_resource_pin(&mut registry);
+    let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(0xe1_0000_0000, 2);
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut authority = MemoryObjectAuthority::<2, 1>::new();
+    let binding = authority
+        .bind_device_mmio(creation, backing, parent)
+        .unwrap();
+    let key = binding.key();
+    let info = authority.object_info(key).unwrap();
+    assert_eq!(info.kind, MemoryObjectKind::DeviceMmio);
+    assert_eq!(info.logical_byte_len, 2 * PAGE_SIZE);
+    assert_eq!(info.protection_ceiling, MemoryProtection::READ_WRITE);
+    let record = authority.object_record(key).unwrap();
+    let range = object_range(record, PAGE_SIZE, PAGE_SIZE).unwrap();
+    assert!(range.uncached());
+    assert_eq!(range.physical_start(), 0xe1_0000_1000);
+    let _ = registry.finish_payload_binding(binding).unwrap();
+
+    // The generic bind path refuses an executable ceiling or a partial BAR.
+    let mut registry = ObjectRegistry::<2>::new();
+    for (ceiling, logical) in [
+        (MemoryProtection::READ_WRITE_EXECUTE, 2 * PAGE_SIZE),
+        (MemoryProtection::READ_WRITE, PAGE_SIZE),
+    ] {
+        let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(0xe2_0000_0000, 2);
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let error = authority
+            .bind_backing(
+                creation,
+                backing,
+                logical,
+                MemoryObjectKind::DeviceMmio,
+                ceiling,
+            )
+            .unwrap_err();
+        assert_eq!(error.error(), MemoryObjectError::ProtectionCeiling);
+        let (creation, _backing) = error.into_parts();
+        registry.cancel_creation(creation).unwrap();
+    }
+}
+
+#[test]
+fn a_device_mmio_parent_must_be_a_device_resource() {
+    let mut registry = ObjectRegistry::<2>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let event = registry.create(deepwyrm_abi::DW_OBJECT_TYPE_EVENT).unwrap();
+    let wrong_parent = registry.creation_into_internal(event).unwrap();
+    let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(0xe3_0000_0000, 1);
+    let mut authority = MemoryObjectAuthority::<1, 1>::new();
+    let (error, parent) = authority
+        .bind_device_mmio(creation, backing, wrong_parent)
+        .unwrap_err();
+    assert_eq!(error.error(), MemoryObjectError::ObjectReference);
+    assert_eq!(parent.object_type(), deepwyrm_abi::DW_OBJECT_TYPE_EVENT);
+    let (creation, _backing) = error.into_parts();
+    registry.cancel_creation(creation).unwrap();
+}
+
+#[test]
+fn device_mmio_finalization_returns_the_bar_then_releases_the_resource() {
+    const RESOURCE_ID: u64 = 0x6b33_0001;
+    const BAR: u64 = 0xe4_0000_0000;
+    crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(RESOURCE_ID, BAR);
+    let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 2);
+    let mut registry = ObjectRegistry::<2>::new();
+    let parent = device_resource_pin(&mut registry);
+    let parent_id = parent.id();
+    let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(BAR, 1);
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut authority = MemoryObjectAuthority::<1, 1>::new();
+    let binding = authority
+        .bind_device_mmio(creation, backing, parent)
+        .unwrap();
+    let bound = registry.finish_payload_binding(binding).unwrap();
+    let handle = registry.bound_into_handle(bound).unwrap();
+    assert!(!crate::device::pci::PCI_FUNCTIONS.bar_is_available_for_test(RESOURCE_ID));
+
+    let final_release = registry.release_handle(handle).unwrap().unwrap();
+    let finalization = authority.take_finalization(final_release).unwrap();
+    let parent_release = complete_memory_finalization(&mut registry, &mut roles, finalization)
+        .expect("the DeviceMmio object held the resource's last reference");
+    assert_eq!(parent_release.id(), parent_id);
+    assert_eq!(
+        parent_release.object_type(),
+        deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE
+    );
+    assert!(crate::device::pci::PCI_FUNCTIONS.bar_is_available_for_test(RESOURCE_ID));
+    // The memory object's slot is free again.
+    assert!(registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).is_ok());
+    let _ = parent_release;
+}

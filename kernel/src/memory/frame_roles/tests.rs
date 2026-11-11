@@ -730,3 +730,50 @@ fn kernel_image_allocator_overlap_rejects_without_allocation() {
     assert_eq!(roles.available_frames(), available);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model never dereferences synthetic BAR pages"
+)]
+fn device_mmio_imports_are_writable_permanent_and_exclusive() {
+    let mut roles = manager(0x10_000, 4);
+    let bar = PhysicalRange::new(0xc0_0000_0000, 4 * BASE_PAGE_SIZE).unwrap();
+    // SAFETY: a synthetic BAR well above the synthetic allocator range.
+    let grant = unsafe { roles.import_device_mmio(bar) }.unwrap();
+    assert_eq!(grant.physical_start(), 0xc0_0000_0000);
+    assert_eq!(grant.byte_len(), 4 * BASE_PAGE_SIZE);
+    assert_eq!(grant.kind(), ObjectBackingKind::DeviceMmio);
+    for writable in [false, true] {
+        assert_eq!(
+            roles.validate_object_backing(
+                grant.identity(),
+                grant.physical_start(),
+                grant.byte_len(),
+                writable,
+            ),
+            Ok(())
+        );
+    }
+
+    // SAFETY: each refused range is never imported.
+    let overlapping = PhysicalRange::new(0xc0_0000_3000, 2 * BASE_PAGE_SIZE).unwrap();
+    assert_eq!(
+        unsafe { roles.import_device_mmio(overlapping) }.unwrap_err(),
+        FrameRoleError::Overlap
+    );
+    let in_ram = PhysicalRange::new(0x11_000, BASE_PAGE_SIZE).unwrap();
+    assert_eq!(
+        unsafe { roles.import_device_mmio(in_ram) }.unwrap_err(),
+        FrameRoleError::ExternalAllocatorOverlap
+    );
+    let partial_page = PhysicalRange::new(0xd0_0000_0000, 0x800).unwrap();
+    assert!(unsafe { roles.import_device_mmio(partial_page) }.is_err());
+    let unaligned = PhysicalRange::new(0xd0_0000_0800, BASE_PAGE_SIZE).unwrap();
+    assert!(unsafe { roles.import_device_mmio(unaligned) }.is_err());
+
+    // The role is permanent: the grant cannot be cancelled back to anything.
+    let error = roles.cancel_object_backing(grant).unwrap_err();
+    assert_eq!(error.error(), FrameRoleError::WrongRole);
+    assert_eq!(error.into_grant().kind(), ObjectBackingKind::DeviceMmio);
+}

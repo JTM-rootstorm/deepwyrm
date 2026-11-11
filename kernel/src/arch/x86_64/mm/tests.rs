@@ -460,6 +460,7 @@ fn rejects_page_zero_half_mismatch_wx_and_unreadable_mappings() {
         readable: true,
         writable: true,
         executable: true,
+        uncached: false,
     };
     assert_eq!(
         root().map_page(&mut tables, page(), 0x5000, wx, &[]),
@@ -470,6 +471,7 @@ fn rejects_page_zero_half_mismatch_wx_and_unreadable_mappings() {
         readable: false,
         writable: false,
         executable: true,
+        uncached: false,
     };
     assert_eq!(
         root().map_page(&mut tables, page(), 0x5000, execute_only, &[]),
@@ -577,4 +579,75 @@ fn capabilities_fail_closed_without_nxe_wp_or_four_level_paging() {
         Err(AddressError::InvalidPhysicalWidth(53))
     );
     assert_eq!(root().physical_limit().exclusive(), LIMIT);
+}
+
+#[test]
+fn uncached_leaves_carry_pcd_and_pwt_and_are_never_executable() {
+    let mut tables = FakeTables::owned_root();
+    tables.mark_zero_exclusive(&[0x2000, 0x3000, 0x4000]);
+    let device = MappingPermissions {
+        uncached: true,
+        ..MappingPermissions::USER_READ_WRITE
+    };
+    root()
+        .map_page(
+            &mut tables,
+            page(),
+            0x5000,
+            device,
+            &[0x2000, 0x3000, 0x4000],
+        )
+        .unwrap();
+    let leaf = tables.entries[&(0x4000, page().index(0))];
+    assert_eq!(
+        leaf & (WRITE_THROUGH | CACHE_DISABLE),
+        WRITE_THROUGH | CACHE_DISABLE
+    );
+    assert_eq!(leaf & HUGE, 0, "PAT stays clear, selecting PA3");
+    assert_ne!(leaf & NO_EXECUTE, 0);
+
+    // A protect keeps the cache attribute.
+    root()
+        .protect_page(
+            &mut tables,
+            page(),
+            MappingPermissions {
+                uncached: true,
+                ..MappingPermissions::USER_READ_ONLY
+            },
+        )
+        .unwrap();
+    let leaf = tables.entries[&(0x4000, page().index(0))];
+    assert_eq!(
+        leaf & (WRITE_THROUGH | CACHE_DISABLE | WRITABLE),
+        WRITE_THROUGH | CACHE_DISABLE
+    );
+
+    let mut fresh = FakeTables::owned_root();
+    let executable = MappingPermissions {
+        uncached: true,
+        ..MappingPermissions::USER_READ_ONLY
+    };
+    let executable = MappingPermissions {
+        executable: true,
+        ..executable
+    };
+    assert_eq!(
+        root().map_page(&mut fresh, page(), 0x5000, executable, &[]),
+        Err(MapError::UnsupportedPermission)
+    );
+
+    let mut cached = FakeTables::owned_root();
+    cached.mark_zero_exclusive(&[0x2000, 0x3000, 0x4000]);
+    root()
+        .map_page(
+            &mut cached,
+            page(),
+            0x5000,
+            MappingPermissions::USER_READ_WRITE,
+            &[0x2000, 0x3000, 0x4000],
+        )
+        .unwrap();
+    let leaf = cached.entries[&(0x4000, page().index(0))];
+    assert_eq!(leaf & (WRITE_THROUGH | CACHE_DISABLE), 0);
 }

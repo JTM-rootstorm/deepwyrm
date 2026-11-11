@@ -28,7 +28,8 @@ mod manager;
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::{
-    synthetic_allocator_backing, synthetic_frame_role_manager, synthetic_immutable_module_backing,
+    synthetic_allocator_backing, synthetic_device_mmio_backing, synthetic_frame_role_manager,
+    synthetic_immutable_module_backing,
 };
 
 static NEXT_MANAGER_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -191,7 +192,12 @@ impl TableIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectBackingKind {
     AllocatorOwned,
-    ImmutableModule { module_index: u32 },
+    ImmutableModule {
+        module_index: u32,
+    },
+    /// One admitted PCI memory BAR: device registers outside the allocator,
+    /// never RAM, mapped uncached and never executable.
+    DeviceMmio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +244,7 @@ pub(crate) enum FrameRoleKind {
     ExternalImmutableModule {
         module_index: u32,
     },
+    ExternalDeviceMmio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,13 +266,14 @@ enum FrameRole {
     ExternalImmutableModule {
         module_index: u32,
     },
+    ExternalDeviceMmio,
 }
 
 impl FrameRole {
     const fn is_dynamic(self) -> bool {
         !matches!(
             self,
-            Self::External(_) | Self::ExternalImmutableModule { .. }
+            Self::External(_) | Self::ExternalImmutableModule { .. } | Self::ExternalDeviceMmio
         )
     }
 
@@ -285,6 +293,7 @@ impl FrameRole {
             Self::ExternalImmutableModule { module_index } => {
                 FrameRoleKind::ExternalImmutableModule { module_index }
             }
+            Self::ExternalDeviceMmio => FrameRoleKind::ExternalDeviceMmio,
         }
     }
 }

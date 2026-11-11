@@ -881,6 +881,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 [Some((out_value, 4, 4)), None, None]
             }
             NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => handle(out_interrupt),
+            NativeSyscallRequest::DeviceMmioObjectCreate {
+                out_memory_object, ..
+            } => handle(out_memory_object),
             NativeSyscallRequest::EventCreate { out_event, .. } => handle(out_event),
             NativeSyscallRequest::TimerCreate { out_timer, .. } => handle(out_timer),
             NativeSyscallRequest::ChannelCreate {
@@ -7656,6 +7659,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     out_value,
                 )
             }
+            NativeSyscallRequest::DeviceMmioObjectCreate {
+                resource,
+                bar,
+                requested_rights,
+                out_memory_object,
+            } => crate::syscall::device_mmio_object_create(
+                user,
+                &mut self.core.registry,
+                &mut self.core.memory,
+                &mut self.core.tasks,
+                &self.core.shared.device_resources,
+                process,
+                resource,
+                bar,
+                requested_rights,
+                out_memory_object,
+                &mut self.core.cleanup,
+            ),
             NativeSyscallRequest::DevicePciConfigRead {
                 resource,
                 offset,
@@ -8146,6 +8167,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | NativeSyscallRequest::DeviceResourceClaim { .. }
             | NativeSyscallRequest::DevicePioRead { .. }
             | NativeSyscallRequest::DevicePciConfigRead { .. }
+            | NativeSyscallRequest::DeviceMmioObjectCreate { .. }
             | NativeSyscallRequest::InterruptCreate { .. }
             | NativeSyscallRequest::MemoryObjectCreate { .. }
             | NativeSyscallRequest::ObjectGetInfoV1 { .. } => {

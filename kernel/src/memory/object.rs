@@ -148,6 +148,9 @@ pub(crate) struct MemoryObjectFinalization {
     final_release: FinalRelease,
     backing: ObjectBackingGrant,
     kind: MemoryObjectKind,
+    /// DeviceMmio only: the DeviceResource the BAR belongs to, kept alive for
+    /// as long as this object (and so any mapping of it) exists.
+    parent: Option<InternalRef>,
 }
 
 impl MemoryObjectFinalization {
@@ -156,6 +159,10 @@ impl MemoryObjectFinalization {
     }
 
     pub(crate) fn into_parts(self) -> (FinalRelease, ObjectBackingGrant) {
+        assert!(
+            self.parent.is_none(),
+            "a DeviceMmio MemoryObject must finalize through complete_memory_finalization"
+        );
         (self.final_release, self.backing)
     }
 
@@ -199,9 +206,19 @@ pub(crate) fn complete_memory_finalization<
     registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
     roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     finalization: MemoryObjectFinalization,
-) {
-    let kind = finalization.kind;
-    let (final_release, backing) = finalization.into_parts();
+) -> Option<FinalRelease> {
+    let MemoryObjectFinalization {
+        final_release,
+        backing,
+        kind,
+        parent,
+    } = finalization;
+    assert_eq!(
+        parent.is_some(),
+        kind == MemoryObjectKind::DeviceMmio,
+        "exactly the DeviceMmio objects hold a parent reference"
+    );
+    let mut parent_release = None;
     match (kind, backing.kind()) {
         (MemoryObjectKind::PageBacked, ObjectBackingKind::AllocatorOwned) => {
             if let Err(error) = roles.cancel_object_backing(backing) {
@@ -216,6 +233,21 @@ pub(crate) fn complete_memory_finalization<
             // the logical MemoryObject payload.
             let _retired_immutable_backing = backing;
         }
+        (MemoryObjectKind::DeviceMmio, ObjectBackingKind::DeviceMmio) => {
+            // The BAR's role is permanent; the grant goes back to the probe
+            // table so a later object can be made over the same BAR. Only
+            // then is the DeviceResource let go, so a new lease never sees a
+            // BAR that an older object still names.
+            crate::device::pci::PCI_FUNCTIONS.return_bar_backing(backing);
+            let parent =
+                parent.expect("a DeviceMmio MemoryObject lost its DeviceResource reference");
+            parent_release = registry.release_internal(parent).unwrap_or_else(|failure| {
+                panic!(
+                    "DeviceMmio finalization lost its DeviceResource reference: {:?}",
+                    failure.error()
+                )
+            });
+        }
         _ => panic!("MemoryObject payload/backing kind diverged before finalization"),
     }
     let cleanup = MemoryObjectCleanup { final_release };
@@ -224,6 +256,7 @@ pub(crate) fn complete_memory_finalization<
             "generic MemoryObject finalization became invalid after typed backing cleanup: {error:?}"
         );
     }
+    parent_release
 }
 
 /// A permission set used both as an object-wide protection ceiling and as one
@@ -289,6 +322,8 @@ pub(crate) enum MemoryObjectKind {
         reason = "bootfs integration constructs immutable module objects after the DW0-C model gate"
     )]
     ImmutableBootModule,
+    /// One whole PCI memory BAR (storage K3).
+    DeviceMmio,
 }
 
 /// Opaque authority-issued identity for one page-backed object.
@@ -466,6 +501,8 @@ pub(crate) struct MemoryObjectRange {
     physical_start: u64,
     object_offset: u64,
     byte_len: u64,
+    /// Device registers: mapped strong-uncacheable (PCD|PWT).
+    uncached: bool,
 }
 
 impl MemoryObjectRange {
@@ -474,6 +511,7 @@ impl MemoryObjectRange {
         physical_start: 0,
         object_offset: 0,
         byte_len: 0,
+        uncached: false,
     };
 
     #[allow(
@@ -486,6 +524,10 @@ impl MemoryObjectRange {
 
     pub(crate) const fn backing_identity(self) -> BackingIdentity {
         self.backing
+    }
+
+    pub(crate) const fn uncached(self) -> bool {
+        self.uncached
     }
 
     pub(crate) const fn object_offset(self) -> u64 {
@@ -659,6 +701,8 @@ pub(crate) struct MemoryObjectAuthority<const OBJECTS: usize, const LEASES: usiz
     domain: u64,
     objects: [ObjectSlot; OBJECTS],
     backings: [Option<ObjectBackingGrant>; OBJECTS],
+    /// DeviceMmio objects' DeviceResource references, by object slot.
+    parents: [Option<InternalRef>; OBJECTS],
     leases: [LeaseSlot; LEASES],
 }
 
@@ -668,6 +712,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             domain: mint_authority_domain(),
             objects: [EMPTY_OBJECT_SLOT; OBJECTS],
             backings: core::array::from_fn(|_| None),
+            parents: core::array::from_fn(|_| None),
             leases: core::array::from_fn(|_| LeaseSlot {
                 generation: 0,
                 record: None,
@@ -713,6 +758,49 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             protection_ceiling,
         );
         Ok(MemoryObjectBinding { creation, key })
+    }
+
+    /// Binds one whole-BAR DeviceMmio object. `parent` is the DeviceResource
+    /// lookup pin, kept until the object finalizes. The ceiling is read/write:
+    /// device registers are never executable.
+    pub(crate) fn bind_device_mmio(
+        &mut self,
+        creation: CreationRef,
+        backing: ObjectBackingGrant,
+        parent: InternalRef,
+    ) -> Result<MemoryObjectBinding, (MemoryObjectBindError, InternalRef)> {
+        if parent.object_type() != deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE {
+            return Err((
+                MemoryObjectBindError {
+                    error: MemoryObjectError::ObjectReference,
+                    creation,
+                    backing,
+                },
+                parent,
+            ));
+        }
+        let byte_len = backing.byte_len();
+        let slot = match self.bind_backing(
+            creation,
+            backing,
+            byte_len,
+            MemoryObjectKind::DeviceMmio,
+            MemoryProtection::READ_WRITE,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return Err((error, parent)),
+        };
+        let index = self
+            .objects
+            .iter()
+            .position(|object| {
+                object
+                    .record
+                    .is_some_and(|record| Some(record.object) == slot.key.object)
+            })
+            .expect("a fresh DeviceMmio binding has a slot");
+        self.parents[index] = Some(parent);
+        Ok(slot)
     }
 
     /// Test-support compatibility path. Production payload-bearing construction
@@ -824,11 +912,17 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             ) | (
                 MemoryObjectKind::ImmutableBootModule,
                 ObjectBackingKind::ImmutableModule { .. }
-            )
+            ) | (MemoryObjectKind::DeviceMmio, ObjectBackingKind::DeviceMmio)
         ) {
             return Err(MemoryObjectError::BackingKind);
         }
         if matches!(kind, MemoryObjectKind::ImmutableBootModule) && protection_ceiling.writable() {
+            return Err(MemoryObjectError::ProtectionCeiling);
+        }
+        // Device registers are never code, and their exact size is the BAR's.
+        if matches!(kind, MemoryObjectKind::DeviceMmio)
+            && (protection_ceiling.executable() || logical_byte_len != backing_len)
+        {
             return Err(MemoryObjectError::ProtectionCeiling);
         }
         let slot = self
@@ -927,6 +1021,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             final_release,
             backing,
             kind: record.kind,
+            parent: self.parents[slot].take(),
         })
     }
 
@@ -1115,6 +1210,7 @@ fn object_range(
         physical_start,
         object_offset,
         byte_len,
+        uncached: matches!(object.kind, MemoryObjectKind::DeviceMmio),
     })
 }
 

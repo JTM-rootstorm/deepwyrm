@@ -442,6 +442,29 @@ pub fn device_pci_command(resource: DwHandle, memory_space: bool, bus_master: bo
     }
 }
 
+/// Create a MemoryObject over one whole admitted memory BAR of a PCI_FUNCTION
+/// resource; map it with `address_region_map`.
+#[inline]
+pub fn device_mmio_object_create(
+    resource: DwHandle,
+    bar: u32,
+    requested_rights: DwRights,
+    out_memory_object: &mut DwHandle,
+) -> DwStatus {
+    // SAFETY: scalar ABI values are copied and the output remains uniquely borrowed.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DEVICE_MMIO_OBJECT_CREATE,
+            resource.0,
+            u64::from(bar),
+            requested_rights.0,
+            output_address(out_memory_object),
+            0,
+            0,
+        )
+    }
+}
+
 /// Write one checked scalar value to a DeviceResource PIO range.
 #[inline]
 pub fn device_pio_write(resource: DwHandle, offset: u32, width: u32, value: u32) -> DwStatus {

@@ -568,6 +568,29 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 if !device::pci::PCI_FUNCTIONS.record(descriptor.resource_id, result) {
                     panic!("PCI probe table rejected a validated boot record");
                 }
+                // Storage K3: each admitted memory BAR gets its permanent
+                // device-MMIO role now, before any process exists.
+                if let Ok(function) = result {
+                    for bar in 0..device::pci::BAR_COUNT {
+                        let Some(device::pci::BarSlot::Admitted(admitted)) = function.bar(bar)
+                        else {
+                            continue;
+                        };
+                        // SAFETY: `probe` just sized and admitted this BAR.
+                        let grant = unsafe {
+                            active_paging.import_device_mmio(admitted.base(), admitted.size())
+                        }
+                        .unwrap_or_else(|error| {
+                            panic!("admitted PCI BAR could not get a device-MMIO role: {error:?}")
+                        });
+                        if device::pci::PCI_FUNCTIONS
+                            .install_bar_backing(descriptor.resource_id, bar, grant)
+                            .is_err()
+                        {
+                            panic!("PCI probe table rejected an admitted BAR's backing");
+                        }
+                    }
+                }
             }
         }
         arch::x86_64::smp::configure_live_cpu_registry(&cpu_topology)

@@ -370,7 +370,7 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 /* Compatible rights for the INTERRUPT object type. */
 #define DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT ((DwRights)(912))
 /* Compatible rights for the DEVICE_RESOURCE object type. */
-#define DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE ((DwRights)(963))
+#define DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE ((DwRights)(971))
 
 static inline DwRights dw_object_compatible_rights(DwObjectType object_type) {
     switch (object_type) {
@@ -700,6 +700,8 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_SYSCALL_DEVICE_PCI_CONFIG_READ ((DwSyscallId)(UINT32_C(0x00060020)))
 /* Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 1 values, preserving other bits and always clearing I/O-space decoding; bus mastering needs DMA remapping covering the function. */
 #define DW_SYSCALL_DEVICE_PCI_COMMAND ((DwSyscallId)(UINT32_C(0x00060021)))
+/* Create a MemoryObject over one whole admitted memory BAR of a live PCI_FUNCTION DeviceResource, for mapping with address_region_map. Its protection ceiling is READ+WRITE, so it is never executable, and its pages are mapped strong-uncacheable. The object keeps the DeviceResource alive until it finalizes. A BAR slot that is not an admitted memory BAR is NOT_FOUND; a BAR another live object already covers is ALREADY_EXISTS; requested_rights must be nonzero, MEMORY_OBJECT-compatible, and exclude EXECUTE. */
+#define DW_SYSCALL_DEVICE_MMIO_OBJECT_CREATE ((DwSyscallId)(UINT32_C(0x00060022)))
 
 /* One normalized physical memory-map entry. */
 typedef struct DwBootMemoryRangeV1 {

@@ -36,7 +36,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_OBJECT_TYPE_EVENT` | `DW_OBJECT_COMPATIBLE_RIGHTS_EVENT` | `DW_RIGHT_WAIT + DW_RIGHT_SIGNAL + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `496` |
 | `DW_OBJECT_TYPE_TIMER` | `DW_OBJECT_COMPATIBLE_RIGHTS_TIMER` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `976` |
 | `DW_OBJECT_TYPE_INTERRUPT` | `DW_OBJECT_COMPATIBLE_RIGHTS_INTERRUPT` | `DW_RIGHT_WAIT + DW_RIGHT_MODIFY + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `912` |
-| `DW_OBJECT_TYPE_DEVICE_RESOURCE` | `DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `963` |
+| `DW_OBJECT_TYPE_DEVICE_RESOURCE` | `DW_OBJECT_COMPATIBLE_RIGHTS_DEVICE_RESOURCE` | `DW_RIGHT_READ + DW_RIGHT_WRITE + DW_RIGHT_MAP + DW_RIGHT_MODIFY + DW_RIGHT_DUPLICATE + DW_RIGHT_TRANSFER + DW_RIGHT_INSPECT` | `971` |
 
 ## Object-signal compatibility
 
@@ -1041,3 +1041,14 @@ Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 
 | `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | WRITE |
 | `RSI` | `memory_space` | `u32` | in | NONE | NONE |
 | `RDX` | `bus_master` | `u32` | in | NONE | NONE |
+
+### `0x00060022` `device_mmio_object_create` (DW2-S)
+
+Create a MemoryObject over one whole admitted memory BAR of a live PCI_FUNCTION DeviceResource, for mapping with address_region_map. Its protection ceiling is READ+WRITE, so it is never executable, and its pages are mapped strong-uncacheable. The object keeps the DeviceResource alive until it finalizes. A BAR slot that is not an admitted memory BAR is NOT_FOUND; a BAR another live object already covers is ALREADY_EXISTS; requested_rights must be nonzero, MEMORY_OBJECT-compatible, and exclude EXECUTE.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | MAP |
+| `RSI` | `bar` | `u32` | in | NONE | NONE |
+| `RDX` | `requested_rights` | `DwRights` | in | NONE | NONE |
+| `R10` | `out_memory_object` | `DwUserAddress` | out | NONE | NONE |

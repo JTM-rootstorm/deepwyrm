@@ -238,6 +238,12 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         implementation_phase: "DW2-S",
         argument_count: 3,
     },
+    DwSyscallDispatchMetadata {
+        number: 0x00060022,
+        name: "device_mmio_object_create",
+        implementation_phase: "DW2-S",
+        argument_count: 4,
+    },
 ];
 
 pub const DW_UNKNOWN_SYSCALL_STATUS_NAME: &str = "NOT_SUPPORTED";

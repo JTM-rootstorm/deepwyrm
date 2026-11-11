@@ -7,6 +7,8 @@
 //! the CPU's physical limit, and clear of every memory-map range that is not
 //! MMIO. Nothing here depends on the device's class or driver.
 
+use crate::memory::frame_roles::{ObjectBackingGrant, ObjectBackingKind};
+
 /// Standard configuration-space registers.
 const REG_IDS: u8 = 0x00;
 const REG_COMMAND: u8 = 0x04;
@@ -343,19 +345,44 @@ pub(crate) fn dma_confined() -> bool {
 
 /// The boot-time probe result for each `PCI_FUNCTION` record, by resource ID.
 /// Written once by the BSP before any process exists; read by claims.
+///
+/// Each admitted memory BAR also owns one permanent device-MMIO backing
+/// grant (storage K3). `device_mmio_object_create` takes it for the life of
+/// one MemoryObject and finalization returns it, so at most one object names a
+/// BAR at a time.
 pub(crate) struct PciProbeTable {
     entries: crate::sync::SpinMutex<[Option<ProbeEntry>; PROBE_CAPACITY]>,
 }
 
-/// A resource ID and what its boot-time probe found.
-type ProbeEntry = (u64, Result<PciFunction, PciProbeError>);
+struct ProbeEntry {
+    resource_id: u64,
+    result: Result<PciFunction, PciProbeError>,
+    bars: [BarBacking; BAR_COUNT],
+}
+
+enum BarBacking {
+    Absent,
+    Available(ObjectBackingGrant),
+    /// Lent to a live MemoryObject over `[physical_start, ..)`.
+    Lent {
+        physical_start: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BarBackingError {
+    /// The resource was not probed, or the slot is not an admitted memory BAR.
+    NotFound,
+    /// Another MemoryObject already names this BAR.
+    InUse,
+}
 
 const PROBE_CAPACITY: usize = crate::boot::MAX_BOOT_RESOURCE_GRANTS;
 
 impl PciProbeTable {
     pub(crate) const fn new() -> Self {
         Self {
-            entries: crate::sync::SpinMutex::new([None; PROBE_CAPACITY]),
+            entries: crate::sync::SpinMutex::new([const { None }; PROBE_CAPACITY]),
         }
     }
 
@@ -365,12 +392,20 @@ impl PciProbeTable {
         result: Result<PciFunction, PciProbeError>,
     ) -> bool {
         let mut entries = self.entries.lock();
-        if entries.iter().flatten().any(|(id, _)| *id == resource_id) {
+        if entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.resource_id == resource_id)
+        {
             return false;
         }
         match entries.iter_mut().find(|entry| entry.is_none()) {
             Some(slot) => {
-                *slot = Some((resource_id, result));
+                *slot = Some(ProbeEntry {
+                    resource_id,
+                    result,
+                    bars: [const { BarBacking::Absent }; BAR_COUNT],
+                });
                 true
             }
             None => false,
@@ -383,8 +418,115 @@ impl PciProbeTable {
             .lock()
             .iter()
             .flatten()
-            .find(|(id, _)| *id == resource_id)
-            .and_then(|(_, result)| result.ok())
+            .find(|entry| entry.resource_id == resource_id)
+            .and_then(|entry| entry.result.ok())
+    }
+
+    /// Boot only: gives admitted BAR `bar` of a recorded function its backing.
+    /// The grant must cover exactly that BAR.
+    pub(crate) fn install_bar_backing(
+        &self,
+        resource_id: u64,
+        bar: usize,
+        grant: ObjectBackingGrant,
+    ) -> Result<(), ObjectBackingGrant> {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.resource_id == resource_id)
+        else {
+            return Err(grant);
+        };
+        let admitted = match entry.result {
+            Ok(function) => match function.bar(bar) {
+                Some(BarSlot::Admitted(admitted)) => admitted,
+                _ => return Err(grant),
+            },
+            Err(_) => return Err(grant),
+        };
+        if admitted.base != grant.physical_start()
+            || admitted.size != grant.byte_len()
+            || !matches!(grant.kind(), ObjectBackingKind::DeviceMmio)
+            || !matches!(entry.bars[bar], BarBacking::Absent)
+        {
+            return Err(grant);
+        }
+        entry.bars[bar] = BarBacking::Available(grant);
+        Ok(())
+    }
+
+    /// Lends BAR `bar`'s backing to one new MemoryObject.
+    pub(crate) fn take_bar_backing(
+        &self,
+        resource_id: u64,
+        bar: u32,
+    ) -> Result<ObjectBackingGrant, BarBackingError> {
+        let bar = usize::try_from(bar)
+            .ok()
+            .filter(|bar| *bar < BAR_COUNT)
+            .ok_or(BarBackingError::NotFound)?;
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.resource_id == resource_id)
+            .ok_or(BarBackingError::NotFound)?;
+        match core::mem::replace(&mut entry.bars[bar], BarBacking::Absent) {
+            BarBacking::Available(grant) => {
+                entry.bars[bar] = BarBacking::Lent {
+                    physical_start: grant.physical_start(),
+                };
+                Ok(grant)
+            }
+            lent @ BarBacking::Lent { .. } => {
+                entry.bars[bar] = lent;
+                Err(BarBackingError::InUse)
+            }
+            BarBacking::Absent => Err(BarBackingError::NotFound),
+        }
+    }
+
+    /// Takes back a grant that `take_bar_backing` lent, when its MemoryObject
+    /// finalizes or its creation rolls back.
+    pub(crate) fn return_bar_backing(&self, grant: ObjectBackingGrant) {
+        let mut entries = self.entries.lock();
+        let slot = entries
+            .iter_mut()
+            .flatten()
+            .flat_map(|entry| entry.bars.iter_mut())
+            .find(|slot| {
+                matches!(slot, BarBacking::Lent { physical_start }
+                    if *physical_start == grant.physical_start())
+            })
+            .expect("a returned device-MMIO grant was never lent");
+        *slot = BarBacking::Available(grant);
+    }
+}
+
+#[cfg(test)]
+impl PciProbeTable {
+    /// Records `resource_id` with one BAR already lent out at
+    /// `physical_start`, for tests of the code that returns it.
+    pub(crate) fn record_lent_for_test(&self, resource_id: u64, physical_start: u64) {
+        let mut entries = self.entries.lock();
+        let slot = entries
+            .iter_mut()
+            .find(|entry| entry.is_none())
+            .expect("test probe table has room");
+        let mut bars = [const { BarBacking::Absent }; BAR_COUNT];
+        bars[0] = BarBacking::Lent { physical_start };
+        *slot = Some(ProbeEntry {
+            resource_id,
+            result: Err(PciProbeError::Absent),
+            bars,
+        });
+    }
+
+    pub(crate) fn bar_is_available_for_test(&self, resource_id: u64) -> bool {
+        self.entries.lock().iter().flatten().any(|entry| {
+            entry.resource_id == resource_id && matches!(entry.bars[0], BarBacking::Available(_))
+        })
     }
 }
 
