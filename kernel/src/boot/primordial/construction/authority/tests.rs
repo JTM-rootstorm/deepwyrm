@@ -177,7 +177,9 @@ impl PrimordialPlatform for HostPlatform {
         for release in releases.into_items().into_iter().flatten() {
             let finalization = memory.take_finalization(release).unwrap();
             let physical_start = finalization.backing_physical_start();
-            complete_memory_finalization(registry, &mut self.roles, finalization);
+            assert!(
+                complete_memory_finalization(registry, &mut self.roles, finalization).is_none()
+            );
             let slot = self
                 .allocations
                 .iter()
@@ -266,7 +268,10 @@ fn finalize_known(
             DW_OBJECT_TYPE_MEMORY_OBJECT => {
                 let finalization = memory.take_finalization(release).unwrap();
                 let physical_start = finalization.backing_physical_start();
-                complete_memory_finalization(registry, &mut platform.roles, finalization);
+                assert!(
+                    complete_memory_finalization(registry, &mut platform.roles, finalization)
+                        .is_none()
+                );
                 let slot = platform
                     .allocations
                     .iter()

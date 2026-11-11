@@ -309,7 +309,7 @@ fn memory_object_info_reports_exact_logical_size() {
         .expect("last MemoryObject handle yields cleanup authority");
     let finalization = memory.take_finalization(final_release).unwrap();
     let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 1>(0x80_000, 1);
-    complete_memory_finalization(&mut registry, &mut roles, finalization);
+    assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
 }
 
 #[test]

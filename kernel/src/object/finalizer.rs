@@ -228,7 +228,11 @@ impl<
                                 failure.error()
                             )
                         });
-                complete_memory_finalization(self.registry, self.roles, finalization);
+                push_pending(
+                    pending,
+                    pending_len,
+                    complete_memory_finalization(self.registry, self.roles, finalization),
+                );
                 WakeBatch::empty()
             }
             DW_OBJECT_TYPE_ADDRESS_REGION => {
@@ -571,6 +575,88 @@ mod tests {
         assert_eq!(interrupts.live_count(), 0);
         assert_eq!(devices.live_count(), 0);
         assert!(!platform.is_bound(binding));
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "test-local AddressSpaceAuthority uniquely owns its synthetic root identities"
+    )]
+    fn device_mmio_finalization_chains_its_parent_device_resource() {
+        const RESOURCE_ID: u64 = 0x6b34_0001;
+        const BAR: u64 = 0xe5_0000_0000;
+        crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(RESOURCE_ID, BAR);
+        let mut registry = ObjectRegistry::<8>::new();
+        let mut roles = synthetic_frame_role_manager::<1, 8>(0x3a_000, 4);
+        let mut memory = MemoryObjectAuthority::<1, 1>::new();
+        let events = EventAuthority::<1>::new();
+        let timers = TimerAuthority::<1>::new();
+        let mut timer_deadlines = TestTimerDeadlines::<2>::new(0);
+        let channels = ChannelAuthority::<1, 2>::new();
+        let waits = WaitRegistry::<4>::new();
+        let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+        let mut regions = AddressRegionObjectAuthority::<1, 1>::new();
+        let (domain, _owner) = tasks.create_root_group(&mut registry).unwrap();
+        let devices = crate::device::DeviceResourceAuthority::<1>::new();
+        let mut handles = crate::handle::HandleTable::<2>::new();
+        let (_, resource) = devices
+            .create(
+                &mut registry,
+                &mut handles,
+                crate::device::DeviceResourceDescriptor {
+                    resource_id: RESOURCE_ID,
+                    lease_generation: 1,
+                    kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+                    pio_base: 0x2f8,
+                    pio_length: 8,
+                    interrupt_source: 3,
+                    pci_address: 0,
+                    pci_ids: 0,
+                    resource_domain: domain,
+                },
+                deepwyrm_abi::DW_RIGHT_MAP,
+            )
+            .unwrap();
+        let parent = handles
+            .lookup(
+                &mut registry,
+                resource,
+                crate::handle::AcceptedObjectTypes::One(
+                    deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE,
+                ),
+                deepwyrm_abi::DW_RIGHT_MAP,
+            )
+            .unwrap()
+            .into_internal();
+        let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(BAR, 1);
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        let binding = memory.bind_device_mmio(creation, backing, parent).unwrap();
+        let bound = registry.finish_payload_binding(binding).unwrap();
+        let object = registry.bound_into_handle(bound).unwrap();
+
+        // The resource handle goes first, so the BAR object holds its last
+        // reference; closing the object must finalize both.
+        assert!(handles.close(&mut registry, resource).unwrap().is_none());
+        assert_eq!(devices.live_count(), 1);
+        let first = registry.release_handle(object).unwrap().unwrap();
+        let mut finalizer = PayloadFinalizer::new(
+            &mut registry,
+            &mut roles,
+            &mut memory,
+            &events,
+            &timers,
+            &mut timer_deadlines,
+            &channels,
+            &waits,
+            &mut tasks,
+            &mut spaces,
+            &mut regions,
+        )
+        .with_device_resources(&devices);
+        assert_eq!(finalizer.finalize_chain(first).len(), 0);
+        assert_eq!(devices.live_count(), 0);
+        assert!(crate::device::pci::PCI_FUNCTIONS.bar_is_available_for_test(RESOURCE_ID));
     }
 
     #[test]

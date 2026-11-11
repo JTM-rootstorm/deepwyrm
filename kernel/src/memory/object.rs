@@ -198,6 +198,7 @@ impl MemoryObjectCleanup {
 }
 
 #[cfg(deepwyrm_integrated)]
+#[must_use = "a DeviceMmio object's parent release must be finalized, not dropped"]
 pub(crate) fn complete_memory_finalization<
     const REGISTRY_OBJECTS: usize,
     const RANGE_CAPACITY: usize,

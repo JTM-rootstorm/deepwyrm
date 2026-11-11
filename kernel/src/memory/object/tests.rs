@@ -130,7 +130,7 @@ fn complete_memory_release(
     final_release: FinalRelease,
 ) {
     let finalization = authority.take_finalization(final_release).unwrap();
-    complete_memory_finalization(registry, roles, finalization);
+    assert!(complete_memory_finalization(registry, roles, finalization).is_none());
 }
 
 #[test]
@@ -717,7 +717,7 @@ fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
         .unwrap();
     let final_release = only_final(prepared.commit());
     let finalization = authority.take_finalization(final_release).unwrap();
-    complete_memory_finalization(&mut registry, &mut roles, finalization);
+    assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
     let recycled = roles.allocate(1).unwrap();
     assert_eq!(recycled.physical_start(), physical_start);
 }
@@ -837,7 +837,7 @@ fn failed_mapping_preparation_drops_last_authorization_pin() {
     assert_eq!(error.error(), MemoryObjectError::Unaligned);
     let final_release = only_final(error.into_final_releases());
     let finalization = authority.take_finalization(final_release).unwrap();
-    complete_memory_finalization(&mut registry, &mut roles, finalization);
+    assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
     let recycled = roles.allocate(1).unwrap();
     assert_eq!(recycled.physical_start(), physical_start);
 }
@@ -956,7 +956,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
     let final_release = only_final(prepared.commit());
     assert_eq!(authority.active_lease_count(), 0);
     let finalization = authority.take_finalization(final_release).unwrap();
-    complete_memory_finalization(&mut registry, &mut roles, finalization);
+    assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
     assert!(registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).is_ok());
 }
 
@@ -1052,7 +1052,7 @@ fn allocator_backing_is_reclaimed_only_through_typed_finalization() {
         authority.object_info(key),
         Err(MemoryObjectError::InvalidObjectKey)
     );
-    complete_memory_finalization(&mut registry, &mut roles, finalization);
+    assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
 
     let recycled = roles.allocate(1).unwrap();
     assert_eq!(recycled.physical_start(), physical_start);
@@ -1076,7 +1076,7 @@ fn immutable_backing_retires_logically_without_allocator_reclamation() {
         .unwrap();
     let final_release = registry.release_creation(creation).unwrap().unwrap();
     let finalization = authority.take_finalization(final_release).unwrap();
-    complete_memory_finalization(&mut registry, &mut roles, finalization);
+    assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
 
     assert!(registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).is_ok());
     assert_eq!(roles.allocate(2).unwrap().byte_len(), PAGE_SIZE * 2);

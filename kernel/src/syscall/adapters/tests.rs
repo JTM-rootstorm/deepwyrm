@@ -2184,10 +2184,13 @@ fn memory_object_create_preflights_output_before_backing_allocation() {
     );
     while let Some(release) = cleanup.pop() {
         let finalization = memory.take_finalization(release).unwrap();
-        crate::memory::object::complete_memory_finalization(
-            &mut registry,
-            &mut backing.roles,
-            finalization,
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut backing.roles,
+                finalization,
+            )
+            .is_none()
         );
     }
     let mut final_cleanup = CleanupQueue::<16>::new();
@@ -2506,10 +2509,13 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     );
     while let Some(release) = cleanup.pop() {
         let finalization = memory.take_finalization(release).unwrap();
-        crate::memory::object::complete_memory_finalization(
-            &mut registry,
-            &mut backing.roles,
-            finalization,
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut backing.roles,
+                finalization,
+            )
+            .is_none()
         );
     }
     let mut final_cleanup = CleanupQueue::<24>::new();
@@ -2764,10 +2770,13 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     while let Some(release) = cleanup.pop() {
         if release.object_type() == deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT {
             let finalization = memory.take_finalization(release).unwrap();
-            crate::memory::object::complete_memory_finalization(
-                &mut registry,
-                &mut backing.roles,
-                finalization,
+            assert!(
+                crate::memory::object::complete_memory_finalization(
+                    &mut registry,
+                    &mut backing.roles,
+                    finalization,
+                )
+                .is_none()
             );
         }
     }
@@ -2930,10 +2939,13 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
     );
     assert!(cleanup.is_empty());
     let finalization = memory.take_finalization(release).unwrap();
-    crate::memory::object::complete_memory_finalization(
-        &mut registry,
-        &mut backing.roles,
-        finalization,
+    assert!(
+        crate::memory::object::complete_memory_finalization(
+            &mut registry,
+            &mut backing.roles,
+            finalization,
+        )
+        .is_none()
     );
 
     // An unmerged held set fails stop. A fresh MemoryObject whose only
@@ -3966,10 +3978,13 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
             deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT
         );
         let finalization = memory.take_finalization(release).unwrap();
-        crate::memory::object::complete_memory_finalization(
-            &mut registry,
-            &mut backing.roles,
-            finalization,
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut backing.roles,
+                finalization,
+            )
+            .is_none()
         );
     }
     let root_pin = regions
@@ -11850,10 +11865,13 @@ fn a_deferred_memory_object_create_consumes_or_returns_its_early_backing() {
     );
     while let Some(release) = cleanup.pop() {
         let finalization = memory.take_finalization(release).unwrap();
-        crate::memory::object::complete_memory_finalization(
-            &mut registry,
-            &mut backing.roles,
-            finalization,
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut backing.roles,
+                finalization,
+            )
+            .is_none()
         );
     }
     let mut final_cleanup = CleanupQueue::<16>::new();
@@ -14054,10 +14072,13 @@ fn the_live_memory_object_create_path_is_limited() {
     );
     while let Some(release) = cleanup.pop() {
         let finalization = memory.take_finalization(release).unwrap();
-        crate::memory::object::complete_memory_finalization(
-            &mut registry,
-            &mut backing.roles,
-            finalization,
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut backing.roles,
+                finalization,
+            )
+            .is_none()
         );
     }
 }
