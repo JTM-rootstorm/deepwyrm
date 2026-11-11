@@ -63,6 +63,7 @@ pub(crate) struct Bus0Functions(pub(crate) [u64; 4]);
 impl Bus0Functions {
     pub(crate) const ALL: Self = Self([u64::MAX; 4]);
 
+    #[cfg(test)]
     pub(crate) const fn contains(self, devfn: u8) -> bool {
         self.0[(devfn >> 6) as usize] & (1 << (devfn & 63)) != 0
     }
@@ -88,6 +89,7 @@ impl DmarUnit {
 
     /// The unit translates every function on its segment not claimed by
     /// another unit's explicit device scope.
+    #[cfg(test)]
     pub(crate) const fn include_pci_all(self) -> bool {
         self.include_pci_all
     }
