@@ -8245,6 +8245,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             NativeSyscallRequest::ProcessExit { exit_code } => self.exit_process(exit_code),
             NativeSyscallRequest::ThreadExit { exit_code } => self.exit_thread(exit_code),
+            NativeSyscallRequest::ThreadSetFsBase { fs_base } => {
+                if !crate::arch::x86_64::user_state::is_valid_user_fs_base(fs_base) {
+                    return NativeSyscallResult::returning(deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT);
+                }
+                // SAFETY: the syscall runtime runs at CPL0 with IF clear on the CPU running the
+                // calling Thread, and the value was just checked to be lower-half canonical. The
+                // register is that Thread's own state from here on: `switch_kernel_context` saves
+                // and restores it.
+                unsafe { crate::arch::x86_64::user_state::write_current_fs_base(fs_base) };
+                NativeSyscallResult::returning(DW_STATUS_SUCCESS)
+            }
             NativeSyscallRequest::DevicePioWrite {
                 resource,
                 offset,

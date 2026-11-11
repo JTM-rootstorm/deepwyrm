@@ -95,6 +95,12 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         argument_count: 3,
     },
     DwSyscallDispatchMetadata {
+        number: 0x00010024,
+        name: "thread_set_fs_base",
+        implementation_phase: "DW2-T",
+        argument_count: 1,
+    },
+    DwSyscallDispatchMetadata {
         number: 0x00020001,
         name: "memory_object_create",
         implementation_phase: "DW0-C",

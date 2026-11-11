@@ -65,6 +65,9 @@ pub(crate) enum NativeSyscallRequest {
         args: DwUserAddress,
         args_size: u64,
     },
+    ThreadSetFsBase {
+        fs_base: u64,
+    },
     ThreadExit {
         exit_code: u32,
     },
@@ -288,6 +291,7 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
             args: DwUserAddress(a[0]),
             args_size: a[1],
         },
+        DwKnownSyscall::ThreadSetFsBase => NativeSyscallRequest::ThreadSetFsBase { fs_base: a[0] },
         DwKnownSyscall::ThreadExit => NativeSyscallRequest::ThreadExit {
             exit_code: u32_arg(a[0])?,
         },
@@ -857,6 +861,9 @@ pub(crate) trait NativeSyscallServices {
     fn interrupt_ack(&mut self, _interrupt: DwHandle) -> NativeSyscallResult {
         unsupported_f()
     }
+    fn thread_set_fs_base(&mut self, _fs_base: u64) -> NativeSyscallResult {
+        unsupported_f()
+    }
 }
 
 const fn unsupported_f() -> NativeSyscallResult {
@@ -912,6 +919,7 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 self.thread_start(args, args_size)
             }
             NativeSyscallRequest::ThreadExit { exit_code } => self.thread_exit(exit_code),
+            NativeSyscallRequest::ThreadSetFsBase { fs_base } => self.thread_set_fs_base(fs_base),
             NativeSyscallRequest::ThreadTerminate {
                 thread,
                 reason,

@@ -701,6 +701,13 @@ arg1 = "reason|DwTerminationReason|in|NONE|NONE"
 arg2 = "code|u32|in|NONE|NONE"
 
 [[syscall]]
+name = "thread_set_fs_base"
+number = 0x00010024
+phase = "DW2-T"
+doc = "Set the calling thread's FS base, its user thread pointer. fs_base must be a lower-half canonical address (below 0x0000800000000000) or DW_STATUS_INVALID_ARGUMENT is returned. The value stays with the thread across preemption and migration; a new thread starts with FS base 0. GS is never user-settable."
+arg0 = "fs_base|u64|in|NONE|NONE"
+
+[[syscall]]
 name = "memory_object_create"
 number = 0x00020001
 phase = "DW0-C"

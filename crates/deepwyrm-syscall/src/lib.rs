@@ -319,6 +319,14 @@ pub fn thread_exit(exit_code: u32) -> DwStatus {
     unsafe { syscall6(DW_SYSCALL_THREAD_EXIT, u64::from(exit_code), 0, 0, 0, 0, 0) }
 }
 
+/// Set the calling Thread's FS base (its user thread pointer). `fs_base`
+/// must be below `0x0000_8000_0000_0000`.
+#[inline]
+pub fn thread_set_fs_base(fs_base: u64) -> DwStatus {
+    // SAFETY: `fs_base` is a generated scalar ABI argument.
+    unsafe { syscall6(DW_SYSCALL_THREAD_SET_FS_BASE, fs_base, 0, 0, 0, 0, 0) }
+}
+
 /// Explicitly terminate one Thread through held `MODIFY` authority.
 #[inline]
 pub fn thread_terminate(thread: DwHandle, reason: DwTerminationReason, code: u32) -> DwStatus {

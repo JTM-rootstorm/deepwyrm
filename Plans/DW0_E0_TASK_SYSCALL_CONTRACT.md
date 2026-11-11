@@ -305,6 +305,9 @@ DW0-E deliberately does **not** use `SWAPGS`. GS remains the kernel per-CPU base
 while CPL3 executes; user page permissions prevent access to the referenced
 higher-half supervisor memory. Before entering CPL3, CR4.FSGSBASE must be clear,
 and E exposes no userspace FS/GS-base mutation API. FS/GS TLS is deferred.
+(Superseded in part: H1 moved the kernel to `SWAPGS` with a per-CPU entry
+record, and §6.6 adds a per-Thread FS base. GS stays kernel-only and
+CR4.FSGSBASE stays clear.)
 
 On syscall entry:
 
@@ -390,6 +393,42 @@ No userspace exception path may turn a kernel-origin fault into a recoverable
 process event.
 
 ---
+
+### 6.6 Per-Thread FS base and FP/SIMD state (toolchain D1, D2, 2026-11-11)
+
+Requested by `TOOLCHAIN_POSIX_LAYER_DESIGN.md` §8 (D1, D2) and decided by Mike
+on 2026-11-10 (`TOOLCHAIN_LLVM_FORK_RULES.md` O4). This replaces E's
+"FP/SIMD unavailable" (CR0.TS set) and "no user TLS" policies.
+
+- **FP/SIMD.** Every CPU runs with CR0.TS and CR0.EM clear, CR0.MP and CR0.NE
+  set, CR4.OSFXSR and CR4.OSXMMEXCPT set. The save mode is chosen by the
+  first CPU to install its syscall boundary and every other CPU must choose
+  the same one or its install fails: XSAVE with XCR0 = x87 | SSE, plus AVX when
+  CPUID offers it (CR4.OSXSAVE set), or FXSAVE on a CPU without XSAVE (CR4.OSXSAVE
+  clear). Wider components (AVX-512, AMX, PKRU) stay out of XCR0, so a save
+  area is at most 1 KiB. A CPU without FXSR, SSE and SSE2 does not boot.
+- **The kernel stays soft-float.** No kernel code touches FP/SIMD state except
+  the two save/restore functions (`arch/x86_64/user_state.rs`), so the FP
+  registers a CPU holds always belong to the user Thread that last ran there.
+- **Save point.** A Thread saves its FP state (into a 64-byte-aligned area in
+  its own kernel-stack frame) and its FS base immediately before
+  `switch_kernel_context` switches away, and restores both when that frame
+  resumes, on whatever CPU it resumes. Every switch between Threads goes
+  through that function, so preemption, blocking and migration preserve the
+  state. A Thread that has never run enters CPL3 with the architectural
+  initial FP state (FCW 0x037F, MXCSR 0x1F80, every register zero) and FS base 0,
+  so nothing leaks from the previous Thread on that CPU. Interrupts and
+  IPIs that do not switch Threads leave the registers alone.
+- **FS base.** `thread_set_fs_base(fs_base)` (0x00010024, phase DW2-T) sets the
+  calling Thread's FS base to any lower-half canonical value
+  (`< 0x0000_8000_0000_0000`), otherwise `INVALID_ARGUMENT`. It acts only on
+  the caller, so it needs no handle or right. The boundary's MSR verification
+  no longer checks IA32_FS_BASE, which is user state like a GPR. A user
+  `mov fs, <selector>` can still reload the base from the GDT (to 0); that
+  only affects the Thread itself.
+- **Faults.** #NM cannot occur and stays process-fatal; unmasked x87 (#MF) and
+  SIMD (#XM) exceptions are process-fatal like every other user exception
+  (§2.1).
 
 ## 7. Syscall adapters preserve D/C business boundaries
 Generated syscall IDs/register metadata are the dispatch source of truth. E does

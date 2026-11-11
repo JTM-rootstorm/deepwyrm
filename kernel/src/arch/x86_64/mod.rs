@@ -50,6 +50,11 @@ pub(crate) mod rendezvous;
 pub(crate) mod smp;
 pub(crate) mod syscall;
 pub mod tss;
+#[cfg_attr(
+    not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+    allow(dead_code, reason = "only the live kernel and host tests use user FP and FS state")
+)]
+pub(crate) mod user_state;
 // The table and invalidation logic is shared with `device::dma`, which the
 // host library also builds; only the live bring-up is target-gated.
 #[cfg_attr(

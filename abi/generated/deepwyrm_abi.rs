@@ -804,6 +804,9 @@ pub const DW_SYSCALL_THREAD_EXIT: DwSyscallId = DwSyscallId(0x00010022);
 /// Explicitly terminate a thread. In DW0-E reason must be DW_TERMINATION_AUTHORIZED and code is recorded as termination detail, not application exit code.
 pub const DW_SYSCALL_THREAD_TERMINATE: DwSyscallId = DwSyscallId(0x00010023);
 
+/// Set the calling thread's FS base, its user thread pointer. fs_base must be a lower-half canonical address (below 0x0000800000000000) or DW_STATUS_INVALID_ARGUMENT is returned. The value stays with the thread across preemption and migration; a new thread starts with FS base 0. GS is never user-settable.
+pub const DW_SYSCALL_THREAD_SET_FS_BASE: DwSyscallId = DwSyscallId(0x00010024);
+
 /// Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.
 pub const DW_SYSCALL_MEMORY_OBJECT_CREATE: DwSyscallId = DwSyscallId(0x00020001);
 
@@ -2018,6 +2021,7 @@ mod generated_layout_tests {
         assert_eq!(DW_SYSCALL_THREAD_START.0, 0x00010021);
         assert_eq!(DW_SYSCALL_THREAD_EXIT.0, 0x00010022);
         assert_eq!(DW_SYSCALL_THREAD_TERMINATE.0, 0x00010023);
+        assert_eq!(DW_SYSCALL_THREAD_SET_FS_BASE.0, 0x00010024);
         assert_eq!(DW_SYSCALL_MEMORY_OBJECT_CREATE.0, 0x00020001);
         assert_eq!(DW_SYSCALL_ADDRESS_REGION_MAP.0, 0x00020010);
         assert_eq!(DW_SYSCALL_ADDRESS_REGION_UNMAP.0, 0x00020011);

@@ -98,7 +98,7 @@ use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,
 };
 
-const ACTIVE_PHASE: DwSyscallImplementationPhase = DwSyscallImplementationPhase::Dw2S;
+const ACTIVE_PHASE: DwSyscallImplementationPhase = DwSyscallImplementationPhase::Dw2T;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RawSyscallArguments([u64; 6]);

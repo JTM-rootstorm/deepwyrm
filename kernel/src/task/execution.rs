@@ -50,12 +50,16 @@ pub(crate) struct GeneralPurposeRegisters {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserTlsPolicy {
-    DisabledKernelGsOnly,
+    /// FS base is the Thread's own (`thread_set_fs_base`), starting at 0; GS
+    /// stays the kernel's.
+    PerThreadFsBase,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FpSimdPolicy {
-    Unavailable,
+    /// x87/SSE/AVX state is the Thread's own, saved across every switch
+    /// (`arch::x86_64::user_state`).
+    PerThreadSaved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,8 +97,8 @@ impl SavedThreadContext {
             user_rsp: start.stack_pointer(),
             user_rflags: E3_INITIAL_USER_RFLAGS,
             startup_arguments: [start.argument0(), start.argument1()],
-            tls_policy: UserTlsPolicy::DisabledKernelGsOnly,
-            fp_simd_policy: FpSimdPolicy::Unavailable,
+            tls_policy: UserTlsPolicy::PerThreadFsBase,
+            fp_simd_policy: FpSimdPolicy::PerThreadSaved,
         }
     }
 }

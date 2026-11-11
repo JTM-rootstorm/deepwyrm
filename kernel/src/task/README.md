@@ -18,9 +18,11 @@ RUNNING, and terminal ownership are mutually exclusive scheduler states.
 
 Each runnable Thread owns one move-only kernel-stack/context pair. The saved
 context records every GPR plus user RIP/RSP/RFLAGS, keeps startup arguments
-explicit for E4 placement, fixes initial RFLAGS to `0x202`, records user TLS as
-unavailable under the E0 kernel-GS policy, and records FP/SIMD as unavailable.
-No loader register/TLS/FP state is inherited implicitly.
+explicit for E4 placement, fixes initial RFLAGS to `0x202`, and records the
+FS base and FP/SIMD state as per-Thread state the context switch saves and
+restores (`Plans/DW0_E0_TASK_SYSCALL_CONTRACT.md` §6.6). A Thread starts with
+FS base 0 and the initial FP state; no loader register/TLS/FP state is
+inherited implicitly.
 
 E3 stack/context pools use generation-tagged identities and private spin locks;
 stale identities cannot reclaim a reused slot. Terminal scheduling/resource

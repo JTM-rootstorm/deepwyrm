@@ -274,7 +274,7 @@ fn e4_live_validation_requires_strict_kernel_gs_orientation() {
     access.values.insert(IA32_KERNEL_GS_BASE, 0);
     verify(&mut access, plan).unwrap();
 
-    for msr in [IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_FS_BASE, IA32_EFER] {
+    for msr in [IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_EFER] {
         let expected = plan.expected(msr).unwrap();
         access.values.insert(msr, expected ^ 1);
         assert!(matches!(
@@ -289,20 +289,14 @@ fn e4_live_validation_requires_strict_kernel_gs_orientation() {
 }
 
 #[test]
-fn e5_cr0_normalization_sets_only_task_switched() {
-    for value in [0, u64::MAX, 0x1234_5678_9abc_def0, CR0_TASK_SWITCHED] {
-        let normalized = normalize_cr0_for_e5(value);
-        assert_ne!(normalized & CR0_TASK_SWITCHED, 0);
-        assert_eq!(normalized & !CR0_TASK_SWITCHED, value & !CR0_TASK_SWITCHED);
-    }
-}
-
-#[test]
-fn e4_cr4_normalization_clears_only_fsgsbase() {
-    for value in [0, u64::MAX, 0x1234_5678_9abc_def0, CR4_FSGSBASE] {
-        let normalized = normalize_cr4_for_e4(value);
-        assert_eq!(normalized & CR4_FSGSBASE, 0);
-        assert_eq!(normalized & !CR4_FSGSBASE, value & !CR4_FSGSBASE);
+fn a_thread_fs_base_is_user_state_not_a_boundary_invariant() {
+    let plan = SyscallMsrPlan::new(0x100, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
+    let mut access = FakeMsr::default();
+    program_and_verify(&mut access, plan).unwrap();
+    assert!(access.writes.contains(&(IA32_FS_BASE, 0)));
+    for fs_base in [0x7fff_0000_1000, 0x1000, 0] {
+        access.values.insert(IA32_FS_BASE, fs_base);
+        verify(&mut access, plan).unwrap();
     }
 }
 

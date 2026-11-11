@@ -796,6 +796,14 @@ Explicitly terminate a thread. In DW0-E reason must be DW_TERMINATION_AUTHORIZED
 | `RSI` | `reason` | `DwTerminationReason` | in | NONE | NONE |
 | `RDX` | `code` | `u32` | in | NONE | NONE |
 
+### `0x00010024` `thread_set_fs_base` (DW2-T)
+
+Set the calling thread's FS base, its user thread pointer. fs_base must be a lower-half canonical address (below 0x0000800000000000) or DW_STATUS_INVALID_ARGUMENT is returned. The value stays with the thread across preemption and migration; a new thread starts with FS base 0. GS is never user-settable.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `fs_base` | `u64` | in | NONE | NONE |
+
 ### `0x00020001` `memory_object_create` (DW0-C)
 
 Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.

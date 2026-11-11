@@ -175,10 +175,10 @@ impl ValidatedUserReturn {
 }
 
 fn validate_policies(context: SavedThreadContext) -> Result<(), UserReturnError> {
-    if context.tls_policy != UserTlsPolicy::DisabledKernelGsOnly {
+    if context.tls_policy != UserTlsPolicy::PerThreadFsBase {
         return Err(UserReturnError::UnsupportedTlsPolicy);
     }
-    if context.fp_simd_policy != FpSimdPolicy::Unavailable {
+    if context.fp_simd_policy != FpSimdPolicy::PerThreadSaved {
         return Err(UserReturnError::UnsupportedFpSimdPolicy);
     }
     Ok(())

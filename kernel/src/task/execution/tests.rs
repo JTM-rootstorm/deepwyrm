@@ -95,8 +95,8 @@ fn initial_context_is_explicit_and_does_not_invent_tls_or_fp_state() {
     assert_eq!(context.user_rsp, start.stack_pointer());
     assert_eq!(context.user_rflags, E3_INITIAL_USER_RFLAGS);
     assert_eq!(context.startup_arguments, [7, 8]);
-    assert_eq!(context.tls_policy, UserTlsPolicy::DisabledKernelGsOnly);
-    assert_eq!(context.fp_simd_policy, FpSimdPolicy::Unavailable);
+    assert_eq!(context.tls_policy, UserTlsPolicy::PerThreadFsBase);
+    assert_eq!(context.fp_simd_policy, FpSimdPolicy::PerThreadSaved);
 }
 
 #[test]

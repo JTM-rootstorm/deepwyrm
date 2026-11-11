@@ -485,20 +485,11 @@ pub(super) fn validate_entry_normalization(disassembly: &str) {
     assert_eq!(normalizer.matches("btr\trax, 0x15").count(), 1);
     assert_eq!(normalizer.matches("btr\tqword ptr [rsp], 0x12").count(), 1);
 
-    let e5_fp_policy = function_body(disassembly, "normalize_cr0_for_e5");
-    assert_eq!(e5_fp_policy.matches("or\trax, 0x8").count(), 1);
-    let e5_fp_live = function_body(disassembly, "enforce_live_fp_simd_unavailable");
-    assert_eq!(e5_fp_live.matches(", cr0").count(), 2);
-    assert_eq!(e5_fp_live.matches("mov\tcr0,").count(), 1);
-    assert_eq!(e5_fp_live.matches("normalize_cr0_for_e5").count(), 1);
-
-    let e4_policy = function_body(disassembly, "normalize_cr4_for_e4");
-    assert_eq!(e4_policy.matches("and\trax, -0x10001").count(), 1);
-    let e4_live = function_body(disassembly, "normalize_live_cr4");
-    assert_eq!(e4_live.matches("mov\trax, cr4").count(), 2);
-    assert_eq!(e4_live.matches("mov\tcr4, rax").count(), 1);
-    assert_eq!(e4_live.matches("normalize_cr4_for_e4").count(), 1);
-    assert_eq!(e4_live.matches("and\trax, 0x10000").count(), 1);
+    // D2: the user FP policy writes CR0 once and CR4 once per CPU install.
+    let fp_cr0 = function_body(disassembly, "enforce_live_user_fp_cr0");
+    assert_eq!(fp_cr0.matches("mov\tcr0,").count(), 1);
+    let fp_cr4 = function_body(disassembly, "normalize_live_cr4");
+    assert_eq!(fp_cr4.matches("mov\tcr4,").count(), 1);
     assert_eq!(disassembly.matches("mov\tcr4,").count(), 2);
 
     let entry = function_body(disassembly, "dw_kernel_rust_entry");
@@ -575,7 +566,38 @@ pub(super) fn validate_f2_kernel_context_switch(disassembly: &str) {
     }
 }
 
+/// The kernel stays soft-float (D2): FP/SIMD state instructions appear only
+/// in the two per-Thread user-state functions, and those use only the
+/// save/restore forms.
 pub(super) fn validate_fp_simd_unavailable(disassembly: &str) {
+    const USER_STATE_FUNCTIONS: &[&str] = &[
+        "dw_x86_64_user_state_save",
+        "dw_x86_64_user_state_restore",
+    ];
+    const USER_STATE_MNEMONICS: &[&str] = &["fxsave64", "fxrstor64", "xsave64", "xrstor64"];
+    let mut remainder = disassembly.to_owned();
+    for symbol in USER_STATE_FUNCTIONS {
+        let body = function_body(disassembly, symbol);
+        for line in body.lines() {
+            let instruction = line.rsplit('\t').next().unwrap_or("").trim().to_ascii_lowercase();
+            let mnemonic = instruction.split_whitespace().next().unwrap_or("");
+            assert!(
+                !["xmm", "ymm", "zmm"].iter().any(|register| instruction.contains(register)),
+                "{symbol} names SIMD registers: {line}"
+            );
+            if ["fx", "xsave", "xrstor", "ldmxcsr", "stmxcsr"]
+                .iter()
+                .any(|prefix| mnemonic.starts_with(prefix))
+            {
+                assert!(
+                    USER_STATE_MNEMONICS.contains(&mnemonic),
+                    "{symbol} uses an unexpected FP state form: {line}"
+                );
+            }
+        }
+        remainder = remainder.replacen(body, "", 1);
+    }
+    let disassembly = remainder.as_str();
     const FORBIDDEN_MNEMONICS: &[&str] = &[
         "emms", "f2xm1", "fabs", "fadd", "fbld", "fbstp", "fchs", "fclex", "fcmov", "fcom", "fcos",
         "fdecstp", "fdiv", "ffree", "fiadd", "ficom", "fidiv", "fild", "fimul", "fincstp", "finit",

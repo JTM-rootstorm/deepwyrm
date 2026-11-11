@@ -10,9 +10,12 @@ use crate::syscall::native::DivergentCarrier;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
 use super::msr::{
-    CR0_TASK_SWITCHED, CR4_FSGSBASE, IA32_EFER, SyscallMsrAccess, SyscallMsrPlan,
-    SyscallMsrPlanError, SyscallMsrProgramError, normalize_cr0_for_e5, normalize_cr4_for_e4,
+    IA32_EFER, SyscallMsrAccess, SyscallMsrPlan, SyscallMsrPlanError, SyscallMsrProgramError,
     program_and_verify, verify,
+};
+use crate::arch::x86_64::user_state::{
+    CR4_FSGSBASE, CR4_OSFXSR, FpArea, FpPolicyError, FpSaveMode, cr0_enforces_user_fp,
+    cr4_enforces_user_fp, normalize_cr0_for_user_fp, normalize_cr4_for_user_fp,
 };
 use super::runtime_binding::{
     RuntimeCarrierClaimError, RuntimeCarrierClaims, RuntimeCarrierLifecycle,
@@ -325,6 +328,9 @@ pub(crate) enum SyscallInstallError {
     InterruptsEnabled,
     FsgsbaseNotCleared,
     FpSimdPolicyNotEnforced,
+    /// The CPU cannot run psABI user code, or chose a different FP save mode
+    /// than the bootstrap CPU.
+    FpMode(FpPolicyError),
     InvalidMsrPlan(SyscallMsrPlanError),
     MsrReadback,
 }
@@ -403,9 +409,9 @@ unsafe fn write_msr(msr: u32, value: u64) {
 
 #[allow(
     unsafe_code,
-    reason = "CR0.TS makes the E3 unavailable FP/SIMD policy architectural before any CPL3 execution"
+    reason = "CR0 enables native user FP/SIMD (D2): no lazy TS trap, no emulation, native x87 errors"
 )]
-unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> {
+unsafe fn enforce_live_user_fp_cr0() -> Result<(), SyscallInstallError> {
     let before: u64;
     // SAFETY: [ASM] side-effect-free CR0 read; the only caller has already checked CPL0.
     unsafe {
@@ -415,10 +421,11 @@ unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> 
             options(nomem, nostack, preserves_flags)
         );
     }
-    let expected = normalize_cr0_for_e5(before);
+    let expected = normalize_cr0_for_user_fp(before);
     if before != expected {
-        // SAFETY: [ASM] sets only CR0.TS (`normalize_cr0_for_e5`). The kernel target is soft-float
-        // (`-mno-sse` for C), so no kernel code executes an FP/SIMD instruction that TS would trap.
+        // SAFETY: [ASM] changes only CR0.MP/EM/TS/NE (`normalize_cr0_for_user_fp`). The kernel
+        // target is soft-float (`-mno-sse` for C), so no kernel FP/SIMD instruction depends on them;
+        // user FP state is saved per Thread by `user_state`.
         unsafe {
             core::arch::asm!(
                 "mov cr0, {}",
@@ -436,34 +443,39 @@ unsafe fn enforce_live_fp_simd_unavailable() -> Result<(), SyscallInstallError> 
             options(nomem, nostack, preserves_flags)
         );
     }
-    if observed != expected || observed & CR0_TASK_SWITCHED == 0 {
+    if observed != expected || !cr0_enforces_user_fp(observed) {
         return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
     Ok(())
 }
 
+/// CR0 still lets user code use FP/SIMD natively and CR4 still has FXSAVE/SSE
+/// on: the per-Thread save in `switch_kernel_context` depends on both.
 #[allow(
     unsafe_code,
-    reason = "IF-clear syscall entry checks that user FP/SIMD remains trapped before and after runtime dispatch"
+    reason = "IF-clear syscall and switch boundaries check that the user FP policy is still installed"
 )]
-fn live_fp_simd_unavailable_is_enforced() -> bool {
+fn live_user_fp_is_enforced() -> bool {
     let cr0: u64;
-    // SAFETY: [ASM] side-effect-free CR0 read; every caller is kernel code at CPL0.
+    let cr4: u64;
+    // SAFETY: [ASM] side-effect-free CR0/CR4 reads; every caller is kernel code at CPL0.
     unsafe {
         core::arch::asm!(
             "mov {}, cr0",
+            "mov {}, cr4",
             out(reg) cr0,
+            out(reg) cr4,
             options(nomem, nostack, preserves_flags)
         );
     }
-    cr0 & CR0_TASK_SWITCHED != 0
+    cr0_enforces_user_fp(cr0) && cr4 & CR4_OSFXSR != 0
 }
 
 #[allow(
     unsafe_code,
-    reason = "CR4 normalization is part of the audited no-FSGSBASE E4 boundary"
+    reason = "CR4 normalization keeps FSGSBASE off (E4) and turns on the user FP state the save mode needs (D2)"
 )]
-unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
+unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError> {
     let before: u64;
     // SAFETY: [ASM] side-effect-free CR4 read; the only caller has already checked CPL0.
     unsafe {
@@ -473,10 +485,11 @@ unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
             options(nomem, nostack, preserves_flags)
         );
     }
-    let expected = normalize_cr4_for_e4(before);
+    let expected = normalize_cr4_for_user_fp(before, mode);
     if before != expected {
-        // SAFETY: [ASM] clears only CR4.FSGSBASE (`normalize_cr4_for_e4`); no kernel code uses
-        // RD/WR{FS,GS}BASE, so disabling them breaks nothing Rust relies on.
+        // SAFETY: [ASM] clears CR4.FSGSBASE and sets OSFXSR/OSXMMEXCPT, and OSXSAVE exactly when
+        // the CPU has XSAVE (`plan_fp_mode`), so the write cannot fault; no kernel code uses
+        // RD/WR{FS,GS}BASE or SSE.
         unsafe {
             core::arch::asm!(
                 "mov cr4, {}",
@@ -494,8 +507,11 @@ unsafe fn normalize_live_cr4() -> Result<(), SyscallInstallError> {
             options(nomem, nostack, preserves_flags)
         );
     }
-    if observed & CR4_FSGSBASE != 0 || observed != expected {
+    if observed & CR4_FSGSBASE != 0 {
         return Err(SyscallInstallError::FsgsbaseNotCleared);
+    }
+    if observed != expected || !cr4_enforces_user_fp(observed, mode) {
+        return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
     Ok(())
 }
@@ -776,10 +792,15 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         if !cpu_supports_syscall() {
             return Err(SyscallInstallError::UnsupportedCpu);
         }
+        let fp_mode =
+            crate::arch::x86_64::user_state::agree_on_fp_mode().map_err(SyscallInstallError::FpMode)?;
         // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR0 write needs.
-        unsafe { enforce_live_fp_simd_unavailable()? };
+        unsafe { enforce_live_user_fp_cr0()? };
         // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR4 write needs.
-        unsafe { normalize_live_cr4()? };
+        unsafe { normalize_live_cr4(fp_mode)? };
+        // SAFETY: CPL0, and CR4.OSXSAVE is set for an XSAVE mode by the normalization above.
+        unsafe { crate::arch::x86_64::user_state::install_xcr0(fp_mode) }
+            .map_err(SyscallInstallError::FpMode)?;
         // SAFETY: this call won the slot's UNSTARTED->INSTALLING exchange above, so it is the
         // record's only writer; see `initialize_entry_state`.
         unsafe {
@@ -866,7 +887,7 @@ pub(crate) fn validate_live_syscall_boundary() -> Result<(), SyscallInstallError
     if cr4 & CR4_FSGSBASE != 0 {
         return Err(SyscallInstallError::FsgsbaseNotCleared);
     }
-    if !live_fp_simd_unavailable_is_enforced() {
+    if !live_user_fp_is_enforced() {
         return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
     }
     // SAFETY: INSTALL_STATE for this slot was just observed INSTALLED with Acquire, which is what
@@ -1999,16 +2020,26 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     // SAFETY: [ENTRY-REF] callers (syscall trampoline, timer gate) run with IF clear and hold no
     // record reference; the stack bound is the one `execute_kernel_switch` below switches to.
     unsafe { bind_current_thread_stack(plan.next_stack()) }.unwrap_or_else(|_| halt_forever());
-    if !live_fp_simd_unavailable_is_enforced() {
+    if !live_user_fp_is_enforced() {
         halt_forever();
     }
+    // The outgoing Thread's user FP state and FS base are still in this CPU's registers (the
+    // kernel is soft-float and never writes FS). They live in this frame while the Thread is
+    // suspended and come back when the frame resumes, on whichever CPU that is.
+    let mut fp = FpArea::zeroed();
+    // SAFETY: CPL0 on a CPU whose boundary installed the user FP policy (checked above); `fp` is
+    // zeroed.
+    let fs_base = unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_save(&mut fp) };
     // SAFETY: the plan came from a runtime `prepare_*` method whose `# Safety` the caller met, and
     // is consumed immediately; the assembly also rejects a save frame outside `current_stack` with
     // `ud2`.
     unsafe { crate::arch::x86_64::context::execute_kernel_switch(plan) };
-    if !live_fp_simd_unavailable_is_enforced() {
+    if !live_user_fp_is_enforced() {
         halt_forever();
     }
+    // SAFETY: this CPU installed the same save mode (`agree_on_fp_mode`); `fp` and `fs_base` are
+    // this Thread's own, saved above, and RDMSR returned a canonical FS base.
+    unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_restore(&fp, fs_base) };
 }
 
 #[allow(
@@ -2039,7 +2070,7 @@ fn wait_for_suspend_interrupt() {
 pub(crate) unsafe extern "sysv64" fn dw_x86_64_first_run_thread_entry() -> ! {
     validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
     if !crate::arch::x86_64::exceptions::user_exception_runtime_is_bound()
-        || !live_fp_simd_unavailable_is_enforced()
+        || !live_user_fp_is_enforced()
     {
         halt_forever();
     }
@@ -2150,6 +2181,13 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     // The assembly helper reads the whole context, then pivots from the bootstrap/idle/reaper
     // carrier (or, on the first-run path, from lower on the same stack) to the bound Thread stack
     // top and runs the ordinary pre-IRET gate there.
+    // Only a Thread that has never run enters user mode here, so it starts from the initial FP
+    // state and FS base 0 rather than whatever the previous Thread on this CPU left.
+    if !live_user_fp_is_enforced() {
+        halt_forever();
+    }
+    // SAFETY: CPL0 on a CPU whose boundary installed the user FP policy (checked above).
+    unsafe { crate::arch::x86_64::user_state::load_initial_user_state() };
     // SAFETY: `state` is a `ValidatedUserReturn`, and the caller established the stack binding and
     // runtime ownership. The helper finishes every read of `*state` before its pivot and its first
     // stack write, so the frames it builds cannot clobber the context wherever it lives.
@@ -2331,14 +2369,14 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
     let frame = unsafe { &mut *frame };
     if !frame.validates_entry()
         || frame.binding_generation() != current_binding_generation()
-        || !live_fp_simd_unavailable_is_enforced()
+        || !live_user_fp_is_enforced()
     {
         halt_forever();
     }
     // SAFETY: the frame's entry signature and binding generation were validated above;
     // `dispatch_bound_runtime` halts if this CPU has no binding.
     unsafe { dispatch_bound_runtime(frame) };
-    if !live_fp_simd_unavailable_is_enforced() {
+    if !live_user_fp_is_enforced() {
         halt_forever();
     }
     // A returning runtime handler must have authorized this exact frame after

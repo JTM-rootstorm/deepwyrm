@@ -391,6 +391,16 @@ pub const DW_SYSCALL_ARGUMENT_METADATA: &[DwSyscallArgumentMetadata] = &[
         required_rights: "NONE",
     },
     DwSyscallArgumentMetadata {
+        syscall_number: 0x00010024,
+        index: 0,
+        register: "RDI",
+        name: "fs_base",
+        abi_type: "u64",
+        direction: "in",
+        required_object_type: "NONE",
+        required_rights: "NONE",
+    },
+    DwSyscallArgumentMetadata {
         syscall_number: 0x00020001,
         index: 0,
         register: "RDI",
