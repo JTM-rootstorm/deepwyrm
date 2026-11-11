@@ -876,7 +876,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | NativeSyscallRequest::TaskGroupCreate { out_handle, .. } => handle(out_handle),
             NativeSyscallRequest::ThreadCreate { out_thread, .. } => handle(out_thread),
             NativeSyscallRequest::DeviceResourceClaim { out_resource, .. } => handle(out_resource),
-            NativeSyscallRequest::DevicePioRead { out_value, .. } => {
+            NativeSyscallRequest::DevicePioRead { out_value, .. }
+            | NativeSyscallRequest::DevicePciConfigRead { out_value, .. } => {
                 [Some((out_value, 4, 4)), None, None]
             }
             NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => handle(out_interrupt),
@@ -7655,6 +7656,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     out_value,
                 )
             }
+            NativeSyscallRequest::DevicePciConfigRead {
+                resource,
+                offset,
+                width,
+                out_value,
+            } => {
+                let mut ports = crate::arch::x86_64::io_port::X86PortIo;
+                let mut config = crate::arch::x86_64::pci_config::Mechanism1::new(&mut ports);
+                crate::syscall::device_pci_config_read(
+                    user,
+                    &mut self.core.registry,
+                    &mut self.core.tasks,
+                    &self.core.shared.device_resources,
+                    &mut config,
+                    process,
+                    resource,
+                    offset,
+                    width,
+                    out_value,
+                )
+            }
             NativeSyscallRequest::InterruptCreate {
                 resource,
                 requested_rights,
@@ -8123,6 +8145,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | NativeSyscallRequest::ThreadCreate { .. }
             | NativeSyscallRequest::DeviceResourceClaim { .. }
             | NativeSyscallRequest::DevicePioRead { .. }
+            | NativeSyscallRequest::DevicePciConfigRead { .. }
             | NativeSyscallRequest::InterruptCreate { .. }
             | NativeSyscallRequest::MemoryObjectCreate { .. }
             | NativeSyscallRequest::ObjectGetInfoV1 { .. } => {
@@ -8191,6 +8214,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     offset,
                     width,
                     value,
+                ))
+            }
+            NativeSyscallRequest::DevicePciCommand {
+                resource,
+                memory_space,
+                bus_master,
+            } => {
+                let mut ports = crate::arch::x86_64::io_port::X86PortIo;
+                let mut config = crate::arch::x86_64::pci_config::Mechanism1::new(&mut ports);
+                NativeSyscallResult::returning(crate::syscall::device_pci_command(
+                    &mut self.core.registry,
+                    &mut self.core.tasks,
+                    &self.core.shared.device_resources,
+                    &mut config,
+                    self.own.scheduled().process,
+                    resource,
+                    memory_space,
+                    bus_master,
+                    crate::device::pci::dma_confined(),
                 ))
             }
             NativeSyscallRequest::InterruptAck { interrupt } => {

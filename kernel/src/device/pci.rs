@@ -262,6 +262,85 @@ fn admit(
     })
 }
 
+/// The standard configuration space a driver may read (`DW2` §4).
+const CONFIG_SPACE_BYTES: u32 = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PciAccessError {
+    /// A width other than 1, 2 or 4, an unaligned offset, or one past 256.
+    InvalidAccess,
+    /// Bus mastering was requested but no remapping unit confines the function.
+    DmaNotConfined,
+}
+
+/// Reads `width` bytes at `offset` of the function's standard config space.
+pub(crate) fn config_read<C: ConfigSpace>(
+    config: &mut C,
+    address: PciAddress,
+    offset: u32,
+    width: u32,
+) -> Result<u32, PciAccessError> {
+    if !matches!(width, 1 | 2 | 4)
+        || !offset.is_multiple_of(width)
+        || offset
+            .checked_add(width)
+            .is_none_or(|end| end > CONFIG_SPACE_BYTES)
+    {
+        return Err(PciAccessError::InvalidAccess);
+    }
+    let dword = config.read32(address, (offset & !3) as u8);
+    let shifted = dword >> ((offset & 3) * 8);
+    Ok(match width {
+        1 => shifted & 0xff,
+        2 => shifted & 0xffff,
+        _ => shifted,
+    })
+}
+
+/// Sets the memory-space and bus-master command bits, preserves every other
+/// bit, and always clears I/O-space decoding.
+///
+/// `dma_confined` says whether a remapping unit translates this function's
+/// DMA. Without one, bus mastering would let the device reach any physical
+/// address, so it is refused; clearing it is always allowed.
+pub(crate) fn set_command<C: ConfigSpace>(
+    config: &mut C,
+    address: PciAddress,
+    memory_space: bool,
+    bus_master: bool,
+    dma_confined: bool,
+) -> Result<(), PciAccessError> {
+    if bus_master && !dma_confined {
+        return Err(PciAccessError::DmaNotConfined);
+    }
+    let command = config.read32(address, REG_COMMAND) & 0xffff;
+    let mut updated =
+        command & !u32::from(COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER);
+    if memory_space {
+        updated |= u32::from(COMMAND_MEMORY_SPACE);
+    }
+    if bus_master {
+        updated |= u32::from(COMMAND_BUS_MASTER);
+    }
+    // The upper half is the status register, whose error bits are
+    // write-one-to-clear; writing zeros there changes nothing.
+    config.write32(address, REG_COMMAND, updated);
+    Ok(())
+}
+
+/// Set once at boot when every segment-0 function is behind a VT-d unit that
+/// translates (an INCLUDE_PCI_ALL unit in default deny).
+static DMA_CONFINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(test, allow(dead_code, reason = "set by the live boot path only"))]
+pub(crate) fn record_dma_confined() {
+    DMA_CONFINED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn dma_confined() -> bool {
+    DMA_CONFINED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The boot-time probe result for each `PCI_FUNCTION` record, by resource ID.
 /// Written once by the BSP before any process exists; read by claims.
 pub(crate) struct PciProbeTable {

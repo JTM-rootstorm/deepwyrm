@@ -861,6 +861,12 @@ pub const DW_SYSCALL_INTERRUPT_CREATE: DwSyscallId = DwSyscallId(0x00060010);
 /// Acknowledge one pending Interrupt fact and rearm its exact source binding when no coalesced fact remains.
 pub const DW_SYSCALL_INTERRUPT_ACK: DwSyscallId = DwSyscallId(0x00060011);
 
+/// Read 1, 2 or 4 bytes at an aligned offset below 256 from a live PCI_FUNCTION DeviceResource's standard configuration space.
+pub const DW_SYSCALL_DEVICE_PCI_CONFIG_READ: DwSyscallId = DwSyscallId(0x00060020);
+
+/// Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 1 values, preserving other bits and always clearing I/O-space decoding; bus mastering needs DMA remapping covering the function.
+pub const DW_SYSCALL_DEVICE_PCI_COMMAND: DwSyscallId = DwSyscallId(0x00060021);
+
 /// One normalized physical memory-map entry.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2013,5 +2019,7 @@ mod generated_layout_tests {
         assert_eq!(DW_SYSCALL_DEVICE_PIO_WRITE.0, 0x00060003);
         assert_eq!(DW_SYSCALL_INTERRUPT_CREATE.0, 0x00060010);
         assert_eq!(DW_SYSCALL_INTERRUPT_ACK.0, 0x00060011);
+        assert_eq!(DW_SYSCALL_DEVICE_PCI_CONFIG_READ.0, 0x00060020);
+        assert_eq!(DW_SYSCALL_DEVICE_PCI_COMMAND.0, 0x00060021);
     }
 }

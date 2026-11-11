@@ -53,7 +53,8 @@ impl DmarUnit {
         self.register_base
     }
 
-    #[cfg(test)]
+    /// The unit translates every function on its segment not claimed by
+    /// another unit's explicit device scope.
     pub(crate) const fn include_pci_all(self) -> bool {
         self.include_pci_all
     }

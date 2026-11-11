@@ -183,6 +183,17 @@ pub(crate) enum NativeSyscallRequest {
         width: u32,
         value: u32,
     },
+    DevicePciConfigRead {
+        resource: DwHandle,
+        offset: u32,
+        width: u32,
+        out_value: DwUserAddress,
+    },
+    DevicePciCommand {
+        resource: DwHandle,
+        memory_space: u32,
+        bus_master: u32,
+    },
     InterruptCreate {
         resource: DwHandle,
         requested_rights: DwRights,
@@ -381,6 +392,17 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
             offset: u32_arg(a[1])?,
             width: u32_arg(a[2])?,
             value: u32_arg(a[3])?,
+        },
+        DwKnownSyscall::DevicePciConfigRead => NativeSyscallRequest::DevicePciConfigRead {
+            resource: DwHandle(a[0]),
+            offset: u32_arg(a[1])?,
+            width: u32_arg(a[2])?,
+            out_value: DwUserAddress(a[3]),
+        },
+        DwKnownSyscall::DevicePciCommand => NativeSyscallRequest::DevicePciCommand {
+            resource: DwHandle(a[0]),
+            memory_space: u32_arg(a[1])?,
+            bus_master: u32_arg(a[2])?,
         },
         DwKnownSyscall::InterruptCreate => NativeSyscallRequest::InterruptCreate {
             resource: DwHandle(a[0]),
@@ -740,6 +762,23 @@ pub(crate) trait NativeSyscallServices {
     ) -> NativeSyscallResult {
         unsupported_f()
     }
+    fn device_pci_config_read(
+        &mut self,
+        _resource: DwHandle,
+        _offset: u32,
+        _width: u32,
+        _out_value: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn device_pci_command(
+        &mut self,
+        _resource: DwHandle,
+        _memory_space: u32,
+        _bus_master: u32,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
     fn interrupt_create(
         &mut self,
         _resource: DwHandle,
@@ -936,6 +975,17 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 width,
                 value,
             } => self.device_pio_write(resource, offset, width, value),
+            NativeSyscallRequest::DevicePciConfigRead {
+                resource,
+                offset,
+                width,
+                out_value,
+            } => self.device_pci_config_read(resource, offset, width, out_value),
+            NativeSyscallRequest::DevicePciCommand {
+                resource,
+                memory_space,
+                bus_master,
+            } => self.device_pci_command(resource, memory_space, bus_master),
             NativeSyscallRequest::InterruptCreate {
                 resource,
                 requested_rights,

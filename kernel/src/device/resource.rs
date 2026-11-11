@@ -3,9 +3,11 @@ use deepwyrm_abi::{
     DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
     DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_RIGHT_READ, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED,
     DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
-    DW_STATUS_WRONG_OBJECT_TYPE, DwDeviceResourceInfoV1, DwDeviceResourceKind, DwHandle, DwStatus,
+    DW_STATUS_NOT_SUPPORTED, DW_STATUS_WRONG_OBJECT_TYPE, DwDeviceResourceInfoV1,
+    DwDeviceResourceKind, DwHandle, DwStatus,
 };
 
+use super::pci::{self, ConfigSpace, PciAccessError, PciAddress};
 use crate::arch::x86_64::io_port::ScalarPortIo;
 use crate::handle::{
     AcceptedObjectTypes, HandleReservationError, HandleTable, HandleTableError, ResolvedHandle,
@@ -331,6 +333,18 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
         Ok(descriptor)
     }
 
+    /// The function a live PCI_FUNCTION resource names.
+    fn pci_address_for_resolved(
+        &self,
+        resolved: &ResolvedHandle,
+    ) -> Result<PciAddress, DeviceResourceError> {
+        let descriptor = self.descriptor_for_resolved(resolved)?;
+        if descriptor.kind != DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION {
+            return Err(DeviceResourceError::InvalidAccess);
+        }
+        PciAddress::from_boot(descriptor.pci_address).ok_or(DeviceResourceError::InvalidAccess)
+    }
+
     fn access_for_resolved(
         &self,
         resolved: &ResolvedHandle,
@@ -622,6 +636,82 @@ pub(crate) fn pio_write<const HANDLES: usize, const OBJECTS: usize, const RESOUR
         PioWidth::U32 => io.write_u32(access.port, value),
     }
     Ok(())
+}
+
+/// `device_pci_config_read`: `DEVICE_RESOURCE:READ` on a PCI_FUNCTION.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "config access keeps handle, typed authority, backend, and ABI scalars explicit at the validation boundary"
+)]
+pub(crate) fn pci_config_read<
+    const HANDLES: usize,
+    const OBJECTS: usize,
+    const RESOURCES: usize,
+>(
+    table: &HandleTable<HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    config: &mut impl ConfigSpace,
+    handle: DwHandle,
+    offset: u32,
+    width: u32,
+) -> Result<u32, DwStatus> {
+    let resolved = table
+        .lookup(
+            registry,
+            handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_DEVICE_RESOURCE),
+            DW_RIGHT_READ,
+        )
+        .map_err(handle_status)?;
+    let result = resources.pci_address_for_resolved(&resolved);
+    release_operation_pin(registry, resolved);
+    let address = result.map_err(resource_status)?;
+    pci::config_read(config, address, offset, width).map_err(pci_status)
+}
+
+/// `device_pci_command`: `DEVICE_RESOURCE:WRITE` on a PCI_FUNCTION. Each flag
+/// must be 0 or 1.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "config access keeps handle, typed authority, backend, and ABI scalars explicit at the validation boundary"
+)]
+pub(crate) fn pci_command<const HANDLES: usize, const OBJECTS: usize, const RESOURCES: usize>(
+    table: &HandleTable<HANDLES>,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    config: &mut impl ConfigSpace,
+    handle: DwHandle,
+    memory_space: u32,
+    bus_master: u32,
+    dma_confined: bool,
+) -> Result<(), DwStatus> {
+    let flag = |value: u32| match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(DW_STATUS_INVALID_ARGUMENT),
+    };
+    let memory_space = flag(memory_space)?;
+    let bus_master = flag(bus_master)?;
+    let resolved = table
+        .lookup(
+            registry,
+            handle,
+            AcceptedObjectTypes::One(DW_OBJECT_TYPE_DEVICE_RESOURCE),
+            DW_RIGHT_WRITE,
+        )
+        .map_err(handle_status)?;
+    let result = resources.pci_address_for_resolved(&resolved);
+    release_operation_pin(registry, resolved);
+    let address = result.map_err(resource_status)?;
+    pci::set_command(config, address, memory_space, bus_master, dma_confined).map_err(pci_status)
+}
+
+fn pci_status(error: PciAccessError) -> DwStatus {
+    match error {
+        PciAccessError::InvalidAccess => DW_STATUS_INVALID_ARGUMENT,
+        PciAccessError::DmaNotConfined => DW_STATUS_NOT_SUPPORTED,
+    }
 }
 
 fn release_operation_pin<const OBJECTS: usize>(

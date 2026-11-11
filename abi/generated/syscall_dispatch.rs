@@ -226,6 +226,18 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         implementation_phase: "DW1-D",
         argument_count: 1,
     },
+    DwSyscallDispatchMetadata {
+        number: 0x00060020,
+        name: "device_pci_config_read",
+        implementation_phase: "DW2-S",
+        argument_count: 4,
+    },
+    DwSyscallDispatchMetadata {
+        number: 0x00060021,
+        name: "device_pci_command",
+        implementation_phase: "DW2-S",
+        argument_count: 3,
+    },
 ];
 
 pub const DW_UNKNOWN_SYSCALL_STATUS_NAME: &str = "NOT_SUPPORTED";

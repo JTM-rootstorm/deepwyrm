@@ -502,6 +502,13 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             }
             let state = arch::x86_64::vtd::initialize(&mut active_paging, dmar)
                 .unwrap_or_else(|error| panic!("VT-d default-deny bring-up failed: {error:?}"));
+            // Bus mastering is admitted only when one unit covers every
+            // segment-0 function; explicit device scopes are not parsed yet.
+            if matches!(state, arch::x86_64::vtd::VtdBootState::DefaultDeny { .. })
+                && dmar.is_some_and(|dmar| dmar.units().iter().any(|unit| unit.include_pci_all()))
+            {
+                device::pci::record_dma_confined();
+            }
             #[cfg(not(feature = "test-support"))]
             let _ = debug::emit_early_record(
                 debug::DiagnosticLevel::Info,

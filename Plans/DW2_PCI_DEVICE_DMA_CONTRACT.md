@@ -1,6 +1,6 @@
 # Deepwyrm PCI function, device-MMIO and IOMMU DMA contract (storage K1–K4)
 
-**Status:** contract for implementation, 2026-11-10. K0 (VT-d default deny) is reached at `49a35e3`/`d508a5c`.
+**Status:** contract for implementation, 2026-11-10. K0 (VT-d default deny) is reached at `49a35e3`/`d508a5c`, K1 at `8964ed8`. The new syscalls carry implementation phase `DW2-S`.
 **Plan:** OS-Project root `STORAGE_PLAN.md` §2–§3 (Mike's decision: IOMMU first).
 **Extends:** `DW1_D0_DEVICE_RESOURCE_INTERRUPT_CONTRACT.md`. Everything there stays true for kind 1.
 
@@ -59,7 +59,7 @@ New syscalls in the device family:
 | Syscall | Number | Authority | Effect |
 |---|---:|---|---|
 | `device_pci_config_read` | `0x00060020` | `DEVICE_RESOURCE:READ` | width 1, 2 or 4 at an aligned offset < 256 |
-| `device_pci_command` | `0x00060021` | `DEVICE_RESOURCE:WRITE` | sets the memory-space and bus-master bits to the two given booleans; every other command bit is preserved; I/O-space decoding is always cleared |
+| `device_pci_command` | `0x00060021` | `DEVICE_RESOURCE:WRITE` | sets the memory-space and bus-master bits to the two given booleans (each 0 or 1); every other command bit is preserved; I/O-space decoding is always cleared. Setting bus mastering fails with `DW_STATUS_NOT_SUPPORTED` unless a VT-d unit with INCLUDE_PCI_ALL is in default deny, since without one the device could reach any physical address; clearing it always succeeds |
 | `device_mmio_map` | `0x00060022` | `DEVICE_RESOURCE:MAP` | maps `[offset, offset+length)` of BAR `bar` (page-aligned, inside the BAR) into an AddressRegion the caller can map into, with read/write rights only, uncached, never executable |
 | `dma_map` | `0x00060023` | `DEVICE_RESOURCE:MODIFY` plus `MEMORY_OBJECT:READ` (and `WRITE` for a device-writable mapping) | maps pages of a MemoryObject into the function's IOMMU domain; returns the IOVA |
 | `dma_unmap` | `0x00060024` | `DEVICE_RESOURCE:MODIFY` | removes a mapping by IOVA and length, then invalidates the IOTLB before returning |

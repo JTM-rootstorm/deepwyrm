@@ -403,6 +403,45 @@ pub fn device_pio_read(
     }
 }
 
+/// Read 1, 2 or 4 bytes of a PCI_FUNCTION resource's standard config space.
+#[inline]
+pub fn device_pci_config_read(
+    resource: DwHandle,
+    offset: u32,
+    width: u32,
+    out_value: &mut u32,
+) -> DwStatus {
+    // SAFETY: scalar ABI values are copied and the output remains uniquely borrowed.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DEVICE_PCI_CONFIG_READ,
+            resource.0,
+            u64::from(offset),
+            u64::from(width),
+            output_address(out_value),
+            0,
+            0,
+        )
+    }
+}
+
+/// Set a PCI_FUNCTION's memory-space and bus-master command bits.
+#[inline]
+pub fn device_pci_command(resource: DwHandle, memory_space: bool, bus_master: bool) -> DwStatus {
+    // SAFETY: all arguments are scalar ABI values.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DEVICE_PCI_COMMAND,
+            resource.0,
+            u64::from(memory_space),
+            u64::from(bus_master),
+            0,
+            0,
+            0,
+        )
+    }
+}
+
 /// Write one checked scalar value to a DeviceResource PIO range.
 #[inline]
 pub fn device_pio_write(resource: DwHandle, offset: u32, width: u32, value: u32) -> DwStatus {

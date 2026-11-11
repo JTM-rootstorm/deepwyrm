@@ -873,6 +873,25 @@ arg2 = "width|u32|in|NONE|NONE"
 arg3 = "value|u32|in|NONE|NONE"
 
 [[syscall]]
+name = "device_pci_config_read"
+number = 0x00060020
+phase = "DW2-S"
+doc = "Read 1, 2 or 4 bytes at an aligned offset below 256 from a live PCI_FUNCTION DeviceResource's standard configuration space."
+arg0 = "resource|DwHandle|in|DEVICE_RESOURCE|READ"
+arg1 = "offset|u32|in|NONE|NONE"
+arg2 = "width|u32|in|NONE|NONE"
+arg3 = "out_value|DwUserAddress|out|NONE|NONE"
+
+[[syscall]]
+name = "device_pci_command"
+number = 0x00060021
+phase = "DW2-S"
+doc = "Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 1 values, preserving other bits and always clearing I/O-space decoding; bus mastering needs DMA remapping covering the function."
+arg0 = "resource|DwHandle|in|DEVICE_RESOURCE|WRITE"
+arg1 = "memory_space|u32|in|NONE|NONE"
+arg2 = "bus_master|u32|in|NONE|NONE"
+
+[[syscall]]
 name = "interrupt_create"
 number = 0x00060010
 phase = "DW1-D"

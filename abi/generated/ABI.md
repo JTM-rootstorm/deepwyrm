@@ -1020,3 +1020,24 @@ Acknowledge one pending Interrupt fact and rearm its exact source binding when n
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
 | `RDI` | `interrupt` | `DwHandle` | in | INTERRUPT | MODIFY |
+
+### `0x00060020` `device_pci_config_read` (DW2-S)
+
+Read 1, 2 or 4 bytes at an aligned offset below 256 from a live PCI_FUNCTION DeviceResource's standard configuration space.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | READ |
+| `RSI` | `offset` | `u32` | in | NONE | NONE |
+| `RDX` | `width` | `u32` | in | NONE | NONE |
+| `R10` | `out_value` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00060021` `device_pci_command` (DW2-S)
+
+Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 1 values, preserving other bits and always clearing I/O-space decoding; bus mastering needs DMA remapping covering the function.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | WRITE |
+| `RSI` | `memory_space` | `u32` | in | NONE | NONE |
+| `RDX` | `bus_master` | `u32` | in | NONE | NONE |

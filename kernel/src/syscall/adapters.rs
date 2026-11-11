@@ -2250,6 +2250,83 @@ pub(crate) fn device_pio_write<
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn device_pci_config_read<
+    U: UserPageAccess,
+    C: crate::device::pci::ConfigSpace,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    config: &mut C,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    offset: u32,
+    width: u32,
+    out_value: DwUserAddress,
+) -> DwStatus {
+    let output = match preflight_output(user, out_value, 4, 4) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let result = process_handle_operation!(tasks, current_process, table, {
+        crate::device::pci_config_read(table, registry, resources, config, resource, offset, width)
+    });
+    match result {
+        Ok(Ok(value)) => {
+            output.commit(&encode_u32(value));
+            DW_STATUS_SUCCESS
+        }
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn device_pci_command<
+    C: crate::device::pci::ConfigSpace,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    config: &mut C,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    memory_space: u32,
+    bus_master: u32,
+    dma_confined: bool,
+) -> DwStatus {
+    match process_handle_operation!(tasks, current_process, table, {
+        crate::device::pci_command(
+            table,
+            registry,
+            resources,
+            config,
+            resource,
+            memory_space,
+            bus_master,
+            dma_confined,
+        )
+    }) {
+        Ok(Ok(())) => DW_STATUS_SUCCESS,
+        Ok(Err(status)) => status,
+        Err(error) => task_status(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn interrupt_create<
     U: UserPageAccess,
     const OBJECTS: usize,

@@ -47,7 +47,7 @@ pub(crate) use resource::{
     DeviceResourceFinalizer, DeviceResourceGrantLease, DeviceResourceInfoProvider,
     DeviceResourceKey, cancel_unpublished_device_resource_claim,
     complete_device_resource_finalization, complete_device_resource_finalization_with_grants,
-    pio_read, pio_write,
+    pci_command, pci_config_read, pio_read, pio_write,
 };
 
 #[cfg(test)]

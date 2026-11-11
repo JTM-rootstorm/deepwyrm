@@ -696,6 +696,10 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_SYSCALL_INTERRUPT_CREATE ((DwSyscallId)(UINT32_C(0x00060010)))
 /* Acknowledge one pending Interrupt fact and rearm its exact source binding when no coalesced fact remains. */
 #define DW_SYSCALL_INTERRUPT_ACK ((DwSyscallId)(UINT32_C(0x00060011)))
+/* Read 1, 2 or 4 bytes at an aligned offset below 256 from a live PCI_FUNCTION DeviceResource's standard configuration space. */
+#define DW_SYSCALL_DEVICE_PCI_CONFIG_READ ((DwSyscallId)(UINT32_C(0x00060020)))
+/* Set a PCI_FUNCTION's memory-space and bus-master command bits to the given 0 or 1 values, preserving other bits and always clearing I/O-space decoding; bus mastering needs DMA remapping covering the function. */
+#define DW_SYSCALL_DEVICE_PCI_COMMAND ((DwSyscallId)(UINT32_C(0x00060021)))
 
 /* One normalized physical memory-map entry. */
 typedef struct DwBootMemoryRangeV1 {

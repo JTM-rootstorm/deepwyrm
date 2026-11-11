@@ -241,3 +241,120 @@ fn io_and_malformed_bars_are_never_admitted() {
         Some(BarSlot::Refused(BarRefusal::Malformed))
     );
 }
+
+/// A flat 256-byte standard config space that records every dword write.
+struct FlatSpace {
+    bytes: [u8; 256],
+    writes: Vec<(u8, u32)>,
+}
+
+impl FlatSpace {
+    fn new() -> Self {
+        let mut bytes = [0; 256];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        Self {
+            bytes,
+            writes: vec![],
+        }
+    }
+
+    fn command(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
+    }
+
+    fn set_command_dword(&mut self, value: u32) {
+        self.bytes[4..8].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+impl ConfigSpace for FlatSpace {
+    fn read32(&mut self, _address: PciAddress, offset: u8) -> u32 {
+        assert_eq!(offset % 4, 0, "config reads are dword-aligned");
+        let at = usize::from(offset);
+        u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn write32(&mut self, _address: PciAddress, offset: u8, value: u32) {
+        self.writes.push((offset, value));
+        let at = usize::from(offset);
+        self.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn function_address() -> PciAddress {
+    PciAddress::from_boot(ADDRESS).unwrap()
+}
+
+#[test]
+fn config_reads_return_the_addressed_bytes_at_each_width() {
+    let mut space = FlatSpace::new();
+    let address = function_address();
+    assert_eq!(config_read(&mut space, address, 0x13, 1), Ok(0x13));
+    assert_eq!(config_read(&mut space, address, 0x12, 2), Ok(0x1312));
+    assert_eq!(config_read(&mut space, address, 0x10, 4), Ok(0x1312_1110));
+    assert_eq!(config_read(&mut space, address, 0xfc, 4), Ok(0xfffe_fdfc));
+    assert_eq!(config_read(&mut space, address, 0xff, 1), Ok(0xff));
+    assert!(space.writes.is_empty());
+}
+
+#[test]
+fn config_reads_refuse_bad_widths_misalignment_and_extended_space() {
+    let mut space = FlatSpace::new();
+    let address = function_address();
+    for (offset, width) in [
+        (0, 0),
+        (0, 3),
+        (0, 8),
+        (1, 2),
+        (2, 4),
+        (0x100, 1),
+        (0x100, 4),
+        (u32::MAX, 1),
+        (u32::MAX - 3, 4),
+    ] {
+        assert_eq!(
+            config_read(&mut space, address, offset, width),
+            Err(PciAccessError::InvalidAccess),
+            "offset {offset:#x} width {width}"
+        );
+    }
+}
+
+#[test]
+fn the_command_filter_sets_only_memory_and_bus_master_and_clears_io() {
+    let address = function_address();
+    // Status 0xffff (every RW1C bit set) over command INTx-disable | SERR |
+    // parity | I/O space.
+    let original = 0xffff_0000 | 0x0400 | 0x0100 | 0x0040 | 0x0001;
+    for (memory, bus_master) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut space = FlatSpace::new();
+        space.set_command_dword(original);
+        set_command(&mut space, address, memory, bus_master, true).unwrap();
+        let mut expected = 0x0400 | 0x0100 | 0x0040;
+        if memory {
+            expected |= u32::from(COMMAND_MEMORY_SPACE);
+        }
+        if bus_master {
+            expected |= u32::from(COMMAND_BUS_MASTER);
+        }
+        // One write, to the command register only, with zeros in the status half.
+        assert_eq!(space.writes, vec![(REG_COMMAND, expected)]);
+        assert_eq!(space.command(), expected);
+    }
+}
+
+#[test]
+fn bus_mastering_is_refused_without_dma_remapping_but_can_be_cleared() {
+    let address = function_address();
+    let mut space = FlatSpace::new();
+    space.set_command_dword(0x0007);
+    assert_eq!(
+        set_command(&mut space, address, true, true, false),
+        Err(PciAccessError::DmaNotConfined)
+    );
+    assert!(space.writes.is_empty());
+    set_command(&mut space, address, true, false, false).unwrap();
+    assert_eq!(space.command(), u32::from(COMMAND_MEMORY_SPACE));
+}
