@@ -185,7 +185,12 @@ pub(crate) fn probe<C: ConfigSpace>(
         }
         index += used;
     }
-    config.write32(address, REG_COMMAND, command_dword & 0xffff);
+    // Firmware may hand a function over bus-mastering (OVMF leaves its
+    // virtio disks at 0x7). Only `device_pci_command` may turn bus mastering
+    // on, and only for a confined function, so it is cleared here; I/O
+    // decoding goes too, as no I/O BAR is admitted. Memory decoding is kept.
+    let inert = u32::from(COMMAND_IO_SPACE | COMMAND_BUS_MASTER);
+    config.write32(address, REG_COMMAND, command_dword & 0xffff & !inert);
     Ok(PciFunction { address, ids, bars })
 }
 

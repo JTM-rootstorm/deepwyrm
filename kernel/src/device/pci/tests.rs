@@ -112,9 +112,10 @@ fn the_q35_virtio_disk_is_probed_and_its_bars_admitted() {
     );
     assert_eq!(probed.bar(5), Some(BarSlot::Upper));
     assert_eq!(probed.bar(6), None);
-    // Every BAR and the command register are left as they were found.
+    // Every BAR is left as it was found; the command register keeps only
+    // memory decoding (and its other bits), never bus mastering or I/O.
     assert_eq!(function.bars, before);
-    assert_eq!(function.command, 0x0010_0007 & 0xffff);
+    assert_eq!(function.command, 0x0010_0007 & 0xffff & !0x5);
 }
 
 #[test]
@@ -122,7 +123,19 @@ fn decoding_is_off_while_bars_hold_sizing_masks() {
     let mut function = Function::virtio_blk();
     probe(&mut function, ADDRESS, VIRTIO_BLK, LIMIT, no_memory).unwrap();
     assert!(function.decode_during_sizing.is_empty());
-    assert_eq!(function.command & 0x3, 0x3);
+    assert_eq!(function.command & 0x3, u32::from(COMMAND_MEMORY_SPACE));
+}
+
+/// Review finding D1: firmware leaves functions bus-mastering, and a probe
+/// that restored that let a driver DMA without `device_pci_command`'s
+/// confinement check, even with no IOMMU or no interrupt remapping.
+#[test]
+fn probe_hands_every_function_over_with_bus_mastering_off() {
+    let mut function = Function::virtio_blk();
+    assert_ne!(function.command & u32::from(COMMAND_BUS_MASTER), 0);
+    probe(&mut function, ADDRESS, VIRTIO_BLK, LIMIT, no_memory).unwrap();
+    assert_eq!(function.command & u32::from(COMMAND_BUS_MASTER), 0);
+    assert_eq!(function.command & u32::from(COMMAND_IO_SPACE), 0);
 }
 
 #[test]
