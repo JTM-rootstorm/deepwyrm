@@ -391,6 +391,10 @@ const FIXTURE_TEXT: u64 = 0xffff_8000_0000_0000;
 const FIXTURE_RODATA: u64 = FIXTURE_TEXT + PAGE_SIZE;
 const FIXTURE_DATA: u64 = FIXTURE_RODATA + PAGE_SIZE;
 const FIXTURE_SCRATCH: u64 = 0xffff_ff00_0000_0000;
+/// The fixture's writable segment: the IST stacks in its first sixteen
+/// pages, then the privilege-entry guard page and stack.
+const FIXTURE_WRITABLE_PAGES: u64 =
+    17 + crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE / PAGE_SIZE;
 
 struct GraphFixture {
     access: FakeGraphAccess,
@@ -442,7 +446,7 @@ fn graph_fixture() -> GraphFixture {
     let privilege_entry = crate::memory::kernel_stack::KernelStackBounds::new(
         FIXTURE_DATA + 16 * PAGE_SIZE,
         FIXTURE_DATA + 17 * PAGE_SIZE,
-        FIXTURE_DATA + 33 * PAGE_SIZE,
+        FIXTURE_DATA + FIXTURE_WRITABLE_PAGES * PAGE_SIZE,
     )
     .unwrap();
     let segments = [
@@ -458,7 +462,7 @@ fn graph_fixture() -> GraphFixture {
         },
         KernelSegment {
             start: FIXTURE_DATA,
-            end: FIXTURE_DATA + 33 * PAGE_SIZE,
+            end: FIXTURE_DATA + FIXTURE_WRITABLE_PAGES * PAGE_SIZE,
             kind: SegmentKind::Writable,
         },
     ];
@@ -499,7 +503,7 @@ fn graph_fixture() -> GraphFixture {
         );
         add_path(&mut access.inactive, page, kernel_tables, physical | flags);
     }
-    for offset in 0..33 {
+    for offset in 0..FIXTURE_WRITABLE_PAGES {
         let page = FIXTURE_DATA + offset * PAGE_SIZE;
         let physical = 0x22_0000 + offset * PAGE_SIZE;
         let flags = PRESENT | WRITABLE | NO_EXECUTE;
@@ -545,7 +549,7 @@ fn graph_fixture() -> GraphFixture {
                 KernelImageSegment::ReadOnlyData,
             ),
             (
-                PhysicalRange::new(0x22_0000, 33 * PAGE_SIZE).unwrap(),
+                PhysicalRange::new(0x22_0000, FIXTURE_WRITABLE_PAGES * PAGE_SIZE).unwrap(),
                 KernelImageSegment::WritableData,
             ),
         ])
@@ -1296,7 +1300,7 @@ fn terminal_reaper_layout_is_independent_guarded_and_conflict_free() {
 #[test]
 fn h1_runtime_cpu_arena_validates_every_private_stack_and_guard() {
     let arena_start = 0xffff_8000_0400_0000;
-    let arena_end = arena_start + 4 * 114 * PAGE_SIZE;
+    let arena_end = arena_start + 4 * 162 * PAGE_SIZE;
     let slots =
         crate::arch::x86_64::runtime_cpu_stack_layout_from_arena(arena_start, arena_end).unwrap();
     let segments = [
@@ -1575,7 +1579,9 @@ fn graph_capacity_rejects_before_any_leaf_or_scratch_access() {
             crate::memory::kernel_stack::KernelStackBounds::new(
                 MID_TWO + 15 * PAGE_SIZE,
                 MID_TWO + 16 * PAGE_SIZE,
-                MID_TWO + 32 * PAGE_SIZE
+                MID_TWO
+                    + 16 * PAGE_SIZE
+                    + crate::memory::kernel_stack::E4_PRIVILEGE_ENTRY_STACK_SIZE
             )
             .unwrap(),
             capabilities,

@@ -139,7 +139,7 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
     assert_eq!(layout.thread_kernel_stack_guard_size, 4_096);
     assert_eq!(layout.thread_kernel_stack_alignment, 4_096);
     assert_eq!(layout.privilege_entry_stack_count, 1);
-    assert_eq!(layout.privilege_entry_stack_size, 65_536);
+    assert_eq!(layout.privilege_entry_stack_size, 262_144);
     assert_eq!(layout.privilege_entry_stack_guard_size, 4_096);
     assert_eq!(layout.privilege_entry_stack_alignment, 4_096);
     assert_eq!(layout.terminal_reaper_stack_count, 1);
@@ -166,7 +166,7 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
             "privilege_entry_stack_count = 2",
         ),
         source.replace(
-            "privilege_entry_stack_size = 65536",
+            "privilege_entry_stack_size = 262144",
             "privilege_entry_stack_size = 8192",
         ),
         source.replace(

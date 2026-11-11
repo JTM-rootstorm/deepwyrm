@@ -1637,13 +1637,13 @@ impl TaskLayout {
             );
         }
         if privilege_count != 1
-            || privilege_size != 65_536
+            || privilege_size != 262_144
             || privilege_guard != 4_096
             || privilege_alignment != 4_096
             || !privilege_size.is_multiple_of(privilege_alignment)
             || !privilege_guard.is_multiple_of(privilege_alignment)
         {
-            return Err("DW0-E4 BSP privilege-entry stack must be one guarded 65536-byte stack on a 4096-byte boundary".into());
+            return Err("DW0-E4 BSP privilege-entry stack must be one guarded 262144-byte stack on a 4096-byte boundary".into());
         }
         if terminal_count != 1
             || terminal_size != 262_144
