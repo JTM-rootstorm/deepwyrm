@@ -296,3 +296,273 @@ fn the_write_buffer_is_flushed_only_when_the_unit_requires_it() {
         Err(VtdError::Timeout("write-buffer flush"))
     );
 }
+
+/// Memory the unit and the kernel share: the invalidation queue and the
+/// interrupt-remapping table, as 8-byte entries of 4 KiB frames.
+#[derive(Clone, Default)]
+struct Shared(std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<(u64, usize), u64>>>);
+
+impl tables::TableMemory for Shared {
+    fn allocate(&mut self) -> Option<u64> {
+        unreachable!("the frames are chosen by the test")
+    }
+    fn free(&mut self, _table: u64) {
+        unreachable!("interrupt-remapping frames are never freed")
+    }
+    fn read(&self, table: u64, index: usize) -> u64 {
+        self.0.borrow().get(&(table, index)).copied().unwrap_or(0)
+    }
+    fn write(&mut self, table: u64, index: usize, value: u64) {
+        self.0.borrow_mut().insert((table, index), value);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Event {
+    Command(u32),
+    TablePointerLatched(u64),
+    InterruptCacheInvalidated,
+    StatusWritten,
+}
+
+/// A unit with queued invalidation and interrupt remapping that processes
+/// descriptors when the tail moves, the way the specification describes.
+struct IrUnit {
+    status: u32,
+    queue: u64,
+    tail: u64,
+    head: u64,
+    table: u64,
+    fault: u32,
+    reject_descriptors: bool,
+    memory: Shared,
+    events: Vec<Event>,
+}
+
+const QUEUE: u64 = 0x9000;
+const IR_TABLE: u64 = 0xa000;
+
+impl IrUnit {
+    fn new(memory: Shared) -> Self {
+        Self {
+            status: GLOBAL_TRANSLATION_ENABLE,
+            queue: 0,
+            tail: 0,
+            head: 0,
+            table: 0,
+            fault: 0,
+            reject_descriptors: false,
+            memory,
+            events: vec![],
+        }
+    }
+
+    fn process(&mut self) {
+        use tables::TableMemory;
+        while self.head != self.tail {
+            let slot = (self.head / 16) as usize;
+            let low = self.memory.read(self.queue, slot * 2);
+            let high = self.memory.read(self.queue, slot * 2 + 1);
+            if self.reject_descriptors {
+                self.fault |= FAULT_QUEUE_ERROR;
+                return;
+            }
+            match low & 0xf {
+                DESCRIPTOR_INTERRUPT_ENTRY_CACHE => {
+                    assert_ne!(self.status & GLOBAL_SET_INTERRUPT_TABLE, 0);
+                    self.events.push(Event::InterruptCacheInvalidated);
+                }
+                DESCRIPTOR_WAIT => {
+                    assert_ne!(low & WAIT_STATUS_WRITE, 0);
+                    assert_eq!(high & 3, 0, "status address is dword-aligned");
+                    let frame = high & !0xfff;
+                    let index = ((high & 0xfff) / 8) as usize;
+                    let old = self.memory.read(frame, index);
+                    self.memory
+                        .write(frame, index, (old & !0xffff_ffff) | (low >> 32));
+                    self.events.push(Event::StatusWritten);
+                }
+                other => panic!("unexpected descriptor type {other}"),
+            }
+            self.head = (self.head + 16) % 4096;
+        }
+    }
+}
+
+impl VtdRegisters for IrUnit {
+    fn read32(&mut self, offset: u32) -> u32 {
+        match offset {
+            REG_GLOBAL_STATUS => self.status,
+            REG_FAULT_STATUS => self.fault,
+            _ => panic!("unexpected 32-bit read at {offset:#x}"),
+        }
+    }
+
+    fn write32(&mut self, offset: u32, value: u32) {
+        assert_eq!(offset, REG_GLOBAL_COMMAND);
+        self.events.push(Event::Command(value));
+        assert_eq!(
+            value & GLOBAL_COMPATIBILITY_INTERRUPTS,
+            0,
+            "CFI is never set"
+        );
+        assert_ne!(value & GLOBAL_TRANSLATION_ENABLE, 0, "translation stays on");
+        let enable_queue = value & GLOBAL_QUEUED_INVALIDATION != 0;
+        if !enable_queue && self.status & GLOBAL_QUEUED_INVALIDATION != 0 {
+            assert_eq!(
+                self.head, self.tail,
+                "the queue is disabled only when empty"
+            );
+        }
+        self.status = (self.status & !GLOBAL_QUEUED_INVALIDATION)
+            | if enable_queue {
+                GLOBAL_QUEUED_INVALIDATION
+            } else {
+                0
+            };
+        if enable_queue && value & GLOBAL_SET_INTERRUPT_TABLE != 0 {
+            self.events.push(Event::TablePointerLatched(self.table));
+            self.status |= GLOBAL_SET_INTERRUPT_TABLE;
+        }
+        if value & GLOBAL_INTERRUPT_REMAPPING != 0 {
+            self.status |= GLOBAL_INTERRUPT_REMAPPING;
+        }
+    }
+
+    fn read64(&mut self, offset: u32) -> u64 {
+        match offset {
+            REG_QUEUE_HEAD => self.head,
+            _ => panic!("unexpected 64-bit read at {offset:#x}"),
+        }
+    }
+
+    fn write64(&mut self, offset: u32, value: u64) {
+        match offset {
+            REG_QUEUE_ADDRESS => {
+                assert_eq!(self.status & GLOBAL_QUEUED_INVALIDATION, 0);
+                self.queue = value;
+                self.head = 0;
+            }
+            REG_QUEUE_TAIL => {
+                self.tail = value;
+                if self.status & GLOBAL_QUEUED_INVALIDATION != 0 {
+                    self.process();
+                }
+            }
+            REG_INTERRUPT_TABLE_ADDRESS => self.table = value,
+            _ => panic!("unexpected 64-bit write at {offset:#x}"),
+        }
+    }
+
+    fn flush_cpu_caches(&mut self) {}
+}
+
+#[test]
+fn interrupt_remapping_invalidates_the_entry_cache_then_blocks_compatibility_format() {
+    let memory = Shared::default();
+    let mut unit = IrUnit::new(memory.clone());
+    let mut kernel = memory.clone();
+    enable_interrupt_remapping(&mut unit, &mut kernel, QUEUE, IR_TABLE).unwrap();
+    assert_eq!(unit.queue, QUEUE);
+    assert_eq!(unit.table, IR_TABLE | 7);
+    // Remapping is on, the queue is off again and compatibility format is
+    // blocked; translation stayed on throughout.
+    assert_eq!(
+        unit.status,
+        GLOBAL_TRANSLATION_ENABLE | GLOBAL_SET_INTERRUPT_TABLE | GLOBAL_INTERRUPT_REMAPPING
+    );
+    let base = GLOBAL_TRANSLATION_ENABLE;
+    assert_eq!(
+        unit.events,
+        [
+            Event::Command(base | GLOBAL_QUEUED_INVALIDATION),
+            Event::Command(base | GLOBAL_QUEUED_INVALIDATION | GLOBAL_SET_INTERRUPT_TABLE),
+            Event::TablePointerLatched(IR_TABLE | 7),
+            Event::InterruptCacheInvalidated,
+            Event::StatusWritten,
+            Event::Command(base),
+            Event::Command(base | GLOBAL_INTERRUPT_REMAPPING),
+        ]
+    );
+}
+
+#[test]
+fn inherited_interrupt_state_is_refused_without_touching_the_unit() {
+    for inherited in [
+        GLOBAL_QUEUED_INVALIDATION,
+        GLOBAL_INTERRUPT_REMAPPING,
+        GLOBAL_COMPATIBILITY_INTERRUPTS,
+    ] {
+        let memory = Shared::default();
+        let mut unit = IrUnit::new(memory.clone());
+        unit.status |= inherited;
+        let mut kernel = memory.clone();
+        assert_eq!(
+            enable_interrupt_remapping(&mut unit, &mut kernel, QUEUE, IR_TABLE),
+            Err(VtdError::FirmwareInterruptState(inherited))
+        );
+        assert!(unit.events.is_empty());
+        assert_eq!(unit.queue, 0);
+    }
+}
+
+#[test]
+fn a_rejected_descriptor_fails_before_remapping_is_enabled() {
+    let memory = Shared::default();
+    let mut unit = IrUnit::new(memory.clone());
+    unit.reject_descriptors = true;
+    let mut kernel = memory.clone();
+    assert_eq!(
+        enable_interrupt_remapping(&mut unit, &mut kernel, QUEUE, IR_TABLE),
+        Err(VtdError::QueueError)
+    );
+    assert_eq!(unit.status & GLOBAL_INTERRUPT_REMAPPING, 0);
+}
+
+#[test]
+fn an_ioapic_entry_is_fixed_physical_and_verifies_the_whole_requester_id() {
+    let (low, high) = ioapic_interrupt_entry(0x30, 2, false, 0xff00);
+    // Present, vector 0x30, xAPIC destination 2 in bits 47:40; edge, fixed,
+    // physical, remapped (not posted), faults recorded.
+    assert_eq!(low, 1 | 0x30 << 16 | 2 << 40);
+    // SID 0xff00, SQ 0, SVT 01b.
+    assert_eq!(high, 0xff00 | 1 << 18);
+    let (level, _) = ioapic_interrupt_entry(0x41, 0, true, 0);
+    assert_eq!(level, 1 | 1 << 4 | 0x41 << 16);
+
+    // The present low half is written last.
+    #[derive(Default)]
+    struct Log(Vec<(usize, u64)>);
+    impl tables::TableMemory for Log {
+        fn allocate(&mut self) -> Option<u64> {
+            None
+        }
+        fn free(&mut self, _: u64) {}
+        fn read(&self, _: u64, _: usize) -> u64 {
+            0
+        }
+        fn write(&mut self, _: u64, index: usize, value: u64) {
+            self.0.push((index, value));
+        }
+    }
+    let mut log = Log::default();
+    install_interrupt_entry(&mut log, IR_TABLE, 3, (low, high));
+    assert_eq!(log.0, [(7, high), (6, low)]);
+}
+
+#[test]
+fn interrupt_remapping_needs_both_remapping_and_queued_invalidation() {
+    for (extended, expected) in [
+        (
+            EXTENDED_INTERRUPT_REMAPPING | EXTENDED_QUEUED_INVALIDATION,
+            true,
+        ),
+        (EXTENDED_INTERRUPT_REMAPPING, false),
+        (EXTENDED_QUEUED_INVALIDATION, false),
+    ] {
+        let mut unit = Unit::q35();
+        unit.extended |= extended;
+        let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
+        assert_eq!(features.interrupt_remapping(), expected);
+    }
+}

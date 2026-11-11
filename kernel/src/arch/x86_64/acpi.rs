@@ -42,7 +42,10 @@ const MADT_PROCESSOR_ENABLED: u32 = 1;
 pub(crate) const MAX_MADT_IOAPICS: usize = 8;
 const MAX_MADT_ISO_OVERRIDES: usize = 16;
 const Q35_COM2_ISA_IRQ: u8 = 3;
-const Q35_COM2_VECTOR: u8 = 0x30;
+pub(crate) const Q35_COM2_VECTOR: u8 = 0x30;
+/// The COM2 route's interrupt-remapping table entry, when VT-d remaps
+/// interrupts: the only entry the kernel installs.
+pub(crate) const Q35_COM2_INTERRUPT_INDEX: usize = 0;
 const FADT_PM_TMR_BLK: usize = 76;
 const FADT_PM_TMR_LEN: usize = 91;
 const FADT_FLAGS: usize = 112;
@@ -457,6 +460,11 @@ const IOAPIC_REDIR_VECTOR_MASK: u64 = 0xff;
 const IOAPIC_REDIR_DELIVERY_STATUS: u64 = 1 << 12;
 const IOAPIC_REDIR_MASK: u64 = 1 << 16;
 const IOAPIC_REDIR_DESTINATION_SHIFT: u32 = 56;
+/// Remappable format (VT-d §5.1.5.1): bit 48 set, the remapping-table index
+/// in bits 63:49 (index bits 14:0) and bit 11 (index bit 15).
+const IOAPIC_REDIR_REMAPPABLE: u64 = 1 << 48;
+const IOAPIC_REDIR_INDEX_LOW_SHIFT: u32 = 49;
+const IOAPIC_REDIR_INDEX_HIGH_BIT: u64 = 1 << 11;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -492,6 +500,36 @@ impl IoApicRedirectionEntry {
                 | mask
                 | ((destination as u64) << IOAPIC_REDIR_DESTINATION_SHIFT),
         )
+    }
+
+    /// The COM2 route in remappable format: the remapping entry at
+    /// [`Q35_COM2_INTERRUPT_INDEX`] carries its destination; the vector field
+    /// still names the vector, which the IOAPIC matches against EOIs.
+    pub(crate) const fn encode_q35_com2_remapped(masked: bool) -> Self {
+        let mask = if masked { IOAPIC_REDIR_MASK } else { 0 };
+        let index = Q35_COM2_INTERRUPT_INDEX as u64;
+        Self(
+            (Q35_COM2_VECTOR as u64)
+                | mask
+                | IOAPIC_REDIR_REMAPPABLE
+                | ((index & 0x7fff) << IOAPIC_REDIR_INDEX_LOW_SHIFT)
+                | (if index & 0x8000 != 0 {
+                    IOAPIC_REDIR_INDEX_HIGH_BIT
+                } else {
+                    0
+                }),
+        )
+    }
+
+    /// The COM2 route as the live controller programs it: remappable when
+    /// VT-d remaps interrupts (compatibility-format interrupts are then
+    /// blocked), else compatibility format to `destination`.
+    pub(crate) fn encode_q35_com2_live(masked: bool, destination: u8) -> Self {
+        if crate::arch::x86_64::vtd::interrupts_remapped() {
+            Self::encode_q35_com2_remapped(masked)
+        } else {
+            Self::encode_q35_com2(masked, destination)
+        }
     }
 
     pub(crate) const fn bits(self) -> u64 {
@@ -1940,6 +1978,18 @@ mod tests {
         assert_eq!(
             q35_route(&mut memory, rsdp, &[]),
             Err(Q35Com2RouteError::InvalidMadt)
+        );
+    }
+
+    #[test]
+    fn the_remapped_com2_route_names_entry_zero_and_keeps_its_vector() {
+        assert_eq!(
+            IoApicRedirectionEntry::encode_q35_com2_remapped(false).bits(),
+            0x30 | 1 << 48
+        );
+        assert_eq!(
+            IoApicRedirectionEntry::encode_q35_com2_remapped(true).bits(),
+            0x30 | 1 << 16 | 1 << 48
         );
     }
 

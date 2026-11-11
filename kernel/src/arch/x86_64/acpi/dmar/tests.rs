@@ -356,3 +356,38 @@ fn malformed_device_scopes_are_refused() {
         Err(DmarError::InvalidStructure)
     );
 }
+
+#[test]
+fn single_hop_ioapic_scopes_record_their_requester_ids() {
+    let snapshot = discover(&[qemu_10_2_dmar()]).unwrap().unwrap();
+    // QEMU's q35 IOAPIC: APIC ID 0 on the pseudo platform bus 0xff, 00.0.
+    assert_eq!(snapshot.ioapic_source_id(0), Some(0xff00));
+    assert_eq!(snapshot.ioapic_source_id(1), None);
+
+    let mut second = scope(3, 0, &[(0x1e, 1)]);
+    second[4] = 9;
+    let mut behind_bridge = scope(3, 0, &[(2, 0), (0, 0)]);
+    behind_bridge[4] = 4;
+    let unit = drhd_with_scopes(0, 0xfed9_0000, &[second, behind_bridge]);
+    let snapshot = discover(&[dmar(38, 1, &[unit])]).unwrap().unwrap();
+    assert_eq!(snapshot.ioapic_source_id(9), Some(0x00f1));
+    assert_eq!(snapshot.ioapic_source_id(4), None);
+}
+
+#[test]
+fn duplicate_or_malformed_ioapic_scopes_are_refused() {
+    let unit = drhd_with_scopes(
+        0,
+        0xfed9_0000,
+        &[scope(3, 0xff, &[(0, 0)]), scope(3, 0xfe, &[(0, 0)])],
+    );
+    assert_eq!(
+        discover(&[dmar(38, 1, &[unit])]),
+        Err(DmarError::DuplicateIoApic)
+    );
+    let unit = drhd_with_scopes(0, 0xfed9_0000, &[scope(3, 0xff, &[(32, 0)])]);
+    assert_eq!(
+        discover(&[dmar(38, 1, &[unit])]),
+        Err(DmarError::InvalidStructure)
+    );
+}

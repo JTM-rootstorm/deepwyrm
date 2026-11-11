@@ -161,7 +161,7 @@ impl Q35InterruptController for ValidatedQ35IoApic {
 
     fn program_and_verify(&self, masked: bool) -> Result<(), Q35ControllerError> {
         let (low_register, high_register) = selected_registers(self.route())?;
-        let bits = crate::arch::x86_64::acpi::IoApicRedirectionEntry::encode_q35_com2(
+        let bits = crate::arch::x86_64::acpi::IoApicRedirectionEntry::encode_q35_com2_live(
             masked,
             self.route().bsp_local_apic_id(),
         )
@@ -215,7 +215,7 @@ impl Q35InterruptController for ValidatedQ35IoApic {
 
     fn revalidate_masked_idle(&self) -> Result<(), Q35ControllerError> {
         let (low_register, high_register) = selected_registers(self.route())?;
-        let expected = crate::arch::x86_64::acpi::IoApicRedirectionEntry::encode_q35_com2(
+        let expected = crate::arch::x86_64::acpi::IoApicRedirectionEntry::encode_q35_com2_live(
             true,
             self.route().bsp_local_apic_id(),
         )

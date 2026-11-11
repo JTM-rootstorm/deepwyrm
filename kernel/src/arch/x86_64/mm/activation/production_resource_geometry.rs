@@ -227,10 +227,8 @@ const STORAGE_WAITS: usize = STORAGE_DRIVERS * 6
     + (2 + 2 + 2 + 2)
     + STORAGE_DRIVERS
     + STORAGE_SERVICES;
-pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS
-    + ADDED_EXIT_WAITS
-    + LIVE_SHELL_JOBS * JOB_OWN_WAITS
-    + STORAGE_WAITS;
+pub(super) const WAIT_PEAK: usize =
+    INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS + LIVE_SHELL_JOBS * JOB_OWN_WAITS + STORAGE_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
 // The product archive (`wyrmroot_bootfs::product`) holds thirteen

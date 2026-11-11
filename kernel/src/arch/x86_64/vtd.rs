@@ -18,9 +18,20 @@ const REG_GLOBAL_COMMAND: u32 = 0x18;
 const REG_GLOBAL_STATUS: u32 = 0x1c;
 const REG_ROOT_TABLE_ADDRESS: u32 = 0x20;
 const REG_CONTEXT_COMMAND: u32 = 0x28;
+const REG_FAULT_STATUS: u32 = 0x34;
+const REG_QUEUE_HEAD: u32 = 0x80;
+const REG_QUEUE_TAIL: u32 = 0x88;
+const REG_QUEUE_ADDRESS: u32 = 0x90;
+const REG_INTERRUPT_TABLE_ADDRESS: u32 = 0xb8;
 
 pub(crate) const GLOBAL_TRANSLATION_ENABLE: u32 = 1 << 31;
 pub(crate) const GLOBAL_SET_ROOT_TABLE: u32 = 1 << 30;
+pub(crate) const GLOBAL_QUEUED_INVALIDATION: u32 = 1 << 26;
+pub(crate) const GLOBAL_INTERRUPT_REMAPPING: u32 = 1 << 25;
+pub(crate) const GLOBAL_SET_INTERRUPT_TABLE: u32 = 1 << 24;
+/// Compatibility-format interrupts pass through untranslated. Never set.
+pub(crate) const GLOBAL_COMPATIBILITY_INTERRUPTS: u32 = 1 << 23;
+const FAULT_QUEUE_ERROR: u32 = 1 << 4;
 /// Status bits that persist; one-shot command bits must not be written back.
 /// This is the mask the VT-d specification's command programming note uses.
 const GLOBAL_PERSISTENT_STATUS: u32 = 0x96ff_ffff;
@@ -33,6 +44,23 @@ const IOTLB_DRAIN_READS: u64 = 1 << 49;
 const IOTLB_DRAIN_WRITES: u64 = 1 << 48;
 
 const EXTENDED_COHERENT: u64 = 1;
+const EXTENDED_QUEUED_INVALIDATION: u64 = 1 << 1;
+const EXTENDED_INTERRUPT_REMAPPING: u64 = 1 << 3;
+
+/// Interrupt-remapping table entries: one page of 16-byte entries, sized as
+/// 2^(S + 1) with S = 7 (VT-d §11.4.9.4).
+pub(crate) const INTERRUPT_TABLE_ENTRIES: usize = 256;
+const INTERRUPT_TABLE_SIZE_FIELD: u64 = 7;
+/// Invalidation descriptors (VT-d §6.5.2): 128 bits each in a 256-entry,
+/// one-page queue (IQA.QS = 0).
+const DESCRIPTOR_INTERRUPT_ENTRY_CACHE: u64 = 0x4;
+const DESCRIPTOR_WAIT: u64 = 0x5;
+const WAIT_STATUS_WRITE: u64 = 1 << 5;
+const WAIT_STATUS_DONE: u64 = 1;
+/// The wait descriptor's status lands in the queue page's last 8 bytes:
+/// descriptor slot 255, which the hardware never fetches because only slots
+/// 0 and 1 are ever queued.
+const QUEUE_STATUS_INDEX: usize = 511;
 const EXTENDED_IOTLB_OFFSET_SHIFT: u32 = 8;
 const EXTENDED_IOTLB_OFFSET_MASK: u64 = 0x3ff;
 const CAPABILITY_DRAIN_READ: u64 = 1 << 55;
@@ -64,6 +92,11 @@ pub(crate) enum VtdError {
     InvalidRootTable(u64),
     /// The unit never acknowledged a command.
     Timeout(&'static str),
+    /// Firmware left queued invalidation, interrupt remapping or
+    /// compatibility-format pass-through on.
+    FirmwareInterruptState(u32),
+    /// The unit rejected an invalidation descriptor.
+    QueueError,
 }
 
 /// Aligned register access to one remapping unit.
@@ -106,6 +139,9 @@ pub(crate) struct UnitFeatures {
     input_bits: u32,
     /// Domain IDs the unit supports.
     domains: u32,
+    /// ECAP.IR and ECAP.QI: interrupt remapping, and the queued invalidation
+    /// its interrupt-entry cache needs.
+    interrupt_remapping: bool,
 }
 
 impl UnitFeatures {
@@ -131,6 +167,8 @@ impl UnitFeatures {
             } else {
                 1 << (4 + 2 * number_of_domains)
             },
+            interrupt_remapping: extended_capability & EXTENDED_INTERRUPT_REMAPPING != 0
+                && extended_capability & EXTENDED_QUEUED_INVALIDATION != 0,
         })
     }
 
@@ -149,6 +187,154 @@ impl UnitFeatures {
     pub(crate) const fn domains(self) -> u32 {
         self.domains
     }
+
+    pub(crate) const fn interrupt_remapping(self) -> bool {
+        self.interrupt_remapping
+    }
+}
+
+/// One interrupt-remapping table entry (VT-d §9.10) for an IOAPIC route in
+/// xAPIC mode: present, remapped (not posted), fixed delivery to physical
+/// destination `destination`, accepted only from requester `source_id`
+/// (SVT = 01b, SQ = 0: all 16 bits compared). Returns the low and high
+/// quadwords.
+pub(crate) const fn ioapic_interrupt_entry(
+    vector: u8,
+    destination: u8,
+    level_triggered: bool,
+    source_id: u16,
+) -> (u64, u64) {
+    let low = 1
+        | ((level_triggered as u64) << 4)
+        | ((vector as u64) << 16)
+        | ((destination as u64) << 40);
+    let high = (source_id as u64) | (1 << 18);
+    (low, high)
+}
+
+/// Writes interrupt-remapping table entry `index` in the table frame `table`:
+/// the high quadword first, so the present bit is the last thing set.
+pub(crate) fn install_interrupt_entry<M: tables::TableMemory>(
+    memory: &mut M,
+    table: u64,
+    index: usize,
+    entry: (u64, u64),
+) {
+    assert!(
+        index < INTERRUPT_TABLE_ENTRIES,
+        "interrupt-remapping index out of range"
+    );
+    memory.write(table, index * 2 + 1, entry.1);
+    memory.write(table, index * 2, entry.0);
+}
+
+/// Turns interrupt remapping on for one unit that already translates DMA
+/// (`enable_default_deny`), over the interrupt-remapping table `table`, with
+/// compatibility-format interrupts blocked. Afterwards the unit delivers only
+/// interrupts a present entry names, from that entry's requester; every other
+/// write to the interrupt address range faults instead. Device DMA can then
+/// no longer forge an interrupt (no vector, NMI or INIT of its choosing).
+///
+/// The interrupt-entry cache can only be invalidated through the queue, so
+/// queued invalidation is on just long enough to invalidate it once after the
+/// table pointer is set, using the one-page queue frame `queue`; then it is
+/// turned off again and DMA invalidations stay register-based. Entries are
+/// written before this and never change while remapping is on, so no later
+/// interrupt-entry invalidation is needed.
+pub(crate) fn enable_interrupt_remapping<R: VtdRegisters, M: tables::TableMemory>(
+    registers: &mut R,
+    memory: &mut M,
+    queue: u64,
+    table: u64,
+) -> Result<(), VtdError> {
+    let status = registers.read32(REG_GLOBAL_STATUS);
+    let inherited = status
+        & (GLOBAL_QUEUED_INVALIDATION
+            | GLOBAL_INTERRUPT_REMAPPING
+            | GLOBAL_COMPATIBILITY_INTERRUPTS);
+    if inherited != 0 {
+        return Err(VtdError::FirmwareInterruptState(inherited));
+    }
+
+    memory.write(queue, QUEUE_STATUS_INDEX, 0);
+    registers.write64(REG_QUEUE_TAIL, 0);
+    // 128-bit descriptors (DW = 0), 256 of them (QS = 0).
+    registers.write64(REG_QUEUE_ADDRESS, queue);
+    command(
+        registers,
+        GLOBAL_QUEUED_INVALIDATION,
+        "queued-invalidation enable",
+    )?;
+
+    // x2APIC destinations are not used (EIME = 0): the kernel runs xAPIC.
+    registers.write64(
+        REG_INTERRUPT_TABLE_ADDRESS,
+        table | INTERRUPT_TABLE_SIZE_FIELD,
+    );
+    command(
+        registers,
+        GLOBAL_SET_INTERRUPT_TABLE,
+        "interrupt-table pointer",
+    )?;
+
+    // A global interrupt-entry-cache invalidation, then a wait whose status
+    // write says the unit has finished it.
+    memory.write(queue, 0, DESCRIPTOR_INTERRUPT_ENTRY_CACHE);
+    memory.write(queue, 1, 0);
+    memory.write(
+        queue,
+        2,
+        DESCRIPTOR_WAIT | WAIT_STATUS_WRITE | (WAIT_STATUS_DONE << 32),
+    );
+    memory.write(queue, 3, queue + (QUEUE_STATUS_INDEX as u64) * 8);
+    let tail = 2 * 16;
+    registers.write64(REG_QUEUE_TAIL, tail);
+    let mut queue_error = false;
+    poll(
+        || {
+            queue_error = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_ERROR != 0;
+            queue_error || memory.read(queue, QUEUE_STATUS_INDEX) as u32 == WAIT_STATUS_DONE as u32
+        },
+        "interrupt-entry-cache invalidation",
+    )?;
+    if queue_error {
+        return Err(VtdError::QueueError);
+    }
+    // Queued invalidation may only be disabled with the queue empty.
+    poll(
+        || registers.read64(REG_QUEUE_HEAD) == tail,
+        "invalidation queue drain",
+    )?;
+    let status = registers.read32(REG_GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATUS;
+    registers.write32(REG_GLOBAL_COMMAND, status & !GLOBAL_QUEUED_INVALIDATION);
+    poll(
+        || registers.read32(REG_GLOBAL_STATUS) & GLOBAL_QUEUED_INVALIDATION == 0,
+        "queued-invalidation disable",
+    )?;
+
+    command(
+        registers,
+        GLOBAL_INTERRUPT_REMAPPING,
+        "interrupt-remapping enable",
+    )?;
+    if registers.read32(REG_GLOBAL_STATUS) & GLOBAL_COMPATIBILITY_INTERRUPTS != 0 {
+        return Err(VtdError::FirmwareInterruptState(
+            GLOBAL_COMPATIBILITY_INTERRUPTS,
+        ));
+    }
+    Ok(())
+}
+
+/// Set once at boot, after every unit remaps interrupts with
+/// compatibility-format interrupts blocked; never cleared.
+static INTERRUPTS_REMAPPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether every remapping unit remaps interrupts. Interrupt routes are then
+/// programmed in remappable format, and only then is any function confined
+/// (bus mastering and DMA domains are admitted).
+pub(crate) fn interrupts_remapped() -> bool {
+    INTERRUPTS_REMAPPED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Points the unit at the all-zero `root_table`, invalidates its context and
@@ -339,6 +525,7 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
             .map_err(VtdBootError::Unit)?;
         *slot = Some((registers, state.features()));
     }
+    let interrupts_remapped = remap_interrupts(&mut pool, &mut units, &snapshot)?;
     let dma_domains = match crate::device::dma::live::LiveIommu::new(pool, units, context) {
         Some(iommu) => {
             crate::device::dma::live::install(iommu);
@@ -349,7 +536,57 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     Ok(VtdBootState::DefaultDeny {
         units: snapshot.units().len(),
         dma_domains,
+        interrupts_remapped,
     })
+}
+
+/// Turns interrupt remapping on in every unit when the platform supports it
+/// (the DMAR's INTR_REMAP flag, every unit's ECAP.IR and ECAP.QI, and a
+/// single-hop IOAPIC scope naming the q35 IOAPIC's requester ID). The table
+/// holds exactly one entry, the q35 COM2 route at
+/// [`crate::arch::x86_64::acpi::Q35_COM2_INTERRUPT_INDEX`]. Returns whether
+/// interrupts are remapped; when they are not, no function is ever confined,
+/// so bus mastering stays refused.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn remap_interrupts(
+    pool: &mut crate::device::dma::live::LiveTablePool,
+    units: &mut [Option<(LiveVtdMmio, UnitFeatures)>],
+    snapshot: &crate::arch::x86_64::acpi::dmar::DmarSnapshot,
+) -> Result<bool, VtdBootError> {
+    use tables::TableMemory;
+    if !snapshot.interrupt_remapping()
+        || units
+            .iter()
+            .flatten()
+            .any(|(_, features)| !features.interrupt_remapping())
+    {
+        return Ok(false);
+    }
+    let Some(ioapic) = crate::arch::x86_64::ioapic_live::q35_ioapic() else {
+        return Ok(false);
+    };
+    let Some(source_id) = snapshot.ioapic_source_id(ioapic.probe().id()) else {
+        return Ok(false);
+    };
+    let queue = pool.allocate().ok_or(VtdBootError::RootTable)?;
+    let table = pool.allocate().ok_or(VtdBootError::RootTable)?;
+    install_interrupt_entry(
+        pool,
+        table,
+        crate::arch::x86_64::acpi::Q35_COM2_INTERRUPT_INDEX,
+        ioapic_interrupt_entry(
+            crate::arch::x86_64::acpi::Q35_COM2_VECTOR,
+            ioapic.route().bsp_local_apic_id(),
+            false,
+            source_id,
+        ),
+    );
+    for (registers, _) in units.iter_mut().flatten() {
+        enable_interrupt_remapping(registers, pool, queue, table).map_err(VtdBootError::Unit)?;
+    }
+    // The queue and table frames stay allocated for good.
+    INTERRUPTS_REMAPPED.store(true, core::sync::atomic::Ordering::Release);
+    Ok(true)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -371,6 +608,8 @@ pub(crate) enum VtdBootState {
     DefaultDeny {
         units: usize,
         dma_domains: bool,
+        /// Every unit remaps interrupts with compatibility format blocked.
+        interrupts_remapped: bool,
     },
 }
 

@@ -505,9 +505,17 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             // Bus mastering and DMA domains are admitted only for functions a
             // unit in default deny translates: all of them under an
             // INCLUDE_PCI_ALL unit, else the bus-0 endpoints the units' device
-            // scopes name (QEMU's q35 DMAR lists every device that way).
-            if matches!(state, arch::x86_64::vtd::VtdBootState::DefaultDeny { .. })
-                && let Some(dmar) = dmar
+            // scopes name (QEMU's q35 DMAR lists every device that way). And
+            // only when interrupts are remapped too: otherwise a device's DMA
+            // write to the interrupt address range would be delivered as an
+            // interrupt of its choosing, which no DMA domain stops.
+            if matches!(
+                state,
+                arch::x86_64::vtd::VtdBootState::DefaultDeny {
+                    interrupts_remapped: true,
+                    ..
+                }
+            ) && let Some(dmar) = dmar
             {
                 device::pci::record_dma_confined(dmar.translated_bus0_functions());
             }
@@ -520,8 +528,14 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                         "no DMA remapping hardware; device DMA is not admitted"
                     }
                     arch::x86_64::vtd::VtdBootState::DefaultDeny {
+                        interrupts_remapped: false,
+                        ..
+                    } => "VT-d translation on; no interrupt remapping, so device DMA stays blocked",
+                    arch::x86_64::vtd::VtdBootState::DefaultDeny {
                         dma_domains: true, ..
-                    } => "VT-d translation on; every device DMA is blocked until dma_map",
+                    } => {
+                        "VT-d translation and interrupt remapping on; every device DMA is blocked until dma_map"
+                    }
                     arch::x86_64::vtd::VtdBootState::DefaultDeny {
                         dma_domains: false, ..
                     } => "VT-d translation on; no 4-level domains, so device DMA stays blocked",

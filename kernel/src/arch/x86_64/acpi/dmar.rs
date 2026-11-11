@@ -26,6 +26,9 @@ const DRHD_FLAG_INCLUDE_PCI_ALL: u8 = 1;
 const SCOPE_HEADER_BYTES: usize = 6;
 const SCOPE_PATH_BYTES: usize = 2;
 const SCOPE_PCI_ENDPOINT: u8 = 1;
+const SCOPE_IOAPIC: u8 = 3;
+/// IOAPICs whose requester IDs the DMAR may name; q35 has one.
+pub(crate) const MAX_DMAR_IOAPICS: usize = 8;
 const PAGE: u64 = 4096;
 /// The address widths VT-d can report and x86_64 can address.
 const MIN_HOST_ADDRESS_WIDTH: u8 = 32;
@@ -45,6 +48,9 @@ pub(crate) enum DmarError {
     MultipleIncludeAll,
     TooManyUnits,
     NoUnits,
+    /// Two IOAPIC scope entries name the same IOAPIC ID.
+    DuplicateIoApic,
+    TooManyIoApics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +106,15 @@ impl DmarUnit {
     }
 }
 
+/// An IOAPIC a DRHD's device scope names: its APIC ID and the PCI requester
+/// ID (bus << 8 | device << 3 | function) its interrupt messages carry, which
+/// interrupt remapping verifies (VT-d §8.3.1.1).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DmarIoApic {
+    pub(crate) id: u8,
+    pub(crate) source_id: u16,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DmarSnapshot {
     host_address_width: u8,
@@ -107,6 +122,8 @@ pub(crate) struct DmarSnapshot {
     reserved_memory_regions: usize,
     units: [DmarUnit; MAX_DMAR_UNITS],
     count: usize,
+    ioapics: [DmarIoApic; MAX_DMAR_IOAPICS],
+    ioapic_count: usize,
 }
 
 impl DmarSnapshot {
@@ -115,9 +132,19 @@ impl DmarSnapshot {
         self.host_address_width
     }
 
-    #[cfg(test)]
+    /// The DMAR's INTR_REMAP flag: the platform supports interrupt
+    /// remapping (each unit still reports its own ECAP.IR).
     pub(crate) const fn interrupt_remapping(&self) -> bool {
         self.interrupt_remapping
+    }
+
+    /// The requester ID of the IOAPIC with APIC ID `id`, when a single-hop
+    /// IOAPIC device scope names it.
+    pub(crate) fn ioapic_source_id(&self, id: u8) -> Option<u16> {
+        self.ioapics[..self.ioapic_count]
+            .iter()
+            .find(|ioapic| ioapic.id == id)
+            .map(|ioapic| ioapic.source_id)
     }
 
     /// RMRR structures: memory firmware says some device keeps using. The
@@ -259,6 +286,8 @@ fn parse_dmar(bytes: &[u8]) -> Result<DmarSnapshot, DmarError> {
             bus0_endpoints: Bus0Functions([0; 4]),
         }; MAX_DMAR_UNITS],
         count: 0,
+        ioapics: [DmarIoApic::default(); MAX_DMAR_IOAPICS],
+        ioapic_count: 0,
     };
     let mut offset = DMAR_HEADER_BYTES;
     while offset < bytes.len() {
@@ -275,7 +304,7 @@ fn parse_dmar(bytes: &[u8]) -> Result<DmarSnapshot, DmarError> {
         debug_assert!(header_end <= end);
         match kind {
             STRUCTURE_DRHD => {
-                let unit = parse_drhd(&bytes[offset..end], address_limit)?;
+                let unit = parse_drhd(&bytes[offset..end], address_limit, &mut snapshot)?;
                 if snapshot
                     .units()
                     .iter()
@@ -312,7 +341,11 @@ fn parse_dmar(bytes: &[u8]) -> Result<DmarSnapshot, DmarError> {
     Ok(snapshot)
 }
 
-fn parse_drhd(bytes: &[u8], address_limit: u64) -> Result<DmarUnit, DmarError> {
+fn parse_drhd(
+    bytes: &[u8],
+    address_limit: u64,
+    snapshot: &mut DmarSnapshot,
+) -> Result<DmarUnit, DmarError> {
     if bytes.len() < DRHD_MIN_BYTES {
         return Err(DmarError::InvalidStructure);
     }
@@ -326,13 +359,19 @@ fn parse_drhd(bytes: &[u8], address_limit: u64) -> Result<DmarUnit, DmarError> {
     Ok(DmarUnit {
         register_base,
         include_pci_all: bytes[4] & DRHD_FLAG_INCLUDE_PCI_ALL != 0,
-        bus0_endpoints: parse_device_scopes(&bytes[DRHD_MIN_BYTES..])?,
+        bus0_endpoints: parse_device_scopes(&bytes[DRHD_MIN_BYTES..], snapshot)?,
     })
 }
 
 /// Walks a DRHD's device scope entries. Every entry must be well formed;
-/// only single-hop PCI endpoints starting at bus 0 are recorded.
-fn parse_device_scopes(bytes: &[u8]) -> Result<Bus0Functions, DmarError> {
+/// only single-hop PCI endpoints starting at bus 0 are recorded, plus every
+/// single-hop IOAPIC (into `snapshot`). An IOAPIC behind a bridge has a
+/// requester ID only bus enumeration could tell, so it is not recorded, and
+/// interrupt remapping then stays off.
+fn parse_device_scopes(
+    bytes: &[u8],
+    snapshot: &mut DmarSnapshot,
+) -> Result<Bus0Functions, DmarError> {
     let mut functions = Bus0Functions::default();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -355,6 +394,24 @@ fn parse_device_scopes(bytes: &[u8]) -> Result<Bus0Functions, DmarError> {
                 return Err(DmarError::InvalidStructure);
             }
             functions.insert(device << 3 | function);
+        }
+        if kind == SCOPE_IOAPIC && path.len() == SCOPE_PATH_BYTES {
+            let (device, function) = (path[0], path[1]);
+            if device >= 32 || function >= 8 {
+                return Err(DmarError::InvalidStructure);
+            }
+            let ioapic = DmarIoApic {
+                id: bytes[offset + 4],
+                source_id: u16::from(start_bus) << 8 | u16::from(device << 3 | function),
+            };
+            if snapshot.ioapic_source_id(ioapic.id).is_some() {
+                return Err(DmarError::DuplicateIoApic);
+            }
+            *snapshot
+                .ioapics
+                .get_mut(snapshot.ioapic_count)
+                .ok_or(DmarError::TooManyIoApics)? = ioapic;
+            snapshot.ioapic_count += 1;
         }
         offset += length;
     }
