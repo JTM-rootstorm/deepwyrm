@@ -33,6 +33,13 @@
 //! registry replacement and shell restart are all reachable without a
 //! selector, so the peaks below carry one replacement generation overlapping
 //! the generation it replaces.
+//!
+//! The storage spine (root `STORAGE_PLAN.md` W2-W7) adds seven resident
+//! roles beneath init: a `virtio-blkd` per disk (boot and data), a `blockmgr`
+//! per volume (boot and root), `fat32d`, `ext4d` and `vfsd`. W2-W6 added four
+//! of them without this ledger, and the product kept fitting only by slack;
+//! the data disk's driver (W7) was the role that stopped fitting, and the
+//! product booted no shell. The storage rows below are that enumeration.
 
 /// Enumerate every lifetime identity, including replaced generations. **This
 /// census sizes no capacity** -- it records that the product was enumerated
@@ -41,7 +48,7 @@
 /// finalized generation releases its slot. Treating a lifetime census as a
 /// capacity is what selector 34's ledger records at `LIVE_IDENTITY_PEAK`, and
 /// what selector 33's `fits` still does.
-pub(super) const LIFETIME_IDENTITIES: [&str; 16] = [
+pub(super) const LIFETIME_IDENTITIES: [&str; 23] = [
     "primordial",
     "system-init",
     "registryd-1",
@@ -58,6 +65,13 @@ pub(super) const LIFETIME_IDENTITIES: [&str; 16] = [
     "shell-job-3",
     "shell-job-4",
     "driver-attempt-2",
+    "virtio-blkd-boot",
+    "virtio-blkd-data",
+    "blockmgr-boot",
+    "blockmgr-root",
+    "fat32d",
+    "ext4d",
+    "vfsd",
 ];
 
 // init's own four authorities; registryd Process/TaskGroup/bootstrap/control;
@@ -66,13 +80,28 @@ pub(super) const LIFETIME_IDENTITIES: [&str; 16] = [
 // endpoint. Identical to selector 33's baseline because the resident set is
 // the same six roles; the products differ after startup, not during it.
 const INIT_RESIDENT_HANDLES: [usize; 6] = [4, 4, 3, 3, 4, 3];
-pub(super) const INIT_BASELINE_HANDLES: usize = sum(&INIT_RESIDENT_HANDLES);
+/// Init holds each disk driver's Process, launch Channel and TaskGroup, and
+/// each storage service's Process, launch Channel, TaskGroup and control
+/// Channel.
+const STORAGE_DRIVERS: usize = 2;
+const STORAGE_SERVICES: usize = 5;
+const INIT_STORAGE_HANDLES: usize = STORAGE_DRIVERS * 3 + STORAGE_SERVICES * 4;
+/// A shell `run` of a file holds the file's Channel and the private memory
+/// init reads it into, beside the loader's own handles.
+const IMAGE_LAUNCH_HANDLES: usize = 2;
+pub(super) const INIT_BASELINE_HANDLES: usize = sum(&INIT_RESIDENT_HANDLES) + INIT_STORAGE_HANDLES;
 
-const RESIDENT_IMAGES: usize = 6;
+/// The six interactive roles and the seven storage roles.
+const RESIDENT_IMAGES: usize = 6 + STORAGE_DRIVERS + STORAGE_SERVICES;
 const RESIDENT_IMAGE_OBJECTS: usize = 2 + 1; // PT_LOADs plus initial stack.
 /// Wyrmroot's job loader refuses an image with more than two PT_LOADs.
 const JOB_IMAGE_OBJECTS: usize = 2 + 1; // PT_LOADs plus initial stack.
-pub(super) const BASELINE_MEMORY: usize = RESIDENT_IMAGES * RESIDENT_IMAGE_OBJECTS + 1; // + bootfs.
+/// Each disk driver's BAR object and DMA object; fat32d's and ext4d's
+/// attached buffers; each blockmgr's discovery buffer, open together with
+/// the rest during boot; init's private copy of a file being launched.
+const STORAGE_MEMORY: usize = STORAGE_DRIVERS * 2 + 2 + 2 + 1;
+pub(super) const BASELINE_MEMORY: usize =
+    RESIDENT_IMAGES * RESIDENT_IMAGE_OBJECTS + 1 + STORAGE_MEMORY; // + bootfs.
 
 /// A replacement generation is constructed before the generation it replaces
 /// is reaped, so exactly one role is doubled at the peak. Init's recovery is
@@ -126,6 +155,7 @@ const STREAM_JOB_LOADER_HANDLES: usize = 1 + 3 + 1 + 2 + 1;
 const REPLACEMENT_STAGING_HANDLES: usize = 3;
 pub(super) const HANDLE_PEAK: usize = INIT_BASELINE_HANDLES
     + STREAM_JOB_LOADER_HANDLES
+    + IMAGE_LAUNCH_HANDLES
     + REPLACEMENT_STAGING_HANDLES
     + LIVE_SHELL_JOBS * JOB_HELD_HANDLES;
 pub(super) const MEMORY_PEAK: usize = BASELINE_MEMORY
@@ -139,7 +169,15 @@ pub(super) const MAPPING_PEAK: usize =
 /// init's five role startups, the service pairs to registryd, devmgr's
 /// publication pair, the device control pair, consoled's launch pair and the
 /// shell's job-control pair.
-pub(super) const BASELINE_CHANNEL_PAIRS: usize = 17;
+/// The storage roles' pairs: per disk driver its startup, devmgr control and
+/// registry publication pairs; per service its startup and control pairs;
+/// the publications (two blockmgrs, vfsd) and registry clients (two
+/// blockmgrs, fat32d, ext4d); both filesystem roots to vfsd; each
+/// filesystem's volume connection and blockmgr's driver connection behind
+/// it; and a shell's vfsd connection with two open nodes.
+const STORAGE_CHANNEL_PAIRS: usize =
+    STORAGE_DRIVERS * 3 + STORAGE_SERVICES * 2 + 3 + 4 + 2 + 2 * 2 + 3;
+pub(super) const BASELINE_CHANNEL_PAIRS: usize = 17 + STORAGE_CHANNEL_PAIRS;
 /// A replacement generation brings its startup, control and publication pairs
 /// before the outgoing generation's peers have closed.
 const REPLACEMENT_CHANNEL_PAIRS: usize = 3;
@@ -151,9 +189,9 @@ pub(super) const CHANNEL_PAIR_PEAK: usize =
 /// assuming any particular peer has already observed close.
 pub(super) const CHANNEL_ENDPOINT_PEAK: usize = 2 * CHANNEL_PAIR_PEAK;
 
-/// devmgr owns the boot resource domain; the driver holds the one UART
-/// DeviceResource and its one Interrupt.
-const DEVICE_RESOURCES: usize = 1;
+/// devmgr owns the boot resource domain; the drivers hold the UART
+/// DeviceResource with its one Interrupt and the two disks' PCI functions.
+const DEVICE_RESOURCES: usize = 1 + STORAGE_DRIVERS;
 const INTERRUPTS: usize = 1;
 /// The UART pacing Timer and init's resident control tick can overlap.
 pub(super) const TIMER_PEAK: usize = 2;
@@ -178,15 +216,30 @@ pub(super) const INTERACTIVE_GRAPH_WAITS: usize = 12 + 3 + 4 + 6 + 7 + 7;
 /// and the replacement generation, each owning a Channel and a Process
 /// registration.
 const ADDED_EXIT_WAITS: usize = (LIVE_SHELL_JOBS + REPLACEMENT_GENERATIONS) * 2;
-pub(super) const WAIT_PEAK: usize =
-    INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS + LIVE_SHELL_JOBS * JOB_OWN_WAITS;
+/// The storage roles' wait sets, each at its usual size: a disk driver's
+/// control, publication and four connections; a blockmgr's control,
+/// publication and three client links of two Channels each; fat32d's and
+/// ext4d's control, root and four open nodes; vfsd's control, publication,
+/// two mounts, two clients and two nodes; and init's exit wait per role.
+const STORAGE_WAITS: usize = STORAGE_DRIVERS * 6
+    + 2 * (2 + 3 * 2)
+    + 2 * (2 + 4)
+    + (2 + 2 + 2 + 2)
+    + STORAGE_DRIVERS
+    + STORAGE_SERVICES;
+pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS
+    + ADDED_EXIT_WAITS
+    + LIVE_SHELL_JOBS * JOB_OWN_WAITS
+    + STORAGE_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
-// The product archive (`wyrmroot_bootfs::product`) holds eight executables --
-// six roles, `bin/hello` and `bin/cpu-hog` -- and four bootstrap entries:
-// launch policy, `rrc-a-v1`, the device manifest and the product marker. No
-// extra kernel object is made per entry.
-pub(super) const BOOTFS_ENTRY_PEAK: usize = 8 + 4;
+// The product archive (`wyrmroot_bootfs::product`) holds thirteen
+// executables -- six roles, `bin/hello`, `bin/cpu-hog` and the five storage
+// executables (`virtio-blkd`, `blockmgr`, `fat32d`, `ext4d`, `vfsd`; the
+// disks and volumes share theirs) -- and four bootstrap entries: launch
+// policy, `rrc-a-v1`, the device manifest and the product marker. No extra
+// kernel object is made per entry.
+pub(super) const BOOTFS_ENTRY_PEAK: usize = 13 + 4;
 pub(super) const BOOTFS_ENTRY_CAPACITY: usize = 4096;
 
 /// The production product produces no evidence records. The collector is
@@ -220,14 +273,16 @@ pub(super) struct Capacity {
     pub evidence: usize,
 }
 
+/// Each pool sits clear of its peak, so the next storage or package role is
+/// an edit to this ledger rather than a product that silently stops booting.
 pub(super) const SELECTED: Capacity = Capacity {
-    handles: 48,
-    memory: 48,
-    mappings: 64,
-    identities: 16,
-    registry: 192,
-    channel_pairs: 40,
-    waits: 68,
+    handles: 96,
+    memory: 96,
+    mappings: 128,
+    identities: 32,
+    registry: 384,
+    channel_pairs: 96,
+    waits: 160,
     evidence: 0,
 };
 
@@ -254,15 +309,14 @@ const _: () = assert!(fits(SELECTED));
 // `primordial::enter` to a panic, `--gc-sections` drops every subsystem the
 // folded continuation no longer reaches, and the artifact boots no product at
 // all. That is the failure selector 34 measured at R1C. The production arena
-// is the ordinary sixteen and this ledger selects exactly sixteen, so the
-// relation holds with no margin -- a seventeenth identity must raise the arena
-// deliberately, not arrive by edit.
+// and this ledger move together: W7 raised both to thirty-two, deliberately,
+// in `task_layout.toml`.
 const _: () = assert!(SELECTED.identities <= crate::memory::kernel_stack::E3_THREAD_STACK_COUNT);
-// Deliberately below selector 33's 64-handle tables, matching selector 34's
-// choice for the same reason: E8's widened per-Process pools are why its
-// termination requirement was 3,014,752 bytes, and this product's demand does
-// not require them.
-const _: () = assert!(SELECTED.handles < 64);
+// Selector 33's 64-handle tables were avoided while the product's demand
+// stayed under 48. With the storage spine, init alone holds 47 handles at
+// rest and its peak is past 64, so the tables are wider than E8's; the bound
+// keeps a stray edit from widening them further unexamined.
+const _: () = assert!(SELECTED.handles <= 96);
 // The production product carries no evidence collector. If `test-support` is
 // ever admitted into a production build this ledger must be revisited rather
 // than silently inheriting a selector's record capacity.
@@ -282,32 +336,37 @@ mod tests {
         // is the reconciliation: a capacity change fails in this repository
         // before it can reach a product whose receipt still claims the old
         // figure.
-        assert_eq!(SELECTED.identities, 16);
-        assert_eq!(SELECTED.handles, 48);
-        assert_eq!(SELECTED.registry, 192);
+        assert_eq!(SELECTED.identities, 32);
+        assert_eq!(SELECTED.handles, 96);
+        assert_eq!(SELECTED.registry, 384);
         // Production links the ordinary arena. Only the E8 and F-closure
         // fairness builds link sixty-four stacks (`kernel_stack.rs`), and this
         // module is compiled into their host tests too.
-        assert_eq!(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT, 16);
+        assert_eq!(crate::memory::kernel_stack::E3_THREAD_STACK_COUNT, 32);
     }
 
     #[test]
     fn production_peaks_are_the_documented_arithmetic() {
-        assert_eq!(INIT_BASELINE_HANDLES, 21);
+        assert_eq!(INIT_STORAGE_HANDLES, 26);
+        assert_eq!(INIT_BASELINE_HANDLES, 47);
         assert_eq!(STREAM_JOB_LOADER_HANDLES, 8);
-        assert_eq!(HANDLE_PEAK, 44);
-        assert_eq!(BASELINE_MEMORY, 19);
-        assert_eq!(MEMORY_PEAK, 35);
-        assert_eq!(MAPPING_PEAK, 63);
-        assert_eq!(LIVE_PROCESSES, 11);
-        assert_eq!(LIVE_TASK_GROUPS, 14);
-        assert_eq!(LIVE_IDENTITY_PEAK, 14);
-        assert_eq!(CHANNEL_PAIR_PEAK, 36);
-        assert_eq!(CHANNEL_ENDPOINT_PEAK, 72);
-        assert_eq!(REGISTRY_PEAK, 158);
+        assert_eq!(HANDLE_PEAK, 72);
+        assert_eq!(RESIDENT_IMAGES, 13);
+        assert_eq!(STORAGE_MEMORY, 9);
+        assert_eq!(BASELINE_MEMORY, 49);
+        assert_eq!(MEMORY_PEAK, 65);
+        assert_eq!(MAPPING_PEAK, 93);
+        assert_eq!(LIVE_PROCESSES, 18);
+        assert_eq!(LIVE_TASK_GROUPS, 21);
+        assert_eq!(LIVE_IDENTITY_PEAK, 21);
+        assert_eq!(STORAGE_CHANNEL_PAIRS, 32);
+        assert_eq!(CHANNEL_PAIR_PEAK, 68);
+        assert_eq!(CHANNEL_ENDPOINT_PEAK, 136);
+        assert_eq!(REGISTRY_PEAK, 282);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
-        assert_eq!(WAIT_PEAK, 65);
-        assert_eq!(BOOTFS_ENTRY_PEAK, 12);
+        assert_eq!(STORAGE_WAITS, 55);
+        assert_eq!(WAIT_PEAK, 120);
+        assert_eq!(BOOTFS_ENTRY_PEAK, 17);
     }
 
     #[test]
@@ -335,7 +394,7 @@ mod tests {
 
     #[test]
     fn the_lifetime_census_is_not_used_as_a_capacity() {
-        // Sixteen lifetime identities, fourteen simultaneous. The census is
+        // Twenty-three lifetime identities, twenty-one simultaneous. The census is
         // larger than every pool it could be mistaken for, which is why it is
         // absent from `fits`.
         assert!(LIFETIME_IDENTITIES.len() > LIVE_IDENTITY_PEAK);

@@ -1622,7 +1622,9 @@ impl TaskLayout {
             parse_u64(required_value(&values, "terminal_reaper_stack_guard_size")?)?;
         let terminal_alignment =
             parse_u64(required_value(&values, "terminal_reaper_stack_alignment")?)?;
-        if count != 16
+        // W7 (root `STORAGE_PLAN.md`): the production ledger's thirty-two
+        // identities, one guarded stack each.
+        if count != 32
             || size != 524_288
             || guard != 4_096
             || alignment != 4_096
@@ -1630,7 +1632,7 @@ impl TaskLayout {
             || !guard.is_multiple_of(alignment)
         {
             return Err(
-                "DW0-E3 thread stack pool must be 16 guarded 524288-byte stacks on 4096-byte boundaries"
+                "DW0-E3 thread stack pool must be 32 guarded 524288-byte stacks on 4096-byte boundaries"
                     .into(),
             );
         }

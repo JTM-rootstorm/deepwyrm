@@ -212,7 +212,7 @@ const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
 #[cfg(not(deepwyrm_production_product))]
 const _: [(); 10] = [(); HANDLES];
 #[cfg(deepwyrm_production_product)]
-const _: [(); 48] = [(); HANDLES];
+const _: [(); 96] = [(); HANDLES];
 #[cfg(deepwyrm_production_product)]
 const _: [(); 2] = [(); TIMERS];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];

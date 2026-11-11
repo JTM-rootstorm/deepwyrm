@@ -206,8 +206,8 @@ ASSERT((__dw_ist_region_end - __dw_ist_region_start) == 15 * DW_KERNEL_BASE_PAGE
 
 ASSERT((__dw_thread_kernel_stack_region_start & (DW_KERNEL_THREAD_STACK_ALIGNMENT - 1)) == 0,
        "thread kernel-stack region must satisfy its configured alignment")
-ASSERT(DW_KERNEL_THREAD_STACK_COUNT == 16,
-       "thread kernel-stack count must be 16")
+ASSERT(DW_KERNEL_THREAD_STACK_COUNT == 32,
+       "thread kernel-stack count must be 32")
 ASSERT(DW_KERNEL_THREAD_STACK_SIZE == 524288,
        "thread kernel-stack size must be the frozen E3 512 KiB for every product")
 ASSERT(DW_KERNEL_THREAD_STACK_GUARD_SIZE == DW_KERNEL_BASE_PAGE_SIZE,

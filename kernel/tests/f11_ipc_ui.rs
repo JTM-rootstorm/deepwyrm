@@ -235,7 +235,7 @@ fn run_compile_fail_case(
         command
             .arg("--cfg")
             .arg("deepwyrm_integrated")
-            .env("DEEPWYRM_E3_THREAD_STACK_COUNT", "16")
+            .env("DEEPWYRM_E3_THREAD_STACK_COUNT", "32")
             .env("DEEPWYRM_E3_THREAD_STACK_SIZE", "524288")
             .env("DEEPWYRM_E3_THREAD_STACK_GUARD_SIZE", "4096")
             .env("DEEPWYRM_E3_THREAD_STACK_ALIGNMENT", "4096")
