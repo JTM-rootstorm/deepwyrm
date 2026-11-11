@@ -200,6 +200,19 @@ pub(crate) enum NativeSyscallRequest {
         requested_rights: DwRights,
         out_memory_object: DwUserAddress,
     },
+    DmaMap {
+        resource: DwHandle,
+        memory_object: DwHandle,
+        offset: u64,
+        byte_len: u64,
+        access: u32,
+        out_iova: DwUserAddress,
+    },
+    DmaUnmap {
+        resource: DwHandle,
+        iova: u64,
+        byte_len: u64,
+    },
     InterruptCreate {
         resource: DwHandle,
         requested_rights: DwRights,
@@ -415,6 +428,19 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
             bar: u32_arg(a[1])?,
             requested_rights: DwRights(a[2]),
             out_memory_object: DwUserAddress(a[3]),
+        },
+        DwKnownSyscall::DmaMap => NativeSyscallRequest::DmaMap {
+            resource: DwHandle(a[0]),
+            memory_object: DwHandle(a[1]),
+            offset: a[2],
+            byte_len: a[3],
+            access: u32_arg(a[4])?,
+            out_iova: DwUserAddress(a[5]),
+        },
+        DwKnownSyscall::DmaUnmap => NativeSyscallRequest::DmaUnmap {
+            resource: DwHandle(a[0]),
+            iova: a[1],
+            byte_len: a[2],
         },
         DwKnownSyscall::InterruptCreate => NativeSyscallRequest::InterruptCreate {
             resource: DwHandle(a[0]),
@@ -800,6 +826,26 @@ pub(crate) trait NativeSyscallServices {
     ) -> NativeSyscallResult {
         unsupported_f()
     }
+    #[allow(clippy::too_many_arguments)]
+    fn dma_map(
+        &mut self,
+        _resource: DwHandle,
+        _memory_object: DwHandle,
+        _offset: u64,
+        _byte_len: u64,
+        _access: u32,
+        _out_iova: DwUserAddress,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
+    fn dma_unmap(
+        &mut self,
+        _resource: DwHandle,
+        _iova: u64,
+        _byte_len: u64,
+    ) -> NativeSyscallResult {
+        unsupported_f()
+    }
     fn interrupt_create(
         &mut self,
         _resource: DwHandle,
@@ -1013,6 +1059,19 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 requested_rights,
                 out_memory_object,
             } => self.device_mmio_object_create(resource, bar, requested_rights, out_memory_object),
+            NativeSyscallRequest::DmaMap {
+                resource,
+                memory_object,
+                offset,
+                byte_len,
+                access,
+                out_iova,
+            } => self.dma_map(resource, memory_object, offset, byte_len, access, out_iova),
+            NativeSyscallRequest::DmaUnmap {
+                resource,
+                iova,
+                byte_len,
+            } => self.dma_unmap(resource, iova, byte_len),
             NativeSyscallRequest::InterruptCreate {
                 resource,
                 requested_rights,

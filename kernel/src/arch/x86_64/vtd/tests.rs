@@ -57,6 +57,9 @@ impl VtdRegisters for Unit {
         self.log.push(Write::W32(offset, value));
         assert_eq!(offset, REG_GLOBAL_COMMAND, "only GCMD is written 32-bit");
         if !self.responsive {
+            if value & GLOBAL_WRITE_BUFFER_FLUSH != 0 {
+                self.status |= GLOBAL_WRITE_BUFFER_FLUSH;
+            }
             return;
         }
         if value & GLOBAL_SET_ROOT_TABLE != 0 {
@@ -211,4 +214,85 @@ fn a_silent_unit_times_out_instead_of_hanging() {
         Err(VtdError::Timeout("root-table pointer"))
     );
     assert_eq!(unit.status & GLOBAL_TRANSLATION_ENABLE, 0);
+}
+
+#[test]
+fn features_decode_levels_width_domains_and_cache_rules() {
+    let mut unit = Unit::q35();
+    // SAGAW 3- and 4-level, MGAW 38 (39 bits), ND 2, caching mode, RWBF.
+    unit.capability |= (0b0110 << CAPABILITY_SAGAW_SHIFT)
+        | (38 << CAPABILITY_MGAW_SHIFT)
+        | 2
+        | CAPABILITY_CACHING_MODE
+        | CAPABILITY_REQUIRED_WRITE_BUFFER_FLUSH;
+    let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
+    assert!(features.four_level());
+    assert_eq!(features.input_bits(), 39);
+    assert_eq!(features.domains(), 256);
+    assert!(features.caching_mode());
+
+    // 3-level only, and the reserved domain-count encoding.
+    let mut unit = Unit::q35();
+    unit.capability |= (0b0010 << CAPABILITY_SAGAW_SHIFT) | 7;
+    let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
+    assert!(!features.four_level());
+    assert_eq!(features.domains(), 0);
+    assert!(!features.caching_mode());
+}
+
+#[test]
+fn a_domain_iotlb_invalidation_names_the_domain_and_drains() {
+    let mut unit = Unit::q35();
+    let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
+    unit.log.clear();
+    invalidate_domain_iotlb(&mut unit, features, 5).unwrap();
+    invalidate_context_cache(&mut unit).unwrap();
+    assert_eq!(
+        unit.log,
+        [
+            Write::W64(
+                IOTLB,
+                IOTLB_INVALIDATE
+                    | IOTLB_DOMAIN
+                    | (5 << IOTLB_DOMAIN_ID_SHIFT)
+                    | IOTLB_DRAIN_READS
+                    | IOTLB_DRAIN_WRITES
+            ),
+            Write::W64(REG_CONTEXT_COMMAND, CONTEXT_INVALIDATE | CONTEXT_GLOBAL),
+        ]
+    );
+
+    unit.responsive = false;
+    assert_eq!(
+        invalidate_domain_iotlb(&mut unit, features, 5),
+        Err(VtdError::Timeout("IOTLB invalidation"))
+    );
+}
+
+#[test]
+fn the_write_buffer_is_flushed_only_when_the_unit_requires_it() {
+    let mut unit = Unit::q35();
+    let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
+    unit.log.clear();
+    flush_write_buffer(&mut unit, features).unwrap();
+    assert!(unit.log.is_empty());
+
+    let mut unit = Unit::q35();
+    unit.capability |= CAPABILITY_REQUIRED_WRITE_BUFFER_FLUSH;
+    let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
+    unit.log.clear();
+    flush_write_buffer(&mut unit, features).unwrap();
+    // Translation stays on: the persistent status bit is carried.
+    assert_eq!(
+        unit.log,
+        [Write::W32(
+            REG_GLOBAL_COMMAND,
+            GLOBAL_TRANSLATION_ENABLE | GLOBAL_WRITE_BUFFER_FLUSH
+        )]
+    );
+    unit.responsive = false;
+    assert_eq!(
+        flush_write_buffer(&mut unit, features),
+        Err(VtdError::Timeout("write-buffer flush"))
+    );
 }

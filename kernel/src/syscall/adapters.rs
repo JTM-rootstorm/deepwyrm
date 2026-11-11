@@ -2326,6 +2326,214 @@ pub(crate) fn device_pci_command<
     }
 }
 
+fn dma_status(error: crate::device::dma::DmaError) -> DwStatus {
+    use crate::device::dma::DmaError;
+    match error {
+        DmaError::InvalidRange => DW_STATUS_INVALID_ARGUMENT,
+        DmaError::NotSupported => DW_STATUS_NOT_SUPPORTED,
+        DmaError::NoResources => DW_STATUS_NO_RESOURCES,
+        DmaError::NoAddressSpace => deepwyrm_abi::DW_STATUS_NO_MEMORY,
+        DmaError::NotFound => deepwyrm_abi::DW_STATUS_NOT_FOUND,
+        DmaError::FunctionBusy => DW_STATUS_BAD_STATE,
+    }
+}
+
+/// Releases a lookup pin whose handle still owns the object, so the pin is
+/// never the last reference.
+fn release_held_lookup_pin<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    pin: crate::object::InternalRef,
+) {
+    match registry.release_internal(pin) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("a lookup pin became final while its handle lived"),
+        Err(failure) => panic!(
+            "a lookup pin violated generic lifetime invariants: {:?}",
+            failure.error()
+        ),
+    }
+}
+
+/// Resolves a PCI_FUNCTION DeviceResource handle with MODIFY to its object
+/// identity and bus-0 device/function. The lookup pin is released before
+/// returning: a domain is keyed by the resource's identity, and the resource
+/// cannot finalize while the caller's handle (and this syscall) holds it.
+fn dma_resource<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    current_process: ProcessKey,
+    resource: DwHandle,
+) -> Result<(crate::object::ObjectId, u8), DwStatus> {
+    let resolved = match tasks.process_handles_mut(current_process) {
+        Ok(table) => table
+            .lookup(
+                registry,
+                resource,
+                crate::handle::AcceptedObjectTypes::One(
+                    deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE,
+                ),
+                deepwyrm_abi::DW_RIGHT_MODIFY,
+            )
+            .map_err(handle_status)?,
+        Err(error) => return Err(task_status(error)),
+    };
+    let address = resources.pci_address_for_resolved(&resolved);
+    let id = resolved.object_id();
+    release_held_lookup_pin(registry, resolved.into_internal());
+    let address = address.map_err(|_| DW_STATUS_INVALID_ARGUMENT)?;
+    if address.bus() != 0 {
+        return Err(DW_STATUS_NOT_SUPPORTED);
+    }
+    Ok((id, (address.device() << 3) | address.function()))
+}
+
+/// `dma_map` (storage K4): maps pages of a page-backed MemoryObject into the
+/// resource's IOMMU domain. The MemoryObject lookup pin becomes the
+/// mapping's reference.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dma_map<
+    U: UserPageAccess,
+    D: crate::device::dma::DmaService,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    user: &mut U,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    dma: &mut D,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    memory_object: DwHandle,
+    offset: u64,
+    byte_len: u64,
+    access: u32,
+    out_iova: DwUserAddress,
+) -> DwStatus {
+    use crate::memory::object::MemoryObjectError;
+    if access == 0 || access & !deepwyrm_abi::DW_DMA_ACCESS_SUPPORTED_MASK != 0 {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let device = crate::arch::x86_64::vtd::tables::DeviceAccess {
+        read: access & deepwyrm_abi::DW_DMA_ACCESS_DEVICE_READ != 0,
+        write: access & deepwyrm_abi::DW_DMA_ACCESS_DEVICE_WRITE != 0,
+    };
+    let output = match preflight_output(user, out_iova, 8, 8) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    let (resource_id, devfn) =
+        match dma_resource(registry, tasks, resources, current_process, resource) {
+            Ok(found) => found,
+            Err(status) => return status,
+        };
+    let mut required = deepwyrm_abi::DW_RIGHT_READ.0;
+    if device.write {
+        required |= deepwyrm_abi::DW_RIGHT_WRITE.0;
+    }
+    let resolved = match tasks.process_handles_mut(current_process) {
+        Ok(table) => match table.lookup(
+            registry,
+            memory_object,
+            crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
+            DwRights(required),
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return handle_status(error),
+        },
+        Err(error) => return task_status(error),
+    };
+    let physical = match memory.dma_physical_range(&resolved, offset, byte_len, device.write) {
+        Ok(physical) => physical,
+        Err(error) => {
+            release_held_lookup_pin(registry, resolved.into_internal());
+            return match error {
+                MemoryObjectError::BackingKind => DW_STATUS_NOT_SUPPORTED,
+                MemoryObjectError::BackingTooSmall => DW_STATUS_INVALID_ARGUMENT,
+                other => memory_object_status(other),
+            };
+        }
+    };
+    let pages = byte_len / crate::memory::object::PAGE_SIZE;
+    match dma.map(
+        resource_id,
+        devfn,
+        physical,
+        pages,
+        device,
+        resolved.into_internal(),
+    ) {
+        Ok(iova) => {
+            output.commit(&iova.to_le_bytes());
+            DW_STATUS_SUCCESS
+        }
+        Err((error, pin)) => {
+            release_held_lookup_pin(registry, pin);
+            dma_status(error)
+        }
+    }
+}
+
+/// `dma_unmap` (storage K4): removes one whole mapping, invalidates the
+/// IOTLB, and only then releases the MemoryObject reference it held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dma_unmap<
+    D: crate::device::dma::DmaService,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    dma: &mut D,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    iova: u64,
+    byte_len: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let page = crate::memory::object::PAGE_SIZE;
+    if byte_len == 0 || !byte_len.is_multiple_of(page) || !iova.is_multiple_of(page) {
+        return DW_STATUS_INVALID_ARGUMENT;
+    }
+    let (resource_id, _) = match dma_resource(registry, tasks, resources, current_process, resource)
+    {
+        Ok(found) => found,
+        Err(status) => return status,
+    };
+    match dma.unmap(resource_id, iova, byte_len / page) {
+        Ok(pin) => {
+            cleanup.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
+                panic!(
+                    "a DMA mapping reference violated generic lifetime invariants: {:?}",
+                    failure.error()
+                )
+            }));
+            DW_STATUS_SUCCESS
+        }
+        Err(error) => dma_status(error),
+    }
+}
+
 /// `device_mmio_object_create` (storage K3): a MemoryObject over one whole
 /// admitted BAR, holding the DeviceResource's lookup pin until it finalizes.
 #[allow(clippy::too_many_arguments)]

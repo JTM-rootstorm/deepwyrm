@@ -990,6 +990,32 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
+    /// The physical start of `[offset, offset + byte_len)` of a page-backed
+    /// object a DMA mapping may name (storage K4). Device-MMIO and boot-module
+    /// objects are refused with `BackingKind`; a device-writable mapping needs
+    /// a writable object.
+    pub(crate) fn dma_physical_range(
+        &self,
+        resolved: &ResolvedHandle,
+        offset: u64,
+        byte_len: u64,
+        device_writes: bool,
+    ) -> Result<u64, MemoryObjectError> {
+        if resolved.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MemoryObjectError::ObjectReference);
+        }
+        let record = self.object_record(MemoryObjectKey {
+            object: Some(resolved.object_id()),
+        })?;
+        if record.kind != MemoryObjectKind::PageBacked {
+            return Err(MemoryObjectError::BackingKind);
+        }
+        if device_writes && !record.protection_ceiling.writable() {
+            return Err(MemoryObjectError::ProtectionCeiling);
+        }
+        Ok(object_range(record, offset, byte_len)?.physical_start())
+    }
+
     pub(crate) fn take_finalization(
         &mut self,
         final_release: FinalRelease,

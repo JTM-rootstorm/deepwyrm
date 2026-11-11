@@ -284,6 +284,22 @@ impl<
                 wakes
             }
             DW_OBJECT_TYPE_DEVICE_RESOURCE => {
+                // The function's DMA domain goes first (storage K4): bus
+                // mastering off, translations gone, IOTLB invalidated. Only
+                // then are the mapped MemoryObjects let go, and only after
+                // that does the lease return for a new claim.
+                for pin in crate::device::dma::release_domain(final_release.id()).into_pins() {
+                    push_pending(
+                        pending,
+                        pending_len,
+                        self.registry.release_internal(pin).unwrap_or_else(|failure| {
+                            panic!(
+                                "a DMA mapping reference violated generic lifetime invariants: {:?}",
+                                failure.error()
+                            )
+                        }),
+                    );
+                }
                 let finalization = self
                     .device_resources
                     .unwrap_or_else(|| {

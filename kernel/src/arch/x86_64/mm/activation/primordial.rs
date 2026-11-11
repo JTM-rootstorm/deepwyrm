@@ -884,6 +884,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             NativeSyscallRequest::DeviceMmioObjectCreate {
                 out_memory_object, ..
             } => handle(out_memory_object),
+            NativeSyscallRequest::DmaMap { out_iova, .. } => [Some((out_iova, 8, 8)), None, None],
             NativeSyscallRequest::EventCreate { out_event, .. } => handle(out_event),
             NativeSyscallRequest::TimerCreate { out_timer, .. } => handle(out_timer),
             NativeSyscallRequest::ChannelCreate {
@@ -7677,6 +7678,28 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 out_memory_object,
                 &mut self.core.cleanup,
             ),
+            NativeSyscallRequest::DmaMap {
+                resource,
+                memory_object,
+                offset,
+                byte_len,
+                access,
+                out_iova,
+            } => crate::syscall::dma_map(
+                user,
+                &mut self.core.registry,
+                &self.core.memory,
+                &mut self.core.tasks,
+                &self.core.shared.device_resources,
+                &mut crate::device::dma::live::LiveDmaService,
+                process,
+                resource,
+                memory_object,
+                offset,
+                byte_len,
+                access,
+                out_iova,
+            ),
             NativeSyscallRequest::DevicePciConfigRead {
                 resource,
                 offset,
@@ -8168,6 +8191,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | NativeSyscallRequest::DevicePioRead { .. }
             | NativeSyscallRequest::DevicePciConfigRead { .. }
             | NativeSyscallRequest::DeviceMmioObjectCreate { .. }
+            | NativeSyscallRequest::DmaMap { .. }
             | NativeSyscallRequest::InterruptCreate { .. }
             | NativeSyscallRequest::MemoryObjectCreate { .. }
             | NativeSyscallRequest::ObjectGetInfoV1 { .. } => {
@@ -8257,6 +8281,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     crate::device::pci::dma_confined(),
                 ))
             }
+            NativeSyscallRequest::DmaUnmap {
+                resource,
+                iova,
+                byte_len,
+            } => NativeSyscallResult::returning(crate::syscall::dma_unmap(
+                &mut self.core.registry,
+                &mut self.core.tasks,
+                &self.core.shared.device_resources,
+                &mut crate::device::dma::live::LiveDmaService,
+                self.own.scheduled().process,
+                resource,
+                iova,
+                byte_len,
+                &mut self.core.cleanup,
+            )),
             NativeSyscallRequest::InterruptAck { interrupt } => {
                 NativeSyscallResult::returning(crate::syscall::interrupt_ack(
                     &mut self.core.registry,

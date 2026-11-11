@@ -278,6 +278,9 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_EXCEPTION_DIVIDE_ERROR` | `DwExceptionType` | `4` | Divide error exception. |
 | `DW_EXCEPTION_GENERAL_PROTECTION` | `DwExceptionType` | `5` | General protection exception. |
 | `DW_EXCEPTION_DEBUG_TRAP` | `DwExceptionType` | `6` | Debug trap exception. |
+| `DW_DMA_ACCESS_DEVICE_READ` | `u32` | `1` | dma_map access: the device may read the mapped pages. |
+| `DW_DMA_ACCESS_DEVICE_WRITE` | `u32` | `2` | dma_map access: the device may write the mapped pages. |
+| `DW_DMA_ACCESS_SUPPORTED_MASK` | `u32` | `3` | Every dma_map access bit this ABI defines. |
 
 ## Records
 
@@ -1052,3 +1055,26 @@ Create a MemoryObject over one whole admitted memory BAR of a live PCI_FUNCTION 
 | `RSI` | `bar` | `u32` | in | NONE | NONE |
 | `RDX` | `requested_rights` | `DwRights` | in | NONE | NONE |
 | `R10` | `out_memory_object` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00060023` `dma_map` (DW2-S)
+
+Map pages of a page-backed MemoryObject into the IOMMU domain of a live PCI_FUNCTION DeviceResource and return the device-visible address (IOVA) the kernel chose. offset and byte_len are nonzero-length, page-aligned and within the object's mappable capacity, else INVALID_ARGUMENT; access is a nonzero subset of DW_DMA_ACCESS_SUPPORTED_MASK, else INVALID_ARGUMENT. DEVICE_WRITE also requires the MemoryObject handle's WRITE right and a writable object, else ACCESS_DENIED. A resource that is not a PCI_FUNCTION is INVALID_ARGUMENT. Device-MMIO and boot-module objects are NOT_SUPPORTED, as are functions off bus 0 and any call without an IOMMU confining the function. A function another live resource already maps is BAD_STATE. The mapping keeps the MemoryObject alive until dma_unmap or the DeviceResource finalizes. Exhausted IOMMU tables, domains or per-domain mappings are NO_RESOURCES; no free IOVA range is NO_MEMORY. Failure leaves the domain and out_iova unchanged.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | MODIFY |
+| `RSI` | `memory_object` | `DwHandle` | in | MEMORY_OBJECT | READ |
+| `RDX` | `offset` | `DwSize` | in | NONE | NONE |
+| `R10` | `byte_len` | `DwSize` | in | NONE | NONE |
+| `R8` | `access` | `u32` | in | NONE | NONE |
+| `R9` | `out_iova` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00060024` `dma_unmap` (DW2-S)
+
+Remove one whole dma_map mapping, named by its exact IOVA and byte length, from the DeviceResource's IOMMU domain, invalidate the IOTLB, and only then release the MemoryObject. A zero or unaligned iova or byte_len is INVALID_ARGUMENT; a range that is not exactly one live mapping is NOT_FOUND; failure changes nothing.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `resource` | `DwHandle` | in | DEVICE_RESOURCE | MODIFY |
+| `RSI` | `iova` | `u64` | in | NONE | NONE |
+| `RDX` | `byte_len` | `DwSize` | in | NONE | NONE |

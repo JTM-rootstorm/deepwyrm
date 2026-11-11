@@ -465,6 +465,39 @@ pub fn device_mmio_object_create(
     }
 }
 
+/// Map `byte_len` bytes of a page-backed MemoryObject, from `offset`, into a
+/// PCI_FUNCTION resource's IOMMU domain; `out_iova` receives the address the
+/// device uses. `access` is a nonzero mask of `DW_DMA_ACCESS_DEVICE_*`.
+#[inline]
+pub fn dma_map(
+    resource: DwHandle,
+    memory_object: DwHandle,
+    offset: u64,
+    byte_len: u64,
+    access: u32,
+    out_iova: &mut u64,
+) -> DwStatus {
+    // SAFETY: scalar ABI values are copied and the output remains uniquely borrowed.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_DMA_MAP,
+            resource.0,
+            memory_object.0,
+            offset,
+            byte_len,
+            u64::from(access),
+            output_address(out_iova),
+        )
+    }
+}
+
+/// Remove one whole `dma_map` mapping by its exact IOVA and length.
+#[inline]
+pub fn dma_unmap(resource: DwHandle, iova: u64, byte_len: u64) -> DwStatus {
+    // SAFETY: all arguments are scalar ABI values.
+    unsafe { syscall6(DW_SYSCALL_DMA_UNMAP, resource.0, iova, byte_len, 0, 0, 0) }
+}
+
 /// Write one checked scalar value to a DeviceResource PIO range.
 #[inline]
 pub fn device_pio_write(resource: DwHandle, offset: u32, width: u32, value: u32) -> DwStatus {

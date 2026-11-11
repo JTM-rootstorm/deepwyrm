@@ -14308,3 +14308,5 @@ fn a_quota_refused_early_backing_fails_closed() {
     assert!(unused.is_none());
     assert_eq!(tasks.process_handle_count(process).unwrap(), handles);
 }
+
+mod dma;

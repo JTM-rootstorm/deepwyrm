@@ -346,7 +346,7 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
     }
 
     /// The function a live PCI_FUNCTION resource names.
-    fn pci_address_for_resolved(
+    pub(crate) fn pci_address_for_resolved(
         &self,
         resolved: &ResolvedHandle,
     ) -> Result<PciAddress, DeviceResourceError> {

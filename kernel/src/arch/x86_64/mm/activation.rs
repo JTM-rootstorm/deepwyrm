@@ -130,7 +130,13 @@ const ENTRY_COUNT: usize = 512;
 // The unit count is `acpi::dmar::MAX_DMAR_UNITS`; a DMAR with more units is
 // refused at parse time, and running out of leaves stops the boot.
 const VTD_UNIT_MMIO_LEAF_COUNT: u64 = 8;
-const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2 + VTD_UNIT_MMIO_LEAF_COUNT;
+// Each frame of the VT-d table pool (`device::dma::VTD_TABLE_POOL_FRAMES`;
+// a test keeps the two equal) is RAM the kernel reaches only through its own
+// permanent UC/NX leaf, so a unit that does not snoop CPU caches still sees
+// every table write.
+const VTD_TABLE_POOL_LEAF_COUNT: u64 = 64;
+const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 =
+    2 + VTD_UNIT_MMIO_LEAF_COUNT + VTD_TABLE_POOL_LEAF_COUNT;
 // Mapping-stability pins are a kernel-global resource shared by every live
 // Process address space.  A designated-VM trace proved that the former capacity
 // of eight rejected the ninth actor load after seven blocked receives retained

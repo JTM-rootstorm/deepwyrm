@@ -63,6 +63,8 @@ pub enum DwKnownSyscall {
     DevicePciConfigRead,
     DevicePciCommand,
     DeviceMmioObjectCreate,
+    DmaMap,
+    DmaUnmap,
 }
 
 impl DwKnownSyscall {
@@ -107,6 +109,8 @@ impl DwKnownSyscall {
             0x00060020 => Some(Self::DevicePciConfigRead),
             0x00060021 => Some(Self::DevicePciCommand),
             0x00060022 => Some(Self::DeviceMmioObjectCreate),
+            0x00060023 => Some(Self::DmaMap),
+            0x00060024 => Some(Self::DmaUnmap),
             _ => None,
         }
     }
@@ -152,6 +156,8 @@ impl DwKnownSyscall {
             Self::DevicePciConfigRead => DwSyscallId(0x00060020),
             Self::DevicePciCommand => DwSyscallId(0x00060021),
             Self::DeviceMmioObjectCreate => DwSyscallId(0x00060022),
+            Self::DmaMap => DwSyscallId(0x00060023),
+            Self::DmaUnmap => DwSyscallId(0x00060024),
         }
     }
 
@@ -196,6 +202,8 @@ impl DwKnownSyscall {
             Self::DevicePciConfigRead => DwSyscallImplementationPhase::Dw2S,
             Self::DevicePciCommand => DwSyscallImplementationPhase::Dw2S,
             Self::DeviceMmioObjectCreate => DwSyscallImplementationPhase::Dw2S,
+            Self::DmaMap => DwSyscallImplementationPhase::Dw2S,
+            Self::DmaUnmap => DwSyscallImplementationPhase::Dw2S,
         }
     }
 
@@ -240,6 +248,8 @@ impl DwKnownSyscall {
             Self::DevicePciConfigRead => 4,
             Self::DevicePciCommand => 3,
             Self::DeviceMmioObjectCreate => 4,
+            Self::DmaMap => 6,
+            Self::DmaUnmap => 3,
         }
     }
 }

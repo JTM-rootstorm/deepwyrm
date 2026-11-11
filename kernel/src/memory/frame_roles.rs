@@ -214,10 +214,10 @@ pub(crate) enum KernelImageSegment {
 pub(crate) enum ArchitectureBootstrapKind {
     /// The single low physical page containing the x86 AP startup image.
     X86ApTrampoline,
-    /// The Intel VT-d root table. It stays all zero, so no PCI function has a
-    /// context entry and every device DMA is blocked until a driver maps
-    /// memory into its own function's domain.
-    X86VtdRootTable,
+    /// One frame of the Intel VT-d table pool: the root table, the bus-0
+    /// context table, or a second-level table of some function's DMA domain.
+    /// The pool is mapped strong-uncacheable for the life of the machine.
+    X86VtdTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

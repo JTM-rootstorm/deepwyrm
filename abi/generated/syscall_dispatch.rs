@@ -244,6 +244,18 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         implementation_phase: "DW2-S",
         argument_count: 4,
     },
+    DwSyscallDispatchMetadata {
+        number: 0x00060023,
+        name: "dma_map",
+        implementation_phase: "DW2-S",
+        argument_count: 6,
+    },
+    DwSyscallDispatchMetadata {
+        number: 0x00060024,
+        name: "dma_unmap",
+        implementation_phase: "DW2-S",
+        argument_count: 3,
+    },
 ];
 
 pub const DW_UNKNOWN_SYSCALL_STATUS_NAME: &str = "NOT_SUPPORTED";

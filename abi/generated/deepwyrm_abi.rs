@@ -753,6 +753,15 @@ pub const DW_EXCEPTION_GENERAL_PROTECTION: DwExceptionType = DwExceptionType(5);
 /// Debug trap exception.
 pub const DW_EXCEPTION_DEBUG_TRAP: DwExceptionType = DwExceptionType(6);
 
+/// dma_map access: the device may read the mapped pages.
+pub const DW_DMA_ACCESS_DEVICE_READ: u32 = 1;
+
+/// dma_map access: the device may write the mapped pages.
+pub const DW_DMA_ACCESS_DEVICE_WRITE: u32 = 2;
+
+/// Every dma_map access bit this ABI defines.
+pub const DW_DMA_ACCESS_SUPPORTED_MASK: u32 = 3;
+
 /// Write DwAbiInfoV1 and report required size without relying on a release string.
 pub const DW_SYSCALL_ABI_GET_INFO: DwSyscallId = DwSyscallId(0x00000001);
 
@@ -869,6 +878,12 @@ pub const DW_SYSCALL_DEVICE_PCI_COMMAND: DwSyscallId = DwSyscallId(0x00060021);
 
 /// Create a MemoryObject over one whole admitted memory BAR of a live PCI_FUNCTION DeviceResource, for mapping with address_region_map. Its protection ceiling is READ+WRITE, so it is never executable, and its pages are mapped strong-uncacheable. The object keeps the DeviceResource alive until it finalizes. A BAR slot that is not an admitted memory BAR is NOT_FOUND; a BAR another live object already covers is ALREADY_EXISTS; requested_rights must be nonzero, MEMORY_OBJECT-compatible, and exclude EXECUTE.
 pub const DW_SYSCALL_DEVICE_MMIO_OBJECT_CREATE: DwSyscallId = DwSyscallId(0x00060022);
+
+/// Map pages of a page-backed MemoryObject into the IOMMU domain of a live PCI_FUNCTION DeviceResource and return the device-visible address (IOVA) the kernel chose. offset and byte_len are nonzero-length, page-aligned and within the object's mappable capacity, else INVALID_ARGUMENT; access is a nonzero subset of DW_DMA_ACCESS_SUPPORTED_MASK, else INVALID_ARGUMENT. DEVICE_WRITE also requires the MemoryObject handle's WRITE right and a writable object, else ACCESS_DENIED. A resource that is not a PCI_FUNCTION is INVALID_ARGUMENT. Device-MMIO and boot-module objects are NOT_SUPPORTED, as are functions off bus 0 and any call without an IOMMU confining the function. A function another live resource already maps is BAD_STATE. The mapping keeps the MemoryObject alive until dma_unmap or the DeviceResource finalizes. Exhausted IOMMU tables, domains or per-domain mappings are NO_RESOURCES; no free IOVA range is NO_MEMORY. Failure leaves the domain and out_iova unchanged.
+pub const DW_SYSCALL_DMA_MAP: DwSyscallId = DwSyscallId(0x00060023);
+
+/// Remove one whole dma_map mapping, named by its exact IOVA and byte length, from the DeviceResource's IOMMU domain, invalidate the IOTLB, and only then release the MemoryObject. A zero or unaligned iova or byte_len is INVALID_ARGUMENT; a range that is not exactly one live mapping is NOT_FOUND; failure changes nothing.
+pub const DW_SYSCALL_DMA_UNMAP: DwSyscallId = DwSyscallId(0x00060024);
 
 /// One normalized physical memory-map entry.
 #[repr(C)]
@@ -1986,6 +2001,9 @@ mod generated_layout_tests {
         assert_eq!(DW_EXCEPTION_DIVIDE_ERROR.0, 4);
         assert_eq!(DW_EXCEPTION_GENERAL_PROTECTION.0, 5);
         assert_eq!(DW_EXCEPTION_DEBUG_TRAP.0, 6);
+        assert_eq!(DW_DMA_ACCESS_DEVICE_READ, 1);
+        assert_eq!(DW_DMA_ACCESS_DEVICE_WRITE, 2);
+        assert_eq!(DW_DMA_ACCESS_SUPPORTED_MASK, 3);
         assert_eq!(DW_SYSCALL_ABI_GET_INFO.0, 0x00000001);
         assert_eq!(DW_SYSCALL_HANDLE_CLOSE.0, 0x00000010);
         assert_eq!(DW_SYSCALL_HANDLE_DUPLICATE.0, 0x00000011);
@@ -2025,5 +2043,7 @@ mod generated_layout_tests {
         assert_eq!(DW_SYSCALL_DEVICE_PCI_CONFIG_READ.0, 0x00060020);
         assert_eq!(DW_SYSCALL_DEVICE_PCI_COMMAND.0, 0x00060021);
         assert_eq!(DW_SYSCALL_DEVICE_MMIO_OBJECT_CREATE.0, 0x00060022);
+        assert_eq!(DW_SYSCALL_DMA_MAP.0, 0x00060023);
+        assert_eq!(DW_SYSCALL_DMA_UNMAP.0, 0x00060024);
     }
 }

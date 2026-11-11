@@ -10,4 +10,4 @@ schema = "deepwyrm-abi-fingerprint-v1"
 abi_name = "Deepwyrm"
 abi_version = 0
 algorithm = "sha256"
-fingerprint = "c9ed060ffc60f681d278cd0946ed6e2699bd04df0cfcbe8ce57845f9b08ecefe"
+fingerprint = "3b59617c479d2d28e3580ef3317a18c4a64831011a960fe23eafd465bd199b6e"

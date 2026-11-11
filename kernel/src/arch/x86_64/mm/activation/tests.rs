@@ -934,7 +934,7 @@ fn active_scratch_installs_every_uc_nx_mmio_leaf_then_refuses_without_consuming_
         target.io.memory.get(&second_leaf).copied(),
         Some(0xfec0_0000 | PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE | NO_EXECUTE)
     );
-    // The remaining slots hold one VT-d unit each.
+    // The remaining slots hold VT-d unit registers and table-pool frames.
     for slot in 2..PER_CPU_SCRATCH_MMIO_LEAF_COUNT {
         let unit = FrameAddress::new(
             0xfed9_0000 + slot * PAGE_SIZE,
@@ -950,6 +950,17 @@ fn active_scratch_installs_every_uc_nx_mmio_leaf_then_refuses_without_consuming_
         target.install_mmio_frame(frame),
         Err(LiveActiveTargetError::Busy)
     );
+}
+
+#[test]
+fn every_vtd_table_pool_frame_has_a_permanent_leaf_and_every_cpu_slot_fits() {
+    assert_eq!(
+        VTD_TABLE_POOL_LEAF_COUNT,
+        crate::device::dma::VTD_TABLE_POOL_FRAMES as u64
+    );
+    // All CPU slots share one 2 MiB page table and must stay clear of its
+    // last two entries.
+    assert!(PerCpuScratchBindings::SLOT_PAGES * crate::cpu::CPU_CAPACITY as u64 <= 0x1fe);
 }
 
 #[test]
