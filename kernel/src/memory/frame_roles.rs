@@ -208,6 +208,10 @@ pub(crate) enum KernelImageSegment {
 pub(crate) enum ArchitectureBootstrapKind {
     /// The single low physical page containing the x86 AP startup image.
     X86ApTrampoline,
+    /// The Intel VT-d root table. It stays all zero, so no PCI function has a
+    /// context entry and every device DMA is blocked until a driver maps
+    /// memory into its own function's domain.
+    X86VtdRootTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

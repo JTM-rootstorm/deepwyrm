@@ -48,6 +48,8 @@ pub(crate) mod rendezvous;
 pub(crate) mod smp;
 pub(crate) mod syscall;
 pub mod tss;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) mod vtd;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use mm::transition::{IstStackBounds, IstStackLayout};

@@ -1741,6 +1741,49 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .install_mmio_frame(frame)
     }
 
+    /// Allocates one frame below `exclusive_ceiling`, zeroes it through the
+    /// bootstrap scratch leaf, and retains it for a permanent architecture
+    /// structure. The early BSP is the only CPU running.
+    #[allow(
+        unsafe_code,
+        reason = "the bootstrap scratch session zeroes the exclusive allocation before its typed role transition"
+    )]
+    pub(crate) fn allocate_zeroed_architecture_frame(
+        &mut self,
+        kind: crate::memory::frame_roles::ArchitectureBootstrapKind,
+        exclusive_ceiling: u64,
+    ) -> Result<ArchitectureBootstrapGrant, LiveActiveTargetError> {
+        let allocation = self
+            .target
+            .roles
+            .allocate_below(1, exclusive_ceiling)
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        let zeroed = FrameAddress::new(allocation.physical_start(), self.root.physical_limit())
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)
+            .and_then(|frame| {
+                self.target
+                    .bootstrap_scratch_target()?
+                    .zero_allocator_frame(frame)
+            });
+        if let Err(error) = zeroed {
+            self.target
+                .roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| {
+                    panic!("architecture frame rollback lost allocation authority")
+                });
+            return Err(error);
+        }
+        // SAFETY: the whole one-page allocation was zeroed immediately above
+        // through the authenticated bootstrap scratch mapping.
+        unsafe {
+            self.target
+                .roles
+                .assume_architecture_bootstrap_initialized(allocation, kind)
+        }
+        .map_err(|_| LiveActiveTargetError::InvalidIndex)
+    }
+
     /// Makes a one-shot UC/NX probe mapping while the early BSP still owns the
     /// bootstrap scratch binding.  It intentionally cannot return a raw
     /// controller pointer beyond `operation`.

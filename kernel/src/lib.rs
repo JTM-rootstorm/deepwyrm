@@ -475,6 +475,49 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             arch::x86_64::ioapic_live::initialize_q35_ioapic(&mut active_paging, q35_snapshot)
                 .unwrap_or_else(|error| panic!("DW1-E2A q35 IOAPIC probe failed: {error:?}"));
         }
+        // STORAGE_PLAN K0: take over every DMA remapping unit with an empty
+        // root table before any device driver exists, so all device DMA is
+        // blocked until a driver maps memory for its own function.
+        {
+            // SAFETY: the one-shot BSP owns the workspace serially; the CPU
+            // topology block above initialized it.
+            let workspace = unsafe { &mut *(*BOOTSTRAP_ACPI_WORKSPACE.slot()).as_mut_ptr() };
+            let dmar = {
+                let mut acpi =
+                    arch::x86_64::acpi::AcpiScratchReader::new(&mut active_paging, boot_info);
+                arch::x86_64::acpi::dmar::discover_dmar(
+                    &mut acpi,
+                    boot_info.header().acpi_rsdp_physical_address,
+                    workspace,
+                )
+                .unwrap_or_else(|error| panic!("DMAR discovery failed: {error:?}"))
+            };
+            #[cfg(not(feature = "test-support"))]
+            if dmar.is_some_and(|dmar| dmar.reserved_memory_regions() != 0) {
+                let _ = debug::emit_early_record(
+                    debug::DiagnosticLevel::Warn,
+                    "iommu",
+                    "firmware reserved-memory regions are not mapped; devices using them lose DMA",
+                );
+            }
+            let state = arch::x86_64::vtd::initialize(&mut active_paging, dmar)
+                .unwrap_or_else(|error| panic!("VT-d default-deny bring-up failed: {error:?}"));
+            #[cfg(not(feature = "test-support"))]
+            let _ = debug::emit_early_record(
+                debug::DiagnosticLevel::Info,
+                "iommu",
+                match state {
+                    arch::x86_64::vtd::VtdBootState::Absent => {
+                        "no DMA remapping hardware; device DMA is not admitted"
+                    }
+                    arch::x86_64::vtd::VtdBootState::DefaultDeny { .. } => {
+                        "VT-d translation on; every device DMA is blocked"
+                    }
+                },
+            );
+            #[cfg(feature = "test-support")]
+            let _ = state;
+        }
         arch::x86_64::smp::configure_live_cpu_registry(&cpu_topology)
             .unwrap_or_else(|error| panic!("failed to configure the H1 CPU registry: {error:?}"));
         let cpu_registry = arch::x86_64::smp::live_cpu_registry();
