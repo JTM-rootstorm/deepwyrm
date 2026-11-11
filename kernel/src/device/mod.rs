@@ -1,6 +1,7 @@
 //! DW1-D typed device-resource and synthetic Interrupt authorities.
 
 mod interrupt;
+pub(crate) mod pci;
 #[cfg(any(test, deepwyrm_dw1e_platform))]
 mod q35_interrupt;
 mod resource;

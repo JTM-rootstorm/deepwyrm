@@ -6012,6 +6012,8 @@ fn device_resource_claim_requires_domain_membership_and_reclaims_exact_lease() {
             pio_base: 0x2f8,
             pio_length: 8,
             interrupt_source: 3,
+            pci_address: 0,
+            pci_ids: 0,
         }])
         .unwrap();
     let grants = crate::boot::BootResourceGrantAuthority::new(snapshot);
@@ -6202,6 +6204,8 @@ fn device_resource_claim_handle_errors_precede_terminating_caller_state() {
             pio_base: 0x2f8,
             pio_length: 8,
             interrupt_source: 3,
+            pci_address: 0,
+            pci_ids: 0,
         }])
         .unwrap();
     let grants = crate::boot::BootResourceGrantAuthority::new(snapshot);
@@ -6315,6 +6319,8 @@ fn device_resource_claim_publication_failures_use_typed_close_and_restore_capaci
             pio_base: 0x2f8,
             pio_length: 8,
             interrupt_source: 3,
+            pci_address: 0,
+            pci_ids: 0,
         }])
         .unwrap();
     let grants = crate::boot::BootResourceGrantAuthority::new(snapshot);

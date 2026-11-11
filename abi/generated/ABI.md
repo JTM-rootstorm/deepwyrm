@@ -147,7 +147,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP` | `1` | Primordial fully-static Wyrmroot bootstrap ELF. |  |
 | `DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS` | `2` | Read-only Wyrmroot bootfs image. |  |
 | `DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1` | `3` | Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace. |  |
-| `DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1` | `4` | Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace. |  |
+| `DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1` | `4` | Optional unique READ_ONLY kernel-internal DwBootDeviceTableV2 carrier; it must never be transferred to userspace. The module kind keeps its V1 name; the table inside carries its own version. |  |
 
 ## Module Flag
 
@@ -192,13 +192,14 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_BOOT_BASE_PAGE_SIZE` | `u32` | `4096` | DW0 base page size in bytes for BootInfo memory ranges and handoff mappings. |
 | `DW_BOOT_MEMORY_RANGE_V1_VERSION` | `u32` | `1` | Required version value for DwBootMemoryRangeV1 records. |
 | `DW_BOOT_MODULE_V1_VERSION` | `u32` | `1` | Required version value for DwBootModuleV1 records. |
-| `DW_BOOT_DEVICE_TABLE_V1_VERSION` | `u32` | `1` | Required version value for the kernel-internal DwBootDeviceTableV1 carrier. |
-| `DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwBootDeviceTableV1 supports no nonzero flags. |
-| `DW_BOOT_DEVICE_TABLE_RECORD_STRIDE` | `u32` | `48` | Required byte stride of each DwBootDeviceResourceV1 record. |
+| `DW_BOOT_DEVICE_TABLE_V2_VERSION` | `u32` | `2` | Required version value for the kernel-internal DwBootDeviceTableV2 carrier. Version 1 tables are rejected. |
+| `DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwBootDeviceTableV2 supports no nonzero flags. |
+| `DW_BOOT_DEVICE_TABLE_RECORD_STRIDE` | `u32` | `64` | Required byte stride of each DwBootDeviceResourceV2 record. |
 | `DW_BOOT_DEVICE_TABLE_MAX_RESOURCES` | `u32` | `8` | Maximum number of immutable resource records accepted from one boot-device table. |
-| `DW_BOOT_DEVICE_RESOURCE_V1_VERSION` | `u32` | `1` | Required version value for DwBootDeviceResourceV1 records. |
-| `DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwBootDeviceResourceV1 supports no nonzero flags. |
+| `DW_BOOT_DEVICE_RESOURCE_V2_VERSION` | `u32` | `2` | Required version value for DwBootDeviceResourceV2 records. |
+| `DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK` | `u32` | `0` | DwBootDeviceResourceV2 supports no nonzero flags. |
 | `DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT` | `DwDeviceResourceKind` | `1` | One bounded x86 port-I/O range paired with one platform interrupt source. |
+| `DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION` | `DwDeviceResourceKind` | `2` | One PCI segment-0 function named by bus/device/function and expected vendor and device IDs, which the kernel checks at boot. |
 | `DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION` | `u32` | `1` | Required version value for DwBootX86_64PagingHandoffV1. |
 | `DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK` | `DwBootX86_64PagingHandoffFlags` | `0` | DwBootX86_64PagingHandoffV1 supports no nonzero flags. |
 | `DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION` | `u32` | `2` | Deepwyrm x86_64 paging-layout contract version bound by the V1 carrier. |
@@ -309,36 +310,39 @@ One loaded boot module supplied by the Wyrmroot EFI loader. Size 64, alignment 8
 | 24 | `byte_len` | `u64` | Exact module byte length. |
 | 32 | `reserved` | `[u64; 4]` | Reserved; all elements must be zero. |
 
-### `DwBootDeviceTableV1`
+### `DwBootDeviceTableV2`
 
-Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records. Size 32, alignment 8.
+Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV2 records. Size 32, alignment 8.
 
 | Offset | Field | Type | Meaning |
 |---:|---|---|---|
-| 0 | `size` | `u32` | Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE. |
-| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION. |
+| 0 | `size` | `u32` | Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V2_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_DEVICE_TABLE_V2_VERSION. |
 | 8 | `resource_count` | `u32` | Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES. |
-| 12 | `flags` | `u32` | Must contain only supported bits; V1 requires zero. |
+| 12 | `flags` | `u32` | Must contain only supported bits; V2 requires zero. |
 | 16 | `record_stride` | `u32` | Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE. |
 | 20 | `reserved0` | `u32` | Reserved; producer sets zero and consumer rejects nonzero. |
 | 24 | `total_byte_len` | `u64` | Exact complete carrier extent: header plus resource_count records. |
 
-### `DwBootDeviceResourceV1`
+### `DwBootDeviceResourceV2`
 
-One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. Size 48, alignment 8.
+One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. Fields that belong to the other kind must be zero. Size 64, alignment 8.
 
 | Offset | Field | Type | Meaning |
 |---:|---|---|---|
-| 0 | `size` | `u32` | Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE. |
-| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION. |
+| 0 | `size` | `u32` | Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V2_SIZE. |
+| 4 | `version` | `u32` | Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V2_VERSION. |
 | 8 | `kind` | `DwDeviceResourceKind` | Admitted device-resource kind. |
-| 12 | `flags` | `u32` | Must contain only supported bits; V1 requires zero. |
+| 12 | `flags` | `u32` | Must contain only supported bits; V2 requires zero. |
 | 16 | `resource_id` | `u64` | Nonzero immutable kernel resource identity. |
 | 24 | `device_correlation_id` | `u64` | Optional non-authoritative policy correlation; zero means absent. |
-| 32 | `pio_base` | `u16` | Exact x86 port-range base. |
-| 34 | `pio_length` | `u16` | Nonzero bounded port-range byte length. |
-| 36 | `interrupt_source` | `u32` | Nonzero platform interrupt-source identity. |
-| 40 | `reserved` | `u64` | Reserved; producer sets zero and consumer rejects nonzero. |
+| 32 | `pio_base` | `u16` | X86_PIO_WITH_PLATFORM_INTERRUPT: exact x86 port-range base. |
+| 34 | `pio_length` | `u16` | X86_PIO_WITH_PLATFORM_INTERRUPT: nonzero bounded port-range byte length. |
+| 36 | `interrupt_source` | `u32` | X86_PIO_WITH_PLATFORM_INTERRUPT: nonzero platform interrupt-source identity. |
+| 40 | `pci_address` | `u32` | PCI_FUNCTION: segment in bits 16-31 (must be zero), bus in bits 8-15, device in bits 3-7, function in bits 0-2. |
+| 44 | `pci_ids` | `u32` | PCI_FUNCTION: expected vendor ID in bits 0-15 and device ID in bits 16-31; vendor 0xffff is invalid. |
+| 48 | `reserved0` | `u64` | Reserved; producer sets zero and consumer rejects nonzero. |
+| 56 | `reserved1` | `u64` | Reserved; producer sets zero and consumer rejects nonzero. |
 
 ### `DwBootX86_64PagingHandoffV1`
 

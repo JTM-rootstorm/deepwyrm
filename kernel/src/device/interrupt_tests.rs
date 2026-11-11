@@ -397,6 +397,8 @@ impl Fixture {
             pio_base: 0x2f8,
             pio_length: 8,
             interrupt_source: 3,
+            pci_address: 0,
+            pci_ids: 0,
             resource_domain: domain,
         };
         let resources = Resources::new();

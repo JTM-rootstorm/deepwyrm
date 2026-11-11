@@ -92,6 +92,8 @@ fn descriptor(resource_id: u64, domain: TaskGroupKey) -> DeviceResourceDescripto
         pio_base: 0x2f8,
         pio_length: 8,
         interrupt_source: 3,
+        pci_address: 0,
+        pci_ids: 0,
         resource_domain: domain,
     }
 }
@@ -360,6 +362,56 @@ fn checked_port_conversion_rejects_namespace_crossing_before_io() {
 }
 
 #[test]
+fn a_pci_function_resource_has_no_ports_and_no_platform_interrupt() {
+    let mut registry = Registry::new();
+    let (_tasks, domain, _owner) = owner_domain(&mut registry);
+    let pci = DeviceResourceDescriptor {
+        kind: deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+        pio_base: 0,
+        pio_length: 0,
+        interrupt_source: 0,
+        pci_address: 1 << 3,
+        pci_ids: 0x1af4 | 0x1042 << 16,
+        ..descriptor(4, domain)
+    };
+    assert!(super::resource::valid_descriptor(pci));
+    assert!(!super::resource::admits_platform_interrupt(pci));
+    assert!(super::resource::admits_platform_interrupt(descriptor(
+        4, domain
+    )));
+    assert_eq!(
+        super::resource::checked_pio_access(pci, 0, 1),
+        Err(DeviceResourceError::InvalidAccess)
+    );
+    // Each kind's fields must stay zero on the other kind.
+    for invalid in [
+        DeviceResourceDescriptor {
+            pio_length: 8,
+            ..pci
+        },
+        DeviceResourceDescriptor {
+            interrupt_source: 3,
+            ..pci
+        },
+        DeviceResourceDescriptor {
+            pci_address: 1 << 16,
+            ..pci
+        },
+        DeviceResourceDescriptor { pci_ids: 0, ..pci },
+        DeviceResourceDescriptor {
+            pci_address: 8,
+            ..descriptor(4, domain)
+        },
+        DeviceResourceDescriptor {
+            pci_ids: 1,
+            ..descriptor(4, domain)
+        },
+    ] {
+        assert!(!super::resource::valid_descriptor(invalid));
+    }
+}
+
+#[test]
 fn invalid_creation_rolls_back_generic_and_typed_capacity() {
     let mut registry = Registry::new();
     let (_tasks, domain, _owner) = owner_domain(&mut registry);
@@ -395,6 +447,8 @@ fn invalid_creation_rolls_back_generic_and_typed_capacity() {
         },
         DeviceResourceDescriptor {
             interrupt_source: 0,
+            pci_address: 0,
+            pci_ids: 0,
             ..valid
         },
     ];
@@ -478,6 +532,8 @@ fn protected_com1_and_irq4_are_rejected_by_the_typed_factory() {
         },
         DeviceResourceDescriptor {
             interrupt_source: 4,
+            pci_address: 0,
+            pci_ids: 0,
             ..valid
         },
     ] {

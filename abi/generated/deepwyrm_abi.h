@@ -319,7 +319,7 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwBootEntropyFlags) == 4, "DwBootEntropyFlags alignm
 #define DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS ((DwBootModuleKind)(2))
 /* Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace. */
 #define DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 ((DwBootModuleKind)(3))
-/* Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace. */
+/* Optional unique READ_ONLY kernel-internal DwBootDeviceTableV2 carrier; it must never be transferred to userspace. The module kind keeps its V1 name; the table inside carries its own version. */
 #define DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1 ((DwBootModuleKind)(4))
 
 /* The module must only be exposed to userspace with read-only authority. */
@@ -451,20 +451,22 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_BOOT_MEMORY_RANGE_V1_VERSION ((uint32_t)(1))
 /* Required version value for DwBootModuleV1 records. */
 #define DW_BOOT_MODULE_V1_VERSION ((uint32_t)(1))
-/* Required version value for the kernel-internal DwBootDeviceTableV1 carrier. */
-#define DW_BOOT_DEVICE_TABLE_V1_VERSION ((uint32_t)(1))
-/* DwBootDeviceTableV1 supports no nonzero flags. */
+/* Required version value for the kernel-internal DwBootDeviceTableV2 carrier. Version 1 tables are rejected. */
+#define DW_BOOT_DEVICE_TABLE_V2_VERSION ((uint32_t)(2))
+/* DwBootDeviceTableV2 supports no nonzero flags. */
 #define DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK ((uint32_t)(0))
-/* Required byte stride of each DwBootDeviceResourceV1 record. */
-#define DW_BOOT_DEVICE_TABLE_RECORD_STRIDE ((uint32_t)(48))
+/* Required byte stride of each DwBootDeviceResourceV2 record. */
+#define DW_BOOT_DEVICE_TABLE_RECORD_STRIDE ((uint32_t)(64))
 /* Maximum number of immutable resource records accepted from one boot-device table. */
 #define DW_BOOT_DEVICE_TABLE_MAX_RESOURCES ((uint32_t)(8))
-/* Required version value for DwBootDeviceResourceV1 records. */
-#define DW_BOOT_DEVICE_RESOURCE_V1_VERSION ((uint32_t)(1))
-/* DwBootDeviceResourceV1 supports no nonzero flags. */
+/* Required version value for DwBootDeviceResourceV2 records. */
+#define DW_BOOT_DEVICE_RESOURCE_V2_VERSION ((uint32_t)(2))
+/* DwBootDeviceResourceV2 supports no nonzero flags. */
 #define DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK ((uint32_t)(0))
 /* One bounded x86 port-I/O range paired with one platform interrupt source. */
 #define DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT ((DwDeviceResourceKind)(1))
+/* One PCI segment-0 function named by bus/device/function and expected vendor and device IDs, which the kernel checks at boot. */
+#define DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION ((DwDeviceResourceKind)(2))
 /* Required version value for DwBootX86_64PagingHandoffV1. */
 #define DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION ((uint32_t)(1))
 /* DwBootX86_64PagingHandoffV1 supports no nonzero flags. */
@@ -754,15 +756,15 @@ DW_STATIC_ASSERT(offsetof(DwBootModuleV1, physical_start) == 16, "DwBootModuleV1
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, byte_len) == 24, "DwBootModuleV1.byte_len offset");
 DW_STATIC_ASSERT(offsetof(DwBootModuleV1, reserved) == 32, "DwBootModuleV1.reserved offset");
 
-/* Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records. */
-typedef struct DwBootDeviceTableV1 {
-    /* Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE. */
+/* Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV2 records. */
+typedef struct DwBootDeviceTableV2 {
+    /* Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V2_SIZE. */
     uint32_t size;
-    /* Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION. */
+    /* Structure version; must equal DW_BOOT_DEVICE_TABLE_V2_VERSION. */
     uint32_t version;
     /* Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES. */
     uint32_t resource_count;
-    /* Must contain only supported bits; V1 requires zero. */
+    /* Must contain only supported bits; V2 requires zero. */
     uint32_t flags;
     /* Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE. */
     uint32_t record_stride;
@@ -770,54 +772,63 @@ typedef struct DwBootDeviceTableV1 {
     uint32_t reserved0;
     /* Exact complete carrier extent: header plus resource_count records. */
     uint64_t total_byte_len;
-} DwBootDeviceTableV1;
-#define DW_BOOT_DEVICE_TABLE_V1_SIZE ((uint32_t)(32))
-DW_STATIC_ASSERT(sizeof(DwBootDeviceTableV1) == 32, "DwBootDeviceTableV1 size");
-DW_STATIC_ASSERT(DW_ALIGNOF(DwBootDeviceTableV1) == 8, "DwBootDeviceTableV1 alignment");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, size) == 0, "DwBootDeviceTableV1.size offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, version) == 4, "DwBootDeviceTableV1.version offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, resource_count) == 8, "DwBootDeviceTableV1.resource_count offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, flags) == 12, "DwBootDeviceTableV1.flags offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, record_stride) == 16, "DwBootDeviceTableV1.record_stride offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, reserved0) == 20, "DwBootDeviceTableV1.reserved0 offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV1, total_byte_len) == 24, "DwBootDeviceTableV1.total_byte_len offset");
+} DwBootDeviceTableV2;
+#define DW_BOOT_DEVICE_TABLE_V2_SIZE ((uint32_t)(32))
+DW_STATIC_ASSERT(sizeof(DwBootDeviceTableV2) == 32, "DwBootDeviceTableV2 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwBootDeviceTableV2) == 8, "DwBootDeviceTableV2 alignment");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, size) == 0, "DwBootDeviceTableV2.size offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, version) == 4, "DwBootDeviceTableV2.version offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, resource_count) == 8, "DwBootDeviceTableV2.resource_count offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, flags) == 12, "DwBootDeviceTableV2.flags offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, record_stride) == 16, "DwBootDeviceTableV2.record_stride offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, reserved0) == 20, "DwBootDeviceTableV2.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceTableV2, total_byte_len) == 24, "DwBootDeviceTableV2.total_byte_len offset");
 
-/* One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. */
-typedef struct DwBootDeviceResourceV1 {
-    /* Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE. */
+/* One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. Fields that belong to the other kind must be zero. */
+typedef struct DwBootDeviceResourceV2 {
+    /* Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V2_SIZE. */
     uint32_t size;
-    /* Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION. */
+    /* Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V2_VERSION. */
     uint32_t version;
     /* Admitted device-resource kind. */
     DwDeviceResourceKind kind;
-    /* Must contain only supported bits; V1 requires zero. */
+    /* Must contain only supported bits; V2 requires zero. */
     uint32_t flags;
     /* Nonzero immutable kernel resource identity. */
     uint64_t resource_id;
     /* Optional non-authoritative policy correlation; zero means absent. */
     uint64_t device_correlation_id;
-    /* Exact x86 port-range base. */
+    /* X86_PIO_WITH_PLATFORM_INTERRUPT: exact x86 port-range base. */
     uint16_t pio_base;
-    /* Nonzero bounded port-range byte length. */
+    /* X86_PIO_WITH_PLATFORM_INTERRUPT: nonzero bounded port-range byte length. */
     uint16_t pio_length;
-    /* Nonzero platform interrupt-source identity. */
+    /* X86_PIO_WITH_PLATFORM_INTERRUPT: nonzero platform interrupt-source identity. */
     uint32_t interrupt_source;
+    /* PCI_FUNCTION: segment in bits 16-31 (must be zero), bus in bits 8-15, device in bits 3-7, function in bits 0-2. */
+    uint32_t pci_address;
+    /* PCI_FUNCTION: expected vendor ID in bits 0-15 and device ID in bits 16-31; vendor 0xffff is invalid. */
+    uint32_t pci_ids;
     /* Reserved; producer sets zero and consumer rejects nonzero. */
-    uint64_t reserved;
-} DwBootDeviceResourceV1;
-#define DW_BOOT_DEVICE_RESOURCE_V1_SIZE ((uint32_t)(48))
-DW_STATIC_ASSERT(sizeof(DwBootDeviceResourceV1) == 48, "DwBootDeviceResourceV1 size");
-DW_STATIC_ASSERT(DW_ALIGNOF(DwBootDeviceResourceV1) == 8, "DwBootDeviceResourceV1 alignment");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, size) == 0, "DwBootDeviceResourceV1.size offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, version) == 4, "DwBootDeviceResourceV1.version offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, kind) == 8, "DwBootDeviceResourceV1.kind offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, flags) == 12, "DwBootDeviceResourceV1.flags offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, resource_id) == 16, "DwBootDeviceResourceV1.resource_id offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, device_correlation_id) == 24, "DwBootDeviceResourceV1.device_correlation_id offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, pio_base) == 32, "DwBootDeviceResourceV1.pio_base offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, pio_length) == 34, "DwBootDeviceResourceV1.pio_length offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, interrupt_source) == 36, "DwBootDeviceResourceV1.interrupt_source offset");
-DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV1, reserved) == 40, "DwBootDeviceResourceV1.reserved offset");
+    uint64_t reserved0;
+    /* Reserved; producer sets zero and consumer rejects nonzero. */
+    uint64_t reserved1;
+} DwBootDeviceResourceV2;
+#define DW_BOOT_DEVICE_RESOURCE_V2_SIZE ((uint32_t)(64))
+DW_STATIC_ASSERT(sizeof(DwBootDeviceResourceV2) == 64, "DwBootDeviceResourceV2 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwBootDeviceResourceV2) == 8, "DwBootDeviceResourceV2 alignment");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, size) == 0, "DwBootDeviceResourceV2.size offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, version) == 4, "DwBootDeviceResourceV2.version offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, kind) == 8, "DwBootDeviceResourceV2.kind offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, flags) == 12, "DwBootDeviceResourceV2.flags offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, resource_id) == 16, "DwBootDeviceResourceV2.resource_id offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, device_correlation_id) == 24, "DwBootDeviceResourceV2.device_correlation_id offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, pio_base) == 32, "DwBootDeviceResourceV2.pio_base offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, pio_length) == 34, "DwBootDeviceResourceV2.pio_length offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, interrupt_source) == 36, "DwBootDeviceResourceV2.interrupt_source offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, pci_address) == 40, "DwBootDeviceResourceV2.pci_address offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, pci_ids) == 44, "DwBootDeviceResourceV2.pci_ids offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, reserved0) == 48, "DwBootDeviceResourceV2.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwBootDeviceResourceV2, reserved1) == 56, "DwBootDeviceResourceV2.reserved1 offset");
 
 /* Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal. */
 typedef struct DwBootX86_64PagingHandoffV1 {

@@ -1985,6 +1985,16 @@ fn device_resource_claim_under_operation<
         .prepare_resource_claim_membership(current_process, owner)
         .map_err(resource_membership_status)?;
     let (boot, reservation) = grants.reserve(resource_id).map_err(boot_grant_status)?;
+    if boot.kind == deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION
+        && crate::device::pci::PCI_FUNCTIONS
+            .function(resource_id)
+            .is_none()
+    {
+        grants.cancel(reservation).unwrap_or_else(|rollback| {
+            panic!("PCI claim rollback drifted for an unprobed function: {rollback:?}")
+        });
+        return Err(deepwyrm_abi::DW_STATUS_NOT_FOUND);
+    }
     let descriptor = DeviceResourceDescriptor {
         resource_id,
         lease_generation: reservation.lease_generation(),
@@ -1992,6 +2002,8 @@ fn device_resource_claim_under_operation<
         pio_base: boot.pio_base,
         pio_length: boot.pio_length,
         interrupt_source: boot.interrupt_source,
+        pci_address: boot.pci_address,
+        pci_ids: boot.pci_ids,
         resource_domain: owner,
     };
     let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE) {

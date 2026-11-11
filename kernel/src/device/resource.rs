@@ -1,9 +1,9 @@
 use deepwyrm_abi::{
     DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_DEVICE_RESOURCE_INFO_V1_VERSION,
-    DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DW_OBJECT_TYPE_DEVICE_RESOURCE,
-    DW_RIGHT_READ, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_HANDLE,
-    DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES, DW_STATUS_WRONG_OBJECT_TYPE,
-    DwDeviceResourceInfoV1, DwDeviceResourceKind, DwHandle, DwStatus,
+    DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+    DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_RIGHT_READ, DW_RIGHT_WRITE, DW_STATUS_ACCESS_DENIED,
+    DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT, DW_STATUS_NO_RESOURCES,
+    DW_STATUS_WRONG_OBJECT_TYPE, DwDeviceResourceInfoV1, DwDeviceResourceKind, DwHandle, DwStatus,
 };
 
 use crate::arch::x86_64::io_port::ScalarPortIo;
@@ -22,6 +22,10 @@ pub(crate) struct DeviceResourceDescriptor {
     pub(crate) pio_base: u16,
     pub(crate) pio_length: u16,
     pub(crate) interrupt_source: u32,
+    /// PCI_FUNCTION only: segment/bus/device/function, as in the boot record.
+    pub(crate) pci_address: u32,
+    /// PCI_FUNCTION only: expected vendor (low 16 bits) and device ID.
+    pub(crate) pci_ids: u32,
     pub(crate) resource_domain: TaskGroupKey,
 }
 
@@ -320,7 +324,11 @@ impl<const RESOURCES: usize> DeviceResourceAuthority<RESOURCES> {
         &self,
         resolved: &ResolvedHandle,
     ) -> Result<DeviceResourceDescriptor, DeviceResourceError> {
-        self.descriptor_for_resolved(resolved)
+        let descriptor = self.descriptor_for_resolved(resolved)?;
+        if !admits_platform_interrupt(descriptor) {
+            return Err(DeviceResourceError::InvalidAccess);
+        }
+        Ok(descriptor)
     }
 
     fn access_for_resolved(
@@ -523,7 +531,23 @@ pub(super) fn checked_pio_access(
     })
 }
 
-fn valid_descriptor(descriptor: DeviceResourceDescriptor) -> bool {
+/// Only a port-I/O resource carries a platform interrupt; a PCI function's
+/// interrupts arrive later as MSI-X (storage K5).
+pub(super) fn admits_platform_interrupt(descriptor: DeviceResourceDescriptor) -> bool {
+    descriptor.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+}
+
+pub(super) fn valid_descriptor(descriptor: DeviceResourceDescriptor) -> bool {
+    if descriptor.resource_id == 0 || descriptor.lease_generation == 0 {
+        return false;
+    }
+    if descriptor.kind == DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION {
+        return descriptor.pio_base == 0
+            && descriptor.pio_length == 0
+            && descriptor.interrupt_source == 0
+            && descriptor.pci_address >> 16 == 0
+            && descriptor.pci_ids != 0;
+    }
     let Some(pio_end) = u32::from(descriptor.pio_base)
         .checked_add(u32::from(descriptor.pio_length))
         .filter(|end| *end <= 0x1_0000)
@@ -531,9 +555,9 @@ fn valid_descriptor(descriptor: DeviceResourceDescriptor) -> bool {
         return false;
     };
     let overlaps_com1 = u32::from(descriptor.pio_base) < 0x400 && 0x3f8 < pio_end;
-    descriptor.resource_id != 0
-        && descriptor.lease_generation != 0
-        && descriptor.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+    descriptor.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+        && descriptor.pci_address == 0
+        && descriptor.pci_ids == 0
         && descriptor.pio_length != 0
         && descriptor.interrupt_source != 0
         && descriptor.interrupt_source != 4

@@ -34,6 +34,8 @@ pub(crate) mod ioapic_live;
 )]
 pub(crate) mod ipi;
 pub mod mm;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) mod pci_config;
 #[cfg(all(
     not(feature = "test-support"),
     target_os = "none",

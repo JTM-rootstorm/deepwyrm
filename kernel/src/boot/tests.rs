@@ -5,9 +5,10 @@ use std::vec;
 use std::vec::Vec;
 
 use deepwyrm_abi::{
-    DW_BOOT_DEVICE_RESOURCE_V1_SIZE, DW_BOOT_DEVICE_RESOURCE_V1_VERSION,
-    DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, DW_BOOT_DEVICE_TABLE_V1_SIZE,
-    DW_BOOT_DEVICE_TABLE_V1_VERSION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+    DW_BOOT_DEVICE_RESOURCE_V2_SIZE, DW_BOOT_DEVICE_RESOURCE_V2_VERSION,
+    DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, DW_BOOT_DEVICE_TABLE_V2_SIZE,
+    DW_BOOT_DEVICE_TABLE_V2_VERSION, DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+    DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
 };
 
 use super::*;
@@ -101,10 +102,10 @@ fn boot_device_resource(
     pio_base: u16,
     pio_length: u16,
     interrupt_source: u32,
-) -> [u8; 48] {
-    let mut bytes = [0_u8; 48];
-    put_u32(&mut bytes, 0, DW_BOOT_DEVICE_RESOURCE_V1_SIZE);
-    put_u32(&mut bytes, 4, DW_BOOT_DEVICE_RESOURCE_V1_VERSION);
+) -> [u8; 64] {
+    let mut bytes = [0_u8; 64];
+    put_u32(&mut bytes, 0, DW_BOOT_DEVICE_RESOURCE_V2_SIZE);
+    put_u32(&mut bytes, 4, DW_BOOT_DEVICE_RESOURCE_V2_VERSION);
     put_u32(
         &mut bytes,
         8,
@@ -118,13 +119,28 @@ fn boot_device_resource(
     bytes
 }
 
-fn install_boot_device_table(fixture: &mut Fixture, records: &[[u8; 48]]) {
+fn pci_function_resource(resource_id: u64, pci_address: u32, pci_ids: u32) -> [u8; 64] {
+    let mut bytes = [0_u8; 64];
+    put_u32(&mut bytes, 0, DW_BOOT_DEVICE_RESOURCE_V2_SIZE);
+    put_u32(&mut bytes, 4, DW_BOOT_DEVICE_RESOURCE_V2_VERSION);
+    put_u32(&mut bytes, 8, DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION.0);
+    put_u64(&mut bytes, 16, resource_id);
+    put_u32(&mut bytes, 40, pci_address);
+    put_u32(&mut bytes, 44, pci_ids);
+    bytes
+}
+
+/// q35 bus 0, device 1, function 0: a modern virtio-blk (1af4:1042).
+const VIRTIO_BLK_ADDRESS: u32 = 1 << 3;
+const VIRTIO_BLK_IDS: u32 = 0x1af4 | 0x1042 << 16;
+
+fn install_boot_device_table(fixture: &mut Fixture, records: &[[u8; 64]]) {
     let count = u32::try_from(records.len()).expect("fixture record count");
-    let total_byte_len = u64::from(DW_BOOT_DEVICE_TABLE_V1_SIZE)
+    let total_byte_len = u64::from(DW_BOOT_DEVICE_TABLE_V2_SIZE)
         + u64::from(count) * u64::from(DW_BOOT_DEVICE_TABLE_RECORD_STRIDE);
     let mut header = [0_u8; 32];
-    put_u32(&mut header, 0, DW_BOOT_DEVICE_TABLE_V1_SIZE);
-    put_u32(&mut header, 4, DW_BOOT_DEVICE_TABLE_V1_VERSION);
+    put_u32(&mut header, 0, DW_BOOT_DEVICE_TABLE_V2_SIZE);
+    put_u32(&mut header, 4, DW_BOOT_DEVICE_TABLE_V2_VERSION);
     put_u32(&mut header, 8, count);
     put_u32(&mut header, 16, DW_BOOT_DEVICE_TABLE_RECORD_STRIDE);
     put_u64(&mut header, 24, total_byte_len);
@@ -132,7 +148,7 @@ fn install_boot_device_table(fixture: &mut Fixture, records: &[[u8; 48]]) {
     for (index, record) in records.iter().enumerate() {
         fixture.bytes_at(
             DEVICE_TABLE
-                + u64::from(DW_BOOT_DEVICE_TABLE_V1_SIZE)
+                + u64::from(DW_BOOT_DEVICE_TABLE_V2_SIZE)
                 + u64::try_from(index).expect("record index")
                     * u64::from(DW_BOOT_DEVICE_TABLE_RECORD_STRIDE),
             record,
@@ -319,7 +335,12 @@ fn rejects_invalid_boot_device_table_headers_and_extents() {
     ];
     for (value, offset, expected) in cases {
         let mut fixture = valid_device_fixture();
-        let replacement = if offset == 0 { 31 } else { value.max(2) as u32 };
+        let replacement = match offset {
+            0 => 31,
+            // Version 1 tables are no longer accepted.
+            4 => 1,
+            _ => value.max(2) as u32,
+        };
         fixture.bytes_at(DEVICE_TABLE + offset, &replacement.to_le_bytes());
         assert_eq!(validate_boot_info(&fixture, BOOT_INFO), Err(expected));
     }
@@ -367,20 +388,26 @@ fn rejects_invalid_boot_device_records() {
     let mutations = [
         (
             0_u64,
-            47_u64,
+            63_u64,
             BootInfoValidationError::InvalidBootDeviceResource,
         ),
-        (4, 2, BootInfoValidationError::UnsupportedVersion),
+        // Version 1 records are no longer accepted.
+        (4, 1, BootInfoValidationError::UnsupportedVersion),
         (8, 2, BootInfoValidationError::InvalidBootDeviceResource),
+        (8, 3, BootInfoValidationError::InvalidBootDeviceResource),
         (12, 1, BootInfoValidationError::UnknownFlags),
         (16, 0, BootInfoValidationError::InvalidBootDeviceResource),
         (36, 0, BootInfoValidationError::InvalidBootDeviceResource),
-        (40, 1, BootInfoValidationError::NonZeroReserved),
+        // A port-I/O record may not carry PCI fields.
+        (40, 1, BootInfoValidationError::InvalidBootDeviceResource),
+        (44, 1, BootInfoValidationError::InvalidBootDeviceResource),
+        (48, 1, BootInfoValidationError::NonZeroReserved),
+        (56, 1, BootInfoValidationError::NonZeroReserved),
     ];
     for (offset, value, expected) in mutations {
         let mut fixture = valid_device_fixture();
         let record = DEVICE_TABLE + 32 + offset;
-        if matches!(offset, 16 | 40) {
+        if matches!(offset, 16 | 48 | 56) {
             fixture.bytes_at(record, &value.to_le_bytes());
         } else {
             fixture.bytes_at(record, &(value as u32).to_le_bytes());
@@ -466,7 +493,7 @@ fn rejects_duplicate_and_overlapping_boot_device_resources_but_accepts_adjacency
 #[test]
 fn accepts_the_exact_maximum_boot_device_table_capacity() {
     let mut fixture = valid_fixture();
-    let records: [[u8; 48]; 8] = core::array::from_fn(|index| {
+    let records: [[u8; 64]; 8] = core::array::from_fn(|index| {
         let id = u64::try_from(index + 1).expect("resource id");
         let irq = [1_u32, 2, 3, 5, 6, 7, 8, 9][index];
         boot_device_resource(
@@ -489,7 +516,7 @@ fn accepts_the_exact_maximum_boot_device_table_capacity() {
 fn boot_device_validation_phases_have_deterministic_precedence() {
     let mut structural_late = valid_fixture();
     let mut malformed_second = boot_device_resource(2, 2, 0x300, 8, 5);
-    put_u32(&mut malformed_second, 4, 2);
+    put_u32(&mut malformed_second, 4, 1);
     install_boot_device_table(
         &mut structural_late,
         &[boot_device_resource(1, 1, 0x3f8, 8, 3), malformed_second],
@@ -568,7 +595,7 @@ fn rejects_duplicate_or_mutable_boot_device_modules_without_partial_grants() {
 
     let materialize_calls = Cell::new(0_u32);
     let result =
-        device_table::parse_boot_resource_grants_with(&late_failure, DEVICE_TABLE, 128, |_| {
+        device_table::parse_boot_resource_grants_with(&late_failure, DEVICE_TABLE, 160, |_| {
             materialize_calls.set(materialize_calls.get() + 1);
             BootResourceGrants::materialize(&[])
         });
@@ -971,5 +998,67 @@ fn validates_framebuffer_and_entropy_presence_semantics() {
     assert_eq!(
         validate_boot_info(&fixture, BOOT_INFO),
         Err(BootInfoValidationError::InvalidFramebuffer)
+    );
+}
+
+#[test]
+fn a_pci_function_record_sits_beside_a_port_io_record() {
+    let mut fixture = valid_fixture();
+    install_boot_device_table(
+        &mut fixture,
+        &[
+            boot_device_resource(1, 1, 0x2f8, 8, 3),
+            pci_function_resource(2, VIRTIO_BLK_ADDRESS, VIRTIO_BLK_IDS),
+        ],
+    );
+    let grants = validate_boot_info(&fixture, BOOT_INFO)
+        .expect("mixed table")
+        .boot_resource_grants();
+    assert_eq!(grants.len(), 2);
+    let pci = grants.grant(1).expect("PCI grant").descriptor();
+    assert_eq!(pci.kind, DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION);
+    assert_eq!(pci.pci_address, VIRTIO_BLK_ADDRESS);
+    assert_eq!(pci.pci_ids, VIRTIO_BLK_IDS);
+    assert_eq!(
+        (pci.pio_base, pci.pio_length, pci.interrupt_source),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn malformed_pci_function_records_are_refused() {
+    let mut with_ports = pci_function_resource(2, VIRTIO_BLK_ADDRESS, VIRTIO_BLK_IDS);
+    with_ports[34..36].copy_from_slice(&8_u16.to_le_bytes());
+    let mut with_interrupt = pci_function_resource(2, VIRTIO_BLK_ADDRESS, VIRTIO_BLK_IDS);
+    put_u32(&mut with_interrupt, 36, 5);
+    for record in [
+        pci_function_resource(2, 1 << 16 | VIRTIO_BLK_ADDRESS, VIRTIO_BLK_IDS),
+        pci_function_resource(2, VIRTIO_BLK_ADDRESS, 0xffff | 0x1042 << 16),
+        pci_function_resource(2, VIRTIO_BLK_ADDRESS, 0x1042 << 16),
+        with_ports,
+        with_interrupt,
+    ] {
+        let mut fixture = valid_fixture();
+        install_boot_device_table(&mut fixture, &[record]);
+        assert_eq!(
+            validate_boot_info(&fixture, BOOT_INFO),
+            Err(BootInfoValidationError::InvalidBootDeviceResource)
+        );
+    }
+}
+
+#[test]
+fn one_pci_function_cannot_be_granted_twice() {
+    let mut fixture = valid_fixture();
+    install_boot_device_table(
+        &mut fixture,
+        &[
+            pci_function_resource(1, VIRTIO_BLK_ADDRESS, VIRTIO_BLK_IDS),
+            pci_function_resource(2, VIRTIO_BLK_ADDRESS, VIRTIO_BLK_IDS),
+        ],
+    );
+    assert_eq!(
+        validate_boot_info(&fixture, BOOT_INFO),
+        Err(BootInfoValidationError::OverlappingBootDeviceResources)
     );
 }

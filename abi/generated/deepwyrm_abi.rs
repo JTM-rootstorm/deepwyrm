@@ -328,7 +328,7 @@ pub const DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS: DwBootModuleKind = DwBootModuleKi
 /// Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier; it must never be transferred to userspace.
 pub const DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1: DwBootModuleKind = DwBootModuleKind(3);
 
-/// Optional unique READ_ONLY kernel-internal DwBootDeviceTableV1 carrier; it must never be transferred to userspace.
+/// Optional unique READ_ONLY kernel-internal DwBootDeviceTableV2 carrier; it must never be transferred to userspace. The module kind keeps its V1 name; the table inside carries its own version.
 pub const DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1: DwBootModuleKind = DwBootModuleKind(4);
 
 /// The module must only be exposed to userspace with read-only authority.
@@ -495,26 +495,29 @@ pub const DW_BOOT_MEMORY_RANGE_V1_VERSION: u32 = 1;
 /// Required version value for DwBootModuleV1 records.
 pub const DW_BOOT_MODULE_V1_VERSION: u32 = 1;
 
-/// Required version value for the kernel-internal DwBootDeviceTableV1 carrier.
-pub const DW_BOOT_DEVICE_TABLE_V1_VERSION: u32 = 1;
+/// Required version value for the kernel-internal DwBootDeviceTableV2 carrier. Version 1 tables are rejected.
+pub const DW_BOOT_DEVICE_TABLE_V2_VERSION: u32 = 2;
 
-/// DwBootDeviceTableV1 supports no nonzero flags.
+/// DwBootDeviceTableV2 supports no nonzero flags.
 pub const DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK: u32 = 0;
 
-/// Required byte stride of each DwBootDeviceResourceV1 record.
-pub const DW_BOOT_DEVICE_TABLE_RECORD_STRIDE: u32 = 48;
+/// Required byte stride of each DwBootDeviceResourceV2 record.
+pub const DW_BOOT_DEVICE_TABLE_RECORD_STRIDE: u32 = 64;
 
 /// Maximum number of immutable resource records accepted from one boot-device table.
 pub const DW_BOOT_DEVICE_TABLE_MAX_RESOURCES: u32 = 8;
 
-/// Required version value for DwBootDeviceResourceV1 records.
-pub const DW_BOOT_DEVICE_RESOURCE_V1_VERSION: u32 = 1;
+/// Required version value for DwBootDeviceResourceV2 records.
+pub const DW_BOOT_DEVICE_RESOURCE_V2_VERSION: u32 = 2;
 
-/// DwBootDeviceResourceV1 supports no nonzero flags.
+/// DwBootDeviceResourceV2 supports no nonzero flags.
 pub const DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK: u32 = 0;
 
 /// One bounded x86 port-I/O range paired with one platform interrupt source.
 pub const DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT: DwDeviceResourceKind = DwDeviceResourceKind(1);
+
+/// One PCI segment-0 function named by bus/device/function and expected vendor and device IDs, which the kernel checks at boot.
+pub const DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION: DwDeviceResourceKind = DwDeviceResourceKind(2);
 
 /// Required version value for DwBootX86_64PagingHandoffV1.
 pub const DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION: u32 = 1;
@@ -904,17 +907,17 @@ pub struct DwBootModuleV1 {
 
 pub const DW_BOOT_MODULE_V1_SIZE: u32 = 64;
 
-/// Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV1 records.
+/// Fixed header for an optional unique READ_ONLY kernel-internal boot-device resource table. The containing module consists exactly of this header followed by resource_count fixed-stride DwBootDeviceResourceV2 records.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DwBootDeviceTableV1 {
-    /// Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V1_SIZE.
+pub struct DwBootDeviceTableV2 {
+    /// Fixed header byte size; must equal DW_BOOT_DEVICE_TABLE_V2_SIZE.
     pub size: u32,
-    /// Structure version; must equal DW_BOOT_DEVICE_TABLE_V1_VERSION.
+    /// Structure version; must equal DW_BOOT_DEVICE_TABLE_V2_VERSION.
     pub version: u32,
     /// Nonzero record count bounded by DW_BOOT_DEVICE_TABLE_MAX_RESOURCES.
     pub resource_count: u32,
-    /// Must contain only supported bits; V1 requires zero.
+    /// Must contain only supported bits; V2 requires zero.
     pub flags: u32,
     /// Record byte stride; must equal DW_BOOT_DEVICE_TABLE_RECORD_STRIDE.
     pub record_stride: u32,
@@ -924,35 +927,41 @@ pub struct DwBootDeviceTableV1 {
     pub total_byte_len: u64,
 }
 
-pub const DW_BOOT_DEVICE_TABLE_V1_SIZE: u32 = 32;
+pub const DW_BOOT_DEVICE_TABLE_V2_SIZE: u32 = 32;
 
-/// One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded.
+/// One immutable numeric kernel-facing boot-device resource descriptor; policy names and userspace identities are excluded. Fields that belong to the other kind must be zero.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DwBootDeviceResourceV1 {
-    /// Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V1_SIZE.
+pub struct DwBootDeviceResourceV2 {
+    /// Fixed record byte size; must equal DW_BOOT_DEVICE_RESOURCE_V2_SIZE.
     pub size: u32,
-    /// Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V1_VERSION.
+    /// Structure version; must equal DW_BOOT_DEVICE_RESOURCE_V2_VERSION.
     pub version: u32,
     /// Admitted device-resource kind.
     pub kind: DwDeviceResourceKind,
-    /// Must contain only supported bits; V1 requires zero.
+    /// Must contain only supported bits; V2 requires zero.
     pub flags: u32,
     /// Nonzero immutable kernel resource identity.
     pub resource_id: u64,
     /// Optional non-authoritative policy correlation; zero means absent.
     pub device_correlation_id: u64,
-    /// Exact x86 port-range base.
+    /// X86_PIO_WITH_PLATFORM_INTERRUPT: exact x86 port-range base.
     pub pio_base: u16,
-    /// Nonzero bounded port-range byte length.
+    /// X86_PIO_WITH_PLATFORM_INTERRUPT: nonzero bounded port-range byte length.
     pub pio_length: u16,
-    /// Nonzero platform interrupt-source identity.
+    /// X86_PIO_WITH_PLATFORM_INTERRUPT: nonzero platform interrupt-source identity.
     pub interrupt_source: u32,
+    /// PCI_FUNCTION: segment in bits 16-31 (must be zero), bus in bits 8-15, device in bits 3-7, function in bits 0-2.
+    pub pci_address: u32,
+    /// PCI_FUNCTION: expected vendor ID in bits 0-15 and device ID in bits 16-31; vendor 0xffff is invalid.
+    pub pci_ids: u32,
     /// Reserved; producer sets zero and consumer rejects nonzero.
-    pub reserved: u64,
+    pub reserved0: u64,
+    /// Reserved; producer sets zero and consumer rejects nonzero.
+    pub reserved1: u64,
 }
 
-pub const DW_BOOT_DEVICE_RESOURCE_V1_SIZE: u32 = 48;
+pub const DW_BOOT_DEVICE_RESOURCE_V2_SIZE: u32 = 64;
 
 /// Fixed header for the sole READ_ONLY kernel-internal x86_64 transition-page-table carrier. The containing module's physical_start is 4096-byte aligned, begins with this header, and is followed at table_frames_offset by a flat u64 list. The list is strictly ascending and unique, contains the distinct CR3 root and three temporary-path child frames, and enumerates every current transition page-table frame exactly once with no data frames. Every physical address is nonzero, 4096-byte aligned, has no bits outside physical_address_width, and remains reserved until Deepwyrm replaces CR3. The containing module's byte_len, total_byte_len, and table_frames_offset plus table_frame_count times table_frame_stride must be exactly equal.
 #[repr(C)]
@@ -1526,27 +1535,30 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwBootModuleV1, physical_start), 16);
         assert_eq!(offset_of!(DwBootModuleV1, byte_len), 24);
         assert_eq!(offset_of!(DwBootModuleV1, reserved), 32);
-        assert_eq!(size_of::<DwBootDeviceTableV1>(), 32);
-        assert_eq!(align_of::<DwBootDeviceTableV1>(), 8);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, size), 0);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, version), 4);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, resource_count), 8);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, flags), 12);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, record_stride), 16);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, reserved0), 20);
-        assert_eq!(offset_of!(DwBootDeviceTableV1, total_byte_len), 24);
-        assert_eq!(size_of::<DwBootDeviceResourceV1>(), 48);
-        assert_eq!(align_of::<DwBootDeviceResourceV1>(), 8);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, size), 0);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, version), 4);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, kind), 8);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, flags), 12);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, resource_id), 16);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, device_correlation_id), 24);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, pio_base), 32);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, pio_length), 34);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, interrupt_source), 36);
-        assert_eq!(offset_of!(DwBootDeviceResourceV1, reserved), 40);
+        assert_eq!(size_of::<DwBootDeviceTableV2>(), 32);
+        assert_eq!(align_of::<DwBootDeviceTableV2>(), 8);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, size), 0);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, version), 4);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, resource_count), 8);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, flags), 12);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, record_stride), 16);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, reserved0), 20);
+        assert_eq!(offset_of!(DwBootDeviceTableV2, total_byte_len), 24);
+        assert_eq!(size_of::<DwBootDeviceResourceV2>(), 64);
+        assert_eq!(align_of::<DwBootDeviceResourceV2>(), 8);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, size), 0);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, version), 4);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, kind), 8);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, flags), 12);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, resource_id), 16);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, device_correlation_id), 24);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, pio_base), 32);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, pio_length), 34);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, interrupt_source), 36);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, pci_address), 40);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, pci_ids), 44);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, reserved0), 48);
+        assert_eq!(offset_of!(DwBootDeviceResourceV2, reserved1), 56);
         assert_eq!(size_of::<DwBootX86_64PagingHandoffV1>(), 112);
         assert_eq!(align_of::<DwBootX86_64PagingHandoffV1>(), 8);
         assert_eq!(offset_of!(DwBootX86_64PagingHandoffV1, size), 0);
@@ -1879,13 +1891,14 @@ mod generated_layout_tests {
         assert_eq!(DW_BOOT_BASE_PAGE_SIZE, 4096);
         assert_eq!(DW_BOOT_MEMORY_RANGE_V1_VERSION, 1);
         assert_eq!(DW_BOOT_MODULE_V1_VERSION, 1);
-        assert_eq!(DW_BOOT_DEVICE_TABLE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_DEVICE_TABLE_V2_VERSION, 2);
         assert_eq!(DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK, 0);
-        assert_eq!(DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, 48);
+        assert_eq!(DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, 64);
         assert_eq!(DW_BOOT_DEVICE_TABLE_MAX_RESOURCES, 8);
-        assert_eq!(DW_BOOT_DEVICE_RESOURCE_V1_VERSION, 1);
+        assert_eq!(DW_BOOT_DEVICE_RESOURCE_V2_VERSION, 2);
         assert_eq!(DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, 0);
         assert_eq!(DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT.0, 1);
+        assert_eq!(DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION.0, 2);
         assert_eq!(DW_BOOT_X86_64_PAGING_HANDOFF_V1_VERSION, 1);
         assert_eq!(DW_BOOT_X86_64_PAGING_HANDOFF_FLAGS_SUPPORTED_MASK.0, 0);
         assert_eq!(DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION, 2);

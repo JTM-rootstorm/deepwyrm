@@ -1,9 +1,10 @@
 use deepwyrm_abi::{
-    DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, DW_BOOT_DEVICE_RESOURCE_V1_SIZE,
-    DW_BOOT_DEVICE_RESOURCE_V1_VERSION, DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
+    DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, DW_BOOT_DEVICE_RESOURCE_V2_SIZE,
+    DW_BOOT_DEVICE_RESOURCE_V2_VERSION, DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
     DW_BOOT_DEVICE_TABLE_MAX_RESOURCES, DW_BOOT_DEVICE_TABLE_RECORD_STRIDE,
-    DW_BOOT_DEVICE_TABLE_V1_SIZE, DW_BOOT_DEVICE_TABLE_V1_VERSION,
-    DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DwDeviceResourceKind,
+    DW_BOOT_DEVICE_TABLE_V2_SIZE, DW_BOOT_DEVICE_TABLE_V2_VERSION,
+    DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+    DwDeviceResourceKind,
 };
 
 use super::{
@@ -38,10 +39,10 @@ where
     R: BootInfoByteReader,
     F: FnOnce(&[BootResourceDescriptor]) -> Result<BootResourceGrants, BootResourceGrantError>,
 {
-    if module_byte_len < u64::from(DW_BOOT_DEVICE_TABLE_V1_SIZE) {
+    if module_byte_len < u64::from(DW_BOOT_DEVICE_TABLE_V2_SIZE) {
         return Err(BootInfoValidationError::InvalidBootDeviceTable);
     }
-    let mut header = [0_u8; DW_BOOT_DEVICE_TABLE_V1_SIZE as usize];
+    let mut header = [0_u8; DW_BOOT_DEVICE_TABLE_V2_SIZE as usize];
     reader
         .read_exact(physical_start, &mut header)
         .map_err(|()| BootInfoValidationError::ReadFailure)?;
@@ -54,10 +55,10 @@ where
     let reserved0 = u32_at(&header, 20)?;
     let total_byte_len = u64_at(&header, 24)?;
 
-    if size != DW_BOOT_DEVICE_TABLE_V1_SIZE {
+    if size != DW_BOOT_DEVICE_TABLE_V2_SIZE {
         return Err(BootInfoValidationError::InvalidBootDeviceTable);
     }
-    if version != DW_BOOT_DEVICE_TABLE_V1_VERSION {
+    if version != DW_BOOT_DEVICE_TABLE_V2_VERSION {
         return Err(BootInfoValidationError::UnsupportedVersion);
     }
     if resource_count == 0 || resource_count > DW_BOOT_DEVICE_TABLE_MAX_RESOURCES {
@@ -76,7 +77,7 @@ where
     let records_byte_len = u64::from(resource_count)
         .checked_mul(u64::from(record_stride))
         .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
-    let expected_byte_len = u64::from(DW_BOOT_DEVICE_TABLE_V1_SIZE)
+    let expected_byte_len = u64::from(DW_BOOT_DEVICE_TABLE_V2_SIZE)
         .checked_add(records_byte_len)
         .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
     if total_byte_len != expected_byte_len || module_byte_len != expected_byte_len {
@@ -99,10 +100,10 @@ where
             .checked_mul(u64::from(record_stride))
             .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
         let record_start = physical_start
-            .checked_add(u64::from(DW_BOOT_DEVICE_TABLE_V1_SIZE))
+            .checked_add(u64::from(DW_BOOT_DEVICE_TABLE_V2_SIZE))
             .and_then(|start| start.checked_add(index_offset))
             .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
-        let mut record = [0_u8; DW_BOOT_DEVICE_RESOURCE_V1_SIZE as usize];
+        let mut record = [0_u8; DW_BOOT_DEVICE_RESOURCE_V2_SIZE as usize];
         reader
             .read_exact(record_start, &mut record)
             .map_err(|()| BootInfoValidationError::ReadFailure)?;
@@ -121,6 +122,15 @@ where
             if left.resource_id == right.resource_id {
                 return Err(BootInfoValidationError::DuplicateBootDeviceResourceId);
             }
+            if left.kind != right.kind {
+                continue;
+            }
+            if left.kind == DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION {
+                if left.pci_address == right.pci_address {
+                    return Err(BootInfoValidationError::OverlappingBootDeviceResources);
+                }
+                continue;
+            }
             if left.interrupt_source == right.interrupt_source {
                 return Err(BootInfoValidationError::DuplicateBootDeviceInterruptSource);
             }
@@ -137,6 +147,8 @@ where
         pio_base: 0,
         pio_length: 0,
         interrupt_source: 0,
+        pci_address: 0,
+        pci_ids: 0,
     }; MAX_BOOT_RESOURCE_GRANTS];
     for (destination, source) in compact.iter_mut().zip(active.iter()) {
         *destination = source.expect("validated boot descriptor slot");
@@ -151,18 +163,15 @@ where
 }
 
 fn parse_resource(
-    record: &[u8; DW_BOOT_DEVICE_RESOURCE_V1_SIZE as usize],
+    record: &[u8; DW_BOOT_DEVICE_RESOURCE_V2_SIZE as usize],
 ) -> Result<BootResourceDescriptor, BootInfoValidationError> {
-    if u32_at(record, 0)? != DW_BOOT_DEVICE_RESOURCE_V1_SIZE {
+    if u32_at(record, 0)? != DW_BOOT_DEVICE_RESOURCE_V2_SIZE {
         return Err(BootInfoValidationError::InvalidBootDeviceResource);
     }
-    if u32_at(record, 4)? != DW_BOOT_DEVICE_RESOURCE_V1_VERSION {
+    if u32_at(record, 4)? != DW_BOOT_DEVICE_RESOURCE_V2_VERSION {
         return Err(BootInfoValidationError::UnsupportedVersion);
     }
     let kind = DwDeviceResourceKind(u32_at(record, 8)?);
-    if kind != DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT {
-        return Err(BootInfoValidationError::InvalidBootDeviceResource);
-    }
     let flags = u32_at(record, 12)?;
     if flags & !DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK != 0 {
         return Err(BootInfoValidationError::UnknownFlags);
@@ -172,32 +181,59 @@ fn parse_resource(
     let pio_base = u16_at(record, 32)?;
     let pio_length = u16_at(record, 34)?;
     let interrupt_source = u32_at(record, 36)?;
-    if u64_at(record, 40)? != 0 {
+    let pci_address = u32_at(record, 40)?;
+    let pci_ids = u32_at(record, 44)?;
+    if u64_at(record, 48)? != 0 || u64_at(record, 56)? != 0 {
         return Err(BootInfoValidationError::NonZeroReserved);
     }
-    if resource_id == 0 || pio_length == 0 || interrupt_source == 0 {
+    if resource_id == 0 {
         return Err(BootInfoValidationError::InvalidBootDeviceResource);
     }
-
-    let pio_end = u32::from(pio_base)
-        .checked_add(u32::from(pio_length))
-        .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
-    if pio_end > 0x1_0000 {
-        return Err(BootInfoValidationError::InvalidBootDeviceResource);
-    }
-    Ok(BootResourceDescriptor {
+    let descriptor = BootResourceDescriptor {
         resource_id,
         device_correlation_id,
         kind,
         pio_base,
         pio_length,
         interrupt_source,
-    })
+        pci_address,
+        pci_ids,
+    };
+    match kind {
+        DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT => {
+            if pio_length == 0 || interrupt_source == 0 || pci_address != 0 || pci_ids != 0 {
+                return Err(BootInfoValidationError::InvalidBootDeviceResource);
+            }
+            let pio_end = u32::from(pio_base)
+                .checked_add(u32::from(pio_length))
+                .ok_or(BootInfoValidationError::ArithmeticOverflow)?;
+            if pio_end > 0x1_0000 {
+                return Err(BootInfoValidationError::InvalidBootDeviceResource);
+            }
+        }
+        DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION => {
+            let vendor = pci_ids & 0xffff;
+            if pio_base != 0
+                || pio_length != 0
+                || interrupt_source != 0
+                || pci_address >> 16 != 0
+                || vendor == 0
+                || vendor == 0xffff
+            {
+                return Err(BootInfoValidationError::InvalidBootDeviceResource);
+            }
+        }
+        _ => return Err(BootInfoValidationError::InvalidBootDeviceResource),
+    }
+    Ok(descriptor)
 }
 
 fn validate_platform_reservations(
     descriptor: BootResourceDescriptor,
 ) -> Result<(), BootInfoValidationError> {
+    if descriptor.kind != DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT {
+        return Ok(());
+    }
     let pio_start = u32::from(descriptor.pio_base);
     let pio_end = pio_start
         .checked_add(u32::from(descriptor.pio_length))

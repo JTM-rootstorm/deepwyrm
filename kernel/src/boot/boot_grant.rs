@@ -20,6 +20,10 @@ pub(crate) struct BootResourceDescriptor {
     pub(crate) pio_base: u16,
     pub(crate) pio_length: u16,
     pub(crate) interrupt_source: u32,
+    /// PCI_FUNCTION only: segment/bus/device/function, as in the boot record.
+    pub(crate) pci_address: u32,
+    /// PCI_FUNCTION only: expected vendor (low 16 bits) and device ID.
+    pub(crate) pci_ids: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +140,18 @@ impl BootResourceGrants {
 
     pub(crate) const fn is_empty(self) -> bool {
         self.count == 0
+    }
+
+    /// Every admitted descriptor, in table order.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "the boot-time PCI probe runs only on the target")
+    )]
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = BootResourceDescriptor> + '_ {
+        self.grants[..self.count]
+            .iter()
+            .flatten()
+            .map(|grant| grant.descriptor)
     }
 
     #[cfg(test)]
@@ -436,6 +452,8 @@ mod tests {
             pio_base: 0x2f8,
             pio_length: 8,
             interrupt_source: 3,
+            pci_address: 0,
+            pci_ids: 0,
         }
     }
 

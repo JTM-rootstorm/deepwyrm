@@ -466,6 +466,8 @@ mod tests {
                     pio_base: 0x2f8,
                     pio_length: 8,
                     interrupt_source: 3,
+                    pci_address: 0,
+                    pci_ids: 0,
                     resource_domain: domain,
                 },
                 deepwyrm_abi::DW_RIGHT_INSPECT,
@@ -527,6 +529,8 @@ mod tests {
                     pio_base: 0x2f8,
                     pio_length: 8,
                     interrupt_source: 3,
+                    pci_address: 0,
+                    pci_ids: 0,
                     resource_domain: domain,
                 },
                 deepwyrm_abi::dw_object_compatible_rights(

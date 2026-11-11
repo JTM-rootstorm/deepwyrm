@@ -518,6 +518,51 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             #[cfg(feature = "test-support")]
             let _ = state;
         }
+        // STORAGE_PLAN K1: check every PCI_FUNCTION boot record against the
+        // hardware and size its BARs before any process can claim it.
+        {
+            let physical_limit = active_paging.root().physical_limit().exclusive();
+            for descriptor in boot_info.boot_resource_grants().descriptors() {
+                if descriptor.kind != deepwyrm_abi::DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION {
+                    continue;
+                }
+                let mut ports = arch::x86_64::io_port::X86PortIo;
+                let mut config = arch::x86_64::pci_config::Mechanism1::new(&mut ports);
+                let result = device::pci::probe(
+                    &mut config,
+                    descriptor.pci_address,
+                    descriptor.pci_ids,
+                    physical_limit,
+                    |start, end| boot_range_overlaps_non_mmio(boot_info, start, end),
+                );
+                #[cfg(not(feature = "test-support"))]
+                let _ = debug::emit_early_record(
+                    match result {
+                        Ok(_) => debug::DiagnosticLevel::Info,
+                        Err(_) => debug::DiagnosticLevel::Warn,
+                    },
+                    "pci",
+                    match result {
+                        Ok(_) => "boot-recorded function present; claimable",
+                        Err(device::pci::PciProbeError::Absent) => {
+                            "boot-recorded function absent; not claimable"
+                        }
+                        Err(device::pci::PciProbeError::IdentityMismatch { .. }) => {
+                            "boot-recorded function has other IDs; not claimable"
+                        }
+                        Err(device::pci::PciProbeError::NotAnEndpoint { .. }) => {
+                            "boot-recorded function is not an endpoint; not claimable"
+                        }
+                        Err(device::pci::PciProbeError::InvalidAddress) => {
+                            "boot-recorded function address invalid; not claimable"
+                        }
+                    },
+                );
+                if !device::pci::PCI_FUNCTIONS.record(descriptor.resource_id, result) {
+                    panic!("PCI probe table rejected a validated boot record");
+                }
+            }
+        }
         arch::x86_64::smp::configure_live_cpu_registry(&cpu_topology)
             .unwrap_or_else(|error| panic!("failed to configure the H1 CPU registry: {error:?}"));
         let cpu_registry = arch::x86_64::smp::live_cpu_registry();
@@ -662,4 +707,27 @@ impl BootInfoByteReader for IdentityMappedBootInfoReader {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     debug::handle_early_panic(info)
+}
+
+/// Whether `[start, end)` touches a boot memory-map range other than MMIO.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn boot_range_overlaps_non_mmio(boot_info: &boot::ValidatedBootInfo, start: u64, end: u64) -> bool {
+    for index in 0..boot_info.memory_map().entry_count() {
+        let Ok(range) = boot_info.memory_range(index) else {
+            return true;
+        };
+        let Some(range_end) = range
+            .physical_start
+            .checked_add(range.page_count.saturating_mul(4096))
+        else {
+            return true;
+        };
+        if range.kind != deepwyrm_abi::DW_BOOT_MEMORY_KIND_MMIO
+            && range.physical_start < end
+            && start < range_end
+        {
+            return true;
+        }
+    }
+    false
 }
