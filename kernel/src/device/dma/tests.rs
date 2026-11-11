@@ -726,9 +726,27 @@ fn another_process_cannot_use_a_domain_and_revoking_it_releases_everything() {
     };
     // The owner itself revokes nothing.
     let mut released = Vec::new();
-    engine.revoke_foreign(resource, predecessor, &mut |pin| released.push(pin.id()));
+    engine
+        .revoke_foreign(resource, predecessor, false, &mut |pin| {
+            released.push(pin.id())
+        })
+        .unwrap();
     assert!(released.is_empty());
-    engine.revoke_foreign(resource, successor, &mut |pin| released.push(pin.id()));
+    // A caller whose handle may not drive DMA cannot take the domain over
+    // (storage review K3); it stays exactly as it was.
+    assert_eq!(
+        engine.revoke_foreign(resource, successor, false, &mut |pin| {
+            released.push(pin.id())
+        }),
+        Err(DmaError::FunctionBusy)
+    );
+    assert!(released.is_empty());
+    assert!(engine.hardware.context_present(7));
+    engine
+        .revoke_foreign(resource, successor, true, &mut |pin| {
+            released.push(pin.id())
+        })
+        .unwrap();
     assert_eq!(released, ids);
     assert!(!model.context_present(7));
     assert_eq!(model.allocated(), 0);

@@ -8,6 +8,7 @@
 //! MMIO. Nothing here depends on the device's class or driver.
 
 use crate::memory::frame_roles::{ObjectBackingGrant, ObjectBackingKind};
+use crate::object::ObjectId;
 
 /// Standard configuration-space registers.
 const REG_IDS: u8 = 0x00;
@@ -379,12 +380,22 @@ struct ProbeEntry {
     bars: [BarBacking; BAR_COUNT],
 }
 
+impl ProbeEntry {
+    fn held_by_other(&self, process: ObjectId) -> bool {
+        self.bars
+            .iter()
+            .any(|bar| matches!(bar, BarBacking::Lent { holder, .. } if *holder != process))
+    }
+}
+
 enum BarBacking {
     Absent,
     Available(ObjectBackingGrant),
-    /// Lent to a live MemoryObject over `[physical_start, ..)`.
+    /// Lent to a live MemoryObject over `[physical_start, ..)`, created by
+    /// process `holder`.
     Lent {
         physical_start: u64,
+        holder: ObjectId,
     },
 }
 
@@ -394,6 +405,9 @@ pub(crate) enum BarBackingError {
     NotFound,
     /// Another MemoryObject already names this BAR.
     InUse,
+    /// A live MemoryObject over another BAR of this function was created by
+    /// a different process.
+    HeldElsewhere,
 }
 
 const PROBE_CAPACITY: usize = crate::boot::MAX_BOOT_RESOURCE_GRANTS;
@@ -475,11 +489,14 @@ impl PciProbeTable {
         Ok(())
     }
 
-    /// Lends BAR `bar`'s backing to one new MemoryObject.
+    /// Lends BAR `bar`'s backing to one new MemoryObject created by process
+    /// `holder`. A function's BAR objects belong to one process at a time:
+    /// while another process holds a live one, this is `HeldElsewhere`.
     pub(crate) fn take_bar_backing(
         &self,
         resource_id: u64,
         bar: u32,
+        holder: ObjectId,
     ) -> Result<ObjectBackingGrant, BarBackingError> {
         let bar = usize::try_from(bar)
             .ok()
@@ -491,10 +508,14 @@ impl PciProbeTable {
             .flatten()
             .find(|entry| entry.resource_id == resource_id)
             .ok_or(BarBackingError::NotFound)?;
+        if entry.held_by_other(holder) {
+            return Err(BarBackingError::HeldElsewhere);
+        }
         match core::mem::replace(&mut entry.bars[bar], BarBacking::Absent) {
             BarBacking::Available(grant) => {
                 entry.bars[bar] = BarBacking::Lent {
                     physical_start: grant.physical_start(),
+                    holder,
                 };
                 Ok(grant)
             }
@@ -506,6 +527,18 @@ impl PciProbeTable {
         }
     }
 
+    /// Whether a process other than `process` holds a live MemoryObject over
+    /// any BAR of `resource_id`'s function. Such a process can program the
+    /// device, so nobody else may give it DMA reach (storage review K2).
+    pub(crate) fn bars_held_by_other(&self, resource_id: u64, process: ObjectId) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .flatten()
+            .find(|entry| entry.resource_id == resource_id)
+            .is_some_and(|entry| entry.held_by_other(process))
+    }
+
     /// Takes back a grant that `take_bar_backing` lent, when its MemoryObject
     /// finalizes or its creation rolls back.
     pub(crate) fn return_bar_backing(&self, grant: ObjectBackingGrant) {
@@ -515,7 +548,7 @@ impl PciProbeTable {
             .flatten()
             .flat_map(|entry| entry.bars.iter_mut())
             .find(|slot| {
-                matches!(slot, BarBacking::Lent { physical_start }
+                matches!(slot, BarBacking::Lent { physical_start, .. }
                     if *physical_start == grant.physical_start())
             })
             .expect("a returned device-MMIO grant was never lent");
@@ -526,15 +559,23 @@ impl PciProbeTable {
 #[cfg(test)]
 impl PciProbeTable {
     /// Records `resource_id` with one BAR already lent out at
-    /// `physical_start`, for tests of the code that returns it.
-    pub(crate) fn record_lent_for_test(&self, resource_id: u64, physical_start: u64) {
+    /// `physical_start` to `holder`, for tests of the code that returns it.
+    pub(crate) fn record_lent_for_test(
+        &self,
+        resource_id: u64,
+        physical_start: u64,
+        holder: ObjectId,
+    ) {
         let mut entries = self.entries.lock();
         let slot = entries
             .iter_mut()
             .find(|entry| entry.is_none())
             .expect("test probe table has room");
         let mut bars = [const { BarBacking::Absent }; BAR_COUNT];
-        bars[0] = BarBacking::Lent { physical_start };
+        bars[0] = BarBacking::Lent {
+            physical_start,
+            holder,
+        };
         *slot = Some(ProbeEntry {
             resource_id,
             result: Err(PciProbeError::Absent),

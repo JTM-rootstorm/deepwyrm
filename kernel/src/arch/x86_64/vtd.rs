@@ -19,7 +19,6 @@ const REG_GLOBAL_STATUS: u32 = 0x1c;
 const REG_ROOT_TABLE_ADDRESS: u32 = 0x20;
 const REG_CONTEXT_COMMAND: u32 = 0x28;
 const REG_FAULT_STATUS: u32 = 0x34;
-const REG_QUEUE_HEAD: u32 = 0x80;
 const REG_QUEUE_TAIL: u32 = 0x88;
 const REG_QUEUE_ADDRESS: u32 = 0x90;
 const REG_INTERRUPT_TABLE_ADDRESS: u32 = 0xb8;
@@ -53,14 +52,19 @@ pub(crate) const INTERRUPT_TABLE_ENTRIES: usize = 256;
 const INTERRUPT_TABLE_SIZE_FIELD: u64 = 7;
 /// Invalidation descriptors (VT-d §6.5.2): 128 bits each in a 256-entry,
 /// one-page queue (IQA.QS = 0).
+const QUEUE_DESCRIPTORS: usize = 256;
+const DESCRIPTOR_CONTEXT_CACHE: u64 = 0x1;
+const DESCRIPTOR_IOTLB: u64 = 0x2;
 const DESCRIPTOR_INTERRUPT_ENTRY_CACHE: u64 = 0x4;
 const DESCRIPTOR_WAIT: u64 = 0x5;
+/// Bits 5:4 of the context-cache and IOTLB descriptors.
+const DESCRIPTOR_GRANULARITY_GLOBAL: u64 = 1 << 4;
+const DESCRIPTOR_GRANULARITY_DOMAIN: u64 = 2 << 4;
+const DESCRIPTOR_IOTLB_DRAIN_WRITES: u64 = 1 << 6;
+const DESCRIPTOR_IOTLB_DRAIN_READS: u64 = 1 << 7;
+const DESCRIPTOR_DOMAIN_ID_SHIFT: u32 = 16;
 const WAIT_STATUS_WRITE: u64 = 1 << 5;
 const WAIT_STATUS_DONE: u64 = 1;
-/// The wait descriptor's status lands in the queue page's last 8 bytes:
-/// descriptor slot 255, which the hardware never fetches because only slots
-/// 0 and 1 are ever queued.
-const QUEUE_STATUS_INDEX: usize = 511;
 const EXTENDED_IOTLB_OFFSET_SHIFT: u32 = 8;
 const EXTENDED_IOTLB_OFFSET_MASK: u64 = 0x3ff;
 const CAPABILITY_DRAIN_READ: u64 = 1 << 55;
@@ -228,25 +232,37 @@ pub(crate) fn install_interrupt_entry<M: tables::TableMemory>(
     memory.write(table, index * 2, entry.0);
 }
 
-/// Turns interrupt remapping on for one unit that already translates DMA
-/// (`enable_default_deny`), over the interrupt-remapping table `table`, with
-/// compatibility-format interrupts blocked. Afterwards the unit delivers only
-/// interrupts a present entry names, from that entry's requester; every other
-/// write to the interrupt address range faults instead. Device DMA can then
-/// no longer forge an interrupt (no vector, NMI or INIT of its choosing).
+/// One unit's invalidation queue. Once queued invalidation is on it stays on,
+/// and every invalidation the unit takes goes through the queue: VT-d §6.5.2
+/// forbids the register-based interface while the queue is enabled.
 ///
-/// The interrupt-entry cache can only be invalidated through the queue, so
-/// queued invalidation is on just long enough to invalidate it once after the
-/// table pointer is set, using the one-page queue frame `queue`; then it is
-/// turned off again and DMA invalidations stay register-based. Entries are
-/// written before this and never change while remapping is on, so no later
-/// interrupt-entry invalidation is needed.
-pub(crate) fn enable_interrupt_remapping<R: VtdRegisters, M: tables::TableMemory>(
+/// Each submission is one descriptor plus a wait whose status write says the
+/// unit has finished both, and the caller polls for it before returning, so
+/// at most two descriptors are ever outstanding.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct InvalidationQueue {
+    queue: u64,
+    /// The byte offset the next descriptor goes to (IQT.QT << 4).
+    tail: u64,
+    /// The 8-byte slot the wait descriptor writes its status into, as a
+    /// table frame and entry index.
+    status_frame: u64,
+    status_index: usize,
+}
+
+/// Turns queued invalidation on for one unit that already translates DMA
+/// (`enable_default_deny`), over the zeroed one-page queue frame `queue`.
+/// Wait descriptors report completion in entry `status_index` of
+/// `status_frame`, which no other unit uses. A unit that inherits queued
+/// invalidation, interrupt remapping or compatibility-format pass-through from
+/// firmware is refused before anything is written.
+pub(crate) fn enable_queued_invalidation<R: VtdRegisters, M: tables::TableMemory>(
     registers: &mut R,
     memory: &mut M,
     queue: u64,
-    table: u64,
-) -> Result<(), VtdError> {
+    status_frame: u64,
+    status_index: usize,
+) -> Result<InvalidationQueue, VtdError> {
     let status = registers.read32(REG_GLOBAL_STATUS);
     let inherited = status
         & (GLOBAL_QUEUED_INVALIDATION
@@ -255,8 +271,11 @@ pub(crate) fn enable_interrupt_remapping<R: VtdRegisters, M: tables::TableMemory
     if inherited != 0 {
         return Err(VtdError::FirmwareInterruptState(inherited));
     }
-
-    memory.write(queue, QUEUE_STATUS_INDEX, 0);
+    assert!(
+        status_index < tables::TABLE_ENTRIES,
+        "invalidation status slot outside its frame"
+    );
+    memory.write(status_frame, status_index, 0);
     registers.write64(REG_QUEUE_TAIL, 0);
     // 128-bit descriptors (DW = 0), 256 of them (QS = 0).
     registers.write64(REG_QUEUE_ADDRESS, queue);
@@ -265,7 +284,134 @@ pub(crate) fn enable_interrupt_remapping<R: VtdRegisters, M: tables::TableMemory
         GLOBAL_QUEUED_INVALIDATION,
         "queued-invalidation enable",
     )?;
+    Ok(InvalidationQueue {
+        queue,
+        tail: 0,
+        status_frame,
+        status_index,
+    })
+}
 
+impl InvalidationQueue {
+    /// Queues `descriptor` and a wait behind it, and returns once the unit
+    /// has written the wait's status, so the invalidation is complete. A
+    /// descriptor the unit rejects (IQE) is `QueueError`.
+    pub(crate) fn submit<R: VtdRegisters, M: tables::TableMemory>(
+        &mut self,
+        registers: &mut R,
+        memory: &mut M,
+        descriptor: (u64, u64),
+    ) -> Result<(), VtdError> {
+        let status_address = self.status_frame + (self.status_index as u64) * 8;
+        memory.write(self.status_frame, self.status_index, 0);
+        let first = (self.tail / 16) as usize;
+        memory.write(self.queue, first * 2, descriptor.0);
+        memory.write(self.queue, first * 2 + 1, descriptor.1);
+        let wait = (first + 1) % QUEUE_DESCRIPTORS;
+        memory.write(
+            self.queue,
+            wait * 2,
+            DESCRIPTOR_WAIT | WAIT_STATUS_WRITE | (WAIT_STATUS_DONE << 32),
+        );
+        memory.write(self.queue, wait * 2 + 1, status_address);
+        let tail = (((wait + 1) % QUEUE_DESCRIPTORS) * 16) as u64;
+        registers.write64(REG_QUEUE_TAIL, tail);
+        self.tail = tail;
+        let mut queue_error = false;
+        poll(
+            || {
+                queue_error = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_ERROR != 0;
+                queue_error
+                    || memory.read(self.status_frame, self.status_index) as u32
+                        == WAIT_STATUS_DONE as u32
+            },
+            "queued invalidation",
+        )?;
+        if queue_error {
+            return Err(VtdError::QueueError);
+        }
+        Ok(())
+    }
+}
+
+/// A global context-cache invalidation descriptor (VT-d §6.5.2.1).
+pub(crate) const fn context_cache_descriptor() -> (u64, u64) {
+    (DESCRIPTOR_CONTEXT_CACHE | DESCRIPTOR_GRANULARITY_GLOBAL, 0)
+}
+
+/// A domain-selective IOTLB invalidation descriptor (VT-d §6.5.2.3), draining
+/// reads and writes where the unit supports it.
+pub(crate) const fn domain_iotlb_descriptor(features: UnitFeatures, domain_id: u16) -> (u64, u64) {
+    let mut low = DESCRIPTOR_IOTLB
+        | DESCRIPTOR_GRANULARITY_DOMAIN
+        | ((domain_id as u64) << DESCRIPTOR_DOMAIN_ID_SHIFT);
+    if features.drain & IOTLB_DRAIN_READS != 0 {
+        low |= DESCRIPTOR_IOTLB_DRAIN_READS;
+    }
+    if features.drain & IOTLB_DRAIN_WRITES != 0 {
+        low |= DESCRIPTOR_IOTLB_DRAIN_WRITES;
+    }
+    (low, 0)
+}
+
+/// How one unit takes invalidations: through its registers until queued
+/// invalidation is on, and only through the queue afterwards.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Invalidator {
+    Registers,
+    Queue(InvalidationQueue),
+}
+
+impl Invalidator {
+    /// Invalidates every context-cache entry of the unit.
+    pub(crate) fn context_cache<R: VtdRegisters, M: tables::TableMemory>(
+        &mut self,
+        registers: &mut R,
+        memory: &mut M,
+    ) -> Result<(), VtdError> {
+        match self {
+            Self::Registers => invalidate_context_cache(registers),
+            Self::Queue(queue) => queue.submit(registers, memory, context_cache_descriptor()),
+        }
+    }
+
+    /// Invalidates one domain's IOTLB entries, draining where supported.
+    pub(crate) fn domain_iotlb<R: VtdRegisters, M: tables::TableMemory>(
+        &mut self,
+        registers: &mut R,
+        memory: &mut M,
+        features: UnitFeatures,
+        domain_id: u16,
+    ) -> Result<(), VtdError> {
+        match self {
+            Self::Registers => invalidate_domain_iotlb(registers, features, domain_id),
+            Self::Queue(queue) => queue.submit(
+                registers,
+                memory,
+                domain_iotlb_descriptor(features, domain_id),
+            ),
+        }
+    }
+}
+
+/// Turns interrupt remapping on for one unit whose queued invalidation is on
+/// (`enable_queued_invalidation`), over the interrupt-remapping table
+/// `table`, with compatibility-format interrupts blocked. Afterwards the unit
+/// delivers only interrupts a present entry names, from that entry's
+/// requester; every other write to the interrupt address range faults
+/// instead. Device DMA can then no longer forge an interrupt (no vector, NMI
+/// or INIT of its choosing).
+///
+/// The interrupt-entry cache is invalidated through the queue once the table
+/// pointer is set. Entries are written before this and never change while
+/// remapping is on, so no later interrupt-entry invalidation is needed. The
+/// queue stays on, and the unit's DMA invalidations go through it too.
+pub(crate) fn enable_interrupt_remapping<R: VtdRegisters, M: tables::TableMemory>(
+    registers: &mut R,
+    memory: &mut M,
+    queue: &mut InvalidationQueue,
+    table: u64,
+) -> Result<(), VtdError> {
     // x2APIC destinations are not used (EIME = 0): the kernel runs xAPIC.
     registers.write64(
         REG_INTERRUPT_TABLE_ADDRESS,
@@ -276,42 +422,8 @@ pub(crate) fn enable_interrupt_remapping<R: VtdRegisters, M: tables::TableMemory
         GLOBAL_SET_INTERRUPT_TABLE,
         "interrupt-table pointer",
     )?;
-
-    // A global interrupt-entry-cache invalidation, then a wait whose status
-    // write says the unit has finished it.
-    memory.write(queue, 0, DESCRIPTOR_INTERRUPT_ENTRY_CACHE);
-    memory.write(queue, 1, 0);
-    memory.write(
-        queue,
-        2,
-        DESCRIPTOR_WAIT | WAIT_STATUS_WRITE | (WAIT_STATUS_DONE << 32),
-    );
-    memory.write(queue, 3, queue + (QUEUE_STATUS_INDEX as u64) * 8);
-    let tail = 2 * 16;
-    registers.write64(REG_QUEUE_TAIL, tail);
-    let mut queue_error = false;
-    poll(
-        || {
-            queue_error = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_ERROR != 0;
-            queue_error || memory.read(queue, QUEUE_STATUS_INDEX) as u32 == WAIT_STATUS_DONE as u32
-        },
-        "interrupt-entry-cache invalidation",
-    )?;
-    if queue_error {
-        return Err(VtdError::QueueError);
-    }
-    // Queued invalidation may only be disabled with the queue empty.
-    poll(
-        || registers.read64(REG_QUEUE_HEAD) == tail,
-        "invalidation queue drain",
-    )?;
-    let status = registers.read32(REG_GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATUS;
-    registers.write32(REG_GLOBAL_COMMAND, status & !GLOBAL_QUEUED_INVALIDATION);
-    poll(
-        || registers.read32(REG_GLOBAL_STATUS) & GLOBAL_QUEUED_INVALIDATION == 0,
-        "queued-invalidation disable",
-    )?;
-
+    // A global interrupt-entry-cache invalidation.
+    queue.submit(registers, memory, (DESCRIPTOR_INTERRUPT_ENTRY_CACHE, 0))?;
     command(
         registers,
         GLOBAL_INTERRUPT_REMAPPING,
@@ -511,8 +623,7 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     // entries are absent, so every function is still blocked.
     tables::install_root_entry(&mut pool, root, 0, context);
 
-    let mut units: [Option<(LiveVtdMmio, UnitFeatures)>;
-        crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS] =
+    let mut units: [Option<LiveUnit>; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS] =
         [const { None }; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
     for (slot, unit) in units.iter_mut().zip(snapshot.units()) {
         let frame = FrameAddress::new(unit.register_base(), physical_limit)
@@ -523,7 +634,11 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         let mut registers = LiveVtdMmio::new(base)?;
         let state = enable_default_deny(&mut registers, root, snapshot.host_address_width())
             .map_err(VtdBootError::Unit)?;
-        *slot = Some((registers, state.features()));
+        *slot = Some(LiveUnit {
+            registers,
+            features: state.features(),
+            invalidator: Invalidator::Registers,
+        });
     }
     let interrupts_remapped = remap_interrupts(&mut pool, &mut units, &snapshot)?;
     let dma_domains = match crate::device::dma::live::LiveIommu::new(pool, units, context) {
@@ -542,15 +657,17 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
 
 /// Turns interrupt remapping on in every unit when the platform supports it
 /// (the DMAR's INTR_REMAP flag, every unit's ECAP.IR and ECAP.QI, and a
-/// single-hop IOAPIC scope naming the q35 IOAPIC's requester ID). The table
-/// holds exactly one entry, the q35 COM2 route at
+/// single-hop IOAPIC scope naming the q35 IOAPIC's requester ID). Each unit
+/// first gets its own invalidation queue, which stays on: from then on all
+/// of that unit's invalidations go through it. The table holds exactly one
+/// entry, the q35 COM2 route at
 /// [`crate::arch::x86_64::acpi::Q35_COM2_INTERRUPT_INDEX`]. Returns whether
 /// interrupts are remapped; when they are not, no function is ever confined,
 /// so bus mastering stays refused.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn remap_interrupts(
     pool: &mut crate::device::dma::live::LiveTablePool,
-    units: &mut [Option<(LiveVtdMmio, UnitFeatures)>],
+    units: &mut [Option<LiveUnit>],
     snapshot: &crate::arch::x86_64::acpi::dmar::DmarSnapshot,
 ) -> Result<bool, VtdBootError> {
     use tables::TableMemory;
@@ -558,7 +675,7 @@ fn remap_interrupts(
         || units
             .iter()
             .flatten()
-            .any(|(_, features)| !features.interrupt_remapping())
+            .any(|unit| !unit.features.interrupt_remapping())
     {
         return Ok(false);
     }
@@ -568,7 +685,8 @@ fn remap_interrupts(
     let Some(source_id) = snapshot.ioapic_source_id(ioapic.probe().id()) else {
         return Ok(false);
     };
-    let queue = pool.allocate().ok_or(VtdBootError::RootTable)?;
+    // Every unit's wait status has its own slot in one frame.
+    let status = pool.allocate().ok_or(VtdBootError::RootTable)?;
     let table = pool.allocate().ok_or(VtdBootError::RootTable)?;
     install_interrupt_entry(
         pool,
@@ -581,12 +699,26 @@ fn remap_interrupts(
             source_id,
         ),
     );
-    for (registers, _) in units.iter_mut().flatten() {
-        enable_interrupt_remapping(registers, pool, queue, table).map_err(VtdBootError::Unit)?;
+    for (index, unit) in units.iter_mut().flatten().enumerate() {
+        let queue = pool.allocate().ok_or(VtdBootError::RootTable)?;
+        let mut queue = enable_queued_invalidation(&mut unit.registers, pool, queue, status, index)
+            .map_err(VtdBootError::Unit)?;
+        enable_interrupt_remapping(&mut unit.registers, pool, &mut queue, table)
+            .map_err(VtdBootError::Unit)?;
+        unit.invalidator = Invalidator::Queue(queue);
     }
-    // The queue and table frames stay allocated for good.
+    // The queue, status and table frames stay allocated for good.
     INTERRUPTS_REMAPPED.store(true, core::sync::atomic::Ordering::Release);
     Ok(true)
+}
+
+/// One live remapping unit: its registers, what it supports, and how it
+/// takes invalidations.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) struct LiveUnit {
+    pub(crate) registers: LiveVtdMmio,
+    pub(crate) features: UnitFeatures,
+    pub(crate) invalidator: Invalidator,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

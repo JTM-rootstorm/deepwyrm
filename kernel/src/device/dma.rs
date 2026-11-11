@@ -345,13 +345,16 @@ pub(crate) trait DmaService {
     /// it: bus mastering off first, then the domain torn down (see
     /// [`DmaDomains::teardown`]); each released MemoryObject reference goes
     /// to `release`. Every syscall that drives a function (bus mastering,
-    /// BAR objects, DMA mappings) calls this first.
+    /// BAR objects, DMA mappings) calls this first. Only a caller whose
+    /// handle may drive DMA (`may_revoke`) takes a domain over; for any other
+    /// caller a foreign domain is `FunctionBusy` and stays untouched.
     fn revoke_foreign(
         &mut self,
         resource: ObjectId,
         process: ObjectId,
+        may_revoke: bool,
         release: &mut dyn FnMut(InternalRef),
-    );
+    ) -> Result<(), DmaError>;
     #[allow(clippy::too_many_arguments)]
     fn map(
         &mut self,
@@ -387,19 +390,24 @@ impl<H: DmaHardware, const DOMAINS: usize, const MAPPINGS: usize> DmaService
         &mut self,
         resource: ObjectId,
         process: ObjectId,
+        may_revoke: bool,
         release: &mut dyn FnMut(InternalRef),
-    ) {
+    ) -> Result<(), DmaError> {
         if self
             .domains
             .owner(resource)
             .is_some_and(|owner| owner != process)
         {
+            if !may_revoke {
+                return Err(DmaError::FunctionBusy);
+            }
             // Host tests have no command register; the live service clears
             // bus mastering here first.
             for pin in self.domains.teardown(self.hardware, resource).into_pins() {
                 release(pin);
             }
         }
+        Ok(())
     }
 
     fn map(

@@ -22,6 +22,9 @@ struct FakeDma {
     fail_with: Option<DmaError>,
     /// Each `revoke_foreign` call: the resource and the calling process.
     revoke_checks: std::vec::Vec<(ObjectId, ObjectId)>,
+    /// Whether another process owns the domain, so a caller that may not
+    /// revoke it is refused.
+    foreign_domain: bool,
     /// The process every mapping was made for.
     owners: std::vec::Vec<ObjectId>,
     /// Pins a revocation hands back, as a foreign owner's would.
@@ -33,12 +36,18 @@ impl DmaService for FakeDma {
         &mut self,
         resource: ObjectId,
         process: ObjectId,
+        may_revoke: bool,
         release: &mut dyn FnMut(InternalRef),
-    ) {
+    ) -> Result<(), DmaError> {
         self.revoke_checks.push((resource, process));
+        if self.foreign_domain && !may_revoke {
+            return Err(DmaError::FunctionBusy);
+        }
+        self.foreign_domain = false;
         for pin in self.revoked.drain(..) {
             release(pin);
         }
+        Ok(())
     }
 
     fn map(
@@ -217,6 +226,49 @@ impl Fixture {
             byte_len,
             &mut self.cleanup,
         )
+    }
+
+    fn mmio_object(&mut self, resource: DwHandle) -> DwStatus {
+        device_mmio_object_create(
+            &mut self.user,
+            &mut self.registry,
+            &mut self.memory,
+            &mut self.tasks,
+            &self.devices,
+            &mut self.dma,
+            self.process,
+            resource,
+            0,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+            DwUserAddress(OUT),
+            &mut self.cleanup,
+        )
+    }
+
+    fn pci_command(&mut self, resource: DwHandle, bus_master: u32) -> DwStatus {
+        let mut config = NoConfig;
+        device_pci_command(
+            &mut self.registry,
+            &mut self.tasks,
+            &self.devices,
+            &mut config,
+            &mut self.dma,
+            self.process,
+            resource,
+            1,
+            bus_master,
+            |_| true,
+            &mut self.cleanup,
+        )
+    }
+
+    /// Another live process's identity.
+    fn other_process(&mut self) -> ObjectId {
+        let creation = self
+            .registry
+            .create(deepwyrm_abi::DW_OBJECT_TYPE_PROCESS)
+            .unwrap();
+        self.registry.creation_into_internal(creation).unwrap().id()
     }
 
     fn close(&mut self, handle: DwHandle) -> Option<FinalRelease> {
@@ -504,4 +556,71 @@ fn map_and_unmap_revoke_a_foreign_domain_first_and_act_as_the_caller() {
     assert_eq!(fixture.unmap(resource, IOVA, 4096), DW_STATUS_SUCCESS);
     assert_eq!(fixture.dma.revoke_checks.len(), 2);
     assert_eq!(fixture.dma.revoke_checks[1], fixture.dma.revoke_checks[0]);
+}
+
+/// A config space no test reaches: every case here stops before the command
+/// register is touched.
+struct NoConfig;
+
+impl crate::device::pci::ConfigSpace for NoConfig {
+    fn read32(&mut self, _: crate::device::pci::PciAddress, _: u8) -> u32 {
+        panic!("the command register was reached")
+    }
+    fn write32(&mut self, _: crate::device::pci::PciAddress, _: u8, _: u32) {
+        panic!("the command register was reached")
+    }
+}
+
+/// Storage review K2: while another process holds a live BAR object of the
+/// function, nothing gives the function DMA reach for the caller, and its
+/// domain is not touched either: `dma_map` and turning bus mastering on are
+/// `BAD_STATE`, and so is a BAR object of its own.
+#[test]
+fn a_predecessors_live_bar_object_blocks_dma_and_bus_mastering() {
+    let mut fixture = Fixture::new();
+    // Bus 0, device 3, function 1: a boot resource ID no other test uses,
+    // since the probe table is global.
+    let address = (3 << 3) | 1;
+    let resource = fixture.resource(
+        DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+        address,
+        DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+    );
+    let predecessor = fixture.other_process();
+    crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(
+        u64::from(address) + 1,
+        0xe7_0000_0000,
+        predecessor,
+    );
+    let object = fixture.object(1, read_write_map());
+
+    assert_eq!(
+        fixture.map(resource, object, 0, 4096, DW_DMA_ACCESS_DEVICE_READ),
+        DW_STATUS_BAD_STATE
+    );
+    assert_eq!(fixture.pci_command(resource, 1), DW_STATUS_BAD_STATE);
+    assert_eq!(fixture.mmio_object(resource), DW_STATUS_BAD_STATE);
+    assert!(fixture.dma.revoke_checks.is_empty(), "nothing was revoked");
+    assert!(fixture.dma.mappings.is_empty());
+}
+
+/// Storage review K3: a holder of MAP alone cannot take a domain over from
+/// another process; one whose handle may drive DMA can.
+#[test]
+fn only_a_handle_that_may_drive_dma_revokes_a_foreign_domain() {
+    let mut fixture = Fixture::new();
+    // Bus 0, device 4: a probe-table ID no other test uses. It has no BAR
+    // backing, so a creation that gets past revocation is `NOT_FOUND`.
+    let map_only = fixture.resource(DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION, 4 << 3, DW_RIGHT_MAP);
+    fixture.dma.foreign_domain = true;
+    assert_eq!(fixture.mmio_object(map_only), DW_STATUS_BAD_STATE);
+    assert!(fixture.dma.foreign_domain, "the domain was left alone");
+
+    let driver = fixture.resource(
+        DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+        5 << 3,
+        DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0),
+    );
+    assert_eq!(fixture.mmio_object(driver), DW_STATUS_NOT_FOUND);
+    assert!(!fixture.dma.foreign_domain, "the domain was revoked");
 }

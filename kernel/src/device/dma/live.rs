@@ -8,7 +8,7 @@ use crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS;
 use crate::arch::x86_64::vtd::tables::{
     DeviceAccess, FOUR_LEVEL_INPUT_BITS, TABLE_ENTRIES, TableMemory,
 };
-use crate::arch::x86_64::vtd::{self, LiveVtdMmio, UnitFeatures, VtdError};
+use crate::arch::x86_64::vtd::{self, LiveUnit, VtdError};
 use crate::object::{InternalRef, ObjectId};
 use crate::sync::IrqSpinMutex;
 
@@ -93,7 +93,7 @@ impl TableMemory for LiveTablePool {
 /// The pool, every remapping unit, and the limits all units share.
 pub(crate) struct LiveIommu {
     pool: LiveTablePool,
-    units: [Option<(LiveVtdMmio, UnitFeatures)>; MAX_DMAR_UNITS],
+    units: [Option<LiveUnit>; MAX_DMAR_UNITS],
     context_table: u64,
     iova_end: u64,
     max_domain_id: u16,
@@ -105,14 +105,14 @@ impl LiveIommu {
     /// then never admitted, and every function stays blocked.
     pub(crate) fn new(
         pool: LiveTablePool,
-        units: [Option<(LiveVtdMmio, UnitFeatures)>; MAX_DMAR_UNITS],
+        units: [Option<LiveUnit>; MAX_DMAR_UNITS],
         context_table: u64,
     ) -> Option<Self> {
         let mut input_bits = FOUR_LEVEL_INPUT_BITS;
         let mut domains = u32::MAX;
         let mut caching_mode = false;
         let mut any = false;
-        for (_, features) in units.iter().flatten() {
+        for features in units.iter().flatten().map(|unit| unit.features) {
             if !features.four_level() {
                 return None;
             }
@@ -136,14 +136,16 @@ impl LiveIommu {
         })
     }
 
+    /// Runs one invalidation on every unit. The pool is passed alongside,
+    /// since a unit with queued invalidation writes its descriptors there.
     fn each_unit(
         &mut self,
-        mut command: impl FnMut(&mut LiveVtdMmio, UnitFeatures) -> Result<(), VtdError>,
+        mut command: impl FnMut(&mut LiveUnit, &mut LiveTablePool) -> Result<(), VtdError>,
     ) {
-        for (registers, features) in self.units.iter_mut().flatten() {
+        for unit in self.units.iter_mut().flatten() {
             // A unit that never completes an invalidation could still be
             // using a translation the kernel is about to free; stop instead.
-            if let Err(error) = command(registers, *features) {
+            if let Err(error) = command(unit, &mut self.pool) {
                 panic!("VT-d unit failed an invalidation: {error:?}");
             }
         }
@@ -181,22 +183,21 @@ impl DmaHardware for LiveIommu {
     fn after_install(&mut self, domain_id: u16) {
         if self.caching_mode {
             // Caching mode lets a unit cache not-present entries.
-            self.each_unit(|registers, features| {
-                vtd::invalidate_domain_iotlb(registers, features, domain_id)
-            });
+            self.invalidate_domain(domain_id);
         } else {
-            self.each_unit(vtd::flush_write_buffer);
+            self.each_unit(|unit, _| vtd::flush_write_buffer(&mut unit.registers, unit.features));
         }
     }
 
     fn invalidate_domain(&mut self, domain_id: u16) {
-        self.each_unit(|registers, features| {
-            vtd::invalidate_domain_iotlb(registers, features, domain_id)
+        self.each_unit(|unit, pool| {
+            unit.invalidator
+                .domain_iotlb(&mut unit.registers, pool, unit.features, domain_id)
         });
     }
 
     fn invalidate_context(&mut self) {
-        self.each_unit(|registers, _| vtd::invalidate_context_cache(registers));
+        self.each_unit(|unit, pool| unit.invalidator.context_cache(&mut unit.registers, pool));
     }
 }
 
@@ -225,19 +226,23 @@ impl DmaService for LiveDmaService {
         &mut self,
         resource: ObjectId,
         process: ObjectId,
+        may_revoke: bool,
         release: &mut dyn FnMut(InternalRef),
-    ) {
+    ) -> Result<(), DmaError> {
         let pins = {
             let mut live = LIVE_DMA.lock();
             let Some(live) = live.as_mut() else {
-                return;
+                return Ok(());
             };
             if !live
                 .domains
                 .owner(resource)
                 .is_some_and(|owner| owner != process)
             {
-                return;
+                return Ok(());
+            }
+            if !may_revoke {
+                return Err(DmaError::FunctionBusy);
             }
             clear_bus_master_and_teardown(live, resource)
         };
@@ -245,6 +250,7 @@ impl DmaService for LiveDmaService {
         for pin in pins.into_pins() {
             release(pin);
         }
+        Ok(())
     }
 
     fn map(

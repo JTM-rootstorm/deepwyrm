@@ -245,8 +245,13 @@ fn a_domain_iotlb_invalidation_names_the_domain_and_drains() {
     let mut unit = Unit::q35();
     let features = enable_default_deny(&mut unit, ROOT, 39).unwrap().features();
     unit.log.clear();
-    invalidate_domain_iotlb(&mut unit, features, 5).unwrap();
-    invalidate_context_cache(&mut unit).unwrap();
+    // A unit without queued invalidation takes both through its registers.
+    let mut invalidator = Invalidator::Registers;
+    let mut memory = Shared::default();
+    invalidator
+        .domain_iotlb(&mut unit, &mut memory, features, 5)
+        .unwrap();
+    invalidator.context_cache(&mut unit, &mut memory).unwrap();
     assert_eq!(
         unit.log,
         [
@@ -322,6 +327,9 @@ enum Event {
     Command(u32),
     TablePointerLatched(u64),
     InterruptCacheInvalidated,
+    /// The low quadword of a context-cache or IOTLB descriptor.
+    ContextInvalidated(u64),
+    IotlbInvalidated(u64),
     StatusWritten,
 }
 
@@ -341,6 +349,8 @@ struct IrUnit {
 
 const QUEUE: u64 = 0x9000;
 const IR_TABLE: u64 = 0xa000;
+const STATUS: u64 = 0xb000;
+const STATUS_INDEX: usize = 3;
 
 impl IrUnit {
     fn new(memory: Shared) -> Self {
@@ -371,6 +381,14 @@ impl IrUnit {
                 DESCRIPTOR_INTERRUPT_ENTRY_CACHE => {
                     assert_ne!(self.status & GLOBAL_SET_INTERRUPT_TABLE, 0);
                     self.events.push(Event::InterruptCacheInvalidated);
+                }
+                DESCRIPTOR_CONTEXT_CACHE => {
+                    assert_eq!(high, 0);
+                    self.events.push(Event::ContextInvalidated(low));
+                }
+                DESCRIPTOR_IOTLB => {
+                    assert_eq!(high, 0, "domain-selective: no address");
+                    self.events.push(Event::IotlbInvalidated(low));
                 }
                 DESCRIPTOR_WAIT => {
                     assert_ne!(low & WAIT_STATUS_WRITE, 0);
@@ -430,10 +448,7 @@ impl VtdRegisters for IrUnit {
     }
 
     fn read64(&mut self, offset: u32) -> u64 {
-        match offset {
-            REG_QUEUE_HEAD => self.head,
-            _ => panic!("unexpected 64-bit read at {offset:#x}"),
-        }
+        panic!("unexpected 64-bit read at {offset:#x}")
     }
 
     fn write64(&mut self, offset: u32, value: u64) {
@@ -457,33 +472,43 @@ impl VtdRegisters for IrUnit {
     fn flush_cpu_caches(&mut self) {}
 }
 
+fn queued(unit: &mut IrUnit, kernel: &mut Shared) -> InvalidationQueue {
+    enable_queued_invalidation(unit, kernel, QUEUE, STATUS, STATUS_INDEX).unwrap()
+}
+
 #[test]
-fn interrupt_remapping_invalidates_the_entry_cache_then_blocks_compatibility_format() {
+fn interrupt_remapping_invalidates_the_entry_cache_and_keeps_the_queue_on() {
     let memory = Shared::default();
     let mut unit = IrUnit::new(memory.clone());
     let mut kernel = memory.clone();
-    enable_interrupt_remapping(&mut unit, &mut kernel, QUEUE, IR_TABLE).unwrap();
+    let mut queue = queued(&mut unit, &mut kernel);
+    enable_interrupt_remapping(&mut unit, &mut kernel, &mut queue, IR_TABLE).unwrap();
     assert_eq!(unit.queue, QUEUE);
     assert_eq!(unit.table, IR_TABLE | 7);
-    // Remapping is on, the queue is off again and compatibility format is
+    // Remapping is on, the queue stays on, and compatibility format is
     // blocked; translation stayed on throughout.
     assert_eq!(
         unit.status,
-        GLOBAL_TRANSLATION_ENABLE | GLOBAL_SET_INTERRUPT_TABLE | GLOBAL_INTERRUPT_REMAPPING
+        GLOBAL_TRANSLATION_ENABLE
+            | GLOBAL_QUEUED_INVALIDATION
+            | GLOBAL_SET_INTERRUPT_TABLE
+            | GLOBAL_INTERRUPT_REMAPPING
     );
-    let base = GLOBAL_TRANSLATION_ENABLE;
+    let base = GLOBAL_TRANSLATION_ENABLE | GLOBAL_QUEUED_INVALIDATION;
     assert_eq!(
         unit.events,
         [
-            Event::Command(base | GLOBAL_QUEUED_INVALIDATION),
-            Event::Command(base | GLOBAL_QUEUED_INVALIDATION | GLOBAL_SET_INTERRUPT_TABLE),
+            Event::Command(base),
+            Event::Command(base | GLOBAL_SET_INTERRUPT_TABLE),
             Event::TablePointerLatched(IR_TABLE | 7),
             Event::InterruptCacheInvalidated,
             Event::StatusWritten,
-            Event::Command(base),
             Event::Command(base | GLOBAL_INTERRUPT_REMAPPING),
         ]
     );
+    // The wait wrote its own unit's status slot, not the queue page.
+    use tables::TableMemory;
+    assert_eq!(kernel.read(STATUS, STATUS_INDEX), WAIT_STATUS_DONE);
 }
 
 #[test]
@@ -498,7 +523,7 @@ fn inherited_interrupt_state_is_refused_without_touching_the_unit() {
         unit.status |= inherited;
         let mut kernel = memory.clone();
         assert_eq!(
-            enable_interrupt_remapping(&mut unit, &mut kernel, QUEUE, IR_TABLE),
+            enable_queued_invalidation(&mut unit, &mut kernel, QUEUE, STATUS, STATUS_INDEX),
             Err(VtdError::FirmwareInterruptState(inherited))
         );
         assert!(unit.events.is_empty());
@@ -510,13 +535,90 @@ fn inherited_interrupt_state_is_refused_without_touching_the_unit() {
 fn a_rejected_descriptor_fails_before_remapping_is_enabled() {
     let memory = Shared::default();
     let mut unit = IrUnit::new(memory.clone());
-    unit.reject_descriptors = true;
     let mut kernel = memory.clone();
+    let mut queue = queued(&mut unit, &mut kernel);
+    unit.reject_descriptors = true;
     assert_eq!(
-        enable_interrupt_remapping(&mut unit, &mut kernel, QUEUE, IR_TABLE),
+        enable_interrupt_remapping(&mut unit, &mut kernel, &mut queue, IR_TABLE),
         Err(VtdError::QueueError)
     );
     assert_eq!(unit.status & GLOBAL_INTERRUPT_REMAPPING, 0);
+}
+
+#[test]
+fn with_the_queue_on_dma_invalidations_go_through_it_and_never_the_registers() {
+    let memory = Shared::default();
+    let mut unit = IrUnit::new(memory.clone());
+    let mut kernel = memory.clone();
+    let mut queue = queued(&mut unit, &mut kernel);
+    enable_interrupt_remapping(&mut unit, &mut kernel, &mut queue, IR_TABLE).unwrap();
+    unit.events.clear();
+    let features = UnitFeatures::read(
+        CAPABILITY_DRAIN_READ | CAPABILITY_DRAIN_WRITE,
+        IOTLB_OFFSET_UNITS << EXTENDED_IOTLB_OFFSET_SHIFT,
+    )
+    .unwrap();
+    let mut invalidator = Invalidator::Queue(queue);
+    // The model panics on any context-command or IOTLB register access.
+    invalidator.context_cache(&mut unit, &mut kernel).unwrap();
+    invalidator
+        .domain_iotlb(&mut unit, &mut kernel, features, 0x1234)
+        .unwrap();
+    assert_eq!(
+        unit.events,
+        [
+            Event::ContextInvalidated(0x1 | 1 << 4),
+            Event::StatusWritten,
+            // Domain-selective, drain writes and reads, DID in bits 31:16.
+            Event::IotlbInvalidated(0x2 | 2 << 4 | 1 << 6 | 1 << 7 | 0x1234 << 16),
+            Event::StatusWritten,
+        ]
+    );
+
+    // Without drain support the drain bits stay clear.
+    let plain = UnitFeatures::read(0, IOTLB_OFFSET_UNITS << EXTENDED_IOTLB_OFFSET_SHIFT).unwrap();
+    assert_eq!(
+        domain_iotlb_descriptor(plain, 7),
+        (0x2 | 2 << 4 | 7 << 16, 0)
+    );
+}
+
+#[test]
+fn the_queue_wraps_and_each_submission_waits_for_its_own_status() {
+    let memory = Shared::default();
+    let mut unit = IrUnit::new(memory.clone());
+    let mut kernel = memory.clone();
+    let mut queue = queued(&mut unit, &mut kernel);
+    // Each submission is two descriptors; 300 of them wrap the 256-slot
+    // queue more than twice.
+    for _ in 0..300 {
+        queue
+            .submit(&mut unit, &mut kernel, context_cache_descriptor())
+            .unwrap();
+        assert_eq!(unit.head, unit.tail, "the unit finished every descriptor");
+    }
+    let invalidations = unit
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::ContextInvalidated(_)))
+        .count();
+    assert_eq!(invalidations, 300);
+    assert_eq!(unit.tail, (600 % 256) * 16);
+}
+
+#[test]
+fn a_unit_that_never_writes_the_status_times_out() {
+    let memory = Shared::default();
+    let mut unit = IrUnit::new(memory.clone());
+    let mut kernel = memory.clone();
+    let mut queue = queued(&mut unit, &mut kernel);
+    // Turning the queue off behind the kernel's back means the tail write is
+    // never processed.
+    unit.status &= !GLOBAL_QUEUED_INVALIDATION;
+    assert_eq!(
+        queue.submit(&mut unit, &mut kernel, context_cache_descriptor()),
+        Err(VtdError::Timeout("queued invalidation"))
+    );
 }
 
 #[test]

@@ -601,7 +601,6 @@ mod tests {
     fn device_mmio_finalization_chains_its_parent_device_resource() {
         const RESOURCE_ID: u64 = 0x6b34_0001;
         const BAR: u64 = 0xe5_0000_0000;
-        crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(RESOURCE_ID, BAR);
         let mut registry = ObjectRegistry::<8>::new();
         let mut roles = synthetic_frame_role_manager::<1, 8>(0x3a_000, 4);
         let mut memory = MemoryObjectAuthority::<1, 1>::new();
@@ -614,6 +613,8 @@ mod tests {
         let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
         let mut regions = AddressRegionObjectAuthority::<1, 1>::new();
         let (domain, _owner) = tasks.create_root_group(&mut registry).unwrap();
+        // Any identity serves as the holder here.
+        crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(RESOURCE_ID, BAR, _owner.id());
         let devices = crate::device::DeviceResourceAuthority::<1>::new();
         let mut handles = crate::handle::HandleTable::<2>::new();
         let (_, resource) = devices

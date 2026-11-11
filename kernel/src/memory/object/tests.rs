@@ -1227,11 +1227,12 @@ fn a_device_mmio_parent_must_be_a_device_resource() {
 fn device_mmio_finalization_returns_the_bar_then_releases_the_resource() {
     const RESOURCE_ID: u64 = 0x6b33_0001;
     const BAR: u64 = 0xe4_0000_0000;
-    crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(RESOURCE_ID, BAR);
     let mut roles = crate::memory::frame_roles::synthetic_frame_role_manager::<1, 8>(0x10_000, 2);
     let mut registry = ObjectRegistry::<2>::new();
     let parent = device_resource_pin(&mut registry);
     let parent_id = parent.id();
+    // Any identity serves as the holder here.
+    crate::device::pci::PCI_FUNCTIONS.record_lent_for_test(RESOURCE_ID, BAR, parent_id);
     let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(BAR, 1);
     let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
     let mut authority = MemoryObjectAuthority::<1, 1>::new();

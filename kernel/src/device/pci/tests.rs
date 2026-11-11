@@ -377,19 +377,67 @@ fn probed_virtio_blk() -> PciFunction {
     probe(&mut function, ADDRESS, VIRTIO_BLK, LIMIT, |_, _| false).unwrap()
 }
 
+/// Two distinct process identities.
+fn processes() -> (ObjectId, ObjectId) {
+    let mut registry = crate::object::ObjectRegistry::<2>::new();
+    let mut process = || {
+        let creation = registry
+            .create(deepwyrm_abi::DW_OBJECT_TYPE_PROCESS)
+            .unwrap();
+        registry.creation_into_internal(creation).unwrap().id()
+    };
+    (process(), process())
+}
+
 #[test]
 fn an_admitted_bar_backing_is_lent_once_and_taken_back() {
+    let (driver, _) = processes();
     let table = PciProbeTable::new();
     assert!(table.record(7, Ok(probed_virtio_blk())));
     let grant = crate::memory::frame_roles::synthetic_device_mmio_backing(0xc0_0000_0000, 4);
     table.install_bar_backing(7, 4, grant).unwrap();
 
-    let lent = table.take_bar_backing(7, 4).unwrap();
+    let lent = table.take_bar_backing(7, 4, driver).unwrap();
     assert_eq!(lent.physical_start(), 0xc0_0000_0000);
-    assert_eq!(table.take_bar_backing(7, 4), Err(BarBackingError::InUse));
+    assert_eq!(
+        table.take_bar_backing(7, 4, driver),
+        Err(BarBackingError::InUse)
+    );
     table.return_bar_backing(lent);
-    let again = table.take_bar_backing(7, 4).unwrap();
+    let again = table.take_bar_backing(7, 4, driver).unwrap();
     assert_eq!(again.byte_len(), 0x4000);
+}
+
+#[test]
+fn bar_objects_of_one_function_belong_to_one_process_at_a_time() {
+    let (predecessor, successor) = processes();
+    let table = PciProbeTable::new();
+    assert!(table.record(7, Ok(probed_virtio_blk())));
+    assert!(table.record(8, Ok(probed_virtio_blk())));
+    let synthetic = crate::memory::frame_roles::synthetic_device_mmio_backing;
+    table
+        .install_bar_backing(7, 4, synthetic(0xc0_0000_0000, 4))
+        .unwrap();
+    assert!(!table.bars_held_by_other(7, successor));
+
+    let lent = table.take_bar_backing(7, 4, predecessor).unwrap();
+    // The successor can neither take a BAR of that function nor be given
+    // DMA reach while the predecessor's object lives; another function and
+    // the holder itself are unaffected.
+    assert!(table.bars_held_by_other(7, successor));
+    assert!(!table.bars_held_by_other(7, predecessor));
+    assert!(!table.bars_held_by_other(8, successor));
+    assert_eq!(
+        table.take_bar_backing(7, 4, successor),
+        Err(BarBackingError::HeldElsewhere)
+    );
+
+    // Once the predecessor's object finalizes, the function is free.
+    table.return_bar_backing(lent);
+    assert!(!table.bars_held_by_other(7, successor));
+    let taken = table.take_bar_backing(7, 4, successor).unwrap();
+    assert!(table.bars_held_by_other(7, predecessor));
+    table.return_bar_backing(taken);
 }
 
 #[test]
@@ -401,7 +449,7 @@ fn only_admitted_memory_bars_of_recorded_functions_have_backing() {
     // there is no BAR 6; resource 9 was never recorded.
     for (resource, bar) in [(7, 1), (7, 5), (7, 6), (7, u32::MAX), (8, 4), (9, 4)] {
         assert_eq!(
-            table.take_bar_backing(resource, bar),
+            table.take_bar_backing(resource, bar, processes().0),
             Err(BarBackingError::NotFound),
             "resource {resource} BAR {bar}"
         );

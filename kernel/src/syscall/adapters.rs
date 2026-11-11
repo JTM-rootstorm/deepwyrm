@@ -2313,15 +2313,26 @@ pub(crate) fn device_pci_command<
 ) -> DwStatus {
     // A process that takes over the function first loses nothing to its
     // predecessor: a domain another process created is revoked before the
-    // command runs. An unusable handle fails below with its own status.
-    if let Some(resource_id) = resource_object_id(
+    // command runs. Bus mastering is refused while another process holds a
+    // BAR object of the function, since that process could program the
+    // device to reach this one's DMA (storage review K2). An unusable handle
+    // fails below with its own status.
+    if let Some((resource_id, boot_id)) = resource_object_id(
         registry,
         tasks,
+        resources,
         current_process,
         resource,
         deepwyrm_abi::DW_RIGHT_WRITE,
     ) {
-        revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process);
+        if bus_master != 0 && bars_held_by_other(boot_id, current_process) {
+            return DW_STATUS_BAD_STATE;
+        }
+        if let Err(status) =
+            revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process, true)
+        {
+            return status;
+        }
     }
     match process_handle_operation!(tasks, current_process, table, {
         crate::device::pci_command(
@@ -2354,20 +2365,23 @@ fn dma_status(error: crate::device::dma::DmaError) -> DwStatus {
 }
 
 /// The object identity behind `handle` when it names a DeviceResource with
-/// `right`; `None` otherwise. The lookup pin is released at once.
+/// `right`, and its boot resource ID when it is a PCI function; `None`
+/// otherwise. The lookup pin is released at once.
 fn resource_object_id<
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
+    const RESOURCES: usize,
 >(
     registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
     current_process: ProcessKey,
     handle: DwHandle,
     right: DwRights,
-) -> Option<crate::object::ObjectId> {
+) -> Option<(crate::object::ObjectId, Option<u64>)> {
     let resolved = tasks
         .process_handles_mut(current_process)
         .ok()?
@@ -2379,29 +2393,48 @@ fn resource_object_id<
         )
         .ok()?;
     let id = resolved.object_id();
+    let boot_id = resources.pci_resource_id_for_resolved(&resolved).ok();
     release_held_lookup_pin(registry, resolved.into_internal());
-    Some(id)
+    Some((id, boot_id))
+}
+
+/// Whether a process other than `current_process` holds a live BAR object
+/// of the PCI function `boot_id` names (storage review K2).
+fn bars_held_by_other(boot_id: Option<u64>, current_process: ProcessKey) -> bool {
+    boot_id.is_some_and(|boot_id| {
+        crate::device::pci::PCI_FUNCTIONS.bars_held_by_other(boot_id, current_process.object_id())
+    })
 }
 
 /// Revokes `resource`'s DMA domain when a process other than
 /// `current_process` owns it (storage K4 follow-up R2): bus mastering off,
 /// every mapping removed and invalidated, and each released MemoryObject
-/// reference queued for cleanup, since one may be the last.
+/// reference queued for cleanup, since one may be the last. Only a caller
+/// whose handle may drive the function's DMA (`may_revoke`: WRITE or
+/// MODIFY) takes a domain over; for any other caller a foreign domain is
+/// `BAD_STATE` and is left alone (storage review K3).
 fn revoke_foreign_dma<D: crate::device::dma::DmaService, const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     dma: &mut D,
     cleanup: &mut CleanupQueue<OBJECTS>,
     resource: crate::object::ObjectId,
     current_process: ProcessKey,
-) {
-    dma.revoke_foreign(resource, current_process.object_id(), &mut |pin| {
-        cleanup.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
-            panic!(
-                "a revoked DMA mapping reference violated generic lifetime invariants: {:?}",
-                failure.error()
-            )
-        }));
-    });
+    may_revoke: bool,
+) -> Result<(), DwStatus> {
+    dma.revoke_foreign(
+        resource,
+        current_process.object_id(),
+        may_revoke,
+        &mut |pin| {
+            cleanup.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
+                panic!(
+                    "a revoked DMA mapping reference violated generic lifetime invariants: {:?}",
+                    failure.error()
+                )
+            }));
+        },
+    )
+    .map_err(dma_status)
 }
 
 /// Releases a lookup pin whose handle still owns the object, so the pin is
@@ -2421,7 +2454,8 @@ fn release_held_lookup_pin<const OBJECTS: usize>(
 }
 
 /// Resolves a PCI_FUNCTION DeviceResource handle with MODIFY to its object
-/// identity and bus-0 device/function. The lookup pin is released before
+/// identity, boot resource ID and bus-0 device/function. The lookup pin is
+/// released before
 /// returning: a domain is keyed by the resource's identity, and the resource
 /// cannot finalize while the caller's handle (and this syscall) holds it.
 fn dma_resource<
@@ -2437,7 +2471,7 @@ fn dma_resource<
     resources: &DeviceResourceAuthority<RESOURCES>,
     current_process: ProcessKey,
     resource: DwHandle,
-) -> Result<(crate::object::ObjectId, u8), DwStatus> {
+) -> Result<(crate::object::ObjectId, u64, u8), DwStatus> {
     let resolved = match tasks.process_handles_mut(current_process) {
         Ok(table) => table
             .lookup(
@@ -2452,13 +2486,15 @@ fn dma_resource<
         Err(error) => return Err(task_status(error)),
     };
     let address = resources.pci_address_for_resolved(&resolved);
+    let boot_id = resources.pci_resource_id_for_resolved(&resolved);
     let id = resolved.object_id();
     release_held_lookup_pin(registry, resolved.into_internal());
     let address = address.map_err(|_| DW_STATUS_INVALID_ARGUMENT)?;
+    let boot_id = boot_id.map_err(|_| DW_STATUS_INVALID_ARGUMENT)?;
     if address.bus() != 0 {
         return Err(DW_STATUS_NOT_SUPPORTED);
     }
-    Ok((id, (address.device() << 3) | address.function()))
+    Ok((id, boot_id, (address.device() << 3) | address.function()))
 }
 
 /// `dma_map` (storage K4): maps pages of a page-backed MemoryObject into the
@@ -2504,12 +2540,21 @@ pub(crate) fn dma_map<
         Ok(output) => output,
         Err(status) => return status,
     };
-    let (resource_id, devfn) =
+    let (resource_id, boot_id, devfn) =
         match dma_resource(registry, tasks, resources, current_process, resource) {
             Ok(found) => found,
             Err(status) => return status,
         };
-    revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process);
+    // Another process's live BAR object could program the device to reach
+    // these mappings (storage review K2).
+    if bars_held_by_other(Some(boot_id), current_process) {
+        return DW_STATUS_BAD_STATE;
+    }
+    if let Err(status) =
+        revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process, true)
+    {
+        return status;
+    }
     let mut required = deepwyrm_abi::DW_RIGHT_READ.0;
     if device.write {
         required |= deepwyrm_abi::DW_RIGHT_WRITE.0;
@@ -2584,12 +2629,16 @@ pub(crate) fn dma_unmap<
     if byte_len == 0 || !byte_len.is_multiple_of(page) || !iova.is_multiple_of(page) {
         return DW_STATUS_INVALID_ARGUMENT;
     }
-    let (resource_id, _) = match dma_resource(registry, tasks, resources, current_process, resource)
+    let (resource_id, _, _) =
+        match dma_resource(registry, tasks, resources, current_process, resource) {
+            Ok(found) => found,
+            Err(status) => return status,
+        };
+    if let Err(status) =
+        revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process, true)
     {
-        Ok(found) => found,
-        Err(status) => return status,
-    };
-    revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process);
+        return status;
+    }
     match dma.unmap(
         resource_id,
         current_process.object_id(),
@@ -2665,10 +2714,12 @@ pub(crate) fn device_mmio_object_create<
     };
     let resource_id = resources.pci_resource_id_for_resolved(&resolved);
     let resource_object = resolved.object_id();
+    // MAP alone lets a holder read the device, not drive its DMA, so it
+    // cannot take a domain over from another process (storage review K3).
+    let may_revoke = resolved.rights().0
+        & (deepwyrm_abi::DW_RIGHT_WRITE.0 | deepwyrm_abi::DW_RIGHT_MODIFY.0)
+        != 0;
     let parent = resolved.into_internal();
-    // The caller's handle keeps the resource alive, so revoking here cannot
-    // release the lookup pin's object.
-    revoke_foreign_dma(registry, dma, cleanup, resource_object, current_process);
     // Every failure below releases the lookup pin. The caller's handle still
     // owns the resource, so the pin is never its last reference.
     let fail = |registry: &mut ObjectRegistry<OBJECTS>, parent, status| match registry
@@ -2685,6 +2736,23 @@ pub(crate) fn device_mmio_object_create<
         Ok(resource_id) => resource_id,
         Err(_) => return fail(registry, parent, DW_STATUS_INVALID_ARGUMENT),
     };
+    // A function's BAR objects belong to one process at a time (storage
+    // review K2); refuse before anything is revoked.
+    if bars_held_by_other(Some(resource_id), current_process) {
+        return fail(registry, parent, DW_STATUS_BAD_STATE);
+    }
+    // The caller's handle keeps the resource alive, so revoking here cannot
+    // release the lookup pin's object.
+    if let Err(status) = revoke_foreign_dma(
+        registry,
+        dma,
+        cleanup,
+        resource_object,
+        current_process,
+        may_revoke,
+    ) {
+        return fail(registry, parent, status);
+    }
     let charge = match admit_objects(
         registry,
         tasks,
@@ -2695,13 +2763,20 @@ pub(crate) fn device_mmio_object_create<
         Ok(charge) => charge,
         Err(status) => return fail(registry, parent, status),
     };
-    let backing = match crate::device::pci::PCI_FUNCTIONS.take_bar_backing(resource_id, bar) {
+    let backing = match crate::device::pci::PCI_FUNCTIONS.take_bar_backing(
+        resource_id,
+        bar,
+        current_process.object_id(),
+    ) {
         Ok(backing) => backing,
         Err(crate::device::pci::BarBackingError::NotFound) => {
             return fail(registry, parent, deepwyrm_abi::DW_STATUS_NOT_FOUND);
         }
         Err(crate::device::pci::BarBackingError::InUse) => {
             return fail(registry, parent, deepwyrm_abi::DW_STATUS_ALREADY_EXISTS);
+        }
+        Err(crate::device::pci::BarBackingError::HeldElsewhere) => {
+            return fail(registry, parent, DW_STATUS_BAD_STATE);
         }
     };
     let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
