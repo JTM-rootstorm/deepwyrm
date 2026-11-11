@@ -229,3 +229,130 @@ fn more_units_than_the_kernel_takes_over_are_refused() {
         Err(DmarError::TooManyUnits)
     );
 }
+
+/// One device scope entry: type, start bus and its (device, function) path.
+fn scope(kind: u8, start_bus: u8, path: &[(u8, u8)]) -> Vec<u8> {
+    let mut bytes = vec![kind, (6 + 2 * path.len()) as u8, 0, 0, 0, start_bus];
+    for (device, function) in path {
+        bytes.extend_from_slice(&[*device, *function]);
+    }
+    bytes
+}
+
+/// A DRHD carrying device scope entries, its length covering them.
+fn drhd_with_scopes(flags: u8, base: u64, scopes: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = drhd(flags, 0, base);
+    for entry in scopes {
+        bytes.extend_from_slice(entry);
+    }
+    let length = bytes.len() as u16;
+    bytes[2..4].copy_from_slice(&length.to_le_bytes());
+    bytes
+}
+
+const fn devfn(device: u8, function: u8) -> u8 {
+    device << 3 | function
+}
+
+/// The DMAR QEMU 10.2 builds for q35 (`build_dmar_q35`): INCLUDE_PCI_ALL
+/// clear, the IOAPIC scope, then one scope per device on each bus that does
+/// not bypass the IOMMU, bridges as type 2.
+fn qemu_10_2_dmar() -> Vec<u8> {
+    let unit = drhd_with_scopes(
+        0,
+        0xfed9_0000,
+        &[
+            scope(3, 0xff, &[(0, 0)]),
+            scope(1, 0, &[(0, 0)]),
+            scope(1, 0, &[(1, 0)]),
+            scope(2, 0, &[(2, 0)]),
+            scope(1, 0, &[(0x1f, 0)]),
+            scope(1, 0, &[(0x1f, 2)]),
+            scope(1, 0, &[(0x1f, 3)]),
+            // An endpoint behind the bridge: another bus, a two-hop path.
+            scope(1, 0, &[(2, 0), (0, 0)]),
+            scope(1, 1, &[(0, 0)]),
+        ],
+    );
+    dmar(38, 1, &[unit])
+}
+
+#[test]
+fn explicit_device_scopes_name_the_translated_bus_zero_endpoints() {
+    let snapshot = discover(&[qemu_10_2_dmar()]).unwrap().unwrap();
+    let unit = snapshot.units()[0];
+    assert!(!unit.include_pci_all());
+    let translated = snapshot.translated_bus0_functions();
+    assert_eq!(translated, unit.bus0_endpoints());
+    for confined in [
+        devfn(0, 0),
+        devfn(1, 0),
+        devfn(0x1f, 0),
+        devfn(0x1f, 2),
+        devfn(0x1f, 3),
+    ] {
+        assert!(translated.contains(confined), "{confined:#x}");
+    }
+    // The bridge itself, functions the table never names, and the IOAPIC's
+    // pseudo-device are not confined.
+    for open in [devfn(2, 0), devfn(1, 1), devfn(3, 0), devfn(0x1f, 7), 0xff] {
+        assert!(!translated.contains(open), "{open:#x}");
+    }
+    let count: u32 = translated.0.iter().map(|bits| bits.count_ones()).sum();
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn an_include_all_unit_translates_every_bus_zero_function() {
+    let snapshot = discover(&[q35_dmar()]).unwrap().unwrap();
+    assert_eq!(snapshot.translated_bus0_functions(), Bus0Functions::ALL);
+    // With a second unit naming explicit scopes, still every function.
+    let scoped = drhd_with_scopes(0, 0xfed9_1000, &[scope(1, 0, &[(4, 0)])]);
+    let both = dmar(38, 0, &[drhd(1, 0, 0xfed9_0000), scoped]);
+    let snapshot = discover(&[both]).unwrap().unwrap();
+    assert_eq!(snapshot.translated_bus0_functions(), Bus0Functions::ALL);
+}
+
+#[test]
+fn units_without_scopes_or_include_all_translate_nothing() {
+    let snapshot = discover(&[dmar(38, 0, &[drhd(0, 0, 0xfed9_0000)])])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.translated_bus0_functions(),
+        Bus0Functions::default()
+    );
+}
+
+#[test]
+fn malformed_device_scopes_are_refused() {
+    let mut short_header = drhd(0, 0, 0xfed9_0000);
+    short_header.extend_from_slice(&[1, 8, 0, 0]);
+    let mut too_short = scope(1, 0, &[(1, 0)]);
+    too_short[1] = 6;
+    let mut odd_path = scope(1, 0, &[(1, 0)]);
+    odd_path.push(0);
+    odd_path[1] = 9;
+    let mut past_end = scope(1, 0, &[(1, 0)]);
+    past_end[1] = 10;
+    for entries in [
+        vec![too_short],
+        vec![odd_path],
+        vec![past_end],
+        vec![scope(1, 0, &[(32, 0)])],
+        vec![scope(1, 0, &[(1, 8)])],
+    ] {
+        let unit = drhd_with_scopes(0, 0xfed9_0000, &entries);
+        assert_eq!(
+            discover(&[dmar(38, 0, &[unit])]),
+            Err(DmarError::InvalidStructure)
+        );
+    }
+    let mut unit = short_header;
+    let length = unit.len() as u16;
+    unit[2..4].copy_from_slice(&length.to_le_bytes());
+    assert_eq!(
+        discover(&[dmar(38, 0, &[unit])]),
+        Err(DmarError::InvalidStructure)
+    );
+}

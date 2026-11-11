@@ -8278,7 +8278,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     resource,
                     memory_space,
                     bus_master,
-                    crate::device::pci::dma_confined(),
+                    crate::device::pci::dma_confined,
                 ))
             }
             NativeSyscallRequest::DmaUnmap {

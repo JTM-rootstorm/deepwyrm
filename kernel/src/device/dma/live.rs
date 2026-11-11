@@ -230,9 +230,9 @@ impl DmaService for LiveDmaService {
         access: DeviceAccess,
         pin: InternalRef,
     ) -> Result<u64, (DmaError, InternalRef)> {
-        // Without an INCLUDE_PCI_ALL unit in default deny, a function may sit
-        // outside every unit's scope, where a domain would confine nothing.
-        if !crate::device::pci::dma_confined() {
+        // A function no unit in default deny translates sits outside every
+        // unit's scope, where a domain would confine nothing.
+        if !crate::device::pci::dma_confined_devfn(devfn) {
             return Err((DmaError::NotSupported, pin));
         }
         let mut live = LIVE_DMA.lock();

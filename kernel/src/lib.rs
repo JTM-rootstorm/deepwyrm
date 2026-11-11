@@ -502,12 +502,14 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             }
             let state = arch::x86_64::vtd::initialize(&mut active_paging, dmar)
                 .unwrap_or_else(|error| panic!("VT-d default-deny bring-up failed: {error:?}"));
-            // Bus mastering is admitted only when one unit covers every
-            // segment-0 function; explicit device scopes are not parsed yet.
+            // Bus mastering and DMA domains are admitted only for functions a
+            // unit in default deny translates: all of them under an
+            // INCLUDE_PCI_ALL unit, else the bus-0 endpoints the units' device
+            // scopes name (QEMU's q35 DMAR lists every device that way).
             if matches!(state, arch::x86_64::vtd::VtdBootState::DefaultDeny { .. })
-                && dmar.is_some_and(|dmar| dmar.units().iter().any(|unit| unit.include_pci_all()))
+                && let Some(dmar) = dmar
             {
-                device::pci::record_dma_confined();
+                device::pci::record_dma_confined(dmar.translated_bus0_functions());
             }
             #[cfg(not(feature = "test-support"))]
             let _ = debug::emit_early_record(

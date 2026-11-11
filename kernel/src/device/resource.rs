@@ -696,7 +696,7 @@ pub(crate) fn pci_command<const HANDLES: usize, const OBJECTS: usize, const RESO
     handle: DwHandle,
     memory_space: u32,
     bus_master: u32,
-    dma_confined: bool,
+    dma_confined: impl FnOnce(pci::PciAddress) -> bool,
 ) -> Result<(), DwStatus> {
     let flag = |value: u32| match value {
         0 => Ok(false),
@@ -716,7 +716,8 @@ pub(crate) fn pci_command<const HANDLES: usize, const OBJECTS: usize, const RESO
     let result = resources.pci_address_for_resolved(&resolved);
     release_operation_pin(registry, resolved);
     let address = result.map_err(resource_status)?;
-    pci::set_command(config, address, memory_space, bus_master, dma_confined).map_err(pci_status)
+    let confined = dma_confined(address);
+    pci::set_command(config, address, memory_space, bus_master, confined).map_err(pci_status)
 }
 
 fn pci_status(error: PciAccessError) -> DwStatus {

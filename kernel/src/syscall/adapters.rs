@@ -2306,7 +2306,7 @@ pub(crate) fn device_pci_command<
     resource: DwHandle,
     memory_space: u32,
     bus_master: u32,
-    dma_confined: bool,
+    dma_confined: impl FnOnce(crate::device::pci::PciAddress) -> bool,
 ) -> DwStatus {
     match process_handle_operation!(tasks, current_process, table, {
         crate::device::pci_command(

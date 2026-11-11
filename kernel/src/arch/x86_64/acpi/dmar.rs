@@ -21,6 +21,11 @@ const STRUCTURE_DRHD: u16 = 0;
 const STRUCTURE_RMRR: u16 = 1;
 const DRHD_MIN_BYTES: usize = 16;
 const DRHD_FLAG_INCLUDE_PCI_ALL: u8 = 1;
+/// A device scope entry: type, length, reserved, enumeration ID, start bus,
+/// then one (device, function) pair per hop (VT-d 4.x §8.3.1).
+const SCOPE_HEADER_BYTES: usize = 6;
+const SCOPE_PATH_BYTES: usize = 2;
+const SCOPE_PCI_ENDPOINT: u8 = 1;
 const PAGE: u64 = 4096;
 /// The address widths VT-d can report and x86_64 can address.
 const MIN_HOST_ADDRESS_WIDTH: u8 = 32;
@@ -46,6 +51,34 @@ pub(crate) enum DmarError {
 pub(crate) struct DmarUnit {
     register_base: u64,
     include_pci_all: bool,
+    /// Bus-0 functions this unit's device scope names as PCI endpoints, one
+    /// bit per `device << 3 | function`.
+    bus0_endpoints: Bus0Functions,
+}
+
+/// A set of segment-0, bus-0 functions, one bit per `device << 3 | function`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Bus0Functions(pub(crate) [u64; 4]);
+
+impl Bus0Functions {
+    pub(crate) const ALL: Self = Self([u64::MAX; 4]);
+
+    pub(crate) const fn contains(self, devfn: u8) -> bool {
+        self.0[(devfn >> 6) as usize] & (1 << (devfn & 63)) != 0
+    }
+
+    const fn insert(&mut self, devfn: u8) {
+        self.0[(devfn >> 6) as usize] |= 1 << (devfn & 63);
+    }
+
+    const fn union(self, other: Self) -> Self {
+        Self([
+            self.0[0] | other.0[0],
+            self.0[1] | other.0[1],
+            self.0[2] | other.0[2],
+            self.0[3] | other.0[3],
+        ])
+    }
 }
 
 impl DmarUnit {
@@ -57,6 +90,11 @@ impl DmarUnit {
     /// another unit's explicit device scope.
     pub(crate) const fn include_pci_all(self) -> bool {
         self.include_pci_all
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn bus0_endpoints(self) -> Bus0Functions {
+        self.bus0_endpoints
     }
 }
 
@@ -88,6 +126,22 @@ impl DmarSnapshot {
 
     pub(crate) fn units(&self) -> &[DmarUnit] {
         &self.units[..self.count]
+    }
+
+    /// The bus-0 functions some unit translates: every function when a unit
+    /// includes all PCI devices, else those named as endpoints in a device
+    /// scope. Endpoints behind bridges (multi-hop paths, other buses) are not
+    /// included, so they never get bus mastering.
+    pub(crate) fn translated_bus0_functions(&self) -> Bus0Functions {
+        self.units()
+            .iter()
+            .fold(Bus0Functions::default(), |functions, unit| {
+                if unit.include_pci_all {
+                    Bus0Functions::ALL
+                } else {
+                    functions.union(unit.bus0_endpoints)
+                }
+            })
     }
 }
 
@@ -200,6 +254,7 @@ fn parse_dmar(bytes: &[u8]) -> Result<DmarSnapshot, DmarError> {
         units: [DmarUnit {
             register_base: 0,
             include_pci_all: false,
+            bus0_endpoints: Bus0Functions([0; 4]),
         }; MAX_DMAR_UNITS],
         count: 0,
     };
@@ -269,7 +324,39 @@ fn parse_drhd(bytes: &[u8], address_limit: u64) -> Result<DmarUnit, DmarError> {
     Ok(DmarUnit {
         register_base,
         include_pci_all: bytes[4] & DRHD_FLAG_INCLUDE_PCI_ALL != 0,
+        bus0_endpoints: parse_device_scopes(&bytes[DRHD_MIN_BYTES..])?,
     })
+}
+
+/// Walks a DRHD's device scope entries. Every entry must be well formed;
+/// only single-hop PCI endpoints starting at bus 0 are recorded.
+fn parse_device_scopes(bytes: &[u8]) -> Result<Bus0Functions, DmarError> {
+    let mut functions = Bus0Functions::default();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes.len() - offset < SCOPE_HEADER_BYTES {
+            return Err(DmarError::InvalidStructure);
+        }
+        let kind = bytes[offset];
+        let length = usize::from(bytes[offset + 1]);
+        if length < SCOPE_HEADER_BYTES + SCOPE_PATH_BYTES
+            || !(length - SCOPE_HEADER_BYTES).is_multiple_of(SCOPE_PATH_BYTES)
+            || length > bytes.len() - offset
+        {
+            return Err(DmarError::InvalidStructure);
+        }
+        let start_bus = bytes[offset + 5];
+        let path = &bytes[offset + SCOPE_HEADER_BYTES..offset + length];
+        if kind == SCOPE_PCI_ENDPOINT && start_bus == 0 && path.len() == SCOPE_PATH_BYTES {
+            let (device, function) = (path[0], path[1]);
+            if device >= 32 || function >= 8 {
+                return Err(DmarError::InvalidStructure);
+            }
+            functions.insert(device << 3 | function);
+        }
+        offset += length;
+    }
+    Ok(functions)
 }
 
 fn le_u16(bytes: &[u8], offset: usize) -> u16 {

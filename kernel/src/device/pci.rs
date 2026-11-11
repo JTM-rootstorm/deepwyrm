@@ -330,17 +330,31 @@ pub(crate) fn set_command<C: ConfigSpace>(
     Ok(())
 }
 
-/// Set once at boot when every segment-0 function is behind a VT-d unit that
-/// translates (an INCLUDE_PCI_ALL unit in default deny).
-static DMA_CONFINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The segment-0, bus-0 functions a VT-d unit in default deny translates,
+/// one bit per `device << 3 | function`. Written once at boot, before any
+/// process exists: every function when a unit includes all PCI devices, else
+/// the endpoints the units' device scopes name. Empty without VT-d.
+static DMA_CONFINED: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
 
 #[cfg_attr(test, allow(dead_code, reason = "set by the live boot path only"))]
-pub(crate) fn record_dma_confined() {
-    DMA_CONFINED.store(true, core::sync::atomic::Ordering::Release);
+pub(crate) fn record_dma_confined(functions: crate::arch::x86_64::acpi::dmar::Bus0Functions) {
+    for (slot, bits) in DMA_CONFINED.iter().zip(functions.0) {
+        slot.store(bits, core::sync::atomic::Ordering::Release);
+    }
 }
 
-pub(crate) fn dma_confined() -> bool {
-    DMA_CONFINED.load(core::sync::atomic::Ordering::Acquire)
+/// Whether a remapping unit translates DMA from the bus-0 function `devfn`.
+pub(crate) fn dma_confined_devfn(devfn: u8) -> bool {
+    DMA_CONFINED[usize::from(devfn >> 6)].load(core::sync::atomic::Ordering::Acquire)
+        & (1 << (devfn & 63))
+        != 0
+}
+
+/// Whether a remapping unit translates DMA from `address`. Only bus 0 is
+/// recorded, so a function on any other bus is never confined.
+pub(crate) fn dma_confined(address: PciAddress) -> bool {
+    address.bus() == 0 && dma_confined_devfn(address.device() << 3 | address.function())
 }
 
 /// The boot-time probe result for each `PCI_FUNCTION` record, by resource ID.
