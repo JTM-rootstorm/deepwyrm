@@ -591,6 +591,36 @@ pub const DW_CHANNEL_MAX_HANDLES: u32 = 16;
 /// Maximum handles accepted by one ABI-0 wait_many operation.
 pub const DW_WAIT_MANY_MAX_ITEMS: u32 = 64;
 
+/// task_group_limit class: Channel endpoints; one channel_create uses two.
+pub const DW_TASK_GROUP_LIMIT_CHANNEL: u32 = 0;
+
+/// task_group_limit class: Event objects.
+pub const DW_TASK_GROUP_LIMIT_EVENT: u32 = 1;
+
+/// task_group_limit class: Timer objects.
+pub const DW_TASK_GROUP_LIMIT_TIMER: u32 = 2;
+
+/// task_group_limit class: MemoryObject objects.
+pub const DW_TASK_GROUP_LIMIT_MEMORY_OBJECT: u32 = 3;
+
+/// task_group_limit class: Thread objects.
+pub const DW_TASK_GROUP_LIMIT_THREAD: u32 = 4;
+
+/// task_group_limit class: Process objects.
+pub const DW_TASK_GROUP_LIMIT_PROCESS: u32 = 5;
+
+/// task_group_limit class: Child TaskGroup objects.
+pub const DW_TASK_GROUP_LIMIT_TASK_GROUP: u32 = 6;
+
+/// task_group_limit class: Concurrently registered wait items of blocked wait_one/wait_many calls.
+pub const DW_TASK_GROUP_LIMIT_WAIT: u32 = 7;
+
+/// Number of task_group_limit classes; every class value is below it.
+pub const DW_TASK_GROUP_LIMIT_CLASS_COUNT: u32 = 8;
+
+/// The initial limit of every class in every task group.
+pub const DW_TASK_GROUP_LIMIT_UNLIMITED: u32 = 4294967295;
+
 /// Wake every waiter eligible for atomic_wake.
 pub const DW_ATOMIC_WAKE_ALL: u32 = 4294967295;
 
@@ -737,6 +767,9 @@ pub const DW_SYSCALL_TASK_GROUP_CREATE: DwSyscallId = DwSyscallId(0x00010001);
 
 /// Recursively terminate a task group and its descendants. In DW0-E callers must supply DW_TERMINATION_AUTHORIZED; descendants record DW_TERMINATION_TASK_GROUP_TEARDOWN.
 pub const DW_SYSCALL_TASK_GROUP_TERMINATE: DwSyscallId = DwSyscallId(0x00010002);
+
+/// Lower one class's limit on a task group. A limit bounds the live objects (or registered waits) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry.
+pub const DW_SYSCALL_TASK_GROUP_LIMIT: DwSyscallId = DwSyscallId(0x00010003);
 
 /// DW0-F activation: create a process using DwProcessCreateArgsV1 and atomically install its bootstrap Channel; DW0-E implements only the reusable internal process-construction core.
 pub const DW_SYSCALL_PROCESS_CREATE: DwSyscallId = DwSyscallId(0x00010010);
@@ -1878,6 +1911,16 @@ mod generated_layout_tests {
         assert_eq!(DW_CHANNEL_MAX_PAYLOAD, 65536);
         assert_eq!(DW_CHANNEL_MAX_HANDLES, 16);
         assert_eq!(DW_WAIT_MANY_MAX_ITEMS, 64);
+        assert_eq!(DW_TASK_GROUP_LIMIT_CHANNEL, 0);
+        assert_eq!(DW_TASK_GROUP_LIMIT_EVENT, 1);
+        assert_eq!(DW_TASK_GROUP_LIMIT_TIMER, 2);
+        assert_eq!(DW_TASK_GROUP_LIMIT_MEMORY_OBJECT, 3);
+        assert_eq!(DW_TASK_GROUP_LIMIT_THREAD, 4);
+        assert_eq!(DW_TASK_GROUP_LIMIT_PROCESS, 5);
+        assert_eq!(DW_TASK_GROUP_LIMIT_TASK_GROUP, 6);
+        assert_eq!(DW_TASK_GROUP_LIMIT_WAIT, 7);
+        assert_eq!(DW_TASK_GROUP_LIMIT_CLASS_COUNT, 8);
+        assert_eq!(DW_TASK_GROUP_LIMIT_UNLIMITED, 4294967295);
         assert_eq!(DW_ATOMIC_WAKE_ALL, 4294967295);
         assert_eq!(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, 1);
         assert_eq!(DW_HANDLE_TRANSFER_MOVE.0, 1);
@@ -1927,6 +1970,7 @@ mod generated_layout_tests {
         assert_eq!(DW_SYSCALL_OBJECT_GET_INFO_V1.0, 0x00000012);
         assert_eq!(DW_SYSCALL_TASK_GROUP_CREATE.0, 0x00010001);
         assert_eq!(DW_SYSCALL_TASK_GROUP_TERMINATE.0, 0x00010002);
+        assert_eq!(DW_SYSCALL_TASK_GROUP_LIMIT.0, 0x00010003);
         assert_eq!(DW_SYSCALL_PROCESS_CREATE.0, 0x00010010);
         assert_eq!(DW_SYSCALL_PROCESS_EXIT.0, 0x00010011);
         assert_eq!(DW_SYSCALL_PROCESS_TERMINATE.0, 0x00010012);

@@ -2691,7 +2691,7 @@ fn user_return_validation_walks_use_a_session_without_usercopy() {
 /// Text test (D1 commit 9): the live ordinary F-service dispatch gets no
 /// user session. Every dispatch arm that takes `user` belongs to a request a
 /// CPU-local facade helper serves first, and the arms left (EventSignal,
-/// TimerSet, TimerCancel) never name it. The stand-in panics on any use.
+/// TimerSet, TimerCancel, TaskGroupLimit) never name it. The stand-in panics on any use.
 #[test]
 fn ordinary_f_dispatch_holds_no_user_session() {
     let primordial = source("src/arch/x86_64/mm/activation/primordial.rs");
@@ -2708,7 +2708,7 @@ fn ordinary_f_dispatch_holds_no_user_session() {
         .split("            NativeSyscallRequest::")
         .skip(1)
         .collect();
-    assert_eq!(arms.len(), 14);
+    assert_eq!(arms.len(), 15);
     let facade_served = [
         (
             "ProcessCreate",
@@ -2754,7 +2754,7 @@ fn ordinary_f_dispatch_holds_no_user_session() {
         let body = arm.split_once("=>").map_or(arm, |(_, body)| body);
         if !body.contains("user") {
             assert!(
-                ["EventSignal", "TimerSet", "TimerCancel"].contains(&name),
+                ["EventSignal", "TimerSet", "TimerCancel", "TaskGroupLimit"].contains(&name),
                 "unexpected arm without user: {name}"
             );
             continue;

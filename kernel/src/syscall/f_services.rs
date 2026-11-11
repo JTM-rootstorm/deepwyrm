@@ -32,8 +32,8 @@ use crate::wait::{
 use super::adapters::{
     CleanupQueue, NativeWaitControl, TerminalWaitCleanup, WaitSuspendError, atomic_wake_with,
     channel_create, channel_receive, channel_send_from_thread, clock_get_with, event_create,
-    event_signal, process_create, resume_wait_thread_syscall, task_status, timer_cancel,
-    timer_create, timer_set, wait_many_syscall_on, wait_one_syscall_on,
+    event_signal, process_create, resume_wait_thread_syscall, task_group_limit, task_status,
+    timer_cancel, timer_create, timer_set, wait_many_syscall_on, wait_one_syscall_on,
 };
 #[cfg_attr(
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
@@ -719,6 +719,19 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
                     &mut self.cleanup,
                 )))
             }
+            NativeSyscallRequest::TaskGroupLimit {
+                task_group,
+                class,
+                limit,
+            } => FServiceRoute::Handled(NativeSyscallResult::returning(task_group_limit(
+                registry,
+                tasks,
+                current_process,
+                task_group,
+                class,
+                limit,
+                &mut self.cleanup,
+            ))),
             NativeSyscallRequest::TimerCancel { timer } => {
                 FServiceRoute::Handled(NativeSyscallResult::returning(timer_cancel(
                     registry,

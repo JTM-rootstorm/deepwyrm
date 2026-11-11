@@ -5,6 +5,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) mod charge;
 #[cfg(deepwyrm_integrated)]
 mod finalizer;
 #[cfg(deepwyrm_integrated)]
@@ -228,6 +229,8 @@ const EMPTY_SLOT: ObjectSlot = ObjectSlot {
 pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     domain: u64,
     slots: [ObjectSlot; CAPACITY],
+    /// Per slot, the limited TaskGroups its creator was charged to.
+    tags: [charge::ChargeTag; CAPACITY],
 }
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
@@ -235,6 +238,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         Self {
             domain: mint_registry_domain(),
             slots: [EMPTY_SLOT; CAPACITY],
+            tags: [charge::ChargeTag::EMPTY; CAPACITY],
         }
     }
 
@@ -263,6 +267,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
                 self.slots[slot].state = SlotState::Retired;
                 continue;
             };
+            self.tags[slot] = charge::ChargeTag::EMPTY;
             self.slots[slot] = ObjectSlot {
                 generation,
                 state: SlotState::Live(LiveObject {
@@ -279,6 +284,42 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
 
         Err(ObjectRegistryError::Capacity)
     }
+    /// Records the quota charge of a live object just created for a process
+    /// (F4 DW1-F4-M1). The tag lives exactly as long as the slot does.
+    pub(crate) fn set_charge_tag(
+        &mut self,
+        id: ObjectId,
+        tag: charge::ChargeTag,
+    ) -> Result<(), ObjectRegistryError> {
+        let slot = self.reference_slot(id)?;
+        let generation = decode_object_id(id.raw)
+            .ok_or(ObjectRegistryError::StaleReference)?
+            .1;
+        if self.slots[slot].generation != generation
+            || !matches!(self.slots[slot].state, SlotState::Live(_))
+        {
+            return Err(ObjectRegistryError::StaleReference);
+        }
+        self.tags[slot] = tag;
+        Ok(())
+    }
+
+    /// Live and finalizing objects of `class` charged to `group`.
+    pub(crate) fn charged(&self, group: ObjectId, class: usize) -> usize {
+        self.slots
+            .iter()
+            .zip(&self.tags)
+            .filter(|(slot, tag)| {
+                let object_type = match slot.state {
+                    SlotState::Live(live) => live.object_type,
+                    SlotState::Finalizing(object_type) => object_type,
+                    SlotState::Vacant | SlotState::Retired => return false,
+                };
+                charge::object_class(object_type) == Some(class) && tag.names(group)
+            })
+            .count()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn creation_into_handle(
         &mut self,

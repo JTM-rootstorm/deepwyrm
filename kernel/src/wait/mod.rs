@@ -594,6 +594,17 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
         }
     }
 
+    /// Registered wait items whose waiting thread satisfies `charged`
+    /// (TaskGroup wait limits, F4 DW1-F4-M1).
+    pub(crate) fn count_waiting(&self, mut charged: impl FnMut(ThreadKey) -> bool) -> usize {
+        self.slots
+            .lock()
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .filter(|entry| charged(entry.identity.thread))
+            .count()
+    }
+
     pub(crate) fn register(
         &self,
         pin: InternalRef,

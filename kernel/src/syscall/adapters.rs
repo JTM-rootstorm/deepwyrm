@@ -655,6 +655,84 @@ pub(super) fn task_status(error: TaskError) -> DwStatus {
     }
 }
 
+/// Admits `needed` objects of `object_type` for `process` under every
+/// limited TaskGroup above it, returning the tag to charge them with
+/// (F4 DW1-F4-M1). Runs before creation, so a refusal has nothing to undo.
+fn admit_objects<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+    object_type: deepwyrm_abi::DwObjectType,
+    needed: usize,
+) -> Result<crate::task::quota::ChargeTag, DwStatus> {
+    let class = crate::task::quota::object_class(object_type)
+        .expect("only limited object classes are admitted");
+    let tag = tasks.charge_tag(process).map_err(quota_status)?;
+    tasks
+        .admit_quota(&tag, class, needed, |group| registry.charged(group, class))
+        .map_err(quota_status)?;
+    Ok(tag)
+}
+
+/// Charges a just-created, still-live object to its creator's tag.
+fn charge_created<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    object: crate::object::ObjectId,
+    tag: crate::task::quota::ChargeTag,
+) {
+    if tag.is_empty() {
+        return;
+    }
+    registry
+        .set_charge_tag(object, tag)
+        .unwrap_or_else(|error| panic!("fresh object rejected its quota charge: {error:?}"));
+}
+
+/// Admits `items` more registered waits for `thread`'s process (F4
+/// DW1-F4-M1). Usage is the live wait entries whose waiting thread is
+/// charged to the same limited group.
+fn admit_waits<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const WAITERS: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    waits: &WaitRegistry<WAITERS>,
+    thread: ThreadKey,
+    items: usize,
+) -> Result<(), DwStatus> {
+    let tag = tasks.thread_charge_tag(thread).map_err(quota_status)?;
+    if tag.is_empty() {
+        return Ok(());
+    }
+    tasks
+        .admit_quota(&tag, crate::task::quota::WAIT_CLASS, items, |group| {
+            waits.count_waiting(|waiter| {
+                tasks
+                    .thread_charge_tag(waiter)
+                    .is_ok_and(|waiter_tag| waiter_tag.names(group))
+            })
+        })
+        .map_err(quota_status)
+}
+
+fn quota_status(error: crate::task::quota::QuotaError) -> DwStatus {
+    match error {
+        crate::task::quota::QuotaError::Exceeded | crate::task::quota::QuotaError::TooDeep => {
+            DW_STATUS_NO_RESOURCES
+        }
+        crate::task::quota::QuotaError::Task => DW_STATUS_BAD_STATE,
+    }
+}
+
 fn task_create_status(error: TaskCreateError) -> DwStatus {
     match error {
         TaskCreateError::Registry(ObjectRegistryError::Capacity)
@@ -1642,12 +1720,26 @@ pub(crate) fn task_group_create<
         Ok(pin) => pin,
         Err(status) => return status,
     };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => {
+            release_lookup_pin(registry, parent_pin, cleanup);
+            return status;
+        }
+    };
     let created = tasks.create_child_group(registry, &parent_pin);
     release_lookup_pin(registry, parent_pin, cleanup);
     let (_key, reference) = match created {
         Ok(created) => created,
         Err(error) => return task_create_status(error),
     };
+    charge_created(registry, reference.id(), charge);
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {
@@ -1677,6 +1769,47 @@ pub(crate) fn task_group_create<
     clippy::too_many_arguments,
     reason = "D5 claim keeps user memory, task membership, grant, registry, and typed authority ownership explicit"
 )]
+/// `task_group_limit` (F4 DW1-F4-M1): lowers one class's limit on a group
+/// the caller holds with MODIFY.
+pub(crate) fn task_group_limit<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    task_group: DwHandle,
+    class: u32,
+    limit: u32,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    let pin = match resolve_current_handle(
+        tasks,
+        registry,
+        current_process,
+        task_group,
+        deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP,
+        DW_RIGHT_MODIFY,
+    ) {
+        Ok(pin) => pin,
+        Err(status) => return status,
+    };
+    let result = tasks.lower_group_limit(
+        crate::task::TaskGroupKey::from_object_id(pin.id()),
+        class,
+        limit,
+    );
+    release_lookup_pin(registry, pin, cleanup);
+    match result {
+        Ok(()) => DW_STATUS_SUCCESS,
+        Err(crate::task::quota::LimitError::InvalidArgument) => DW_STATUS_INVALID_ARGUMENT,
+        Err(crate::task::quota::LimitError::Task(error)) => task_status(error),
+    }
+}
+
 pub(crate) fn device_resource_claim<
     U: UserPageAccess,
     const OBJECTS: usize,
@@ -2714,6 +2847,21 @@ fn process_create_publish<
         discard_and_return!(status);
     }
 
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_PROCESS,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => {
+            cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
+            release_lookup_pin(registry, bootstrap_pin, cleanup);
+            release_lookup_pin(registry, parent_pin, cleanup);
+            discard_and_return!(status);
+        }
+    };
     let prepared_process = match tasks.prepare_process(registry, &parent_pin) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -2723,6 +2871,7 @@ fn process_create_publish<
             discard_and_return!(task_create_status(error));
         }
     };
+    charge_created(registry, prepared_process.key().object_id(), charge);
     if let Err(status) = inject(ProcessCreatePreparation::ProcessShell) {
         cancel_prepared_process(prepared_process, registry, tasks, cleanup);
         cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
@@ -3091,6 +3240,10 @@ pub(crate) fn channel_create<
         Ok(outputs) => outputs,
         Err(status) => return status,
     };
+    let charge = match admit_objects(registry, tasks, current_process, DW_OBJECT_TYPE_CHANNEL, 2) {
+        Ok(charge) => charge,
+        Err(status) => return status,
+    };
     let mut reservation = match tasks.process_handles_mut(current_process) {
         Ok(table) => match table.reserve_pair(DW_OBJECT_TYPE_CHANNEL, requested_rights) {
             Ok(reservation) => reservation,
@@ -3106,6 +3259,8 @@ pub(crate) fn channel_create<
         }
     };
     let [first_reference, second_reference] = references;
+    charge_created(registry, first_reference.id(), charge);
+    charge_created(registry, second_reference.id(), charge);
     let handles = tasks
         .process_handles_mut(current_process)
         .unwrap_or_else(|error| {
@@ -4727,6 +4882,13 @@ fn wait_one_begin_with_interrupts<
     signals: DwSignals,
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
+    if let Err(status) = admit_waits(tasks, waits, thread, 1) {
+        return WaitSyscallBegin::Returning {
+            status,
+            output,
+            result: None,
+        };
+    }
     let request = [DwWaitItemV1 { handle, signals }];
     match ResolvedWaitSet::resolve(tasks, registry, process, &request) {
         Ok(set) => begin_wait_set(
@@ -4877,6 +5039,13 @@ fn wait_many_requests_begin<
     requests: &[DwWaitItemV1],
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
+    if let Err(status) = admit_waits(tasks, waits, thread, requests.len()) {
+        return WaitSyscallBegin::Returning {
+            status,
+            output,
+            result: None,
+        };
+    }
     match ResolvedWaitSet::resolve(tasks, registry, process, requests) {
         Ok(set) => begin_wait_set(
             set,
@@ -5542,10 +5711,21 @@ pub(crate) fn event_create<
         Ok(output) => output,
         Err(status) => return status,
     };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_EVENT,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => return status,
+    };
     let (_key, reference) = match events.create_event(registry) {
         Ok(created) => created,
         Err(error) => return event_create_status(error),
     };
+    charge_created(registry, reference.id(), charge);
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {
@@ -5646,10 +5826,21 @@ pub(crate) fn timer_create<
         Ok(output) => output,
         Err(status) => return status,
     };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_TIMER,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => return status,
+    };
     let (_key, reference) = match timers.create_timer(registry) {
         Ok(created) => created,
         Err(error) => return timer_create_status(error),
     };
+    charge_created(registry, reference.id(), charge);
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {
@@ -5796,12 +5987,26 @@ pub(crate) fn thread_create<
         Ok(pin) => pin,
         Err(status) => return status,
     };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_THREAD,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => {
+            release_lookup_pin(registry, process_pin, cleanup);
+            return status;
+        }
+    };
     let created = tasks.create_thread(registry, &process_pin);
     release_lookup_pin(registry, process_pin, cleanup);
     let (key, reference) = match created {
         Ok(created) => created,
         Err(error) => return task_create_status(error),
     };
+    charge_created(registry, reference.id(), charge);
     let _ = key;
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
@@ -7834,6 +8039,16 @@ pub(crate) fn memory_object_create<
         Ok(output) => output,
         Err(status) => return status,
     };
+    let charge = match admit_objects(
+        registry,
+        tasks,
+        current_process,
+        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+        1,
+    ) {
+        Ok(charge) => charge,
+        Err(status) => return status,
+    };
     let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
         Ok(creation) => creation,
         Err(ObjectRegistryError::Capacity | ObjectRegistryError::ReferenceCountExhausted) => {
@@ -7892,6 +8107,7 @@ pub(crate) fn memory_object_create<
             failure.error()
         )
     });
+    charge_created(registry, reference.id(), charge);
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {

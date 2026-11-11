@@ -20,6 +20,7 @@ use crate::object::{
 mod authority;
 mod blocked_operation;
 mod execution;
+pub(crate) mod quota;
 mod scheduler;
 #[cfg(any(
     test,
@@ -440,6 +441,8 @@ struct TaskGroupRecord<const GROUPS: usize, const PROCESSES: usize> {
     child_groups: [Option<ObjectId>; GROUPS],
     processes: [Option<ObjectId>; PROCESSES],
     reserved_processes: [Option<ObjectId>; PROCESSES],
+    /// `task_group_limit` limits, indexed by class; see [`quota`].
+    limits: [u32; quota::LIMIT_CLASSES],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

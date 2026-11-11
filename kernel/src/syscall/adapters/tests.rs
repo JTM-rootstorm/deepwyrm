@@ -769,8 +769,13 @@ fn close_event_for_test<const EVENTS: usize>(
     crate::wait::complete_event_finalization(registry, finalization);
 }
 
-fn close_channel_for_test<const PAIRS: usize, const DEPTH: usize, const WAITERS: usize>(
-    registry: &mut ObjectRegistry<16>,
+fn close_channel_for_test<
+    const OBJECTS: usize,
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const WAITERS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
     tasks: &mut Tasks,
     process: ProcessKey,
     channels: &ChannelAuthority<PAIRS, DEPTH>,
@@ -13720,4 +13725,204 @@ fn terminating_a_never_started_thread_keeps_its_process_live() {
         &mut cleanup,
     );
     finish_task_cleanup(&mut registry, &mut tasks, cleanup);
+}
+
+/// A root group, a child "jobs" group and one process inside the jobs group.
+fn limited_fixture() -> (
+    ObjectRegistry<32>,
+    Tasks,
+    TaskGroupKey,
+    TaskGroupKey,
+    ProcessKey,
+    InternalRef,
+) {
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (jobs, jobs_ref) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let jobs_owner = registry.handle_into_internal(jobs_ref).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &jobs_owner).unwrap();
+    let process_owner = registry.handle_into_internal(process_ref).unwrap();
+    (registry, tasks, root, jobs, process, process_owner)
+}
+
+fn try_channel_pair(
+    user: &mut FakeUserMemory,
+    registry: &mut ObjectRegistry<32>,
+    channels: &ChannelAuthority<8, 4>,
+    tasks: &mut Tasks,
+    process: ProcessKey,
+) -> Result<[DwHandle; 2], DwStatus> {
+    use deepwyrm_abi::{DW_RIGHT_READ, DW_RIGHT_WRITE};
+    let status = channel_create(
+        user,
+        registry,
+        channels,
+        tasks,
+        process,
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+        DwUserAddress(BASE + 0x180),
+        DwUserAddress(BASE + 0x188),
+    );
+    if status != DW_STATUS_SUCCESS {
+        return Err(status);
+    }
+    Ok([
+        DwHandle(u64_at(user, BASE + 0x180)),
+        DwHandle(u64_at(user, BASE + 0x188)),
+    ])
+}
+
+/// F4 DW1-F4-M1: a jobs group limited to one channel pair refuses the
+/// second, publishes nothing for it, and admits a new pair once the first
+/// is finalized. The charge is the live slot, so it needs no release step.
+#[test]
+fn task_group_channel_limit_bounds_live_endpoints() {
+    let (mut registry, mut tasks, _root, jobs, process, _) = limited_fixture();
+    let channels = ChannelAuthority::<8, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_CHANNEL, 2)
+        .unwrap();
+    let [first, second] =
+        try_channel_pair(&mut user, &mut registry, &channels, &mut tasks, process).unwrap();
+    let handles = tasks.process_handle_count(process).unwrap();
+    let generations = registry.test_slot_generations();
+    for _ in 0..3 {
+        assert_eq!(
+            try_channel_pair(&mut user, &mut registry, &channels, &mut tasks, process),
+            Err(DW_STATUS_NO_RESOURCES)
+        );
+        assert_eq!(tasks.process_handle_count(process).unwrap(), handles);
+        assert_eq!(registry.test_slot_generations(), generations);
+    }
+    close_channel_for_test(&mut registry, &mut tasks, process, &channels, &waits, first);
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        second,
+    );
+    let [first, second] =
+        try_channel_pair(&mut user, &mut registry, &channels, &mut tasks, process).unwrap();
+    close_channel_for_test(&mut registry, &mut tasks, process, &channels, &waits, first);
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        second,
+    );
+}
+
+/// A limit on an ancestor bounds every process below it, and a zero limit
+/// refuses even the first object.
+#[test]
+fn task_group_limit_on_an_ancestor_bounds_the_subtree() {
+    let (mut registry, mut tasks, root, _jobs, process, _) = limited_fixture();
+    let channels = ChannelAuthority::<8, 4>::new();
+    let mut user = FakeUserMemory::new();
+    tasks
+        .lower_group_limit(root, deepwyrm_abi::DW_TASK_GROUP_LIMIT_CHANNEL, 0)
+        .unwrap();
+    assert_eq!(
+        try_channel_pair(&mut user, &mut registry, &channels, &mut tasks, process),
+        Err(DW_STATUS_NO_RESOURCES)
+    );
+}
+
+/// An unlimited tree charges nothing and admits as before.
+#[test]
+fn unlimited_groups_tag_nothing() {
+    let (mut registry, mut tasks, _root, _jobs, process, _) = limited_fixture();
+    let channels = ChannelAuthority::<8, 4>::new();
+    let waits = WaitRegistry::<8>::new();
+    let mut user = FakeUserMemory::new();
+    assert!(tasks.charge_tag(process).unwrap().is_empty());
+    let [first, second] =
+        try_channel_pair(&mut user, &mut registry, &channels, &mut tasks, process).unwrap();
+    close_channel_for_test(&mut registry, &mut tasks, process, &channels, &waits, first);
+    close_channel_for_test(
+        &mut registry,
+        &mut tasks,
+        process,
+        &channels,
+        &waits,
+        second,
+    );
+}
+
+/// Limits only fall; an unknown class is refused.
+#[test]
+fn task_group_limits_only_fall() {
+    use crate::task::quota::LimitError;
+    let (_registry, mut tasks, _root, jobs, _process, _) = limited_fixture();
+    let channel = deepwyrm_abi::DW_TASK_GROUP_LIMIT_CHANNEL;
+    tasks.lower_group_limit(jobs, channel, 4).unwrap();
+    tasks.lower_group_limit(jobs, channel, 4).unwrap();
+    assert_eq!(
+        tasks.lower_group_limit(jobs, channel, 5),
+        Err(LimitError::InvalidArgument)
+    );
+    assert_eq!(
+        tasks.lower_group_limit(jobs, channel, u32::MAX),
+        Err(LimitError::InvalidArgument)
+    );
+    tasks.lower_group_limit(jobs, channel, 0).unwrap();
+    assert_eq!(
+        tasks.lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_CLASS_COUNT, 0),
+        Err(LimitError::InvalidArgument)
+    );
+}
+
+/// More than four limited ancestors is refused rather than dropping one
+/// from the tag, which would let the dropped group's subtree escape it.
+#[test]
+fn too_many_limited_ancestors_refuse_creation() {
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = TaskAuthority::<8, 2, 2, 8>::new();
+    let (root, mut owner) = tasks.create_root_group(&mut registry).unwrap();
+    let mut groups = [root; 5];
+    for group in groups.iter_mut().skip(1) {
+        let (key, handle) = tasks.create_child_group(&mut registry, &owner).unwrap();
+        owner = registry.handle_into_internal(handle).unwrap();
+        *group = key;
+    }
+    for group in &groups[..4] {
+        tasks
+            .lower_group_limit(*group, deepwyrm_abi::DW_TASK_GROUP_LIMIT_EVENT, 8)
+            .unwrap();
+    }
+    let (process, _) = tasks.create_process(&mut registry, &owner).unwrap();
+    assert!(tasks.charge_tag(process).is_ok());
+    tasks
+        .lower_group_limit(groups[4], deepwyrm_abi::DW_TASK_GROUP_LIMIT_EVENT, 8)
+        .unwrap();
+    assert_eq!(
+        tasks.charge_tag(process),
+        Err(crate::task::quota::QuotaError::TooDeep)
+    );
+}
+
+/// Wait admission counts the requested items against the WAIT limit.
+#[test]
+fn wait_limit_admits_items_up_to_the_limit() {
+    let (mut registry, mut tasks, _root, jobs, _process, process_owner) = limited_fixture();
+    let waits = WaitRegistry::<8>::new();
+    let (thread, _) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert_eq!(admit_waits(&tasks, &waits, thread, 64), Ok(()));
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_WAIT, 4)
+        .unwrap();
+    assert_eq!(admit_waits(&tasks, &waits, thread, 4), Ok(()));
+    assert_eq!(
+        admit_waits(&tasks, &waits, thread, 5),
+        Err(DW_STATUS_NO_RESOURCES)
+    );
 }

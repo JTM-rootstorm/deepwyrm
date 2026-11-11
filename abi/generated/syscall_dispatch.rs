@@ -47,6 +47,12 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         argument_count: 2,
     },
     DwSyscallDispatchMetadata {
+        number: 0x00010003,
+        name: "task_group_limit",
+        implementation_phase: "DW1-D",
+        argument_count: 3,
+    },
+    DwSyscallDispatchMetadata {
         number: 0x00010010,
         name: "process_create",
         implementation_phase: "DW0-F",

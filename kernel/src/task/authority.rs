@@ -1,3 +1,4 @@
+use super::quota::{self, ChargeTag, LimitError, QuotaError};
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,6 +43,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             child_groups: [None; GROUPS],
             processes: [None; PROCESSES],
             reserved_processes: [None; PROCESSES],
+            limits: [quota::UNLIMITED; quota::LIMIT_CLASSES],
         });
         Ok(TaskPayloadBinding::TaskGroup { creation, key })
     }
@@ -94,6 +96,7 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             child_groups: [None; GROUPS],
             processes: [None; PROCESSES],
             reserved_processes: [None; PROCESSES],
+            limits: [quota::UNLIMITED; quota::LIMIT_CLASSES],
         });
         Ok(TaskPayloadBinding::TaskGroup { creation, key })
     }
@@ -1500,6 +1503,76 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             .expect("live parent process");
         remove_child(&mut parent.threads, record.object)?;
         Ok(Some(record.parent))
+    }
+
+    /// The limited TaskGroups above `process`, nearest first (F4 DW1-F4-M1).
+    pub(crate) fn charge_tag(&self, process: ProcessKey) -> Result<ChargeTag, QuotaError> {
+        let record = self.process(process).map_err(|_| QuotaError::Task)?;
+        let mut group = Some(record.parent.id());
+        let mut tag = ChargeTag::EMPTY;
+        while let Some(object) = group {
+            let slot = self
+                .group_slot(TaskGroupKey(object))
+                .map_err(|_| QuotaError::Task)?;
+            let record = self.groups[slot].as_ref().expect("validated group slot");
+            if record.limits != [quota::UNLIMITED; quota::LIMIT_CLASSES] && !tag.push(object) {
+                return Err(QuotaError::TooDeep);
+            }
+            group = record.parent.as_ref().map(InternalRef::id);
+        }
+        Ok(tag)
+    }
+
+    /// [`Self::charge_tag`] of the thread's process.
+    pub(crate) fn thread_charge_tag(&self, thread: ThreadKey) -> Result<ChargeTag, QuotaError> {
+        let process = self.thread_process(thread).map_err(|_| QuotaError::Task)?;
+        self.charge_tag(process)
+    }
+
+    /// Admits `needed` more of `class` for a creator tagged `tag`, given each
+    /// group's current usage. A group in the tag that has since finalized is
+    /// skipped; its limited ancestors are in the tag too.
+    pub(crate) fn admit_quota(
+        &self,
+        tag: &ChargeTag,
+        class: usize,
+        needed: usize,
+        mut usage: impl FnMut(ObjectId) -> usize,
+    ) -> Result<(), QuotaError> {
+        for object in tag.groups() {
+            let Ok(slot) = self.group_slot(TaskGroupKey(object)) else {
+                continue;
+            };
+            let limit = self.groups[slot]
+                .as_ref()
+                .expect("validated group slot")
+                .limits[class];
+            if limit != quota::UNLIMITED && usage(object).saturating_add(needed) > limit as usize {
+                return Err(QuotaError::Exceeded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lowers one class's limit. Raising, or an unknown class, is refused.
+    pub(crate) fn lower_group_limit(
+        &mut self,
+        group: TaskGroupKey,
+        class: u32,
+        limit: u32,
+    ) -> Result<(), LimitError> {
+        let class = usize::try_from(class).map_err(|_| LimitError::InvalidArgument)?;
+        let slot = self.group_slot(group).map_err(LimitError::Task)?;
+        let limits = &mut self.groups[slot]
+            .as_mut()
+            .expect("validated group slot")
+            .limits;
+        let current = limits.get_mut(class).ok_or(LimitError::InvalidArgument)?;
+        if limit > *current {
+            return Err(LimitError::InvalidArgument);
+        }
+        *current = limit;
+        Ok(())
     }
 
     fn group_slot(&self, key: TaskGroupKey) -> Result<usize, TaskError> {

@@ -37,6 +37,11 @@ pub(crate) enum NativeSyscallRequest {
         task_group: DwHandle,
         reason: DwTerminationReason,
     },
+    TaskGroupLimit {
+        task_group: DwHandle,
+        class: u32,
+        limit: u32,
+    },
     ProcessCreate {
         args: DwUserAddress,
         args_size: u64,
@@ -230,6 +235,11 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
         DwKnownSyscall::TaskGroupTerminate => NativeSyscallRequest::TaskGroupTerminate {
             task_group: DwHandle(a[0]),
             reason: DwTerminationReason(u32_arg(a[1])?),
+        },
+        DwKnownSyscall::TaskGroupLimit => NativeSyscallRequest::TaskGroupLimit {
+            task_group: DwHandle(a[0]),
+            class: u32_arg(a[1])?,
+            limit: u32_arg(a[2])?,
         },
         DwKnownSyscall::ProcessExit => NativeSyscallRequest::ProcessExit {
             exit_code: u32_arg(a[0])?,
@@ -535,6 +545,16 @@ pub(crate) trait NativeSyscallServices {
         task_group: DwHandle,
         reason: DwTerminationReason,
     ) -> NativeSyscallResult;
+    /// `task_group_limit`. The live runtime serves it through the F-service
+    /// dispatch; a runtime without TaskGroup limits refuses it.
+    fn task_group_limit(
+        &mut self,
+        _task_group: DwHandle,
+        _class: u32,
+        _limit: u32,
+    ) -> NativeSyscallResult {
+        NativeSyscallResult::returning(deepwyrm_abi::DW_STATUS_NOT_SUPPORTED)
+    }
     fn process_exit(&mut self, exit_code: u32) -> NativeSyscallResult;
     fn process_terminate(
         &mut self,
@@ -766,6 +786,11 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
             NativeSyscallRequest::TaskGroupTerminate { task_group, reason } => {
                 self.task_group_terminate(task_group, reason)
             }
+            NativeSyscallRequest::TaskGroupLimit {
+                task_group,
+                class,
+                limit,
+            } => self.task_group_limit(task_group, class, limit),
             NativeSyscallRequest::ProcessExit { exit_code } => self.process_exit(exit_code),
             NativeSyscallRequest::ProcessTerminate {
                 process,
