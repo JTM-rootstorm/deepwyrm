@@ -7671,6 +7671,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.core.memory,
                 &mut self.core.tasks,
                 &self.core.shared.device_resources,
+                &mut crate::device::dma::live::LiveDmaService,
                 process,
                 resource,
                 bar,
@@ -7699,6 +7700,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 byte_len,
                 access,
                 out_iova,
+                &mut self.core.cleanup,
             ),
             NativeSyscallRequest::DevicePciConfigRead {
                 resource,
@@ -8274,11 +8276,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     &mut self.core.tasks,
                     &self.core.shared.device_resources,
                     &mut config,
+                    &mut crate::device::dma::live::LiveDmaService,
                     self.own.scheduled().process,
                     resource,
                     memory_space,
                     bus_master,
                     crate::device::pci::dma_confined,
+                    &mut self.core.cleanup,
                 ))
             }
             NativeSyscallRequest::DmaUnmap {

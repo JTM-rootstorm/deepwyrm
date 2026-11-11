@@ -79,6 +79,11 @@ impl Mapping {
 
 struct Domain<const MAPPINGS: usize> {
     resource: ObjectId,
+    /// The process that created the domain (its first `dma_map`). Only it
+    /// may use the domain; any other process that drives the function first
+    /// has the domain revoked, so a replacement driver never inherits its
+    /// predecessor's IOVAs or the buffers they pin.
+    owner: ObjectId,
     devfn: u8,
     domain_id: u16,
     root: u64,
@@ -122,13 +127,15 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
     }
 
     /// Maps `pages` pages starting at `physical` for `resource`'s function
-    /// and returns the IOVA. On success `pin` stays with the mapping; on
-    /// failure it comes back unchanged.
+    /// on behalf of process `owner`, and returns the IOVA. On success `pin`
+    /// stays with the mapping; on failure it comes back unchanged. A domain
+    /// another process owns is `FunctionBusy`: the caller revokes it first.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map<H: DmaHardware>(
         &mut self,
         hardware: &mut H,
         resource: ObjectId,
+        owner: ObjectId,
         devfn: u8,
         physical: u64,
         pages: u64,
@@ -145,6 +152,13 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
         let context_table = hardware.context_table();
         // Find the domain, or prepare a new one without publishing it.
         let (slot, fresh) = match self.domain_slot(resource) {
+            Some(slot)
+                if self.domains[slot]
+                    .as_ref()
+                    .is_some_and(|d| d.owner != owner) =>
+            {
+                return Err((DmaError::FunctionBusy, pin));
+            }
             Some(slot) => (slot, false),
             None => {
                 if self
@@ -170,6 +184,7 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
                 };
                 self.domains[slot] = Some(Domain {
                     resource,
+                    owner,
                     devfn,
                     domain_id,
                     root,
@@ -244,17 +259,21 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
         }
     }
 
-    /// Removes the mapping at exactly `iova` with `pages` pages, invalidates
-    /// the IOTLB, and returns the MemoryObject reference it held.
+    /// Removes `owner`'s mapping at exactly `iova` with `pages` pages,
+    /// invalidates the IOTLB, and returns the MemoryObject reference it held.
     pub(crate) fn unmap<H: DmaHardware>(
         &mut self,
         hardware: &mut H,
         resource: ObjectId,
+        owner: ObjectId,
         iova: u64,
         pages: u64,
     ) -> Result<InternalRef, DmaError> {
         let slot = self.domain_slot(resource).ok_or(DmaError::NotFound)?;
         let domain = self.domains[slot].as_mut().expect("selected domain exists");
+        if domain.owner != owner {
+            return Err(DmaError::NotFound);
+        }
         let index = domain
             .mappings
             .iter()
@@ -272,6 +291,13 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
             .take()
             .expect("selected mapping exists");
         Ok(mapping.pin)
+    }
+
+    /// The process that owns `resource`'s domain, if it has one.
+    pub(crate) fn owner(&self, resource: ObjectId) -> Option<ObjectId> {
+        self.domain_slot(resource)
+            .and_then(|slot| self.domains[slot].as_ref())
+            .map(|domain| domain.owner)
     }
 
     /// The PCI device/function `resource`'s domain covers, if it has one.
@@ -313,19 +339,37 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
     }
 }
 
-/// What the `dma_map` and `dma_unmap` syscalls need from the domains.
+/// What the device syscalls need from the domains.
 pub(crate) trait DmaService {
+    /// Revokes `resource`'s domain when a process other than `process` owns
+    /// it: bus mastering off first, then the domain torn down (see
+    /// [`DmaDomains::teardown`]); each released MemoryObject reference goes
+    /// to `release`. Every syscall that drives a function (bus mastering,
+    /// BAR objects, DMA mappings) calls this first.
+    fn revoke_foreign(
+        &mut self,
+        resource: ObjectId,
+        process: ObjectId,
+        release: &mut dyn FnMut(InternalRef),
+    );
+    #[allow(clippy::too_many_arguments)]
     fn map(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         devfn: u8,
         physical: u64,
         pages: u64,
         access: DeviceAccess,
         pin: InternalRef,
     ) -> Result<u64, (DmaError, InternalRef)>;
-    fn unmap(&mut self, resource: ObjectId, iova: u64, pages: u64)
-    -> Result<InternalRef, DmaError>;
+    fn unmap(
+        &mut self,
+        resource: ObjectId,
+        owner: ObjectId,
+        iova: u64,
+        pages: u64,
+    ) -> Result<InternalRef, DmaError>;
 }
 
 /// Domains bound to one piece of hardware, for host tests of the syscalls.
@@ -339,26 +383,56 @@ pub(crate) struct DmaEngine<'a, H: DmaHardware, const DOMAINS: usize, const MAPP
 impl<H: DmaHardware, const DOMAINS: usize, const MAPPINGS: usize> DmaService
     for DmaEngine<'_, H, DOMAINS, MAPPINGS>
 {
+    fn revoke_foreign(
+        &mut self,
+        resource: ObjectId,
+        process: ObjectId,
+        release: &mut dyn FnMut(InternalRef),
+    ) {
+        if self
+            .domains
+            .owner(resource)
+            .is_some_and(|owner| owner != process)
+        {
+            // Host tests have no command register; the live service clears
+            // bus mastering here first.
+            for pin in self.domains.teardown(self.hardware, resource).into_pins() {
+                release(pin);
+            }
+        }
+    }
+
     fn map(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         devfn: u8,
         physical: u64,
         pages: u64,
         access: DeviceAccess,
         pin: InternalRef,
     ) -> Result<u64, (DmaError, InternalRef)> {
-        self.domains
-            .map(self.hardware, resource, devfn, physical, pages, access, pin)
+        self.domains.map(
+            self.hardware,
+            resource,
+            owner,
+            devfn,
+            physical,
+            pages,
+            access,
+            pin,
+        )
     }
 
     fn unmap(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         iova: u64,
         pages: u64,
     ) -> Result<InternalRef, DmaError> {
-        self.domains.unmap(self.hardware, resource, iova, pages)
+        self.domains
+            .unmap(self.hardware, resource, owner, iova, pages)
     }
 }
 

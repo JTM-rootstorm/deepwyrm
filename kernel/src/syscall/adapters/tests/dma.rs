@@ -20,12 +20,31 @@ const OUT: u64 = BASE + 0x200;
 struct FakeDma {
     mappings: std::vec::Vec<(ObjectId, u8, u64, u64, DeviceAccess, InternalRef)>,
     fail_with: Option<DmaError>,
+    /// Each `revoke_foreign` call: the resource and the calling process.
+    revoke_checks: std::vec::Vec<(ObjectId, ObjectId)>,
+    /// The process every mapping was made for.
+    owners: std::vec::Vec<ObjectId>,
+    /// Pins a revocation hands back, as a foreign owner's would.
+    revoked: std::vec::Vec<InternalRef>,
 }
 
 impl DmaService for FakeDma {
+    fn revoke_foreign(
+        &mut self,
+        resource: ObjectId,
+        process: ObjectId,
+        release: &mut dyn FnMut(InternalRef),
+    ) {
+        self.revoke_checks.push((resource, process));
+        for pin in self.revoked.drain(..) {
+            release(pin);
+        }
+    }
+
     fn map(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         devfn: u8,
         physical: u64,
         pages: u64,
@@ -36,6 +55,7 @@ impl DmaService for FakeDma {
             return Err((error, pin));
         }
         let iova = IOVA + (self.mappings.len() as u64) * 0x10_0000;
+        self.owners.push(owner);
         self.mappings
             .push((resource, devfn, physical, pages, access, pin));
         Ok(iova)
@@ -44,12 +64,16 @@ impl DmaService for FakeDma {
     fn unmap(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         iova: u64,
         pages: u64,
     ) -> Result<InternalRef, DmaError> {
         let index = usize::try_from((iova - IOVA) / 0x10_0000).unwrap();
         match self.mappings.get(index) {
-            Some(mapping) if mapping.0 == resource && mapping.3 == pages => {
+            Some(mapping)
+                if mapping.0 == resource && mapping.3 == pages && self.owners[index] == owner =>
+            {
+                self.owners.remove(index);
                 Ok(self.mappings.remove(index).5)
             }
             _ => Err(DmaError::NotFound),
@@ -177,6 +201,7 @@ impl Fixture {
             byte_len,
             access,
             DwUserAddress(OUT),
+            &mut self.cleanup,
         )
     }
 
@@ -436,4 +461,47 @@ fn device_mmio_objects_cannot_be_dma_targets() {
         DW_STATUS_NOT_SUPPORTED
     );
     assert!(fixture.dma.mappings.is_empty());
+}
+
+/// Storage K4 follow-up R2: every map and unmap first asks the domains to
+/// revoke a domain another process owns, as the calling process, and the
+/// mapping is made for that process. References a revocation hands back go
+/// to cleanup, so the last one finalizes its object.
+#[test]
+fn map_and_unmap_revoke_a_foreign_domain_first_and_act_as_the_caller() {
+    let mut fixture = Fixture::new();
+    let resource = fixture.function();
+    let object = fixture.object(1, read_write_map());
+    let caller = fixture.process.object_id();
+
+    // A predecessor's mapping whose object has no other reference left.
+    let orphan = fixture.object(1, read_write_map());
+    let orphan_pin = {
+        let table = fixture.tasks.process_handles_mut(fixture.process).unwrap();
+        let resolved = table
+            .lookup(
+                &mut fixture.registry,
+                orphan,
+                crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
+                DW_RIGHT_READ,
+            )
+            .unwrap();
+        resolved.into_internal()
+    };
+    assert!(fixture.close(orphan).is_none());
+    fixture.dma.revoked.push(orphan_pin);
+
+    assert_eq!(
+        fixture.map(resource, object, 0, 4096, DW_DMA_ACCESS_DEVICE_READ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(fixture.dma.revoke_checks.len(), 1);
+    assert_eq!(fixture.dma.revoke_checks[0].1, caller);
+    assert_eq!(fixture.dma.owners, [caller]);
+    // The revoked reference was the orphan's last: it is queued for cleanup.
+    assert_eq!(fixture.cleanup.len, 1);
+
+    assert_eq!(fixture.unmap(resource, IOVA, 4096), DW_STATUS_SUCCESS);
+    assert_eq!(fixture.dma.revoke_checks.len(), 2);
+    assert_eq!(fixture.dma.revoke_checks[1], fixture.dma.revoke_checks[0]);
 }

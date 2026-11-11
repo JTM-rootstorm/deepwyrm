@@ -221,9 +221,36 @@ pub(crate) fn install(iommu: LiveIommu) {
 pub(crate) struct LiveDmaService;
 
 impl DmaService for LiveDmaService {
+    fn revoke_foreign(
+        &mut self,
+        resource: ObjectId,
+        process: ObjectId,
+        release: &mut dyn FnMut(InternalRef),
+    ) {
+        let pins = {
+            let mut live = LIVE_DMA.lock();
+            let Some(live) = live.as_mut() else {
+                return;
+            };
+            if !live
+                .domains
+                .owner(resource)
+                .is_some_and(|owner| owner != process)
+            {
+                return;
+            }
+            clear_bus_master_and_teardown(live, resource)
+        };
+        // References are released outside the lock: one may be the last.
+        for pin in pins.into_pins() {
+            release(pin);
+        }
+    }
+
     fn map(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         devfn: u8,
         physical: u64,
         pages: u64,
@@ -242,6 +269,7 @@ impl DmaService for LiveDmaService {
         live.domains.map(
             &mut live.iommu,
             resource,
+            owner,
             devfn,
             physical,
             pages,
@@ -253,6 +281,7 @@ impl DmaService for LiveDmaService {
     fn unmap(
         &mut self,
         resource: ObjectId,
+        owner: ObjectId,
         iova: u64,
         pages: u64,
     ) -> Result<InternalRef, DmaError> {
@@ -260,7 +289,8 @@ impl DmaService for LiveDmaService {
         let Some(live) = live.as_mut() else {
             return Err(DmaError::NotSupported);
         };
-        live.domains.unmap(&mut live.iommu, resource, iova, pages)
+        live.domains
+            .unmap(&mut live.iommu, resource, owner, iova, pages)
     }
 }
 
@@ -272,6 +302,15 @@ pub(crate) fn teardown(resource: ObjectId) -> DomainPins<DMA_MAPPINGS_PER_DOMAIN
     let Some(live) = live.as_mut() else {
         return DomainPins::empty();
     };
+    clear_bus_master_and_teardown(live, resource)
+}
+
+/// Clears the function's bus mastering, so it issues no new DMA, then tears
+/// its domain down.
+fn clear_bus_master_and_teardown(
+    live: &mut LiveDma,
+    resource: ObjectId,
+) -> DomainPins<DMA_MAPPINGS_PER_DOMAIN> {
     if let Some(devfn) = live.domains.devfn(resource) {
         let address = crate::device::pci::PciAddress::from_boot(u32::from(devfn))
             .expect("a bus-0 device/function is a valid PCI address");

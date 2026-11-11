@@ -2291,6 +2291,7 @@ pub(crate) fn device_pci_config_read<
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn device_pci_command<
     C: crate::device::pci::ConfigSpace,
+    D: crate::device::dma::DmaService,
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -2302,12 +2303,26 @@ pub(crate) fn device_pci_command<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     resources: &DeviceResourceAuthority<RESOURCES>,
     config: &mut C,
+    dma: &mut D,
     current_process: ProcessKey,
     resource: DwHandle,
     memory_space: u32,
     bus_master: u32,
     dma_confined: impl FnOnce(crate::device::pci::PciAddress) -> bool,
+    cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
+    // A process that takes over the function first loses nothing to its
+    // predecessor: a domain another process created is revoked before the
+    // command runs. An unusable handle fails below with its own status.
+    if let Some(resource_id) = resource_object_id(
+        registry,
+        tasks,
+        current_process,
+        resource,
+        deepwyrm_abi::DW_RIGHT_WRITE,
+    ) {
+        revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process);
+    }
     match process_handle_operation!(tasks, current_process, table, {
         crate::device::pci_command(
             table,
@@ -2336,6 +2351,57 @@ fn dma_status(error: crate::device::dma::DmaError) -> DwStatus {
         DmaError::NotFound => deepwyrm_abi::DW_STATUS_NOT_FOUND,
         DmaError::FunctionBusy => DW_STATUS_BAD_STATE,
     }
+}
+
+/// The object identity behind `handle` when it names a DeviceResource with
+/// `right`; `None` otherwise. The lookup pin is released at once.
+fn resource_object_id<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    handle: DwHandle,
+    right: DwRights,
+) -> Option<crate::object::ObjectId> {
+    let resolved = tasks
+        .process_handles_mut(current_process)
+        .ok()?
+        .lookup(
+            registry,
+            handle,
+            crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_DEVICE_RESOURCE),
+            right,
+        )
+        .ok()?;
+    let id = resolved.object_id();
+    release_held_lookup_pin(registry, resolved.into_internal());
+    Some(id)
+}
+
+/// Revokes `resource`'s DMA domain when a process other than
+/// `current_process` owns it (storage K4 follow-up R2): bus mastering off,
+/// every mapping removed and invalidated, and each released MemoryObject
+/// reference queued for cleanup, since one may be the last.
+fn revoke_foreign_dma<D: crate::device::dma::DmaService, const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    dma: &mut D,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+    resource: crate::object::ObjectId,
+    current_process: ProcessKey,
+) {
+    dma.revoke_foreign(resource, current_process.object_id(), &mut |pin| {
+        cleanup.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
+            panic!(
+                "a revoked DMA mapping reference violated generic lifetime invariants: {:?}",
+                failure.error()
+            )
+        }));
+    });
 }
 
 /// Releases a lookup pin whose handle still owns the object, so the pin is
@@ -2424,6 +2490,7 @@ pub(crate) fn dma_map<
     byte_len: u64,
     access: u32,
     out_iova: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
     use crate::memory::object::MemoryObjectError;
     if access == 0 || access & !deepwyrm_abi::DW_DMA_ACCESS_SUPPORTED_MASK != 0 {
@@ -2442,6 +2509,7 @@ pub(crate) fn dma_map<
             Ok(found) => found,
             Err(status) => return status,
         };
+    revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process);
     let mut required = deepwyrm_abi::DW_RIGHT_READ.0;
     if device.write {
         required |= deepwyrm_abi::DW_RIGHT_WRITE.0;
@@ -2472,6 +2540,7 @@ pub(crate) fn dma_map<
     let pages = byte_len / crate::memory::object::PAGE_SIZE;
     match dma.map(
         resource_id,
+        current_process.object_id(),
         devfn,
         physical,
         pages,
@@ -2520,7 +2589,13 @@ pub(crate) fn dma_unmap<
         Ok(found) => found,
         Err(status) => return status,
     };
-    match dma.unmap(resource_id, iova, byte_len / page) {
+    revoke_foreign_dma(registry, dma, cleanup, resource_id, current_process);
+    match dma.unmap(
+        resource_id,
+        current_process.object_id(),
+        iova,
+        byte_len / page,
+    ) {
         Ok(pin) => {
             cleanup.push_optional(registry.release_internal(pin).unwrap_or_else(|failure| {
                 panic!(
@@ -2539,6 +2614,7 @@ pub(crate) fn dma_unmap<
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn device_mmio_object_create<
     U: UserPageAccess,
+    D: crate::device::dma::DmaService,
     const OBJECTS: usize,
     const MEMORY_OBJECTS: usize,
     const LEASES: usize,
@@ -2553,6 +2629,7 @@ pub(crate) fn device_mmio_object_create<
     memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     resources: &DeviceResourceAuthority<RESOURCES>,
+    dma: &mut D,
     current_process: ProcessKey,
     resource: DwHandle,
     bar: u32,
@@ -2587,7 +2664,11 @@ pub(crate) fn device_mmio_object_create<
         Err(error) => return task_status(error),
     };
     let resource_id = resources.pci_resource_id_for_resolved(&resolved);
+    let resource_object = resolved.object_id();
     let parent = resolved.into_internal();
+    // The caller's handle keeps the resource alive, so revoking here cannot
+    // release the lookup pin's object.
+    revoke_foreign_dma(registry, dma, cleanup, resource_object, current_process);
     // Every failure below releases the lookup pin. The caller's handle still
     // owns the resource, so the pin is never its last reference.
     let fail = |registry: &mut ObjectRegistry<OBJECTS>, parent, status| match registry
