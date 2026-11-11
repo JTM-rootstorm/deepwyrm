@@ -386,19 +386,19 @@ fn trusted_toolchain_binds_tree_and_internal_library_identities() {
     let trusted = load_trusted_toolchain(&workspace_root().join(TRUSTED_TOOLCHAIN_CONFIG)).unwrap();
     assert_eq!(
         trusted.toolchain_tree_sha256,
-        "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca"
+        "61fbbf59bc8ca5ebe3362208c353875d73d693ecfeee5034f0a32f0fea526105"
     );
     assert!(
         trusted
             .rustc_driver_internal_library
             .path
-            .ends_with("lib/librustc_driver-948919618f142f9a.so")
+            .ends_with("lib/librustc_driver-ec77465cc608d8ef.so")
     );
     assert!(
         trusted
             .llvm_internal_library
             .path
-            .ends_with("lib/libLLVM.so.22.1-rust-1.97.1-stable")
+            .ends_with("lib/libLLVM.so.22.1-rust-dev")
     );
 }
 

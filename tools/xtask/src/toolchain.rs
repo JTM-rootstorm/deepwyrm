@@ -41,7 +41,7 @@ pub(super) fn load_trusted_toolchain(path: &Path) -> io::Result<TrustedToolchain
     if values.get("schema").map(String::as_str) != Some("deepwyrm-rust-toolchain-identity-v1") {
         return invalid_input("trusted toolchain config has an unknown schema".into());
     }
-    if values.get("request_id").map(String::as_str) != Some("RUST-WYR0-I-B-SYSROOTS-007") {
+    if values.get("request_id").map(String::as_str) != Some("RUST-TC2-WYRMROOT-PSABI-008") {
         return invalid_input("trusted toolchain config has an unexpected request ID".into());
     }
     if values.get("toolchain_tree_recipe").map(String::as_str)

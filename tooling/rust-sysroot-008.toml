@@ -1,0 +1,10 @@
+# Deepwyrm consumer identity for the immutable shared Rust 008 bundle.
+schema = "deepwyrm-rust-sysroot-manifest-v1"
+rust_toolchain_commit = "d54c16b7f2160f9c5bd61456cf27eaf7f3c45aab"
+target = "x86_64-unknown-none"
+toolchain_config_sha256 = "8279453db176e04b50cca2d1dd8ac274d3445794edfdfda9bf64948a0db5d45a"
+cargo_sha256 = "a73b2c25573d251489101c0d8f19ad3702eb9761166de5ed8437b472b6c038ce"
+rustc_sha256 = "32ffeaa4f1e2ed800dc72a5c1b51ed33d792749a3ac2b78feed268d16245335a"
+rust_lld_sha256 = "e1db91e76e6a8a59708c38bfedb6b3223f2f3ae5a79750e8234c19205794ba97"
+core_sha256 = "340d621a713ccedbbbb9e2816af7948cb6d2cd5931d1ea92e46573139f5a1f10"
+compiler_builtins_sha256 = "87d1bf9ab89a89047809cb5a82202e97f9aa15ff2285b9779735ed92b1d2efcb"
