@@ -57,14 +57,24 @@ No Critical, High or Low findings.
 
 **Validation** (development tier): host tests, clippy and fmt on Deepwyrm `b9bfb55`, the production target check, the full Wyrmroot `xtask test` on `f39b350`, and `dev-boot --check` on that pair, which runs `bin/hello` as a limited job.
 
-**Residual risks** (not defects):
+**Residual risks.** Mike asked for these to be fixed (2026-11-10). Fixed in `5fa9b6a` and `3caecc3`, with Wyrmroot `d32c49f` and `5f00b55`:
 
-- **Mapping leases are not a limit class.** A process can map one memory object many times, so the global lease pool can still be drained. Shell jobs today map nothing beyond their image. Disposition: accepted; add a mapping or lease limit before a job can map memory objects.
-- **Frames before admission.** The MemoryObjectCreate facade allocates backing frames before the runtime lock, so a refused request briefly holds `byte_len` worth of frames. Memory accounting is deferred by §10.
-- **Limits do not follow a process created into another TaskGroup.** The charge tag comes from the creating process's group ancestry. Jobs hold no other TaskGroup today.
-- **Wait admission precedes handle resolution**, and a wait limit of one rules out multi-item waits for future job binaries.
-- **`count_waiting` walks ancestry under the IRQ-disabling lock.** Bounded by the wait pool (56) and four ancestors.
-- **The test-only `memory_object_create` duplicates the production adapter.** That split caused D1; unify the two.
+| Residual risk | Fix | Follow-up review |
+|---|---|---|
+| Mapping leases are not a limit class | Lease pool sized for every job filling its 10-slot region (mappings 48 → 64; `REGION_SLOTS <= JOB_REGION_MAPPINGS` asserted) | Partially closed: still not a limit class. The bound holds because Wyrmroot gives jobs no handles to other processes; §10 now says so. |
+| Frames allocated before admission | The facade asks the quota before allocating; a race falls back to NO_RESOURCES | Closed for quota refusals |
+| Limits do not follow a process created into another TaskGroup | `confine_creation`: a limited process creates TaskGroups, Processes and Threads only inside its limited subtree, else ACCESS_DENIED | Closed for creation. Delegation (starting another process's thread, mapping into it) is not confined; §10 records this. |
+| Wait admission before handle resolution; one wait per job | Admission after resolution, with the resolved pins released on refusal; job waits 1 → 4 (waits 56 → 68) | Closed |
+| `count_waiting` under the IRQ-disabling lock | The lock is held per slot; the ancestry walk runs outside it | Closed |
+| Duplicate test-only `memory_object_create` | Removed; tests drive `memory_object_create_owned` through a shim | Closed |
+
+**Follow-up review** (Claude Opus 5.5, `claude-opus-5-5`, read-only, 2026-11-10, Deepwyrm `5fa9b6a` with Wyrmroot `d32c49f`): no Critical, High or Medium defects. The one Low defect was a doc comment taken by the new facade helper, fixed in `3caecc3`. Accepted Low notes:
+
+- Wait admission counts the items of a deadline-now poll that would register nothing.
+- Lease and wait slots retire permanently when their u32 generation runs out. This predates F4.
+- No test covers the process-create refusal path, `wait_many`'s admission order, or the live facade's early check. By reading, each mirrors a tested path.
+
+**Validation** (development tier, final pair Deepwyrm `3caecc3` / Wyrmroot `5f00b55`): host tests (1187 pass), clippy, fmt and the production target check; Wyrmroot `xtask test`; and `dev-boot --check`. The new tests were mutation-checked.
 
 ## Risks and questions
 
