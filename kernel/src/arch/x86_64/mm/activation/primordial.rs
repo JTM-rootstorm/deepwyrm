@@ -7715,9 +7715,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// The guarded half of a deferred `MemoryObjectCreate` (D1 commit 6c):
-    /// the ordinary adapter call, with the early backing and output standing
-    /// in for the user session.
+    /// Whether the scheduled process may create one more MemoryObject now;
+    /// asked before frames are allocated (F4 residual).
     fn memory_object_quota_allows(&self) -> bool {
         crate::syscall::memory_object_quota_allows(
             &self.core.registry,
@@ -7726,6 +7725,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// The guarded half of a deferred `MemoryObjectCreate` (D1 commit 6c):
+    /// the ordinary adapter call, with the early backing and output standing
+    /// in for the user session.
     fn run_deferred_output_with(
         &mut self,
         request: NativeSyscallRequest,
