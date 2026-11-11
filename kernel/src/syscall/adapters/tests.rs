@@ -2032,6 +2032,94 @@ impl MemoryObjectBackingAccess for TestBacking {
     }
 }
 
+/// Drives the production `memory_object_create_owned` with a split fake user
+/// memory and backing, the shape the older tests were written against.
+struct SplitMemoryObjectAccess<'a, B> {
+    user: &'a mut FakeUserMemory,
+    backing: &'a mut B,
+}
+
+impl<B> OwnedUserOutputAccess for SplitMemoryObjectAccess<'_, B> {
+    type OwnedOutput = FakeOwnedOutput;
+
+    fn preflight_owned_output(
+        &mut self,
+        range: UserRange,
+    ) -> Result<Self::OwnedOutput, Self::Error> {
+        self.user.preflight_owned_output(range)
+    }
+
+    fn commit_owned_output(&mut self, output: Self::OwnedOutput, source: &[u8]) {
+        self.user.commit_owned_output(output, source);
+    }
+
+    fn discard_owned_output(&mut self, output: Self::OwnedOutput) {
+        self.user.discard_owned_output(output);
+    }
+}
+
+impl<B> UserPageAccess for SplitMemoryObjectAccess<'_, B> {
+    type Error = ();
+    type Pinned<'a>
+        = FakePinned<'a>
+    where
+        Self: 'a;
+
+    fn pin(&mut self, range: UserRange) -> Result<Self::Pinned<'_>, Self::Error> {
+        self.user.pin(range)
+    }
+}
+
+impl<B: MemoryObjectBackingAccess> MemoryObjectBackingAccess for SplitMemoryObjectAccess<'_, B> {
+    fn allocate_zeroed_backing(
+        &mut self,
+        page_count: u64,
+    ) -> Result<crate::memory::frame_roles::ObjectBackingGrant, DwStatus> {
+        self.backing.allocate_zeroed_backing(page_count)
+    }
+
+    fn rollback_object_backing(&mut self, backing: crate::memory::frame_roles::ObjectBackingGrant) {
+        self.backing.rollback_object_backing(backing);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_object_create<
+    B: MemoryObjectBackingAccess,
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    user: &mut FakeUserMemory,
+    backing: &mut B,
+    registry: &mut ObjectRegistry<OBJECTS>,
+    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    current_process: ProcessKey,
+    byte_len: u64,
+    flags: u32,
+    requested_rights: DwRights,
+    out_handle: DwUserAddress,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> DwStatus {
+    memory_object_create_owned(
+        &mut SplitMemoryObjectAccess { user, backing },
+        registry,
+        memory,
+        tasks,
+        current_process,
+        byte_len,
+        flags,
+        requested_rights,
+        out_handle,
+        cleanup,
+    )
+}
+
 #[test]
 fn memory_object_create_preflights_output_before_backing_allocation() {
     use deepwyrm_abi::{DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE};
@@ -13966,4 +14054,230 @@ fn the_live_memory_object_create_path_is_limited() {
             finalization,
         );
     }
+}
+
+/// F4 residual: a limited process cannot escape its limits by creating into
+/// a TaskGroup or Process outside its limited subtree, but may still create
+/// inside it.
+#[test]
+fn limited_creation_stays_inside_the_limited_subtree() {
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = TaskAuthority::<4, 3, 3, 8>::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (jobs, jobs_ref) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let jobs_owner = registry.handle_into_internal(jobs_ref).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &jobs_owner).unwrap();
+    let (outside, outside_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_CHANNEL, 0)
+        .unwrap();
+
+    let install = |tasks: &mut TaskAuthority<4, 3, 3, 8>, reference| {
+        tasks
+            .process_handles_mut(process)
+            .unwrap()
+            .install(reference, DW_RIGHT_MODIFY)
+            .unwrap()
+    };
+    let root_pin = registry.retain_internal(&root_owner).unwrap();
+    let root_handle = install(&mut tasks, registry.internal_into_handle(root_pin).unwrap());
+    let jobs_pin = registry.retain_internal(&jobs_owner).unwrap();
+    let jobs_handle = install(&mut tasks, registry.internal_into_handle(jobs_pin).unwrap());
+    let own_handle = install(&mut tasks, process_ref);
+    let outside_handle = install(&mut tasks, outside_ref);
+
+    let mut user = FakeUserMemory::new();
+    let mut cleanup = CleanupQueue::<32>::new();
+    let out = DwUserAddress(BASE + 0x100);
+    let generations = registry.test_slot_generations();
+    let handles = tasks.process_handle_count(process).unwrap();
+    assert_eq!(
+        task_group_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            root_handle,
+            DW_RIGHT_INSPECT,
+            out,
+            &mut cleanup,
+        ),
+        DW_STATUS_ACCESS_DENIED
+    );
+    assert_eq!(
+        thread_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            outside_handle,
+            DW_RIGHT_INSPECT,
+            out,
+            &mut cleanup,
+        ),
+        DW_STATUS_ACCESS_DENIED
+    );
+    assert_eq!(registry.test_slot_generations(), generations);
+    assert_eq!(tasks.process_handle_count(process).unwrap(), handles);
+    assert_eq!(
+        confine_creation(&tasks, process, tasks.group_charge_tag(root_owner.id())),
+        Err(DW_STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        confine_creation(&tasks, outside, tasks.group_charge_tag(jobs_owner.id())),
+        Ok(())
+    );
+
+    let mut created = [DwHandle(0); 2];
+    for (index, status) in [
+        task_group_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            jobs_handle,
+            DW_RIGHT_INSPECT,
+            out,
+            &mut cleanup,
+        ),
+        thread_create(
+            &mut user,
+            &mut registry,
+            &mut tasks,
+            process,
+            own_handle,
+            DW_RIGHT_INSPECT,
+            DwUserAddress(BASE + 0x108),
+            &mut cleanup,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(status, DW_STATUS_SUCCESS);
+        created[index] = DwHandle(u64_at(&user, BASE + 0x100 + 8 * index as u64));
+    }
+    for handle in [root_handle, jobs_handle, outside_handle, own_handle]
+        .into_iter()
+        .chain(created)
+    {
+        assert_eq!(
+            handle_close(&mut registry, &mut tasks, process, handle, &mut cleanup),
+            DW_STATUS_SUCCESS
+        );
+    }
+}
+
+/// F4 residual: a wait at its limit still reports a bad handle as one, and a
+/// refused wait over good handles releases what resolution pinned.
+#[test]
+fn wait_admission_follows_handle_resolution() {
+    use deepwyrm_abi::{DW_DEADLINE_NOW, DW_RIGHT_SIGNAL, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED};
+
+    let mut registry = ObjectRegistry::<16>::new();
+    let mut tasks = Tasks::new();
+    let (root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (process, _process_ref) = tasks.create_process(&mut registry, &root_owner).unwrap();
+    let process_owner = registry.handle_into_internal(_process_ref).unwrap();
+    let (thread, thread_ref) = tasks.create_thread(&mut registry, &process_owner).unwrap();
+    assert!(registry.release_handle(thread_ref).unwrap().is_none());
+    let execution = ExecutionDomain::<1>::new(test_stack_bounds::<1>()).unwrap();
+    execution
+        .start_thread(&mut tasks, thread, test_start(0xd2))
+        .unwrap();
+    assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+    let events = EventAuthority::<1>::new();
+    let timers = TimerAuthority::<1>::new();
+    let channels = ChannelAuthority::<1, 2>::new();
+    let waits = WaitRegistry::<8>::new();
+    let (_event, reference) = events.create_event(&mut registry).unwrap();
+    let event = tasks
+        .process_handles_mut(process)
+        .unwrap()
+        .install(reference, DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_SIGNAL.0))
+        .unwrap();
+    let mut operations = WaitOperationRegistry::<(), 1>::new();
+    tasks
+        .lower_group_limit(root, deepwyrm_abi::DW_TASK_GROUP_LIMIT_WAIT, 0)
+        .unwrap();
+
+    let mut wait =
+        |registry: &mut ObjectRegistry<16>, tasks: &mut Tasks, handle| match wait_one_begin(
+            (),
+            registry,
+            tasks,
+            &events,
+            &timers,
+            &channels,
+            &waits,
+            &execution,
+            &mut operations,
+            None,
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            process,
+            thread,
+            handle,
+            DW_SIGNAL_SIGNALED,
+            DW_DEADLINE_NOW,
+        ) {
+            WaitSyscallBegin::Returning { status, .. } => status,
+            WaitSyscallBegin::Suspended { .. } => panic!("a refused wait suspended"),
+        };
+    assert_eq!(
+        wait(&mut registry, &mut tasks, DwHandle(0x7777)),
+        DW_STATUS_BAD_HANDLE
+    );
+    let references = registry.test_snapshot();
+    assert_eq!(
+        wait(&mut registry, &mut tasks, event),
+        DW_STATUS_NO_RESOURCES
+    );
+    assert_eq!(registry.test_snapshot(), references);
+    let mut cleanup = CleanupQueue::<16>::new();
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, event, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+}
+
+/// F4 residual: when the live facade's early quota check refused and left
+/// no frames, but usage fell before the adapter's own admission, the request
+/// fails with NO_RESOURCES instead of reaching for backing that is absent.
+#[test]
+fn a_quota_refused_early_backing_fails_closed() {
+    use deepwyrm_abi::{DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, _root, _jobs, process, _) = limited_fixture();
+    let mut memory = MemoryObjectAuthority::<4, 4>::new();
+    let mut cleanup = CleanupQueue::<32>::new();
+    let out = DwUserAddress(BASE + 0x100);
+    let range = output_range(out, 8, 8).unwrap();
+    let mut access = DeferredMemoryObjectAccess::new(
+        crate::memory::usercopy::DeferredUserOutput::new(Some(range)),
+        1,
+        Some(Err(DW_STATUS_NO_RESOURCES)),
+    );
+    let handles = tasks.process_handle_count(process).unwrap();
+    assert!(memory_object_quota_allows(&registry, &tasks, process));
+    assert_eq!(
+        memory_object_create_owned(
+            &mut access,
+            &mut registry,
+            &mut memory,
+            &mut tasks,
+            process,
+            4096,
+            0,
+            DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+            out,
+            &mut cleanup,
+        ),
+        DW_STATUS_NO_RESOURCES
+    );
+    let (output, unused) = access.into_parts();
+    assert!(output.written().is_none());
+    assert!(unused.is_none());
+    assert_eq!(tasks.process_handle_count(process).unwrap(), handles);
 }

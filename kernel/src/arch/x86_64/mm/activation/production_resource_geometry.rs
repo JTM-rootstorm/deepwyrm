@@ -70,7 +70,8 @@ pub(super) const INIT_BASELINE_HANDLES: usize = sum(&INIT_RESIDENT_HANDLES);
 
 const RESIDENT_IMAGES: usize = 6;
 const RESIDENT_IMAGE_OBJECTS: usize = 2 + 1; // PT_LOADs plus initial stack.
-const JOB_IMAGE_OBJECTS: usize = 2 + 1; // `bin/hello` also has two PT_LOADs.
+/// Wyrmroot's job loader refuses an image with more than two PT_LOADs.
+const JOB_IMAGE_OBJECTS: usize = 2 + 1; // PT_LOADs plus initial stack.
 pub(super) const BASELINE_MEMORY: usize = RESIDENT_IMAGES * RESIDENT_IMAGE_OBJECTS + 1; // + bootfs.
 
 /// A replacement generation is constructed before the generation it replaces
@@ -83,9 +84,15 @@ const REPLACEMENT_GENERATIONS: usize = 1;
 /// `spawn` made more than one job reachable; the earlier value of one was
 /// stale.
 const LIVE_SHELL_JOBS: usize = 4;
-/// The wait items one job may register itself. Wyrmroot limits each job's
-/// TaskGroup to this with `task_group_limit`, and to no objects of its own.
-const JOB_OWN_WAITS: usize = 1;
+/// The wait items one job may register itself, enough for a small
+/// wait-many. Wyrmroot limits each job's TaskGroup to this with
+/// `task_group_limit`, and to no objects of its own.
+const JOB_OWN_WAITS: usize = 4;
+/// The mapping leases one job can hold. Its TaskGroup limits leave it one
+/// Process, which has one root region of `REGION_SLOTS` mapping slots, and
+/// it may map an object it holds into every slot. The lease pool is sized for
+/// that, not for its image alone, so jobs cannot drain it.
+pub(super) const JOB_REGION_MAPPINGS: usize = 10;
 /// Init holds each live job's Process, TaskGroup and launch Channel.
 const JOB_HELD_HANDLES: usize = 3;
 
@@ -125,7 +132,8 @@ pub(super) const MEMORY_PEAK: usize = BASELINE_MEMORY
     + REPLACEMENT_GENERATIONS * RESIDENT_IMAGE_OBJECTS
     + LIVE_SHELL_JOBS * JOB_IMAGE_OBJECTS
     + 1; // Loader scratch view, open until the child mapping is installed.
-pub(super) const MAPPING_PEAK: usize = MEMORY_PEAK;
+pub(super) const MAPPING_PEAK: usize =
+    MEMORY_PEAK + LIVE_SHELL_JOBS * (JOB_REGION_MAPPINGS - JOB_IMAGE_OBJECTS);
 
 /// Selector 33's baseline for this identical resident set: primordial->init,
 /// init's five role startups, the service pairs to registryd, devmgr's
@@ -215,11 +223,11 @@ pub(super) struct Capacity {
 pub(super) const SELECTED: Capacity = Capacity {
     handles: 48,
     memory: 48,
-    mappings: 48,
+    mappings: 64,
     identities: 16,
     registry: 192,
     channel_pairs: 40,
-    waits: 56,
+    waits: 68,
     evidence: 0,
 };
 
@@ -290,7 +298,7 @@ mod tests {
         assert_eq!(HANDLE_PEAK, 44);
         assert_eq!(BASELINE_MEMORY, 19);
         assert_eq!(MEMORY_PEAK, 35);
-        assert_eq!(MAPPING_PEAK, 35);
+        assert_eq!(MAPPING_PEAK, 63);
         assert_eq!(LIVE_PROCESSES, 11);
         assert_eq!(LIVE_TASK_GROUPS, 14);
         assert_eq!(LIVE_IDENTITY_PEAK, 14);
@@ -298,7 +306,7 @@ mod tests {
         assert_eq!(CHANNEL_ENDPOINT_PEAK, 72);
         assert_eq!(REGISTRY_PEAK, 158);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
-        assert_eq!(WAIT_PEAK, 53);
+        assert_eq!(WAIT_PEAK, 65);
         assert_eq!(BOOTFS_ENTRY_PEAK, 12);
     }
 

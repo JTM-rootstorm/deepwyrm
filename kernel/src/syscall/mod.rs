@@ -72,8 +72,9 @@ pub(crate) use adapters::{
 )]
 pub(crate) use adapters::{
     DeferredMemoryObjectAccess, MemoryObjectBackingAccess, ProcessRootReservation,
-    ThreadStartMappingAccess, memory_object_create_owned, process_create_with_root,
-    process_terminate, thread_create, thread_start_with_access, thread_terminate,
+    ThreadStartMappingAccess, memory_object_create_owned, memory_object_quota_allows,
+    process_create_with_root, process_terminate, thread_create, thread_start_with_access,
+    thread_terminate,
 };
 #[cfg(deepwyrm_e7_guest)]
 pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};

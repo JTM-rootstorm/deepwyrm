@@ -132,6 +132,7 @@ const _: () = {
     assert!(TIMERS >= super::production_resource_geometry::TIMER_PEAK);
     assert!(EVENTS >= super::production_resource_geometry::EVENT_PEAK);
     assert!(REGION_SLOTS >= super::production_resource_geometry::REGION_MAPPING_PEAK);
+    assert!(REGION_SLOTS <= super::production_resource_geometry::JOB_REGION_MAPPINGS);
     assert!(fits(Capacity {
         handles: HANDLES,
         memory: MEMORY_OBJECTS,
@@ -909,12 +910,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             _ => None,
         };
         let cpu = self.cpu;
-        let Ok((phase, root, process)) = self.with_synchronized_runtime_at_safe_point(|runtime| {
-            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                runtime.service_pending_timer_expiries_on_bootstrap();
-            }
-            runtime.prepare_guard_free_usercopy()
-        }) else {
+        let Ok(((phase, root, process), quota_allows)) = self
+            .with_synchronized_runtime_at_safe_point(|runtime| {
+                if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                    runtime.service_pending_timer_expiries_on_bootstrap();
+                }
+                let prepared = runtime.prepare_guard_free_usercopy();
+                // Frames are allocated only for a request its quota admits
+                // now; the adapter's admission under the next hold decides.
+                let allows = backing_pages.is_none() || runtime.memory_object_quota_allows();
+                (prepared, allows)
+            })
+        else {
             return Some(Err(()));
         };
         // Every range the adapter will preflight, or `None` if one cannot be
@@ -969,6 +976,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             };
             let backing = match (backing_pages, &pinned) {
+                // Refused by quota: no frames. Should the adapter admit after
+                // all (usage fell in between), the request fails, not panics.
+                (Some(_), Some(_)) if !quota_allows => {
+                    Some(Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+                }
                 (Some(page_count), Some(_)) => Some(
                     crate::syscall::MemoryObjectBackingAccess::allocate_zeroed_backing(
                         &mut user, page_count,
@@ -7706,6 +7718,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// The guarded half of a deferred `MemoryObjectCreate` (D1 commit 6c):
     /// the ordinary adapter call, with the early backing and output standing
     /// in for the user session.
+    fn memory_object_quota_allows(&self) -> bool {
+        crate::syscall::memory_object_quota_allows(
+            &self.core.registry,
+            &self.core.tasks,
+            self.own.scheduled().process,
+        )
+    }
+
     fn run_deferred_output_with(
         &mut self,
         request: NativeSyscallRequest,

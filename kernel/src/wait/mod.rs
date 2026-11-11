@@ -596,13 +596,23 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
 
     /// Registered wait items whose waiting thread satisfies `charged`
     /// (TaskGroup wait limits, F4 DW1-F4-M1).
+    ///
+    /// The IRQ-disabling lock is held only to read one slot; `charged` runs
+    /// outside it. The caller holds the runtime lock, which serializes every
+    /// registration, so the count can only be stale by entries removed
+    /// meanwhile (an IRQ wake or a cancel), which errs toward refusal.
     pub(crate) fn count_waiting(&self, mut charged: impl FnMut(ThreadKey) -> bool) -> usize {
-        self.slots
-            .lock()
-            .iter()
-            .filter_map(|slot| slot.entry.as_ref())
-            .filter(|entry| charged(entry.identity.thread))
-            .count()
+        let mut count = 0;
+        for index in 0..CAPACITY {
+            let thread = self.slots.lock()[index]
+                .entry
+                .as_ref()
+                .map(|entry| entry.identity.thread);
+            if thread.is_some_and(&mut charged) {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub(crate) fn register(

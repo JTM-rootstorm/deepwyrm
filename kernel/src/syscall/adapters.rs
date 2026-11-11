@@ -680,6 +680,31 @@ fn admit_objects<
     Ok(tag)
 }
 
+/// Refuses creation into a TaskGroup or Process outside the creator's
+/// limited subtree (F4 residual: limits must follow what a limited process
+/// creates). `target` is the tag the created thing will be charged with.
+fn confine_creation<
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    creator: ProcessKey,
+    target: Result<crate::task::quota::ChargeTag, crate::task::quota::QuotaError>,
+) -> Result<(), DwStatus> {
+    let creator = tasks.charge_tag(creator).map_err(quota_status)?;
+    if creator.is_empty() {
+        return Ok(());
+    }
+    let target = target.map_err(quota_status)?;
+    if tasks.limits_cover(&creator, &target) {
+        Ok(())
+    } else {
+        Err(DW_STATUS_ACCESS_DENIED)
+    }
+}
+
 /// Charges a just-created, still-live object to its creator's tag.
 fn charge_created<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
@@ -1720,6 +1745,11 @@ pub(crate) fn task_group_create<
         Ok(pin) => pin,
         Err(status) => return status,
     };
+    let target = tasks.group_charge_tag(parent_pin.id());
+    if let Err(status) = confine_creation(tasks, current_process, target) {
+        release_lookup_pin(registry, parent_pin, cleanup);
+        return status;
+    }
     let charge = match admit_objects(
         registry,
         tasks,
@@ -2847,6 +2877,13 @@ fn process_create_publish<
         discard_and_return!(status);
     }
 
+    let target = tasks.group_charge_tag(parent_pin.id());
+    if let Err(status) = confine_creation(tasks, current_process, target) {
+        cancel_prepared_handle_move(&mut prepared_move, tasks, current_process);
+        release_lookup_pin(registry, bootstrap_pin, cleanup);
+        release_lookup_pin(registry, parent_pin, cleanup);
+        discard_and_return!(status);
+    }
     let charge = match admit_objects(
         registry,
         tasks,
@@ -4882,33 +4919,37 @@ fn wait_one_begin_with_interrupts<
     signals: DwSignals,
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
-    if let Err(status) = admit_waits(tasks, waits, thread, 1) {
-        return WaitSyscallBegin::Returning {
-            status,
-            output,
-            result: None,
-        };
-    }
     let request = [DwWaitItemV1 { handle, signals }];
     match ResolvedWaitSet::resolve(tasks, registry, process, &request) {
-        Ok(set) => begin_wait_set(
-            set,
-            output,
-            deadline,
-            registry,
-            tasks,
-            events,
-            timers,
-            channels,
-            interrupts,
-            waits,
-            execution,
-            operations,
-            deadline_authority,
-            current_cpu,
-            process,
-            thread,
-        ),
+        Ok(set) => {
+            // After resolution, so a bad handle reports its own status.
+            if let Err(status) = admit_waits(tasks, waits, thread, set.len()) {
+                set.release(registry);
+                return WaitSyscallBegin::Returning {
+                    status,
+                    output,
+                    result: None,
+                };
+            }
+            begin_wait_set(
+                set,
+                output,
+                deadline,
+                registry,
+                tasks,
+                events,
+                timers,
+                channels,
+                interrupts,
+                waits,
+                execution,
+                operations,
+                deadline_authority,
+                current_cpu,
+                process,
+                thread,
+            )
+        }
         Err(error) => WaitSyscallBegin::Returning {
             status: wait_set_status(error),
             output,
@@ -5039,32 +5080,36 @@ fn wait_many_requests_begin<
     requests: &[DwWaitItemV1],
     deadline: DwDeadline,
 ) -> WaitSyscallBegin<OUTPUT> {
-    if let Err(status) = admit_waits(tasks, waits, thread, requests.len()) {
-        return WaitSyscallBegin::Returning {
-            status,
-            output,
-            result: None,
-        };
-    }
     match ResolvedWaitSet::resolve(tasks, registry, process, requests) {
-        Ok(set) => begin_wait_set(
-            set,
-            output,
-            deadline,
-            registry,
-            tasks,
-            events,
-            timers,
-            channels,
-            interrupts,
-            waits,
-            execution,
-            operations,
-            deadline_authority,
-            current_cpu,
-            process,
-            thread,
-        ),
+        Ok(set) => {
+            // After resolution, so a bad handle reports its own status.
+            if let Err(status) = admit_waits(tasks, waits, thread, set.len()) {
+                set.release(registry);
+                return WaitSyscallBegin::Returning {
+                    status,
+                    output,
+                    result: None,
+                };
+            }
+            begin_wait_set(
+                set,
+                output,
+                deadline,
+                registry,
+                tasks,
+                events,
+                timers,
+                channels,
+                interrupts,
+                waits,
+                execution,
+                operations,
+                deadline_authority,
+                current_cpu,
+                process,
+                thread,
+            )
+        }
         Err(error) => WaitSyscallBegin::Returning {
             status: wait_set_status(error),
             output,
@@ -5987,6 +6032,11 @@ pub(crate) fn thread_create<
         Ok(pin) => pin,
         Err(status) => return status,
     };
+    let target = tasks.process_object_charge_tag(process_pin.id());
+    if let Err(status) = confine_creation(tasks, current_process, target) {
+        release_lookup_pin(registry, process_pin, cleanup);
+        return status;
+    }
     let charge = match admit_objects(
         registry,
         tasks,
@@ -7999,143 +8049,38 @@ fn memory_object_status(error: crate::memory::object::MemoryObjectError) -> DwSt
     }
 }
 
-pub(crate) fn memory_object_create<
-    U: UserPageAccess,
-    B: MemoryObjectBackingAccess,
+/// Whether `process` may create one more MemoryObject now. The live facade
+/// asks before allocating backing frames, so a request its quota refuses
+/// takes no frames; `memory_object_create_owned` admits again, under the same
+/// lock as creation, and that admission is the one that counts.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime allocates backing early")
+)]
+pub(crate) fn memory_object_quota_allows<
     const OBJECTS: usize,
-    const MEMORY_OBJECTS: usize,
-    const LEASES: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
     const THREADS: usize,
     const HANDLES: usize,
 >(
-    user: &mut U,
-    backing_access: &mut B,
-    registry: &mut ObjectRegistry<OBJECTS>,
-    memory: &mut MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
-    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
-    current_process: ProcessKey,
-    byte_len: u64,
-    flags: u32,
-    requested_rights: DwRights,
-    out_handle: DwUserAddress,
-    cleanup: &mut CleanupQueue<OBJECTS>,
-) -> DwStatus {
-    if byte_len == 0
-        || !byte_len.is_multiple_of(u64::from(DW_BASE_PAGE_SIZE))
-        || flags != 0
-        || requested_rights.0 == 0
-        || !deepwyrm_abi::dw_rights_are_known(requested_rights)
-        || !deepwyrm_abi::dw_rights_are_compatible(
-            deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
-            requested_rights,
-        )
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
-    }
-    let page_count = byte_len / u64::from(DW_BASE_PAGE_SIZE);
-    let output = match preflight_output(user, out_handle, 8, 8) {
-        Ok(output) => output,
-        Err(status) => return status,
-    };
-    let charge = match admit_objects(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+) -> bool {
+    admit_objects(
         registry,
         tasks,
-        current_process,
+        process,
         deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
         1,
-    ) {
-        Ok(charge) => charge,
-        Err(status) => return status,
-    };
-    let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
-        Ok(creation) => creation,
-        Err(ObjectRegistryError::Capacity | ObjectRegistryError::ReferenceCountExhausted) => {
-            return DW_STATUS_NO_RESOURCES;
-        }
-        Err(error) => panic!("E5 MemoryObject generic creation failed unexpectedly: {error:?}"),
-    };
-    let backing = match backing_access.allocate_zeroed_backing(page_count) {
-        Ok(backing) => backing,
-        Err(status) => {
-            registry
-                .cancel_creation(creation)
-                .unwrap_or_else(|failure| {
-                    panic!(
-                        "E5 MemoryObject creation rollback drifted: {:?}",
-                        failure.error()
-                    )
-                });
-            return status;
-        }
-    };
-    let binding = match memory.bind_backing(
-        creation,
-        backing,
-        byte_len,
-        crate::memory::object::MemoryObjectKind::PageBacked,
-        crate::memory::object::MemoryProtection::READ_WRITE_EXECUTE,
-    ) {
-        Ok(binding) => binding,
-        Err(error) => {
-            let status = memory_object_status(error.error());
-            let (creation, backing) = error.into_parts();
-            backing_access.rollback_object_backing(backing);
-            registry
-                .cancel_creation(creation)
-                .unwrap_or_else(|failure| {
-                    panic!(
-                        "E5 failed payload bind could not cancel creation: {:?}",
-                        failure.error()
-                    )
-                });
-            return status;
-        }
-    };
-    let bound = registry
-        .finish_payload_binding(binding)
-        .unwrap_or_else(|failure| {
-            panic!(
-                "fresh E5 MemoryObject payload binding was rejected by ObjectRegistry: {:?}",
-                failure.error()
-            )
-        });
-    let reference = registry.bound_into_handle(bound).unwrap_or_else(|failure| {
-        panic!(
-            "fresh E5 MemoryObject bound creation could not become a handle: {:?}",
-            failure.error()
-        )
-    });
-    charge_created(registry, reference.id(), charge);
-    let handle = match tasks.process_handles_mut(current_process) {
-        Ok(table) => {
-            match install_created_handle(table, registry, reference, requested_rights, cleanup) {
-                Ok(handle) => handle,
-                Err(status) => return status,
-            }
-        }
-        Err(error) => {
-            cleanup.push_optional(
-                registry
-                    .release_handle(reference)
-                    .unwrap_or_else(|failure| {
-                        panic!(
-                            "E5 MemoryObject publication rollback drifted: {:?}",
-                            failure.error()
-                        )
-                    }),
-            );
-            return task_status(error);
-        }
-    };
-    output.commit(&encode_handle(handle));
-    DW_STATUS_SUCCESS
+    )
+    .is_ok()
 }
 
-/// Live MemoryObject creation uses one combined address-space session for the
-/// detached output pin and physical backing authority. This avoids creating
-/// simultaneous mutable aliases merely to satisfy the older split adapter.
+/// MemoryObjectCreate. One combined access provides the detached output pin
+/// and the physical backing, so the two cannot alias. This is the only
+/// MemoryObjectCreate transaction; host tests drive it through a shim.
 pub(crate) fn memory_object_create_owned<
     U: OwnedUserOutputAccess + MemoryObjectBackingAccess,
     const OBJECTS: usize,

@@ -1508,7 +1508,13 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
     /// The limited TaskGroups above `process`, nearest first (F4 DW1-F4-M1).
     pub(crate) fn charge_tag(&self, process: ProcessKey) -> Result<ChargeTag, QuotaError> {
         let record = self.process(process).map_err(|_| QuotaError::Task)?;
-        let mut group = Some(record.parent.id());
+        self.group_charge_tag(record.parent.id())
+    }
+
+    /// The limited TaskGroups at and above `group`, nearest first: the tag a
+    /// process created into `group` is charged with.
+    pub(crate) fn group_charge_tag(&self, group: ObjectId) -> Result<ChargeTag, QuotaError> {
+        let mut group = Some(group);
         let mut tag = ChargeTag::EMPTY;
         while let Some(object) = group {
             let slot = self
@@ -1521,6 +1527,24 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
             group = record.parent.as_ref().map(InternalRef::id);
         }
         Ok(tag)
+    }
+
+    /// [`Self::charge_tag`] of the process whose object is `process`.
+    pub(crate) fn process_object_charge_tag(
+        &self,
+        process: ObjectId,
+    ) -> Result<ChargeTag, QuotaError> {
+        self.charge_tag(ProcessKey(process))
+    }
+
+    /// Whether every live limited group of `creator` also limits `target`.
+    /// A creator may only create into a TaskGroup or Process that its own
+    /// limits still cover, so a limit cannot be escaped through a handle to
+    /// a group or process outside the limited subtree.
+    pub(crate) fn limits_cover(&self, creator: &ChargeTag, target: &ChargeTag) -> bool {
+        creator
+            .groups()
+            .all(|group| self.group_slot(TaskGroupKey(group)).is_err() || target.names(group))
     }
 
     /// [`Self::charge_tag`] of the thread's process.

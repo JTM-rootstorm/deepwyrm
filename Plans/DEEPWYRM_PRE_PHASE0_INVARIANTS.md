@@ -211,7 +211,7 @@ The TaskGroup model must remain capable of supporting later:
 
 The scheduler/resource-control algorithms themselves remain deferred.
 
-The first object/resource quotas exist (F4 DW1-F4-M1, 2026-11-10). `task_group_limit` lowers a per-class limit on a TaskGroup, for channel endpoints, events, timers, memory objects, threads, processes, child task groups and registered wait items. Each limit bounds what processes in that group's subtree create after it is set, and it can only fall. Usage is derived from live registry slots and wait entries, not kept as counters. Memory accounting and CPU policy remain deferred.
+The first object/resource quotas exist (F4 DW1-F4-M1, 2026-11-10). `task_group_limit` lowers a per-class limit on a TaskGroup, for channel endpoints, events, timers, memory objects, threads, processes, child task groups and registered wait items. Each limit bounds what processes in that group's subtree create after it is set, and it can only fall. Usage is derived from live registry slots and wait entries, not kept as counters. A process under a limit may create a TaskGroup, Process or Thread only inside its limited subtree (else ACCESS_DENIED), so a handle to a foreign group or process cannot carry it past its limits. Mapping leases are not a limit class: a process holds at most its one root region's mapping slots, so they are bounded through the process limit and sized for in the production geometry. Memory accounting and CPU policy remain deferred.
 
 ## 10.1 General-purpose scheduling with a future real-time class
 

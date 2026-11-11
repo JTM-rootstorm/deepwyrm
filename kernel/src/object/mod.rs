@@ -247,6 +247,13 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         core::array::from_fn(|slot| self.slots[slot].generation)
     }
 
+    /// Every slot's generation, state and reference counts, for tests that
+    /// prove an operation left the registry exactly as it found it.
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self) -> impl PartialEq + core::fmt::Debug + use<CAPACITY> {
+        self.slots
+    }
+
     pub(crate) fn create(
         &mut self,
         object_type: DwObjectType,
