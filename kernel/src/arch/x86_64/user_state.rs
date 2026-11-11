@@ -30,7 +30,6 @@ pub(crate) const CR4_PAGE_SIZE_EXTENSIONS: u64 = 1 << 4;
 pub(crate) const CR4_PAE: u64 = 1 << 5;
 pub(crate) const CR4_MACHINE_CHECK: u64 = 1 << 6;
 pub(crate) const CR4_PGE: u64 = 1 << 7;
-pub(crate) const CR4_PCE: u64 = 1 << 8;
 pub(crate) const CR4_OSFXSR: u64 = 1 << 9;
 pub(crate) const CR4_OSXMMEXCPT: u64 = 1 << 10;
 pub(crate) const CR4_UMIP: u64 = 1 << 11;
@@ -42,9 +41,6 @@ pub(crate) const CR4_PCIDE: u64 = 1 << 17;
 pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
 pub(crate) const CR4_SMEP: u64 = 1 << 20;
 pub(crate) const CR4_SMAP: u64 = 1 << 21;
-pub(crate) const CR4_PKE: u64 = 1 << 22;
-pub(crate) const CR4_CET: u64 = 1 << 23;
-pub(crate) const CR4_PKS: u64 = 1 << 24;
 
 /// The CR4 bits kept from firmware or the loader: paging and machine-check
 /// controls, supervisor protections, and VMX/SMX enables, which only CPL0

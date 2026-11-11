@@ -3,6 +3,10 @@ use super::*;
 const FXSR_SSE_SSE2: u32 = (1 << 24) | (1 << 25) | (1 << 26);
 const XSAVE: u32 = 1 << 26;
 const AVX: u32 = 1 << 28;
+const CR4_PCE: u64 = 1 << 8;
+const CR4_PKE: u64 = 1 << 22;
+const CR4_CET: u64 = 1 << 23;
+const CR4_PKS: u64 = 1 << 24;
 
 fn features(leaf1_ecx: u32, leaf1_edx: u32, xcr0_supported: u64) -> CpuFpFeatures {
     CpuFpFeatures {
