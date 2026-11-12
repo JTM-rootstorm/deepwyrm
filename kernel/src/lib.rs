@@ -743,6 +743,12 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             "boot",
             "activated Deep-owned page tables",
         );
+        #[cfg(not(feature = "test-support"))]
+        let _ = debug::emit_early_record(
+            debug::DiagnosticLevel::Info,
+            "cpu",
+            arch::x86_64::syscall::supervisor_protections_record(),
+        );
         #[cfg(feature = "test-support")]
         match test_support::BUILD_GUEST_TEST {
             #[cfg(deepwyrm_memory_guest)]

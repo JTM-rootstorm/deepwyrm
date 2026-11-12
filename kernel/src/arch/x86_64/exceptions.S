@@ -66,6 +66,12 @@ NO_ERROR 31
 .Lexception_common:
     cli
     cld
+    /* RFLAGS.AC is user-settable and interrupt delivery keeps it: clear it so
+       SMAP holds in the handler (DW2 M2). CLAC would #UD without SMAP; the
+       saved user RFLAGS keeps the user's AC. */
+    pushfq
+    btrq $18, (%rsp)
+    popfq
     /* Preserve RAX before using it to normalize the optional old-stack tail. */
     pushq %rax
     movq 32(%rsp), %rax
@@ -116,6 +122,12 @@ NO_ERROR 31
 dw_x86_64_apic_timer_entry:
     /* Interrupt gates enter with IF clear. Preserve the complete interrupted GPR set. */
     cld
+    /* RFLAGS.AC is user-settable and interrupt delivery keeps it: clear it so
+       SMAP holds in the handler (DW2 M2). CLAC would #UD without SMAP; the
+       saved user RFLAGS keeps the user's AC. */
+    pushfq
+    btrq $18, (%rsp)
+    popfq
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -210,6 +222,12 @@ dw_x86_64_apic_spurious_entry:
 .Lterminal_interrupt_common:
     cli
     cld
+    /* RFLAGS.AC is user-settable and interrupt delivery keeps it: clear it so
+       SMAP holds in the handler (DW2 M2). CLAC would #UD without SMAP; the
+       saved user RFLAGS keeps the user's AC. */
+    pushfq
+    btrq $18, (%rsp)
+    popfq
     pushq %rax
     movq 32(%rsp), %rax
     testb $3, %al

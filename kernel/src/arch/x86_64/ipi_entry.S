@@ -13,6 +13,12 @@
 \symbol:
     /* Interrupt gates enter with IF clear. */
     cld
+    /* RFLAGS.AC is user-settable and interrupt delivery keeps it: clear it so
+       SMAP holds in the handler (DW2 M2). CLAC would #UD without SMAP; the
+       saved user RFLAGS keeps the user's AC. */
+    pushfq
+    btrq $18, (%rsp)
+    popfq
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -89,6 +95,12 @@ IPI_ENTRY dw_x86_64_tlb_shootdown_ipi_entry, dw_x86_64_tlb_shootdown_ipi_dispatc
 dw_x86_64_q35_com2_entry:
     /* Interrupt gates enter with IF clear. */
     cld
+    /* RFLAGS.AC is user-settable and interrupt delivery keeps it: clear it so
+       SMAP holds in the handler (DW2 M2). CLAC would #UD without SMAP; the
+       saved user RFLAGS keeps the user's AC. */
+    pushfq
+    btrq $18, (%rsp)
+    popfq
     pushq %rax
     pushq %rbx
     pushq %rcx

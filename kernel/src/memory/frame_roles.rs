@@ -216,7 +216,8 @@ pub(crate) enum ArchitectureBootstrapKind {
     X86ApTrampoline,
     /// One frame of the Intel VT-d table pool: the root table, the bus-0
     /// context table, or a second-level table of some function's DMA domain.
-    /// The pool is mapped strong-uncacheable for the life of the machine.
+    /// The pool keeps its frames for the life of the machine and reaches
+    /// them through the direct map, flushing each line it touches.
     X86VtdTable,
 }
 

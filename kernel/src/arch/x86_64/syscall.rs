@@ -66,7 +66,8 @@ pub(crate) use live::{
     handoff_current_rendezvous_from_carrier, install_syscall_boundary,
     install_syscall_boundary_for_slot, kernel_alignment_flag_is_clear,
     native_runtime_carrier_lifecycle, publish_current_quantum_expiry,
-    release_native_runtime_carrier_for_slot, validate_live_syscall_boundary,
+    release_native_runtime_carrier_for_slot, supervisor_protections_record,
+    validate_live_syscall_boundary,
 };
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use runtime_binding::RuntimeCarrierLifecycle;

@@ -764,11 +764,13 @@ pub(super) fn validate_inactive_graph_with_workspace<
     let scratch_slots = scratch
         .slots()
         .ok_or(InactiveGraphError::InvalidScratchPath)?;
+    use crate::arch::x86_64::mm::direct_map::{DIRECT_MAP_BASE, DIRECT_MAP_SPAN};
+    const DIRECT_MAP_END: u64 = DIRECT_MAP_BASE + DIRECT_MAP_SPAN;
     let direct = scratch.direct;
     if direct.is_some()
         && (segments.iter().any(|segment| {
-            crate::arch::x86_64::mm::direct_map::in_direct_map_region(segment.start)
-                || crate::arch::x86_64::mm::direct_map::in_direct_map_region(segment.end - 1)
+            // The whole interval, not only its ends (M2 review R8).
+            segment.start < DIRECT_MAP_END && segment.end > DIRECT_MAP_BASE
         }) || scratch_slots.iter().any(|slot| {
             crate::arch::x86_64::mm::direct_map::in_direct_map_region(slot.window_page)
         }))

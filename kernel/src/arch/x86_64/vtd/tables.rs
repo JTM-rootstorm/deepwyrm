@@ -3,9 +3,10 @@
 //! `DW2_PCI_DEVICE_DMA_CONTRACT.md` §5. Every table is one 4 KiB frame from a
 //! fixed pool that [`TableMemory`] owns; entries are written one 64-bit word
 //! at a time, with the present bit written last on install and first on
-//! removal, so the unit never walks a half-written entry. The live pool maps
-//! its frames strong-uncacheable, so a unit that does not snoop CPU caches
-//! still reads every store.
+//! removal, so the unit never walks a half-written entry. The live pool
+//! reaches its frames through the write-back direct map and flushes the line
+//! of every entry it writes or reads, so a unit that does not snoop CPU
+//! caches still reads every store (DW2 M2).
 //!
 //! Only the legacy (non-scalable) formats are used: a root entry per bus, a
 //! context entry per device/function, and a 4-level second-level table with

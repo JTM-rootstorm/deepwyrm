@@ -497,6 +497,19 @@ fn local_supervisor_protections() -> u64 {
     crate::arch::x86_64::user_state::supervisor_protections(__cpuid_count(7, 0).ebx)
 }
 
+/// The serial record of the protections every CPU agreed on (DW2 M2), so a
+/// boot shows whether SMEP and SMAP are really on.
+pub(crate) fn supervisor_protections_record() -> &'static str {
+    use crate::arch::x86_64::user_state::{CR4_SMAP, CR4_SMEP};
+    let protections = published_supervisor_protections();
+    match (protections & CR4_SMEP != 0, protections & CR4_SMAP != 0) {
+        (true, true) => "smep and smap on",
+        (true, false) => "smep on, no smap",
+        (false, true) => "smap on, no smep",
+        (false, false) => "no smep or smap",
+    }
+}
+
 /// The protections every CPU agreed on, or none before any CPU installed.
 fn published_supervisor_protections() -> u64 {
     match SUPERVISOR_PROTECTIONS.load(Ordering::Acquire) {
