@@ -499,6 +499,12 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                     let base = unit.register_base();
                     boot_range_overlaps_non_mmio(boot_info, base, base.saturating_add(4096))
                 });
+                if !sound {
+                    // The units' pages stay closed to BARs even unmapped.
+                    for unit in dmar.units() {
+                        device::pci::KERNEL_MMIO.record(unit.register_base());
+                    }
+                }
                 #[cfg(not(feature = "test-support"))]
                 if !sound {
                     let _ = debug::emit_early_record(
