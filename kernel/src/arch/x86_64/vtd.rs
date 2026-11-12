@@ -606,9 +606,10 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         return Ok(VtdBootState::Absent);
     };
     let physical_limit = active.root().physical_limit();
-    // Map every unit and check that it answers before any unit or table is
-    // touched: if one does not, the DMAR is ignored as a whole and nothing
-    // is left half set up. Each page stays closed to BARs either way.
+    // Map every unit, which closes every unit's page to BARs, then check
+    // that each answers, all before any unit or table is touched: if one
+    // does not, the DMAR is ignored as a whole and nothing is left half set
+    // up.
     let mut bases = [0_u64; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
     for (base, unit) in bases.iter_mut().zip(snapshot.units()) {
         let frame = FrameAddress::new(unit.register_base(), physical_limit)
@@ -616,7 +617,9 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         *base = active
             .install_kernel_mmio_page(frame)
             .map_err(|_| VtdBootError::Mapping)?;
-        if !unit_responds(&mut LiveVtdMmio::new(*base)?) {
+    }
+    for base in bases.iter().copied().take(snapshot.units().len()) {
+        if !unit_responds(&mut LiveVtdMmio::new(base)?) {
             return Ok(VtdBootState::Unresponsive);
         }
     }

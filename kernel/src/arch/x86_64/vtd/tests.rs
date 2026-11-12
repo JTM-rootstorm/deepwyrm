@@ -686,12 +686,12 @@ fn a_unit_reading_all_ones_does_not_respond_and_is_never_written() {
         assert!(!unit_responds(&mut unit));
         assert!(unit.log.is_empty());
     }
-    // Without the probe the same page would fail the boot.
+    // Without the probe the same page would fail the boot: here on the
+    // all-ones IOTLB offset, which lies outside the register page.
     let mut floating = Unit::q35();
     floating.version = u32::MAX;
     floating.capability = u64::MAX;
     floating.extended = u64::MAX;
     floating.status = u32::MAX;
-    // (as an IOTLB offset outside the page, the first all-ones field checked).
     assert!(enable_default_deny(&mut floating, ROOT, 39).is_err());
 }
