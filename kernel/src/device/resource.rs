@@ -94,7 +94,12 @@ pub(crate) struct DeviceResourceFinalization {
     grant: Option<DeviceResourceGrantLease>,
 }
 
-impl DeviceResourceFinalization {}
+impl DeviceResourceFinalization {
+    /// The boot resource whose lease this finalization returns, if any.
+    pub(crate) fn boot_resource_id(&self) -> Option<u64> {
+        self.grant.map(|grant| grant.resource_id)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DeviceResourceGrantLease {

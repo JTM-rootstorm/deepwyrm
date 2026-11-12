@@ -1745,9 +1745,13 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         frame: FrameAddress,
     ) -> Result<u64, LiveActiveTargetError> {
-        self.target
+        let page = self
+            .target
             .bootstrap_scratch_target()?
-            .install_mmio_frame(frame)
+            .install_mmio_frame(frame)?;
+        // No PCI BAR may later be admitted over a kernel MMIO page.
+        crate::device::pci::KERNEL_MMIO.record(frame.address());
+        Ok(page)
     }
 
     /// Gives one admitted PCI memory BAR a permanent device-MMIO frame role

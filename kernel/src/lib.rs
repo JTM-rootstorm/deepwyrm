@@ -492,6 +492,23 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 )
                 .unwrap_or_else(|error| panic!("DMAR discovery failed: {error:?}"))
             };
+            // A remapping unit whose registers would lie in memory is not
+            // one: without it no device is confined, so none gets DMA.
+            let dmar = dmar.filter(|dmar| {
+                let sound = !dmar.units().iter().any(|unit| {
+                    let base = unit.register_base();
+                    boot_range_overlaps_non_mmio(boot_info, base, base.saturating_add(4096))
+                });
+                #[cfg(not(feature = "test-support"))]
+                if !sound {
+                    let _ = debug::emit_early_record(
+                        debug::DiagnosticLevel::Warn,
+                        "iommu",
+                        "a DMAR unit's registers overlap memory; remapping hardware ignored",
+                    );
+                }
+                sound
+            });
             #[cfg(not(feature = "test-support"))]
             if dmar.is_some_and(|dmar| dmar.reserved_memory_regions() != 0) {
                 let _ = debug::emit_early_record(
@@ -559,7 +576,10 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                     descriptor.pci_address,
                     descriptor.pci_ids,
                     physical_limit,
-                    |start, end| boot_range_overlaps_non_mmio(boot_info, start, end),
+                    |start, end| {
+                        boot_range_overlaps_non_mmio(boot_info, start, end)
+                            || device::pci::KERNEL_MMIO.overlaps(start, end)
+                    },
                 );
                 #[cfg(not(feature = "test-support"))]
                 let _ = debug::emit_early_record(

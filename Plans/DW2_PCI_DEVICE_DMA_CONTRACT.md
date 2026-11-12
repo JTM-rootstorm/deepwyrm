@@ -48,7 +48,7 @@ offset type                  field
 
 At boot the kernel reads each PCI-function record's vendor and device ID through configuration mechanism #1 (ports 0xCF8/0xCFC; standard space only, so no MCFG/ECAM is needed yet). It also sizes the BARs: it saves each BAR, writes all ones, reads the size back, and restores the BAR with memory decoding disabled for the duration. A function whose IDs differ from the record, which is absent, or whose BARs fail validation is **unavailable**: its claim fails with `DW_STATUS_NOT_FOUND`, and COM1 says why. Other records are unaffected.
 
-A memory BAR is admitted only if it is non-empty and page-aligned, has a page-multiple size, lies below the CPU's physical-address limit, and overlaps no range the boot memory map marks usable, ACPI, kernel or module. I/O BARs are recorded but not admitted in this revision.
+A memory BAR is admitted only if it is non-empty and page-aligned, has a page-multiple size, lies below the CPU's physical-address limit, and overlaps no range the boot memory map marks usable, ACPI, kernel or module, no page the kernel maps for itself as MMIO (local APIC, IOAPIC, VT-d registers and tables, all mapped before the probe), and not the interrupt window 0xFEE00000–0xFEFFFFFF. A DMAR unit whose register page overlaps a non-MMIO memory-map range is ignored, so no device is confined and none gets DMA. I/O BARs are recorded but not admitted in this revision.
 
 The kernel serializes all 0xCF8/0xCFC access under one IRQ-safe lock. Userspace never gets those ports.
 
@@ -86,7 +86,7 @@ This replaces the earlier `device_mmio_map(resource, bar, offset, length, region
 - **Who may revoke** (review risk K3, closed 2026-11-11). Only a caller whose handle carries WRITE or MODIFY, the rights that drive the function's DMA, takes another process's domain over. `device_pci_command` (WRITE), `dma_map` and `dma_unmap` (MODIFY) always qualify; `device_mmio_object_create` needs only MAP, and a MAP-only caller meets a foreign domain with `DW_STATUS_BAD_STATE` and leaves it untouched.
 - **Inert at probe** (review finding D1, 2026-11-11). K1's probe restores the command register after sizing with bus mastering and I/O decoding cleared, whatever firmware left (OVMF hands its virtio disks over at 0x7); memory decoding is kept. Bus mastering is therefore on only where `device_pci_command` turned it on for a confined function.
 - **No IOMMU.** With K0's `Absent`, or for a function no unit translates, `dma_map` and bus mastering are `NOT_SUPPORTED`. There is no pass-through mode.
-- **Teardown** runs when the DeviceResource finalizes, before its boot lease returns for a new claim: memory decoding and bus mastering are cleared in the command register, the context entry is cleared (present half first), the context cache and the domain's IOTLB are invalidated, the tables are zeroed and returned to the pool, and only then are the MemoryObject references released. The device can therefore never reach a page after it is freed.
+- **Teardown** runs when the DeviceResource finalizes, before its boot lease returns for a new claim: memory decoding and bus mastering are cleared in the command register (for every PCI function, whether or not it had a domain), the context entry is cleared (present half first), the context cache and the domain's IOTLB are invalidated, the tables are zeroed and returned to the pool, and only then are the MemoryObject references released. The device can therefore never reach a page after it is freed.
 
 ## 6. Out of scope
 

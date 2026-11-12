@@ -311,6 +311,11 @@ impl<
                     .unwrap_or_else(|(error, _)| {
                         panic!("DeviceResource final release bypassed its typed payload: {error:?}")
                     });
+                // Decoding and bus mastering go off before the lease returns,
+                // domain or not (DW2 contract §5).
+                if let Some(resource_id) = finalization.boot_resource_id() {
+                    crate::device::pci::quiesce_boot_resource(resource_id);
+                }
                 if let Some(grants) = self.boot_resource_grants {
                     complete_device_resource_finalization_with_grants(
                         self.registry,

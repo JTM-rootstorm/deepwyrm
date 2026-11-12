@@ -592,5 +592,85 @@ impl PciProbeTable {
 
 pub(crate) static PCI_FUNCTIONS: PciProbeTable = PciProbeTable::new();
 
+/// The xAPIC and MSI address window: no BAR may decode it.
+const INTERRUPT_WINDOW: (u64, u64) = (0xfee0_0000, 0xff00_0000);
+const KERNEL_MMIO_CAPACITY: usize = 192;
+
+/// Every page the kernel maps for itself as MMIO (local APIC, IOAPIC, VT-d
+/// registers and tables), recorded as it is mapped. All of them are mapped
+/// before the boot PCI probe, which refuses any BAR over one: a driver that
+/// could map such a page could, for one, turn VT-d translation off (storage
+/// review D5).
+pub(crate) struct KernelMmioPages {
+    pages: crate::sync::SpinMutex<([u64; KERNEL_MMIO_CAPACITY], usize, bool)>,
+}
+
+impl KernelMmioPages {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pages: crate::sync::SpinMutex::new(([0; KERNEL_MMIO_CAPACITY], 0, false)),
+        }
+    }
+
+    /// Records the page at `physical`. Past capacity every range overlaps,
+    /// so no BAR is admitted rather than one over an unrecorded page.
+    pub(crate) fn record(&self, physical: u64) {
+        let mut pages = self.pages.lock();
+        let (list, count, saturated) = &mut *pages;
+        if *count < KERNEL_MMIO_CAPACITY {
+            list[*count] = physical & !(PAGE - 1);
+            *count += 1;
+        } else {
+            *saturated = true;
+        }
+    }
+
+    /// Whether `[start, end)` touches a recorded page or the interrupt window.
+    pub(crate) fn overlaps(&self, start: u64, end: u64) -> bool {
+        if start < INTERRUPT_WINDOW.1 && INTERRUPT_WINDOW.0 < end {
+            return true;
+        }
+        let pages = self.pages.lock();
+        let (list, count, saturated) = &*pages;
+        *saturated
+            || list[..*count]
+                .iter()
+                .any(|&page| page < end && start < page.saturating_add(PAGE))
+    }
+}
+
+pub(crate) static KERNEL_MMIO: KernelMmioPages = KernelMmioPages::new();
+
+/// Clears memory decoding and bus mastering of the function behind boot
+/// resource `resource_id`, if one was probed. Runs whenever a DeviceResource
+/// finalizes, before its lease returns, so the next driver never inherits a
+/// function still mastering the bus, whether or not it ever had a DMA domain
+/// (DW2 contract §5 Teardown; storage review D2). Returns whether a function
+/// was cleared.
+pub(crate) fn quiesce<C: ConfigSpace>(
+    table: &PciProbeTable,
+    config: &mut C,
+    resource_id: u64,
+) -> bool {
+    let Some(function) = table.function(resource_id) else {
+        return false;
+    };
+    set_command(config, function.address(), false, false, true)
+        .expect("clearing the command bits is always allowed");
+    true
+}
+
+/// [`quiesce`] over the live configuration mechanism.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn quiesce_boot_resource(resource_id: u64) {
+    let mut ports = crate::arch::x86_64::io_port::X86PortIo;
+    let mut config = crate::arch::x86_64::pci_config::Mechanism1::new(&mut ports);
+    quiesce(&PCI_FUNCTIONS, &mut config, resource_id);
+}
+
+/// Host builds probe no live function.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) fn quiesce_boot_resource(_resource_id: u64) {}
+
 #[cfg(test)]
 mod tests;

@@ -492,3 +492,53 @@ fn a_backing_must_match_its_admitted_bar_exactly_and_only_once() {
             .is_err()
     );
 }
+
+/// A finalizing DeviceResource leaves its function with decoding and bus
+/// mastering off even when it never had a DMA domain (review D2).
+#[test]
+fn quiescing_a_probed_function_clears_decoding_and_bus_mastering() {
+    let table = PciProbeTable::new();
+    assert!(table.record(7, Ok(probed_virtio_blk())));
+    let mut space = FlatSpace::new();
+    space.set_command_dword(0x0400 | 0x0007);
+    assert!(quiesce(&table, &mut space, 7));
+    assert_eq!(space.command(), 0x0400);
+    // An unprobed resource touches no function.
+    let mut untouched = FlatSpace::new();
+    assert!(!quiesce(&table, &mut untouched, 8));
+    assert!(untouched.writes.is_empty());
+}
+
+/// No BAR may decode a kernel MMIO page or the interrupt window (review D5).
+#[test]
+fn kernel_mmio_pages_and_the_interrupt_window_overlap_every_bar_over_them() {
+    let pages = KernelMmioPages::new();
+    pages.record(0xfed9_0000);
+    assert!(pages.overlaps(0xfed9_0000, 0xfed9_1000));
+    assert!(pages.overlaps(0xfed0_0000, 0xfee0_0000));
+    assert!(!pages.overlaps(0xfed9_1000, 0xfed9_2000));
+    assert!(!pages.overlaps(0xc0_0000_0000, 0xc0_0000_4000));
+    assert!(pages.overlaps(0xfee0_0000, 0xfee0_1000));
+    assert!(pages.overlaps(0xfec0_0000, 0xfef0_0000));
+    // A BAR over a kernel page is refused at probe.
+    pages.record(0xc0_0000_2000);
+    let mut function = Function::virtio_blk();
+    let probed = probe(&mut function, ADDRESS, VIRTIO_BLK, LIMIT, |start, end| {
+        pages.overlaps(start, end)
+    })
+    .unwrap();
+    assert_eq!(
+        probed.bar(4),
+        Some(BarSlot::Refused(BarRefusal::OverlapsMemory))
+    );
+}
+
+/// Past capacity, every range overlaps: nothing unrecorded slips through.
+#[test]
+fn a_full_kernel_mmio_record_admits_no_bar() {
+    let pages = KernelMmioPages::new();
+    for page in 0..=KERNEL_MMIO_CAPACITY as u64 {
+        pages.record(0x1_0000_0000 + page * PAGE);
+    }
+    assert!(pages.overlaps(0xc0_0000_0000, 0xc0_0000_4000));
+}
