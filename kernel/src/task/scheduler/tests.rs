@@ -4013,3 +4013,30 @@ fn threads_passing_messages_cannot_starve_a_cpu_bound_thread() {
     }
     let _ = (client, service);
 }
+
+#[test]
+fn runnable_order_keeps_retained_quantum_first() {
+    // D8 review D8-1: a wake that kept nothing kept its block-time position,
+    // ahead of a Thread that had woken earlier with time kept.
+    let (mut cpu0, threads) = OneCpu::with_threads(4);
+    let (spent, first, second, hog) = (threads[0], threads[1], threads[2], threads[3]);
+    assert_eq!(cpu0.dispatch_first(), spent);
+    let spent_wake = cpu0.block(false);
+    assert_eq!(cpu0.current(), Some(first));
+    cpu0.now_ns += 1_000_000;
+    let first_wake = cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(second));
+    cpu0.now_ns += 1_000_000;
+    let second_wake = cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(hog));
+    cpu0.wake(first_wake);
+    cpu0.wake(spent_wake);
+    cpu0.wake(second_wake);
+    let mut order = std::vec::Vec::new();
+    for _ in 0..3 {
+        cpu0.expire();
+        order.push(cpu0.current().unwrap());
+    }
+    assert_eq!(order, [first, second, spent]);
+    assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+}

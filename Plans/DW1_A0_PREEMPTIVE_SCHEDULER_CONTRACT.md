@@ -187,9 +187,16 @@ clock, the Thread keeps what its exact quantum had left, if that is at least
 Thread that kept nothing, in FIFO order among those that kept some, and its
 next dispatch arms a quantum of only what it kept. Quantum expiry and yield
 requeue with nothing kept, and a dispatch from ordinary order arms a full
-quantum. So between two dispatches from ordinary order a Thread runs at most
-one quantum in total: a chain of Threads passing messages runs promptly but
-cannot starve a CPU-bound peer. Precedent: MINIX 3 enqueues a process that
+quantum. A wake that kept nothing moves the Thread behind every Runnable
+Thread that kept some, so those always come first (D8 review D8-1). So while a peer is
+Runnable on its CPU, a Thread runs at most one quantum between two dispatches
+from ordinary order: a chain of Threads passing messages runs promptly but
+cannot starve a CPU-bound peer. The bound is in charged time: a quantum is
+armed at return to userspace and the block samples the clock before its
+scheduler commit and switch, so kernel time outside that window (the switch,
+and a woken Thread's completion of its wait) is not charged. Accepted
+2026-11-12 (D8 review R1, Medium): the wait stays bounded; charging from
+dispatch would need the clock at claim time. Precedent: MINIX 3 enqueues a process that
 blocked with time left at the head of its queue (Tanenbaum and Woodhull,
 *Operating Systems: Design and Implementation*, 3rd ed., §2.6). A block with no
 clock sample keeps nothing, which is the behaviour before D8.

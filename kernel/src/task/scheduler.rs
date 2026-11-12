@@ -1327,25 +1327,36 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         self.dispatch_budget[cpu.index()] = (budget_ns != 0).then_some((claim, budget_ns));
     }
 
-    /// Moves a just-woken entry holding retained quantum ahead of every
-    /// Runnable entry that holds none, keeping FIFO order among those that do
-    /// (D8). Positions only order Runnable entries; Blocked ones are skipped
-    /// by every claim.
+    /// Keeps Runnable order with every entry holding retained quantum ahead
+    /// of every entry holding none (D8). A woken entry holding some moves
+    /// ahead of the first Runnable entry holding none, behind those holding
+    /// some; one holding none moves behind the last Runnable entry holding
+    /// some, and otherwise keeps its place, as before D8. Expiry and yield
+    /// requeue at the tail with nothing retained. Positions only order
+    /// Runnable entries; Blocked ones are skipped by every claim.
     fn advance_woken_entry(&mut self, index: usize) {
         let Some(entry) = self.queue[index] else {
             return;
         };
-        if entry.retained_quantum_ns == 0 {
-            return;
-        }
-        let Some(target) = self.queue[..index].iter().position(|queued| {
+        let runnable_holding = |queued: &Option<QueueEntry>, holding: bool| {
             queued.is_some_and(|queued| {
-                queued.state == SchedulerThreadState::Runnable && queued.retained_quantum_ns == 0
+                queued.state == SchedulerThreadState::Runnable
+                    && (queued.retained_quantum_ns != 0) == holding
             })
-        }) else {
-            return;
         };
-        self.queue[target..=index].rotate_right(1);
+        if entry.retained_quantum_ns == 0 {
+            if let Some(last) = self.queue[index + 1..self.len]
+                .iter()
+                .rposition(|queued| runnable_holding(queued, true))
+            {
+                self.queue[index..=index + 1 + last].rotate_left(1);
+            }
+        } else if let Some(target) = self.queue[..index]
+            .iter()
+            .position(|queued| runnable_holding(queued, false))
+        {
+            self.queue[target..=index].rotate_right(1);
+        }
     }
 
     fn claim_first_runnable_for_idle(
