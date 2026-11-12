@@ -388,6 +388,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         identity: active.identity,
         roles: &mut *active.target.roles,
         scratch: &mut scratch,
+        journal: crate::arch::x86_64::mm::JournalStorage::new(),
         _not_send_sync: core::marker::PhantomData,
     };
     if let Err(detail) = setup.validate_live_kernel_guard_layout() {

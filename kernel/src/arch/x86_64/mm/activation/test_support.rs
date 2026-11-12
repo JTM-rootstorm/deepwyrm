@@ -18,6 +18,8 @@ struct ActiveRootTestAuthority<'a, const RANGE_CAPACITY: usize, const ROLE_CAPAC
     identity: TableIdentity,
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     scratch: &'a mut ActiveScratchTarget<LiveActiveScratchIo>,
+    /// The publishers' journal storage (Deepwyrm D7: a journal borrows it).
+    journal: crate::arch::x86_64::mm::JournalStorage<4, 1>,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
 
@@ -460,6 +462,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 self.roles,
                 self.scratch,
                 candidates,
+                &mut self.journal,
             )
         }
         .map_err(|_| 0x0405_u32)
@@ -1397,6 +1400,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             identity: self.identity,
             roles: &mut *self.target.roles,
             scratch: &mut scratch,
+            journal: crate::arch::x86_64::mm::JournalStorage::new(),
             _not_send_sync: core::marker::PhantomData,
         };
         if let Err(detail) = authority.validate_live_kernel_guard_layout() {
