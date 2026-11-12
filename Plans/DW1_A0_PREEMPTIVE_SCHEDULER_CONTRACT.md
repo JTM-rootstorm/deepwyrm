@@ -180,6 +180,20 @@ eligible peer runs. A voluntary yield has the same queue-order effect but is
 accounted separately. Blocking and terminal transitions do not enqueue the
 outgoing Thread.
 
+D8 (2026-11-12) adds one exception to FIFO order, for Threads that block
+before their quantum is spent. When the block path samples the monotonic
+clock, the Thread keeps what its exact quantum had left, if that is at least
+`MIN_RETAINED_QUANTUM_NS` (100 µs). Its wake places it ahead of every Runnable
+Thread that kept nothing, in FIFO order among those that kept some, and its
+next dispatch arms a quantum of only what it kept. Quantum expiry and yield
+requeue with nothing kept, and a dispatch from ordinary order arms a full
+quantum. So between two dispatches from ordinary order a Thread runs at most
+one quantum in total: a chain of Threads passing messages runs promptly but
+cannot starve a CPU-bound peer. Precedent: MINIX 3 enqueues a process that
+blocked with time left at the head of its queue (Tanenbaum and Woodhull,
+*Operating Systems: Design and Implementation*, 3rd ed., §2.6). A block with no
+clock sample keeps nothing, which is the behaviour before D8.
+
 If no peer is locally runnable, quantum expiry may retain the current Thread,
 clear the consumed reschedule request, and arm a fresh quantum. It still records
 the expiration; it must not manufacture a context switch.

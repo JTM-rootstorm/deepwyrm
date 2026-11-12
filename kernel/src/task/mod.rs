@@ -92,6 +92,19 @@ fn scheduler_requester_cpu() -> SchedulerCpuId {
     SchedulerCpuId::BOOTSTRAP
 }
 
+/// The monotonic time at which a Thread blocks, so it keeps its unused
+/// quantum (D8). `None` before the live clock exists or when it faults; the
+/// block then keeps nothing, as before D8.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn scheduler_block_time_ns() -> Option<u64> {
+    crate::time::monotonic_now().ok()
+}
+
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+fn scheduler_block_time_ns() -> Option<u64> {
+    None
+}
+
 /// Notifies an exact continuation owner, or eligible remote idle CPUs for
 /// unpinned Runnable work. This is intentionally a no-op in host/model builds;
 /// their deterministic idle-wake controller tests drive the protocol directly.

@@ -3833,3 +3833,183 @@ fn per_cpu_scheduler_tables_span_the_canonical_cpu_capacity() {
     let _: &[Option<BlockWakeKey>; crate::cpu::CPU_CAPACITY] = &state.pending_block;
     let _: &[Option<SuspendedContinuation>; crate::cpu::CPU_CAPACITY] = &state.suspended;
 }
+
+/// D8 harness: one CPU, explicit monotonic time.
+struct OneCpu {
+    scheduler: CooperativeScheduler<16>,
+    now_ns: u64,
+    ticket: Option<SchedulerQuantumTicket>,
+}
+
+impl OneCpu {
+    fn with_threads(count: usize) -> (Self, std::vec::Vec<ThreadKey>) {
+        let scheduler = CooperativeScheduler::<16>::new();
+        let mut registry = ObjectRegistry::<16>::new();
+        let threads: std::vec::Vec<_> = (0..count).map(|_| thread_key(&mut registry)).collect();
+        for thread in &threads {
+            scheduler
+                .commit_on(cpu(0), scheduler.reserve(*thread).unwrap())
+                .unwrap();
+        }
+        (
+            Self {
+                scheduler,
+                now_ns: 1_000,
+                ticket: None,
+            },
+            threads,
+        )
+    }
+
+    fn current(&self) -> Option<ThreadKey> {
+        self.scheduler.current_on(cpu(0))
+    }
+
+    /// Returns the current Thread to userspace, arming its quantum if it has
+    /// none, as the live return path does.
+    fn run(&mut self) -> SchedulerQuantumTicket {
+        if let Some(ticket) = self
+            .scheduler
+            .prepare_quantum_if_needed_on(cpu(0), self.now_ns)
+            .unwrap()
+        {
+            self.ticket = Some(ticket);
+        }
+        self.ticket.unwrap()
+    }
+
+    fn dispatch_first(&mut self) -> ThreadKey {
+        let next = self
+            .scheduler
+            .schedule_next_on(cpu(0))
+            .unwrap()
+            .current
+            .unwrap();
+        self.run();
+        next
+    }
+
+    fn block(&mut self, sampled: bool) -> BlockWakeKey {
+        let claim = self.scheduler.running_claim_on(cpu(0)).unwrap();
+        let block = self
+            .scheduler
+            .prepare_block_current_on(cpu(0), claim.thread())
+            .unwrap();
+        let wake = block.wake_key();
+        let at = sampled.then_some(self.now_ns);
+        self.scheduler.commit_block_at(cpu(0), block, at).unwrap();
+        self.scheduler.complete_switch_on(claim).unwrap();
+        self.ticket = None;
+        if self.current().is_some() {
+            self.run();
+        }
+        wake
+    }
+
+    fn wake(&self, key: BlockWakeKey) {
+        self.scheduler.wake_on(cpu(0), key).unwrap();
+    }
+
+    /// Expires the current quantum and takes the safe-return decision.
+    fn expire(&mut self) {
+        let ticket = self.ticket.take().unwrap();
+        self.now_ns = self.now_ns.max(ticket.deadline_ns());
+        assert_eq!(self.scheduler.publish_quantum_expiry(ticket), Ok(true));
+        match self.scheduler.preempt_current_on(cpu(0)).unwrap() {
+            SchedulerPreemptionDecision::Switch { outgoing, .. } => {
+                self.scheduler.complete_switch_on(outgoing).unwrap();
+            }
+            SchedulerPreemptionDecision::RetainCurrent { .. } => {}
+            SchedulerPreemptionDecision::Deferred => panic!("safe return was deferred"),
+        }
+        self.run();
+    }
+}
+
+#[test]
+fn a_woken_thread_spends_its_unused_quantum_ahead_of_preempted_threads() {
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    let (service, hog1, hog2) = (threads[0], threads[1], threads[2]);
+    assert_eq!(cpu0.dispatch_first(), service);
+    cpu0.now_ns += 1_000_000;
+    let wake = cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(hog1));
+    cpu0.wake(wake);
+    cpu0.expire();
+    // Before D8 the service sat behind hog2 for another whole quantum.
+    assert_eq!(cpu0.current(), Some(service));
+    assert_eq!(
+        cpu0.ticket.unwrap().deadline_ns(),
+        cpu0.now_ns + DEFAULT_NORMAL_QUANTUM_NS - 1_000_000,
+        "the service runs on what its slice had left, not a fresh quantum"
+    );
+    cpu0.expire();
+    assert_eq!(cpu0.current(), Some(hog2));
+    assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_block_keeps_no_quantum_without_a_clock_sample_or_below_the_minimum() {
+    for (advance, sampled) in [
+        (1_000_000, false),
+        (
+            DEFAULT_NORMAL_QUANTUM_NS - MIN_RETAINED_QUANTUM_NS + 1,
+            true,
+        ),
+    ] {
+        let (mut cpu0, threads) = OneCpu::with_threads(3);
+        assert_eq!(cpu0.dispatch_first(), threads[0]);
+        cpu0.now_ns += advance;
+        let wake = cpu0.block(sampled);
+        cpu0.wake(wake);
+        cpu0.expire();
+        assert_eq!(cpu0.current(), Some(threads[2]), "FIFO order is unchanged");
+        cpu0.expire();
+        assert_eq!(cpu0.current(), Some(threads[0]));
+        assert_eq!(
+            cpu0.ticket.unwrap().deadline_ns(),
+            cpu0.now_ns + DEFAULT_NORMAL_QUANTUM_NS
+        );
+    }
+}
+
+#[test]
+fn threads_passing_messages_cannot_starve_a_cpu_bound_thread() {
+    // Two Threads that each wake the other and block, the shape of a client
+    // and a service, against one Thread that never blocks.
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    let (client, service, hog) = (threads[0], threads[1], threads[2]);
+    assert_eq!(cpu0.dispatch_first(), client);
+    let mut parked = None;
+    let mut chain_ns = 0;
+    let mut hog_turns = 0;
+    let mut last = cpu0.now_ns;
+    while hog_turns < 20 {
+        let current = cpu0.current().unwrap();
+        cpu0.now_ns += 300_000;
+        if current == hog {
+            hog_turns += 1;
+            cpu0.expire();
+        } else {
+            chain_ns += cpu0.now_ns - last;
+            if cpu0.now_ns >= cpu0.ticket.unwrap().deadline_ns() {
+                cpu0.expire();
+            } else {
+                if let Some(peer) = parked.take() {
+                    cpu0.wake(peer);
+                }
+                parked = Some(cpu0.block(true));
+            }
+            assert!(
+                chain_ns <= 2 * DEFAULT_NORMAL_QUANTUM_NS + 300_000,
+                "the pair ran {chain_ns} ns without the hog"
+            );
+        }
+        if cpu0.current() == Some(hog) {
+            chain_ns = 0;
+        }
+        last = cpu0.now_ns;
+        assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+    }
+    let _ = (client, service);
+}

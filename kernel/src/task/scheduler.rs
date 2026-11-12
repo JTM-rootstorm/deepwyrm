@@ -64,6 +64,11 @@ pub(crate) enum SchedulerError {
 /// Fixed DW1 normal-class quantum. This is internal policy, not ABI.
 pub(crate) const DEFAULT_NORMAL_QUANTUM_NS: u64 = 5_000_000;
 
+/// The least unused quantum a blocking Thread keeps (D8). Below it, the
+/// Thread is woken into ordinary FIFO order and its next dispatch mints a full
+/// quantum, so a nearly spent slice never earns a near-zero timer arm.
+pub(crate) const MIN_RETAINED_QUANTUM_NS: u64 = 100_000;
+
 /// Exact identity of one CPU-local scheduler deadline source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerQuantumTicket {
@@ -590,6 +595,13 @@ struct QueueEntry {
     #[cfg(test)]
     migration_exclusion: Option<SchedulerMigrationRejectionReason>,
     ready_at_ns: Option<u64>,
+    /// Unused quantum kept when this Thread blocked (D8); zero when none. A
+    /// wake places a Thread holding some ahead of every Runnable Thread that
+    /// holds none, and its next dispatch runs on what is left instead of a
+    /// fresh quantum. Quantum expiry and yield requeue with zero, so between
+    /// two dispatches from ordinary FIFO order a Thread runs at most one
+    /// quantum in total and cannot starve its peers.
+    retained_quantum_ns: u64,
 }
 
 const SCHEDULER_TRACE_CAPACITY: usize = 64;
@@ -895,6 +907,9 @@ struct SchedulerState<const CAPACITY: usize> {
     instrumentation_now_ns: [Option<u64>; H2_SCHEDULER_CPU_CAPACITY],
     instrumentation_global_now_ns: Option<u64>,
     quantum: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
+    /// The retained quantum of the Thread last claimed on each CPU, consumed
+    /// by that exact claim's next quantum mint.
+    dispatch_budget: [Option<(RunningClaim, u64)>; H2_SCHEDULER_CPU_CAPACITY],
     need_resched: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
     preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
     last_migration: Option<SchedulerMigrationRecord>,
@@ -940,6 +955,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             instrumentation_now_ns: [None; H2_SCHEDULER_CPU_CAPACITY],
             instrumentation_global_now_ns: None,
             quantum: [None; H2_SCHEDULER_CPU_CAPACITY],
+            dispatch_budget: [None; H2_SCHEDULER_CPU_CAPACITY],
             need_resched: [None; H2_SCHEDULER_CPU_CAPACITY],
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             last_migration: None,
@@ -1283,6 +1299,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         cpu: SchedulerCpuId,
     ) -> Result<Option<RunningClaim>, SchedulerError> {
         let Some(index) = self.first_local_runnable_index(cpu) else {
+            self.dispatch_budget[cpu.index()] = None;
             return Ok(None);
         };
         let entry = self.remove_index(index);
@@ -1291,10 +1308,44 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         } else {
             self.mint_execution_generation()?
         };
-        Ok(Some(RunningClaim {
+        let claim = RunningClaim {
             thread: entry.thread,
             generation,
-        }))
+        };
+        self.publish_dispatch_budget(cpu, claim, entry.retained_quantum_ns);
+        Ok(Some(claim))
+    }
+
+    /// Hands a claimed entry's retained quantum to that exact claim's next
+    /// mint. Any earlier unconsumed budget on the CPU is dropped.
+    fn publish_dispatch_budget(
+        &mut self,
+        cpu: SchedulerCpuId,
+        claim: RunningClaim,
+        budget_ns: u64,
+    ) {
+        self.dispatch_budget[cpu.index()] = (budget_ns != 0).then_some((claim, budget_ns));
+    }
+
+    /// Moves a just-woken entry holding retained quantum ahead of every
+    /// Runnable entry that holds none, keeping FIFO order among those that do
+    /// (D8). Positions only order Runnable entries; Blocked ones are skipped
+    /// by every claim.
+    fn advance_woken_entry(&mut self, index: usize) {
+        let Some(entry) = self.queue[index] else {
+            return;
+        };
+        if entry.retained_quantum_ns == 0 {
+            return;
+        }
+        let Some(target) = self.queue[..index].iter().position(|queued| {
+            queued.is_some_and(|queued| {
+                queued.state == SchedulerThreadState::Runnable && queued.retained_quantum_ns == 0
+            })
+        }) else {
+            return;
+        };
+        self.queue[target..=index].rotate_right(1);
     }
 
     fn claim_first_runnable_for_idle(
@@ -1325,10 +1376,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             self.mint_execution_generation()?
         };
         let entry = self.remove_index(index);
-        Ok(Some(RunningClaim {
+        let claim = RunningClaim {
             thread: entry.thread,
             generation,
-        }))
+        };
+        self.publish_dispatch_budget(cpu, claim, entry.retained_quantum_ns);
+        Ok(Some(claim))
     }
 
     fn steal_oldest_for(
@@ -1522,8 +1575,12 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         claim: RunningClaim,
         now_ns: u64,
     ) -> Result<SchedulerQuantumTicket, SchedulerError> {
+        let budget_ns = match self.dispatch_budget[cpu.index()].take() {
+            Some((owner, budget_ns)) if owner == claim => budget_ns,
+            _ => DEFAULT_NORMAL_QUANTUM_NS,
+        };
         let deadline_ns = now_ns
-            .checked_add(DEFAULT_NORMAL_QUANTUM_NS)
+            .checked_add(budget_ns)
             .ok_or(SchedulerError::TokenExhausted)?;
         let source_arm_generation = self.next_quantum_generation[cpu.index()];
         self.next_quantum_generation[cpu.index()] = source_arm_generation
@@ -2045,6 +2102,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             #[cfg(test)]
             migration_exclusion: None,
             ready_at_ns: None,
+            retained_quantum_ns: 0,
         })?;
         state.next_token = next_token;
         state.assert_invariants();
@@ -2379,6 +2437,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns,
+                retained_quantum_ns: 0,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
         state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -2680,6 +2739,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns,
+                retained_quantum_ns: 0,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
         state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -2787,6 +2847,19 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         cpu: SchedulerCpuId,
         reservation: BlockReservation,
     ) -> Result<ScheduleDecision, BlockReservationFailure> {
+        self.commit_block_at(cpu, reservation, None)
+    }
+
+    /// Commits a block as `commit_block_on` does. When the caller sampled the
+    /// monotonic clock (`blocked_at_ns`), the Thread keeps what its exact
+    /// cancelled quantum had left, if that is at least
+    /// `MIN_RETAINED_QUANTUM_NS`, for its next dispatch (D8).
+    pub(crate) fn commit_block_at(
+        &self,
+        cpu: SchedulerCpuId,
+        reservation: BlockReservation,
+        blocked_at_ns: Option<u64>,
+    ) -> Result<ScheduleDecision, BlockReservationFailure> {
         let mut state = self.state.lock();
         if reservation.key.domain != state.domain {
             return Err(BlockReservationFailure {
@@ -2843,6 +2916,17 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.pending_block[cpu_index] = None;
         let cleared_preemption = state.clear_preemption_on(cpu);
         let cancelled_quantum = cleared_preemption.cancelled_quantum;
+        let retained_quantum_ns = match (cancelled_quantum, blocked_at_ns) {
+            (Some(ticket), Some(now_ns))
+                if ticket.thread == reservation.key.thread
+                    && ticket.execution_generation == reservation.key.execution_generation =>
+            {
+                Some(ticket.deadline_ns.saturating_sub(now_ns))
+                    .filter(|left| *left >= MIN_RETAINED_QUANTUM_NS)
+                    .map_or(0, |left| left.min(DEFAULT_NORMAL_QUANTUM_NS))
+            }
+            _ => 0,
+        };
         state.running[cpu_index] = None;
         state
             .push(QueueEntry {
@@ -2863,6 +2947,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns: None,
+                retained_quantum_ns,
             })
             .expect("moving one Running Thread to the queue preserves scheduler capacity");
         state.running[cpu_index] = current;
@@ -2995,6 +3080,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
         state.next_wake_generation = next_wake_generation;
         state.accounting = accounting;
+        state.advance_woken_entry(index);
         state.record_trace(
             SchedulerTraceKind::Wake,
             requester,

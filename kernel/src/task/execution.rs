@@ -1000,7 +1000,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         reservation: BlockReservation,
     ) -> Result<super::ScheduleDecision, BlockReservationFailure> {
         let wake = reservation.wake_key();
-        let decision = self.scheduler.commit_block_on(cpu, reservation)?;
+        let blocked_at_ns = super::scheduler_block_time_ns();
+        let decision = self
+            .scheduler
+            .commit_block_at(cpu, reservation, blocked_at_ns)?;
         if self
             .blocked_operations
             .winner(wake)
