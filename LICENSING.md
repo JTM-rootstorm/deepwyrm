@@ -10,6 +10,7 @@ The full license texts carried by this repository are:
 
 - `LICENSES/GPL-2.0-or-later.txt`
 - `LICENSES/GPL-3.0-or-later.txt`
+- `LICENSES/Classpath-exception-2.0.txt`
 
 ## Guidance for Codex and contributors
 
@@ -27,14 +28,21 @@ When GPLv2-family third-party material is involved:
 
 Non-GPL imports require an explicit compatibility check against the destination lane before implementation lands. Preserve upstream attribution, notices, patent terms, reciprocal-file rules, source obligations, and other license conditions.
 
+## The ABI crates linked into SDK programs
+
+Every program built with the Wyrmroot SDK (`../wyrmroot-sdk`) links `deepwyrm-abi` and `deepwyrm-syscall`, the ABI records and the syscall veneer. They are generated from the schema, so they cannot be split into separate SDK-facing copies without hand-copying the ABI. They are therefore `GPL-2.0-or-later WITH Classpath-exception-2.0` (Mike, 2026-11-12), matching the SDK runtime's exception (root `LICENSING_POLICY.md`). This covers:
+
+- `crates/deepwyrm-abi/**` and `crates/deepwyrm-syscall/**`;
+- `abi/schema/**`, and the generated `abi/generated/**` those crates compile in (`deepwyrm_abi.rs`, `syscall_veneer_x86_64.S`, and the C header and documentation generated beside them).
+
+All of it is first-party: every commit to these paths and to `tools/abi-gen` is Mike's. The generator, `tools/abi-gen/**`, stays `GPL-2.0-or-later`; its output takes the exception from this declaration, not from the generator. The kernel is unaffected: it remains `GPL-2.0-or-later` and uses these crates under that license.
+
 ## Existing GPL-2.0-or-later surface
 
 At the time of this policy update, the existing Deepwyrm repository remains GPL-2.0-or-later across its current components, including:
 
 - `kernel/**`;
-- `crates/deepwyrm-abi/**`;
-- `crates/deepwyrm-syscall/**`;
-- `abi/schema/**` and `abi/generated/**`;
+- `crates/deepwyrm-abi/**`, `crates/deepwyrm-syscall/**`, `abi/schema/**` and `abi/generated/**`, with the Classpath exception above;
 - `tools/abi-gen/**` and `tools/xtask/**`; and
 - kernel-coupled tests and test-support code.
 

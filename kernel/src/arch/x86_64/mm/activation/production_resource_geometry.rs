@@ -241,9 +241,12 @@ const STORAGE_WAITS: usize = STORAGE_DRIVERS * 6
 /// vfsd waits on every client connection it serves, and each live file job
 /// holds one as its namespace.
 const JOB_NAMESPACE_WAITS: usize = 1;
+/// Each file or directory a job holds open is a node vfsd or a filesystem
+/// waits on: every pair the job may create but its sleeper (W9).
+const JOB_OPEN_NODE_WAITS: usize = JOB_OWN_CHANNEL_PAIRS - 1;
 pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS
     + ADDED_EXIT_WAITS
-    + LIVE_SHELL_JOBS * (JOB_OWN_WAITS + JOB_NAMESPACE_WAITS)
+    + LIVE_SHELL_JOBS * (JOB_OWN_WAITS + JOB_NAMESPACE_WAITS + JOB_OPEN_NODE_WAITS)
     + STORAGE_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
@@ -379,7 +382,7 @@ mod tests {
         assert_eq!(REGISTRY_PEAK, 346);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
         assert_eq!(STORAGE_WAITS, 55);
-        assert_eq!(WAIT_PEAK, 124);
+        assert_eq!(WAIT_PEAK, 140);
         assert_eq!(BOOTFS_ENTRY_PEAK, 17);
     }
 
