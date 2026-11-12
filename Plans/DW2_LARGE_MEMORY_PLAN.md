@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is in progress: the direct map, usercopy through it, and SMEP/SMAP are done (§5); the RAM-sized role table is designed (§5.3) and approved by Mike (2026-11-12), not started.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -94,7 +94,9 @@ Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into sca
 - **R9 (Low): fixed.** Two stale comments.
 - **R10 (Low), accepted:** the guest-test-only usercopy in `activation/test_support.rs` still uses user addresses. It is in no product, and under SMAP it would fault loudly, not silently.
 
-### 5.3 The RAM-sized role table (not started)
+### 5.3 The RAM-sized role table (Deepwyrm `e6a07c3`, review fix `aae63fc`)
+
+Designed below, approved by Mike (2026-11-12); §5.3a records what was built.
 
 The table is more than one array. Three things the plan did not list scale with it:
 
@@ -107,3 +109,13 @@ The table is more than one array. Three things the plan did not list scale with 
 3. **Growth.** The manager starts with today's static capacity, then, right after activation, re-homes its slots, free list and index into one run carved from RAM through the direct map. Slot numbers and generations are kept, so issued identities stay valid. Size: one slot per 2 MiB of allocator RAM plus 4096, and the free list by `free_range_bound`.
 
 Teardown (item 2) changes object and address-space finalization, so it needs the independent review this plan already requires of M2.
+
+### 5.3a As built
+
+- **Growth** (`memory/growable.rs`, `FrameRoleManager::grown_layout`/`adopt_storage`, `ActiveDeepPaging::grow_frame_roles`, called in `lib.rs` right after activation): the slots, the free-slot stack, the start index and the allocator's free list move into one run allocated first-fit and reached through the direct map. Slots: the 4096 boot slots plus one per 2 MiB of allocator RAM; the dev-boot guest (2 GiB) logs `[DW0][INFO][memory] frame-role slots=5079`. The free list is `free_range_bound(initial ranges, 0, slots)`, and at least one entry longer than the boot list. Slot numbers and generations are kept. The run takes the permanent `RoleTableStorage` role, which no API frees.
+- **Slots and lookups:** a slot comes off the free-slot stack; a slot whose generation is spent is retired, not reused. The start index holds, for each allocator page, one plus the slot of the dynamic role starting there; `table_identity` reads it (it scans the boot table only before growth).
+- **Proof and teardown:** each committed PML4 counts the committed tables below it (`publish_staged_table` adds, `reclaim_preflighted_table` subtracts; the count is per root, which is per owner because an owner has one PML4). The proof marks observed slots with an epoch, and finishes only when the observed count equals the root's count and no role changed since it began (a role version). Teardown clears only the root's 256 low-half entries in one batch, then, after the H0 barrier, walks the disconnected tables again and reclaims each after its children. Freed tables keep their entries; every consumer of a fresh allocation zeroes or writes it first (`FrameRoleKind::AllocatedUninitialized`).
+- **Deviation:** roles outside allocator RAM (kernel image, transition tables, modules, BARs) have no separate bounded list. Their lookups (`validate_external_pages`, `validate_kernel_image_page`, `owns_any`) still scan every slot, but run only at boot. The duplicate-root check on PML4 creation also still scans (review R4).
+- **Validation:** kernel host tests (1156, five new for growth, refusals, slot retirement, the grown free list and proof invalidation, one for D1), fmt and clippy. dev-boot `--check --sdk` with Wyrmroot `d5ac3af`: 11 of 12 runs passed at 35–37 s, against 63 s before; the scans this removes ran on every user page walk, which is the likely cause of the 41 s/63 s spread seen before. One run (on `e6a07c3`) hung after the shell exited: QEMU did not exit in the check's 180 s, and COM1 shows no retirement or panic record after the boot lines. Its cause is not found; it has not recurred in 11 runs.
+- **Independent review:** Claude Opus 5.5, default effort, 2026-11-12, Deepwyrm `e6a07c3` against `31d352d`. No Critical or High. D1 (Medium: below about 780 MiB of allocator RAM growth was refused and boot panicked, since the free-list bound is shorter than the 4503-entry boot list) fixed in `aae63fc` with a production-shaped test that fails without it. R2 (freed tables keep stale entries) taken as documentation. Accepted, Low: R1 (the run is one contiguous first-fit allocation, 64 MiB of index at 64 GiB; a map too fragmented for it panics at boot), R3 (a second proof on the same root between finish and reclaim panics; the only caller holds the manager exclusively throughout), R4 (the remaining O(slots) scans above), R5 (`start_position` scans the initial ranges per lookup, at most about 400). Open question from the review, not new in this change: the proof does not check that no other owner's tables point into this owner's hierarchy.
+
