@@ -3910,6 +3910,29 @@ impl OneCpu {
         self.scheduler.wake_on(cpu(0), key).unwrap();
     }
 
+    /// Takes the safe-return decision for a pending wake preemption, as the
+    /// live return path does; reports whether the CPU switched.
+    fn return_to_user(&mut self) -> bool {
+        if !self.scheduler.has_reschedule_request_on(cpu(0)) {
+            return false;
+        }
+        let switched = match self
+            .scheduler
+            .preempt_current_at(cpu(0), Some(self.now_ns))
+            .unwrap()
+        {
+            SchedulerPreemptionDecision::Switch { outgoing, .. } => {
+                self.scheduler.complete_switch_on(outgoing).unwrap();
+                self.ticket = None;
+                true
+            }
+            SchedulerPreemptionDecision::RetainCurrent { .. } => false,
+            SchedulerPreemptionDecision::Deferred => panic!("safe return was deferred"),
+        };
+        self.run();
+        switched
+    }
+
     /// Expires the current quantum and takes the safe-return decision.
     fn expire(&mut self) {
         let ticket = self.ticket.take().unwrap();
@@ -4038,5 +4061,142 @@ fn runnable_order_keeps_retained_quantum_first() {
         order.push(cpu0.current().unwrap());
     }
     assert_eq!(order, [first, second, spent]);
+    assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_wake_that_kept_quantum_preempts_the_running_thread_which_keeps_its_rest() {
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    let (service, hog1, hog2) = (threads[0], threads[1], threads[2]);
+    assert_eq!(cpu0.dispatch_first(), service);
+    cpu0.now_ns += 1_000_000;
+    let wake = cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(hog1));
+    cpu0.now_ns += 2_000_000;
+    // An interrupt wakes the service while hog1 runs: before the follow-up
+    // it waited for the rest of hog1's quantum.
+    cpu0.wake(wake);
+    assert!(cpu0.scheduler.has_reschedule_request_on(cpu(0)));
+    assert!(cpu0.return_to_user());
+    assert_eq!(cpu0.current(), Some(service));
+    assert_eq!(
+        cpu0.ticket.unwrap().deadline_ns(),
+        cpu0.now_ns + DEFAULT_NORMAL_QUANTUM_NS - 1_000_000
+    );
+    cpu0.now_ns += 500_000;
+    cpu0.block(false);
+    // hog1 resumes ahead of hog2 on the 3 ms its quantum had left.
+    assert_eq!(cpu0.current(), Some(hog1));
+    assert_eq!(
+        cpu0.ticket.unwrap().deadline_ns(),
+        cpu0.now_ns + DEFAULT_NORMAL_QUANTUM_NS - 2_000_000
+    );
+    cpu0.expire();
+    assert_eq!(cpu0.current(), Some(hog2));
+    assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_wake_preempts_only_for_kept_quantum_and_only_the_thread_it_found() {
+    // A wake that kept nothing asks for nothing.
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    assert_eq!(cpu0.dispatch_first(), threads[0]);
+    let wake = cpu0.block(false);
+    cpu0.wake(wake);
+    assert!(!cpu0.scheduler.has_reschedule_request_on(cpu(0)));
+    assert!(!cpu0.return_to_user());
+    assert_eq!(cpu0.current(), Some(threads[1]));
+
+    // A request for a Thread that then blocks dies with its claim: the
+    // woken Thread is dispatched by the block instead, and nothing is
+    // left pending for it.
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    let (service, client) = (threads[0], threads[1]);
+    assert_eq!(cpu0.dispatch_first(), service);
+    cpu0.now_ns += 1_000_000;
+    let wake = cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(client));
+    cpu0.wake(wake);
+    cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(service));
+    assert!(!cpu0.scheduler.has_reschedule_request_on(cpu(0)));
+    assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+}
+
+#[test]
+fn interrupt_wakes_cannot_starve_cpu_bound_threads() {
+    // A service woken by an interrupt every 300 us preempts the running hog
+    // each time, runs 100 us and blocks again, against two Threads that
+    // never block. Each hog still runs within two quanta of its last turn:
+    // the other hog's quantum, and the service's kept time, which shrinks by
+    // what it runs until it is queued behind the hogs.
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    let (service, hog1, hog2) = (threads[0], threads[1], threads[2]);
+    assert_eq!(cpu0.dispatch_first(), service);
+    let mut parked = Some(cpu0.block(true));
+    let mut last_ran = [cpu0.now_ns; 2];
+    let mut preemptions = 0;
+    for _ in 0..2_000 {
+        let current = cpu0.current().unwrap();
+        if current == service {
+            cpu0.now_ns += 100_000;
+            if cpu0.now_ns >= cpu0.ticket.unwrap().deadline_ns() {
+                cpu0.expire();
+            } else {
+                parked = Some(cpu0.block(true));
+            }
+        } else {
+            let step = 300_000.min(cpu0.ticket.unwrap().deadline_ns() - cpu0.now_ns);
+            cpu0.now_ns += step;
+            last_ran[usize::from(current == hog2)] = cpu0.now_ns;
+            if cpu0.now_ns >= cpu0.ticket.unwrap().deadline_ns() {
+                cpu0.expire();
+            } else if let Some(wake) = parked.take() {
+                cpu0.wake(wake);
+                if cpu0.return_to_user() {
+                    preemptions += 1;
+                }
+            }
+        }
+        for (hog, last) in [hog1, hog2].into_iter().zip(last_ran) {
+            if cpu0.current() == Some(hog) {
+                continue;
+            }
+            assert!(
+                cpu0.now_ns - last <= 2 * DEFAULT_NORMAL_QUANTUM_NS + 300_000,
+                "a hog waited {} ns",
+                cpu0.now_ns - last
+            );
+        }
+        assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
+    }
+    assert!(preemptions > 100, "only {preemptions} wake preemptions");
+    let _ = hog1;
+}
+
+#[test]
+fn a_wake_preemption_whose_woken_thread_was_stolen_keeps_the_runner() {
+    let (mut cpu0, threads) = OneCpu::with_threads(3);
+    let (service, other, hog) = (threads[0], threads[1], threads[2]);
+    assert_eq!(cpu0.dispatch_first(), service);
+    cpu0.now_ns += 1_000_000;
+    let service_wake = cpu0.block(true);
+    assert_eq!(cpu0.current(), Some(other));
+    let other_wake = cpu0.block(false);
+    assert_eq!(cpu0.current(), Some(hog));
+    cpu0.wake(service_wake);
+    cpu0.wake(other_wake);
+    // An idle CPU takes the woken service before CPU 0 returns to userspace.
+    let stolen = cpu0
+        .scheduler
+        .schedule_next_on_with_migration(cpu(1))
+        .unwrap();
+    assert_eq!(stolen.decision().current, Some(service));
+    // What is left kept nothing, so the hog is not preempted for it.
+    let deadline = cpu0.ticket.unwrap().deadline_ns();
+    assert!(!cpu0.return_to_user());
+    assert_eq!(cpu0.current(), Some(hog));
+    assert_eq!(cpu0.ticket.unwrap().deadline_ns(), deadline);
+    assert!(!cpu0.scheduler.has_reschedule_request_on(cpu(0)));
     assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
 }

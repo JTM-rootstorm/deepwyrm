@@ -912,7 +912,10 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         &self,
         cpu: SchedulerCpuId,
     ) -> Result<super::SchedulerPreemptionDecision, SchedulerError> {
-        let decision = self.scheduler.preempt_current_on(cpu)?;
+        // A Thread a wake preempts keeps what its quantum had left (D8).
+        let decision = self
+            .scheduler
+            .preempt_current_at(cpu, super::scheduler_block_time_ns())?;
         Ok(decision)
     }
 

@@ -201,6 +201,21 @@ blocked with time left at the head of its queue (Tanenbaum and Woodhull,
 *Operating Systems: Design and Implementation*, 3rd ed., §2.6). A block with no
 clock sample keeps nothing, which is the behaviour before D8.
 
+The D8 follow-up (2026-11-12) lets such a wake preempt. When a wake that kept
+some quantum targets a CPU whose running Thread has its quantum armed and no
+expiry published, it asks that exact claim to give way at the CPU's next
+return to userspace (syscall return or timer return; an idle target is woken by
+its rescan notification as before). There, if the first local Runnable entry
+holds retained quantum, the running Thread is requeued holding what its armed
+quantum had left (at least `MIN_RETAINED_QUANTUM_NS`, sampled at the switch),
+behind the entries that kept some, and that entry runs. Otherwise the request is
+dropped and the armed quantum continues. A published expiry takes precedence,
+and the request dies with the claim it names, so a Thread that blocks or
+switches first leaves nothing pending. The bound above still holds: the
+preempted Thread's turn continues on its rest, and the woken Thread's time
+shrinks by what it runs. A wake on another CPU takes effect at that CPU's next
+syscall or timer return; there is no reschedule IPI to a busy CPU.
+
 If no peer is locally runnable, quantum expiry may retain the current Thread,
 clear the consumed reschedule request, and arm a fresh quantum. It still records
 the expiration; it must not manufacture a context switch.

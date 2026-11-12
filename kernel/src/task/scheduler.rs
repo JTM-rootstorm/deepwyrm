@@ -106,7 +106,8 @@ impl SchedulerQuantumTicket {
 pub(crate) enum SchedulerPreemptionDecision {
     /// The exact request remains pending until the checked depth reaches zero.
     Deferred,
-    /// The request was consumed, but no eligible local peer existed.
+    /// The request was consumed, but no eligible local peer existed. For a
+    /// wake preemption the ticket is the current quantum, which stays armed.
     RetainCurrent {
         consumed_published_expiry: SchedulerQuantumTicket,
     },
@@ -911,6 +912,11 @@ struct SchedulerState<const CAPACITY: usize> {
     /// by that exact claim's next quantum mint.
     dispatch_budget: [Option<(RunningClaim, u64)>; H2_SCHEDULER_CPU_CAPACITY],
     need_resched: [Option<SchedulerQuantumTicket>; H2_SCHEDULER_CPU_CAPACITY],
+    /// A wake that kept retained quantum asks the exact claim running on its
+    /// target CPU to give way at that CPU's next return to userspace (D8
+    /// follow-up). Valid only while that claim still runs with its quantum
+    /// armed; anything else makes it stale and ignored.
+    wake_preemption: [Option<RunningClaim>; H2_SCHEDULER_CPU_CAPACITY],
     preemption_disable_depth: [u32; H2_SCHEDULER_CPU_CAPACITY],
     last_migration: Option<SchedulerMigrationRecord>,
     carrier_admission: CarrierAdmissionState,
@@ -957,6 +963,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             quantum: [None; H2_SCHEDULER_CPU_CAPACITY],
             dispatch_budget: [None; H2_SCHEDULER_CPU_CAPACITY],
             need_resched: [None; H2_SCHEDULER_CPU_CAPACITY],
+            wake_preemption: [None; H2_SCHEDULER_CPU_CAPACITY],
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             last_migration: None,
             carrier_admission: CarrierAdmissionState::new(),
@@ -1567,7 +1574,47 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         Ok((generation, next))
     }
 
+    /// Asks the Thread running on `cpu` to give way to a woken entry that
+    /// kept retained quantum. Only a running claim whose own quantum is armed
+    /// can be asked: an idle CPU is woken by its rescan notification, and a
+    /// published expiry already switches at the same boundary.
+    fn request_wake_preemption(&mut self, cpu: SchedulerCpuId) {
+        let index = cpu.index();
+        let Some(claim) = self.running[index] else {
+            return;
+        };
+        if self.need_resched[index].is_none() && self.armed_quantum_of(cpu, claim).is_some() {
+            self.wake_preemption[index] = Some(claim);
+        }
+    }
+
+    /// The armed quantum of exactly `claim` on `cpu`.
+    fn armed_quantum_of(
+        &self,
+        cpu: SchedulerCpuId,
+        claim: RunningClaim,
+    ) -> Option<SchedulerQuantumTicket> {
+        self.quantum[cpu.index()].filter(|ticket| {
+            ticket.thread == claim.thread && ticket.execution_generation == claim.generation
+        })
+    }
+
+    /// The armed quantum of the running claim a still-valid wake preemption
+    /// names.
+    fn pending_wake_preemption(&self, cpu: SchedulerCpuId) -> Option<SchedulerQuantumTicket> {
+        let claim = self.wake_preemption[cpu.index()]?;
+        if self.running[cpu.index()] != Some(claim) {
+            return None;
+        }
+        self.armed_quantum_of(cpu, claim)
+    }
+
+    fn reschedule_requested(&self, cpu: SchedulerCpuId) -> bool {
+        self.need_resched[cpu.index()].is_some() || self.pending_wake_preemption(cpu).is_some()
+    }
+
     fn clear_preemption_on(&mut self, cpu: SchedulerCpuId) -> ClearedPreemption {
+        self.wake_preemption[cpu.index()] = None;
         let cancelled_quantum = self.quantum[cpu.index()].take();
         let published_expiry = self.need_resched[cpu.index()].take();
         debug_assert!(
@@ -2603,7 +2650,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     }
 
     pub(crate) fn has_reschedule_request_on(&self, cpu: SchedulerCpuId) -> bool {
-        self.state.lock().need_resched[cpu.index()].is_some()
+        self.state.lock().reschedule_requested(cpu)
     }
 
     pub(crate) fn preemption_snapshot_on(
@@ -2639,25 +2686,49 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.preemption_disable_depth[cpu.index()] = state.preemption_disable_depth[cpu.index()]
             .checked_sub(1)
             .ok_or(SchedulerError::PreemptionDepthUnderflow)?;
-        let ready = state.preemption_disable_depth[cpu.index()] == 0
-            && state.need_resched[cpu.index()].is_some();
+        let ready =
+            state.preemption_disable_depth[cpu.index()] == 0 && state.reschedule_requested(cpu);
         state.assert_invariants();
         Ok(ready)
+    }
+
+    /// [`Self::preempt_current_at`] without a clock sample: a Thread
+    /// preempted by a wake keeps nothing.
+    pub(crate) fn preempt_current_on(
+        &self,
+        cpu: SchedulerCpuId,
+    ) -> Result<SchedulerPreemptionDecision, SchedulerError> {
+        self.preempt_current_at(cpu, None)
     }
 
     /// Consumes the current CPU's exact request at a guard-free CPL3 return boundary.
     /// The outgoing Thread is placed at the FIFO tail only when a local peer
     /// can be claimed in the same scheduler transaction.
-    pub(crate) fn preempt_current_on(
+    ///
+    /// A published quantum expiry takes precedence. Without one, a pending
+    /// wake preemption (D8 follow-up) switches only to a local entry that kept
+    /// retained quantum, and the outgoing Thread keeps what its armed quantum
+    /// had left at `now_ns` (at least `MIN_RETAINED_QUANTUM_NS`), queued with
+    /// the other entries that kept some. Otherwise the request is dropped and
+    /// the armed quantum keeps running.
+    pub(crate) fn preempt_current_at(
         &self,
         cpu: SchedulerCpuId,
+        now_ns: Option<u64>,
     ) -> Result<SchedulerPreemptionDecision, SchedulerError> {
         let mut state = self.state.lock();
         let cpu_index = cpu.index();
-        let request = state.need_resched[cpu_index].ok_or(SchedulerError::StaleQuantum)?;
+        let published = state.need_resched[cpu_index];
+        let Some(request) = published.or_else(|| state.pending_wake_preemption(cpu)) else {
+            state.wake_preemption[cpu_index] = None;
+            state.assert_invariants();
+            return Err(SchedulerError::StaleQuantum);
+        };
+        let by_wake = published.is_none();
         let current = state.running[cpu_index].ok_or(SchedulerError::NotRunning)?;
         if current.thread != request.thread || current.generation != request.execution_generation {
             state.need_resched[cpu_index] = None;
+            state.wake_preemption[cpu_index] = None;
             state.assert_invariants();
             return Err(SchedulerError::StaleQuantum);
         }
@@ -2671,7 +2742,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         // saturated CPU reaches, so load recovery is offered here as well as at
         // the idle path §5 describes. A refused pull costs one bounded victim
         // scan under a lock this transition already holds.
-        let pulled = state.rebalance_pull_for(cpu)?;
+        // A wake preemption only reorders local work; it pulls nothing.
+        let pulled = if by_wake {
+            None
+        } else {
+            state.rebalance_pull_for(cpu)?
+        };
         let Some(next_entry) = state.queue[..state.len]
             .iter()
             .flatten()
@@ -2681,11 +2757,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     && entry.continuation_cpu.is_none()
             })
             .copied()
+            .filter(|entry| !by_wake || entry.retained_quantum_ns != 0)
         else {
             if let Some(pending) = pulled {
                 state.rollback_pending_migration(pending);
             }
             state.need_resched[cpu_index] = None;
+            state.wake_preemption[cpu_index] = None;
             state.assert_invariants();
             return Ok(SchedulerPreemptionDecision::RetainCurrent {
                 consumed_published_expiry: request,
@@ -2731,6 +2809,12 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         };
         state.running[cpu_index] = Some(next);
         let ready_at_ns = state.instrumentation_global_now_ns;
+        let retained_quantum_ns = match now_ns {
+            Some(now_ns) if by_wake => Some(request.deadline_ns.saturating_sub(now_ns))
+                .filter(|left| *left >= MIN_RETAINED_QUANTUM_NS)
+                .map_or(0, |left| left.min(DEFAULT_NORMAL_QUANTUM_NS)),
+            _ => 0,
+        };
         state
             .push(QueueEntry {
                 thread: current.thread,
@@ -2750,9 +2834,13 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 #[cfg(test)]
                 migration_exclusion: None,
                 ready_at_ns,
-                retained_quantum_ns: 0,
+                retained_quantum_ns,
             })
             .expect("replacing one Running Thread preserves scheduler capacity");
+        if retained_quantum_ns != 0 {
+            let index = state.len - 1;
+            state.advance_woken_entry(index);
+        }
         state.suspended[cpu_index] = Some(SuspendedContinuation {
             thread: current.thread,
             generation: current.generation,
@@ -2761,6 +2849,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         });
         state.next_enqueue_generation = next_enqueue_generation;
         state.need_resched[cpu_index] = None;
+        state.wake_preemption[cpu_index] = None;
         state.quantum[cpu_index] = None;
         state.accounting = accounting;
         state.record_trace(
@@ -3092,6 +3181,9 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         state.next_wake_generation = next_wake_generation;
         state.accounting = accounting;
         state.advance_woken_entry(index);
+        if blocked.retained_quantum_ns != 0 {
+            state.request_wake_preemption(target);
+        }
         state.record_trace(
             SchedulerTraceKind::Wake,
             requester,
