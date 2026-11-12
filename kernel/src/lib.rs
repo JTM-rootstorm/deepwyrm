@@ -565,6 +565,9 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                     arch::x86_64::vtd::VtdBootState::Absent => {
                         "no DMA remapping hardware; device DMA is not admitted"
                     }
+                    arch::x86_64::vtd::VtdBootState::Unresponsive => {
+                        "a DMAR unit's registers read all ones; remapping hardware ignored"
+                    }
                     arch::x86_64::vtd::VtdBootState::DefaultDeny {
                         interrupts_remapped: false,
                         ..

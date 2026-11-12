@@ -668,3 +668,30 @@ fn interrupt_remapping_needs_both_remapping_and_queued_invalidation() {
         assert_eq!(features.interrupt_remapping(), expected);
     }
 }
+
+/// A register page that decodes to nothing reads all ones; the unit counts as
+/// absent, judged by reads alone, instead of as translation left on by
+/// firmware (review N6).
+#[test]
+fn a_unit_reading_all_ones_does_not_respond_and_is_never_written() {
+    let mut unit = Unit::q35();
+    assert!(unit_responds(&mut unit));
+    for floated in 0..3 {
+        let mut unit = Unit::q35();
+        match floated {
+            0 => unit.version = u32::MAX,
+            1 => unit.capability = u64::MAX,
+            _ => unit.extended = u64::MAX,
+        }
+        assert!(!unit_responds(&mut unit));
+        assert!(unit.log.is_empty());
+    }
+    // Without the probe the same page would fail the boot.
+    let mut floating = Unit::q35();
+    floating.version = u32::MAX;
+    floating.capability = u64::MAX;
+    floating.extended = u64::MAX;
+    floating.status = u32::MAX;
+    // (as an IOTLB offset outside the page, the first all-ones field checked).
+    assert!(enable_default_deny(&mut floating, ROOT, 39).is_err());
+}

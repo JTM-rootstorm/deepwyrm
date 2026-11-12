@@ -449,6 +449,18 @@ pub(crate) fn interrupts_remapped() -> bool {
     INTERRUPTS_REMAPPED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Whether anything answers at the unit's register page, by reads only.
+/// A page that decodes to nothing reads all ones, and no defined VT-d
+/// version, capability or extended-capability value is all ones (their
+/// reserved bits read zero). Linux treats such a unit as absent too. Without
+/// this check the all-ones values would fail `enable_default_deny` and the
+/// boot with it (review N6).
+pub(crate) fn unit_responds<R: VtdRegisters>(registers: &mut R) -> bool {
+    registers.read32(REG_VERSION) != u32::MAX
+        && registers.read64(REG_CAPABILITY) != u64::MAX
+        && registers.read64(REG_EXTENDED_CAPABILITY) != u64::MAX
+}
+
 /// Points the unit at the all-zero `root_table`, invalidates its context and
 /// IOTLB caches, and enables translation. On success every DMA through this
 /// unit is blocked.
@@ -593,8 +605,22 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     let Some(snapshot) = snapshot else {
         return Ok(VtdBootState::Absent);
     };
-    let ceiling = 1_u64 << snapshot.host_address_width();
     let physical_limit = active.root().physical_limit();
+    // Map every unit and check that it answers before any unit or table is
+    // touched: if one does not, the DMAR is ignored as a whole and nothing
+    // is left half set up. Each page stays closed to BARs either way.
+    let mut bases = [0_u64; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
+    for (base, unit) in bases.iter_mut().zip(snapshot.units()) {
+        let frame = FrameAddress::new(unit.register_base(), physical_limit)
+            .map_err(|_| VtdBootError::Mapping)?;
+        *base = active
+            .install_kernel_mmio_page(frame)
+            .map_err(|_| VtdBootError::Mapping)?;
+        if !unit_responds(&mut LiveVtdMmio::new(*base)?) {
+            return Ok(VtdBootState::Unresponsive);
+        }
+    }
+    let ceiling = 1_u64 << snapshot.host_address_width();
     // Every table the units will ever walk comes from one fixed pool of
     // zeroed frames, each mapped UC for the life of the machine.
     let mut pool = crate::device::dma::live::LiveTablePool::new();
@@ -625,12 +651,10 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
 
     let mut units: [Option<LiveUnit>; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS] =
         [const { None }; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
-    for (slot, unit) in units.iter_mut().zip(snapshot.units()) {
-        let frame = FrameAddress::new(unit.register_base(), physical_limit)
-            .map_err(|_| VtdBootError::Mapping)?;
-        let base = active
-            .install_kernel_mmio_page(frame)
-            .map_err(|_| VtdBootError::Mapping)?;
+    for (slot, base) in units
+        .iter_mut()
+        .zip(bases.iter().copied().take(snapshot.units().len()))
+    {
         let mut registers = LiveVtdMmio::new(base)?;
         let state = enable_default_deny(&mut registers, root, snapshot.host_address_width())
             .map_err(VtdBootError::Unit)?;
@@ -735,6 +759,9 @@ fn write_back_and_invalidate_caches() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VtdBootState {
     Absent,
+    /// A unit's register page reads all ones: the DMAR is ignored, so no
+    /// device is confined and none gets DMA.
+    Unresponsive,
     /// `dma_domains` says whether every unit can give a function a 4-level
     /// domain, so `dma_map` is available.
     DefaultDeny {
