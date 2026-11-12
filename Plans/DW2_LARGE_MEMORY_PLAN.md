@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done; the rest is not started.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is in progress: the direct map, usercopy through it, and SMEP/SMAP are done (§5); the RAM-sized role table is designed (§5.3) and not started.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -53,3 +53,36 @@ Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into sca
 - `DW0_IMPLEMENTATION_PLAN.md` §2.14, `DW0_D0_OBJECT_HANDLE_CONTRACT.md` §5.
 - Root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` §5 and §8 (D6, D7), and the D7 review (`.tmp/toolchain-review/d7-journal-review.md`).
 - Not read for this draft: `DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md` in full. M2 changes the kernel's physical-access boundaries, so its implementation must read that design first.
+
+## 5. M2 as built (2026-11-12)
+
+### 5.1 The direct map (Deepwyrm `fb395be`)
+
+- **What it covers:** exactly the allocator's initial ranges, mapped at `0xffff_8000_0000_0000 + physical` (PML4 slots 256–383, so at most 64 TiB of physical address space; a boot whose allocator owns memory above that stops). Nothing else is mapped: not the kernel image, the boot modules, firmware tables or devices. Those keep the per-CPU scratch window.
+- **Leaves:** read-write, no-execute, supervisor-only. 1 GiB pages where the CPU has `pdpe1gb`, 2 MiB pages otherwise, and 4 KiB pages only at a range's unaligned ends, so no page reaches outside a range.
+- **Build:** the deep-root build fills the map and maps it before activation. The PML4 entries exist before `KernelHalfBinding` captures the kernel half, so every root shares them.
+- **Graph check:** accepts a direct-map leaf only with the exact flags, mapping `virtual - base`, inside one range, and as a 1 GiB page only when the CPU has them. The leaves must cover the ranges exactly, which is checked by summing their bytes. A map that overlaps the kernel image is refused. `MAX_DEEP_TABLE_FRAMES` rose from 256 to 2048 (L9). A machine without 1 GiB pages and with more than about 1.9 TiB would exceed it and stop at boot.
+- **After activation:** page-table entries, zeroing (`rep stosq`) and physical byte copies of allocator frames go through the map.
+- **No second memory type:** a UC leaf over direct-mapped RAM is refused. So the VT-d table pool moved onto the map, as WB, and flushes the line of each entry it writes or reads (`clflush` + `mfence`), for units that do not snoop, as Linux does. Its 64 UC leaves are gone.
+- **Cost:** dev-boot `--check --sdk` time is unchanged (40 s).
+
+### 5.2 Usercopy and SMEP/SMAP (Deepwyrm `7e2d64c`, Wyrmroot `6e0f0e6`)
+
+- **Usercopy:** every copy re-walks each pinned, preflighted page and copies through the direct map. This covers deferred outputs and the atomic-wait load. The kernel never dereferences a user address, and a copy no longer needs CR3 to hold the target root.
+- **New refusal:** preflight refuses a user page with no direct-map address, such as mapped device registers.
+- **SMEP and SMAP:** each CPU turns them on, where it has them, when it installs its syscall boundary. The first CPU's set is recorded, and a CPU with a different set fails its install. The IF-clear boundary check also requires the recorded bits to stay set. AC is never set, because no STAC window exists.
+- **dev-boot CPU:** dev-boot now gives the guest `qemu64,+pdpe1gb,+smep,+smap`.
+
+### 5.3 The RAM-sized role table (not started)
+
+The table is more than one array. Three things the plan did not list scale with it:
+
+1. **Hot linear scans.** `table_identity` runs three times on every user page walk, which means on every usercopy and every return to user. It, `next_slot` and the lookups by physical address scan every slot.
+   - Design: a free-slot stack, and a per-frame index over the direct-mapped ranges (one `u32` slot number per 4 KiB page, 0.1% of RAM).
+   - Roles outside allocator RAM (image, modules, device MMIO) are few, and keep a bounded list.
+2. **Slot-indexed stack arrays.** The empty-hierarchy proof (`observed`, `levels`) and process teardown (`disconnects`) keep arrays sized by role capacity on the stack. At 4096 roles that is about 100 KiB already.
+   - Design: the proof marks slots with an epoch stored in the table, and keeps a per-owner table count, so finishing needs no full scan.
+   - Teardown disconnects the root's 256 low-half entries atomically, then reclaims the subtree bottom-up by walking it again. The hardware can no longer reach it, so it needs no journal.
+3. **Growth.** The manager starts with today's static capacity, then, right after activation, re-homes its slots, free list and index into one run carved from RAM through the direct map. Slot numbers and generations are kept, so issued identities stay valid. Size: one slot per 2 MiB of allocator RAM plus 4096, and the free list by `free_range_bound`.
+
+Teardown (item 2) changes object and address-space finalization, so it needs the independent review this plan already requires of M2.
