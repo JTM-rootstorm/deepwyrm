@@ -571,6 +571,20 @@ fn firmware_registers_may_lie_in_reserved_but_not_in_kernel_memory() {
     // RAM and ACPI storage never.
     assert!(!admissible(0x0020_0000, &[], &nothing_owned));
     assert!(!admissible(0x7800_0000, &[], &nothing_owned));
+    // Nor any other kind but MMIO and RESERVED.
+    for kind in [
+        deepwyrm_abi::DW_BOOT_MEMORY_KIND_UNSPECIFIED,
+        deepwyrm_abi::DW_BOOT_MEMORY_KIND_ACPI_RECLAIM,
+        deepwyrm_abi::DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
+        deepwyrm_abi::DW_BOOT_MEMORY_KIND_UNUSABLE,
+    ] {
+        assert!(!firmware_register_page_admissible(
+            0xfed9_0000,
+            [Some((0xfed9_0000, 0xfed9_1000, kind))],
+            [],
+            nothing_owned
+        ));
+    }
     // An unaligned register base is judged by its whole page.
     assert!(!admissible(0x7800_0800, &[], &nothing_owned));
     // Loader RESERVED: handoff data or a kernel-owned frame is refused.
