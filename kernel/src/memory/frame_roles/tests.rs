@@ -800,3 +800,56 @@ fn owns_any_covers_allocator_candidates_and_role_records() {
     // A sub-page range covering an owned page is owned.
     assert!(roles.owns_any(PhysicalRange::new(0x20_0800, 16).unwrap()));
 }
+
+/// Leaves `steps` live runs, each just after a hole, and returns the free
+/// ranges' count through the first refused free, if any. Step `i` takes a run
+/// of `2i + 1` pages and one of `2i + 2` from the tail (both larger than any
+/// earlier hole, so first fit cannot place them lower) and frees the first.
+fn fragment_manager<const RANGES: usize, const ROLES: usize>(
+    roles: &mut FrameRoleManager<RANGES, ROLES>,
+    steps: u64,
+) -> Result<(), FrameRoleError> {
+    for step in 0..steps {
+        let hole = roles.allocate(2 * step + 1)?;
+        roles.allocate(2 * step + 2)?;
+        roles
+            .cancel_allocation(hole)
+            .map_err(|error| error.error())?;
+    }
+    Ok(())
+}
+
+fn bounded_manager<const RANGES: usize, const ROLES: usize>() -> FrameRoleManager<RANGES, ROLES> {
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 128, limit).unwrap();
+    let allocator = PhysicalFrameAllocator::from_candidates(&[candidate], limit, []).unwrap();
+    FrameRoleManager::new(allocator).unwrap()
+}
+
+#[test]
+fn a_manager_sized_by_the_free_range_bound_never_fails_a_free() {
+    const ROLES: usize = 8;
+    const RANGES: usize = super::super::physical::free_range_bound(1, 0, ROLES);
+    // Seven live runs and the run being placed fill the role slots; the
+    // seven holes and the tail make eight free ranges.
+    let mut roles = bounded_manager::<RANGES, ROLES>();
+    let initial = roles.available_frames();
+    assert_eq!(fragment_manager(&mut roles, 7), Ok(()));
+    assert_eq!(roles.check_invariants(), Ok(()));
+    assert_eq!(
+        roles.available_frames(),
+        initial - (2 + 4 + 6 + 8 + 10 + 12 + 14)
+    );
+    assert_eq!(roles.allocate(1).map(|_| ()), Ok(()));
+
+    // Eight free ranges is one short of the bound: a manager can never use
+    // its last range slot, because every hole needs a slot while it is live.
+    // A free list one range short of what the pattern reaches is refused.
+    let mut short = bounded_manager::<{ RANGES - 2 }, ROLES>();
+    assert_eq!(
+        fragment_manager(&mut short, 7),
+        Err(FrameRoleError::Physical(
+            PhysicalMemoryError::CapacityExceeded
+        ))
+    );
+}

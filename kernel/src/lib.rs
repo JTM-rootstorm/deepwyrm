@@ -85,7 +85,15 @@ use boot::BootInfoByteReader;
 const MAX_X86_PHYSICAL_ADDRESS_EXCLUSIVE: u64 = 1_u64 << 52;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-const BOOTSTRAP_FRAME_RANGE_CAPACITY: usize = memory::boot_map::MAX_SANITIZED_USABLE_RANGES;
+// Every allocator run holds one role slot for its whole life, so the role
+// capacity bounds the live runs, and with them the free list: a free can never
+// fail for want of a range slot (DW2 large-memory plan, M1). It also leaves
+// room for reservations that split usable ranges at boot.
+const BOOTSTRAP_FRAME_RANGE_CAPACITY: usize = memory::physical::free_range_bound(
+    memory::boot_map::MAX_SANITIZED_USABLE_RANGES,
+    memory::boot_map::MAX_BOOTSTRAP_RESERVATIONS,
+    BOOTSTRAP_FRAME_ROLE_CAPACITY,
+);
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 // Selector 28 keeps the bootstrap/controller pair and ten actor address spaces
 // resident together.  The former 544-slot registry exhausted while reserving

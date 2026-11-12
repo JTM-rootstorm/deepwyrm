@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** draft for Mike's decisions (2026-11-12). Nothing here is implemented.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done; the rest is not started.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -30,21 +30,22 @@ Each stage is a Deepwyrm change with its own tests, and each is useful without t
 
 | Stage | Change | Removes | ABI |
 |---|---|---|---|
-| **M1** | Size the allocator's free-range storage and the frame-role table from the boot memory map, carving their storage from usable RAM at boot instead of fixed statics. Make a failed free impossible by construction: either the free-range storage is large enough for the worst case (one range per two frames is the trivial bound, so a bitmap or a buddy allocator over each usable range is the likelier shape), or table frames are tracked per address space rather than in the global role table | L4, L5 | none |
-| **M2** | A direct map: all usable RAM mapped once in the kernel half, read-write, no-execute, supervisor-only, built from 1 GiB pages where the CPU has them (`pdpe1gb`) and 2 MiB pages otherwise. Zeroing uses `rep stosq` through it. The temporary window stays only for the bootstrap paths that run before the direct map exists | L6, keeps L9 satisfied | none |
+| **M1** | Make a failed free impossible. Every allocator run holds one role slot for its whole life and is freed whole, and an allocation never adds a free range. So the free list never holds more than the initial ranges plus the live runs (`free_range_bound`, with its proof, in `memory/physical.rs`), and production sizes it to that bound. The same bound covers boot reservations that split usable ranges, which could also fail the boot before. **Done 2026-11-12.** Sizing the role table and the free list from installed RAM moved to M2: storage carved from RAM needs the direct map to reach it | L4; L5 moves to M2 | none |
+| **M2** | Size the frame-role table and the free list from installed RAM, carving their storage from usable RAM through the direct map. A direct map: all usable RAM mapped once in the kernel half, read-write, no-execute, supervisor-only, built from 1 GiB pages where the CPU has them (`pdpe1gb`) and 2 MiB pages otherwise. Zeroing uses `rep stosq` through it. The temporary window stays only for the bootstrap paths that run before the direct map exists. SMAP and SMEP are enabled with it | L5, L6, keeps L9 satisfied | none |
 | **M3** | Scattered backing: a MemoryObject is backed by a bounded list of runs (extents), allocated largest-first, so a large object needs free memory, not a large hole. Reclamation and finalization (DW0 D0 §5) carry the list | L3 | none |
 | **M4** | Chunked publication: a map call publishes in batches of at most the journal's capacity. Each batch is a complete D7 journal. If a later batch fails, the call unmaps the batches it already published and returns the error, so the call is still all-or-nothing as userspace sees it. The global locks are released between batches, which also bounds the lock-hold time (R1) | L2 | none |
 | **M5** | Wyrmroot: init gives a job a budget derived from installed RAM (Mike to set the rule, for example half of RAM less the resident set), more MemoryObjects, and the D6 mapping slots. The SDK layer drops the four-arena scheme for one `mmap` per large allocation | L1 | Wyrmroot policy only |
-| later | 2 MiB user pages for objects whose backing has 2 MiB-aligned runs (needs M3); demand-zero paging (a map reserves, the first touch allocates and zeroes) | L8, L7 | demand-zero needs a fault-service path in the kernel and a schema decision on how a refused fault is reported |
+| **M6** | Allocate on first touch: a map of anonymous memory reserves the range and publishes nothing; the first touch allocates, zeroes and maps the page, charged to the job's budget then. A fault the kernel cannot serve (budget spent, no frames) is delivered as today's exception. This shrinks M4's job to maps of existing objects | L7 | a map flag or object kind for lazily backed memory, and the fault outcome, in the schema |
+| later | 2 MiB user pages for objects whose backing has 2 MiB-aligned runs (needs M3) | L8 | none |
 
-Order: M1, then M2, then M3 and M4 (independent of each other), then M5. M2 and M3 change the boot path and object finalization, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
+Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into scattered backing), then M5. M2, M3 and M6 change the boot path, object finalization and fault handling, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
 
-## 3. Decisions for Mike
+## 3. Decisions (Mike, 2026-11-12)
 
-1. **Direct map (M2), and with it SMAP/SMEP.** Recommended: yes to both. The alternative, a pool of per-CPU windows, removes the per-page `invlpg` but keeps the window design's other costs. The direct map is what other kernels of this kind do.
-2. **Demand paging.** Recommended: later. M4's chunked eager map gets large allocations working without a fault-service path. Demand-zero is worth doing when programs reserve much more than they touch, which a database with a large cache will.
-3. **The job budget rule (M5).** A fraction of RAM, a fixed size set in the platform config, or both.
-4. **Where this sits relative to SQLite.** SQLite at its default cache size fits in 16 MiB, so it does not need this plan. Recommended order: M1 now, since it is a latent panic at any size; then SQLite; then M2–M5 before any port that needs large memory.
+1. **Direct map, with SMAP and SMEP:** yes to both (M2).
+2. **Allocate on first touch:** yes, as stage M6, not deferred.
+3. **The job budget rule:** both: a fraction of installed RAM, capped or overridden by a size in the platform config (M5).
+4. **Order:** M1 now; then SQLite; then M2–M6 before any port that needs large memory.
 
 ## 4. Sources used
 

@@ -203,3 +203,69 @@ fn allocator_rejects_invalid_candidate_ranges() {
         Err(PhysicalMemoryError::OutsidePhysicalLimit)
     ));
 }
+
+/// Fills a range with `runs` single-frame runs and frees every other one,
+/// leaving `runs / 2` live runs each followed by a hole, plus the free tail:
+/// one free range more than the live runs, the worst case.
+fn fragment<const RANGE_CAPACITY: usize>(
+    allocator: &mut PhysicalFrameAllocator<RANGE_CAPACITY>,
+    runs: usize,
+) -> Result<(), PhysicalMemoryError> {
+    let mut frames = [PhysicalFrame { physical_start: 0 }; 16];
+    for frame in frames.iter_mut().take(runs) {
+        *frame = allocator.allocate_frame()?;
+    }
+    for frame in frames.iter().take(runs).step_by(2) {
+        allocator.free_frame(*frame)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn the_free_range_bound_holds_at_its_worst_case() {
+    // One candidate, no reservations, four live runs: at most five ranges.
+    let candidates = [PageRange {
+        start: 0x1000,
+        end: 0x10_000,
+    }];
+    const BOUND: usize = free_range_bound(1, 0, 4);
+    let mut allocator =
+        PhysicalFrameAllocator::<BOUND>::from_candidates(&candidates, LIMIT, []).unwrap();
+    assert_eq!(fragment(&mut allocator, 8), Ok(()));
+    assert_eq!(allocator.free_len, BOUND);
+    assert_eq!(allocator.available_frames(), 15 - 4);
+
+    // One range slot fewer, and the last free of the same pattern is refused.
+    let mut short =
+        PhysicalFrameAllocator::<{ BOUND - 1 }>::from_candidates(&candidates, LIMIT, []).unwrap();
+    assert_eq!(
+        fragment(&mut short, 8),
+        Err(PhysicalMemoryError::CapacityExceeded)
+    );
+}
+
+#[test]
+fn the_free_range_bound_counts_reservations_that_split_ranges() {
+    // Two candidates, each split by a reservation strictly inside it, and
+    // page zero trimmed from the first without splitting it.
+    let candidates = [
+        PageRange {
+            start: 0,
+            end: 0x8000,
+        },
+        PageRange {
+            start: 0x10_000,
+            end: 0x18_000,
+        },
+    ];
+    let reservations = [range(0x3000, 0x1000), range(0x13_000, 0x1000)];
+    const BOUND: usize = free_range_bound(2, 2, 0);
+    let allocator =
+        PhysicalFrameAllocator::<BOUND>::from_candidates(&candidates, LIMIT, reservations).unwrap();
+    assert_eq!(allocator.initial_len, BOUND);
+    assert_eq!(allocator.available_frames(), 7 + 8 - 2);
+    assert!(matches!(
+        PhysicalFrameAllocator::<{ BOUND - 1 }>::from_candidates(&candidates, LIMIT, reservations),
+        Err(PhysicalMemoryError::CapacityExceeded)
+    ));
+}

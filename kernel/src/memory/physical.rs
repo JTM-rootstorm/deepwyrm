@@ -209,9 +209,32 @@ pub enum PhysicalMemoryError {
     DoubleFree,
 }
 
+/// The most free ranges a [`PhysicalFrameAllocator`] can ever hold, given at
+/// most `candidates` disjoint candidate ranges, at most `reservations`
+/// reservations, and at most `live_runs` runs allocated at any one time.
+/// A `RANGE_CAPACITY` of at least this makes `CapacityExceeded`
+/// unreachable, so a free never fails (DW2 large-memory plan, M1).
+///
+/// Construction: each reservation removes a piece of the free ranges, and
+/// splits a range in two only when it lies strictly inside it, so it adds at
+/// most one range. Page zero cannot split anything: a range containing it
+/// starts at zero and is only trimmed. So construction ends with at most
+/// `candidates + reservations` ranges, which become the initial ranges.
+///
+/// Afterwards an allocation takes the start of a free range and never adds
+/// one. A free returns exactly one allocated run, and every run lies inside
+/// one initial range. Inside an initial range holding `k` live runs, the free
+/// pages form at most `k + 1` maximal intervals; merging across adjacent
+/// initial ranges only lowers the count. Summed, the free list holds at most
+/// the initial ranges plus the live runs.
+pub const fn free_range_bound(candidates: usize, reservations: usize, live_runs: usize) -> usize {
+    candidates + reservations + live_runs
+}
+
 /// A simple first-fit allocator over sanitized, already-reserved physical
 /// ranges. `RANGE_CAPACITY` is caller-selected so production bootstrap storage
 /// remains fixed while host tests can exercise fragmentation explicitly.
+/// Production sizes it with [`free_range_bound`].
 pub(super) struct PhysicalFrameAllocator<const RANGE_CAPACITY: usize> {
     initial: [PageRange; RANGE_CAPACITY],
     initial_len: usize,
