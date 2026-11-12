@@ -237,6 +237,9 @@ pub(crate) enum ExternalFrameRole {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrameRoleKind {
+    /// A fresh run whose contents are whatever its last owner left: freed
+    /// page tables keep their entries (DW2 M2 §5.3). Every consumer zeroes
+    /// or fully writes it before use.
     AllocatedUninitialized,
     Zeroed,
     ObjectBacking(ObjectBackingKind),

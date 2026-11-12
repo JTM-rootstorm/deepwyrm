@@ -1071,3 +1071,25 @@ fn a_role_change_during_a_hierarchy_proof_invalidates_it() {
         Err(FrameRoleError::InvalidTableParent)
     );
 }
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model hands the manager a leaked buffer as its grown run"
+)]
+fn growth_succeeds_when_the_boot_free_list_is_longer_than_the_grown_bound() {
+    // Production shape: the boot free list (64) is longer than the bound
+    // the grown table needs on a small machine (1 initial range + 17 slots).
+    let mut roles: FrameRoleManager<64, 16> = {
+        let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+        let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 512, limit).unwrap();
+        let allocator = PhysicalFrameAllocator::from_candidates(&[candidate], limit, []).unwrap();
+        FrameRoleManager::new(allocator).unwrap()
+    };
+    let layout = roles.grown_layout().unwrap();
+    assert!(layout.ranges > 64);
+    let grant = roles.allocate(layout.page_count()).unwrap();
+    // SAFETY: an 8-aligned leaked buffer of the run's size, used by nothing else.
+    unsafe { roles.adopt_storage(grant, grown_run(layout.page_count() * BASE_PAGE_SIZE)) }.unwrap();
+    assert_eq!(roles.check_invariants(), Ok(()));
+}

@@ -1186,7 +1186,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .filter(|slots| u32::try_from(*slots).is_ok_and(|slots| slots < u32::MAX))
             .ok_or(FrameRoleError::Capacity)?;
         let starts = usize::try_from(frames).map_err(|_| FrameRoleError::Capacity)?;
-        let ranges = self.allocator.free_list_capacity_for(slots);
+        // The bound can be below the boot list on small machines, but the
+        // move needs a longer list: keep at least one more than the boot list.
+        let ranges = self
+            .allocator
+            .free_list_capacity_for(slots)
+            .max(RANGE_CAPACITY + 1);
         let align = |offset: usize| offset.checked_next_multiple_of(8);
         let after = |offset: usize, count: usize, size: usize| {
             count
