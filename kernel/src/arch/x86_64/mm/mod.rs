@@ -44,7 +44,8 @@ pub(crate) use journal::OwnedPageTableJournalError;
     reason = "DW0-C exposes the sealed publisher before the live temporary mapper is wired"
 )]
 pub(crate) use journal::{
-    AtomicPageTableTarget, X86AddressSpacePublishError, X86AddressSpacePublisher,
+    AtomicPageTableTarget, JournalStorage, X86AddressSpacePublishError, X86AddressSpacePublisher,
+    table_candidates_for,
 };
 #[allow(
     unused_imports,

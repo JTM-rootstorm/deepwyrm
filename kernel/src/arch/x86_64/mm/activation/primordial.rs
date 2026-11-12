@@ -165,7 +165,12 @@ const TIMERS: usize = 2;
 // the controller plus its deterministic config and asset and is exactly 39
 // pages after init0 termination-race reconciliation. The ordinary Wave 4
 // bootfs is exactly 17 pages with its selector-specific init0 artifact.
-const PRIMORDIAL_TABLE_CANDIDATES: usize = 6;
+//
+// D7: a user map may now span 16 MiB (`PRIMORDIAL_MAX_USER_MAPPING_PAGES`),
+// which crosses up to nine PT, two PD and two PDPT boundaries. The pool holds
+// sixteen; a map prepares only the candidates its length can need, so small
+// maps still prepare six.
+pub(super) const PRIMORDIAL_TABLE_CANDIDATES: usize = 16;
 // F3A.6y. This was a literal 17 -- "the ordinary Wave 4 bootfs is exactly 17
 // pages", per the comment above, and true of the archive that was current when
 // it was written. The WYR1-F production archive is 203 pages, so the mapping
@@ -187,17 +192,31 @@ const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();
 const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
     crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
 const _: () = assert!(crate::boot::primordial::construction::STACK_BYTES % 4096 == 0);
-// Mapping machinery must fit both the selector-local bootfs ceiling and the
-// independently owned primordial stack without widening bootfs admission.
-const PRIMORDIAL_MAX_MAPPING_PAGES: usize =
-    if PRIMORDIAL_BOOTFS_MAX_PAGES > PRIMORDIAL_STACK_MAPPING_PAGES {
-        PRIMORDIAL_BOOTFS_MAX_PAGES
-    } else {
-        PRIMORDIAL_STACK_MAPPING_PAGES
-    };
-const PRIMORDIAL_JOURNAL_ENTRIES: usize =
-    PRIMORDIAL_MAX_MAPPING_PAGES + PRIMORDIAL_TABLE_CANDIDATES;
-const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
+/// The most pages one user map, unmap or protect may change (Deepwyrm D7):
+/// 16 MiB, a userspace job's whole RAM budget (Wyrmroot's `JOB_MEMORY_PAGES`).
+/// Larger requests are refused with `NO_RESOURCES`. The journal that stages a
+/// mapping lives in static storage beneath P (`LiveJournalStorage`), not on a
+/// kernel stack, so this bound costs static memory only.
+const PRIMORDIAL_MAX_USER_MAPPING_PAGES: usize = 4096;
+// Mapping machinery must fit the selector-local bootfs ceiling, the
+// independently owned primordial stack and the largest user mapping, without
+// widening bootfs admission.
+const PRIMORDIAL_MAX_MAPPING_PAGES: usize = {
+    let mut pages = PRIMORDIAL_BOOTFS_MAX_PAGES;
+    if PRIMORDIAL_STACK_MAPPING_PAGES > pages {
+        pages = PRIMORDIAL_STACK_MAPPING_PAGES;
+    }
+    if PRIMORDIAL_MAX_USER_MAPPING_PAGES > pages {
+        pages = PRIMORDIAL_MAX_USER_MAPPING_PAGES;
+    }
+    pages
+};
+// One leaf entry per page, plus the parent entries a mapping observes or
+// writes: each table it creates, and each existing one it walks, at three
+// levels.
+pub(super) const PRIMORDIAL_JOURNAL_ENTRIES: usize =
+    PRIMORDIAL_MAX_MAPPING_PAGES + 3 * PRIMORDIAL_TABLE_CANDIDATES;
+pub(super) const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 
 // The native binding table and kernel-wide CPU identity must describe the
 // same bounded carrier set; a capacity drift is a compile-time error.
@@ -2706,6 +2725,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     target.roles,
                     &mut tracked,
                     &mut candidates,
+                    &mut *self.active.journal,
                 )
             }
             .unwrap_or_else(|_| panic!("primordial teardown publisher unavailable"));
@@ -2835,6 +2855,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                     target.roles,
                     &mut tracked,
                     &mut candidates,
+                    &mut *self.active.journal,
                 )
             }
             .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
@@ -4914,11 +4935,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
                     .map_err(|_| ())?;
                 let mut publisher = user
-                    .publisher::<
-                        PRIMORDIAL_TABLE_CANDIDATES,
-                        PRIMORDIAL_JOURNAL_ENTRIES,
-                        PRIMORDIAL_INVALIDATIONS,
-                    >(region.address_space_key(), region.region_key(), &mut candidates)
+                    .publisher::<PRIMORDIAL_TABLE_CANDIDATES>(
+                        region.address_space_key(),
+                        region.region_key(),
+                        &mut candidates,
+                    )
                     .map_err(|_| ())?;
                 region
                     .unmap(
@@ -4986,11 +5007,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
                     .map_err(|_| ())?;
                 let mut publisher = user
-                    .publisher::<
-                        PRIMORDIAL_TABLE_CANDIDATES,
-                        PRIMORDIAL_JOURNAL_ENTRIES,
-                        PRIMORDIAL_INVALIDATIONS,
-                    >(region.address_space_key(), region.region_key(), &mut candidates)
+                    .publisher::<PRIMORDIAL_TABLE_CANDIDATES>(
+                        region.address_space_key(),
+                        region.region_key(),
+                        &mut candidates,
+                    )
                     .map_err(|_| ())?;
                 region
                     .unmap(
@@ -8488,46 +8509,33 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     Err(DW_STATUS_BAD_STATE)
                 } else {
                     let result = (|| {
-                        candidates[0] = Some(
-                            session
-                                .prepare_table_candidate(TableLevel::Pdpt)
-                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                        );
-                        candidates[1] = Some(
-                            session
-                                .prepare_table_candidate(TableLevel::Pd)
-                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                        );
-                        candidates[2] = Some(
-                            session
-                                .prepare_table_candidate(TableLevel::Pt)
-                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                        );
-                        candidates[3] = Some(
-                            session
-                                .prepare_table_candidate(TableLevel::Pdpt)
-                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                        );
-                        candidates[4] = Some(
-                            session
-                                .prepare_table_candidate(TableLevel::Pd)
-                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                        );
-                        candidates[5] = Some(
-                            session
-                                .prepare_table_candidate(TableLevel::Pt)
-                                .map_err(|_| DW_STATUS_NO_RESOURCES)?,
-                        );
+                        // As many tables as the mapping's length can need
+                        // at each level (D7), never more than the pool.
+                        let levels = crate::arch::x86_64::mm::table_candidates_for(
+                            args.byte_len.0,
+                            PRIMORDIAL_TABLE_CANDIDATES,
+                        )
+                        .ok_or(DW_STATUS_NO_RESOURCES)?;
+                        let mut slot = 0;
+                        for (level, count) in levels {
+                            for _ in 0..count {
+                                candidates[slot] = Some(
+                                    session
+                                        .prepare_table_candidate(level)
+                                        .map_err(|_| DW_STATUS_NO_RESOURCES)?,
+                                );
+                                slot += 1;
+                            }
+                        }
                         let mut driver = user_access::LiveTlbShootdownDriver::current();
                         // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
                         let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);
                         let (mut publisher, coherency) = match session
-                            .publisher_with_coherency::<
-                                PRIMORDIAL_TABLE_CANDIDATES,
-                                PRIMORDIAL_JOURNAL_ENTRIES,
-                                PRIMORDIAL_INVALIDATIONS,
-                            >(target.address_space, target.region_key, &mut candidates)
-                        {
+                            .publisher_with_coherency::<PRIMORDIAL_TABLE_CANDIDATES>(
+                                target.address_space,
+                                target.region_key,
+                                &mut candidates,
+                            ) {
                             Ok(parts) => parts,
                             Err(_) => {
                                 initiator.release_unused();
@@ -8632,11 +8640,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
             let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);
             let (mut publisher, coherency) = session
-                .publisher_with_coherency::<
-                    PRIMORDIAL_TABLE_CANDIDATES,
-                    PRIMORDIAL_JOURNAL_ENTRIES,
-                    PRIMORDIAL_INVALIDATIONS,
-                >(target.address_space, target.region_key, &mut candidates)
+                .publisher_with_coherency::<PRIMORDIAL_TABLE_CANDIDATES>(
+                    target.address_space,
+                    target.region_key,
+                    &mut candidates,
+                )
                 .unwrap_or_else(|_| panic!("primordial unmap publisher unavailable"));
             // SAFETY: as for `map_memory`: the coherency domain lives in its stationary root
             // binding until this shootdown's permit, which S, held until then, protects.
@@ -8724,11 +8732,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // S, beneath P, before the publisher's prepare_mutation (D1 option B1).
             let initiator = PRIMORDIAL_SHOOTDOWN_INITIATOR.acquire_beneath(&session);
             let (mut publisher, coherency) = session
-                .publisher_with_coherency::<
-                    PRIMORDIAL_TABLE_CANDIDATES,
-                    PRIMORDIAL_JOURNAL_ENTRIES,
-                    PRIMORDIAL_INVALIDATIONS,
-                >(target.address_space, target.region_key, &mut candidates)
+                .publisher_with_coherency::<PRIMORDIAL_TABLE_CANDIDATES>(
+                    target.address_space,
+                    target.region_key,
+                    &mut candidates,
+                )
                 .unwrap_or_else(|_| panic!("primordial protect publisher unavailable"));
             // SAFETY: as for `map_memory`: the coherency domain lives in its stationary root
             // binding until this shootdown's permit, which S, held until then, protects.

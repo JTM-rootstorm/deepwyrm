@@ -12,6 +12,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::tlb_mailbox::LiveTlbMailbox;
 
+/// Entries in the live publishers' journal (Deepwyrm D7).
+pub(crate) const LIVE_JOURNAL_ENTRIES: usize = super::primordial::PRIMORDIAL_JOURNAL_ENTRIES;
+/// Pages the live publishers' journal may invalidate.
+pub(crate) const LIVE_JOURNAL_INVALIDATIONS: usize = super::primordial::PRIMORDIAL_INVALIDATIONS;
+/// The live publishers' journal storage: sized for the largest mapping one
+/// call may change, too large for a kernel stack, so it lives in static
+/// storage that the paging state lends to each session beneath P.
+pub(crate) type LiveJournalStorage =
+    crate::arch::x86_64::mm::JournalStorage<LIVE_JOURNAL_ENTRIES, LIVE_JOURNAL_INVALIDATIONS>;
+
 static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
     [const { LiveTlbMailbox::new() }; crate::cpu::CPU_CAPACITY];
 static LIVE_TLB_READY: AtomicBool = AtomicBool::new(false);
@@ -82,12 +92,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// The plain (non-coherent) publisher, for the terminal unmaps of a
     /// quiesced Process, whose root no other CPU uses (D1 commit 9; the
     /// teardown's own shootdown story is D2's).
-    pub(crate) fn publisher<
-        'publisher,
-        const CANDIDATE_CAPACITY: usize,
-        const ENTRY_CAPACITY: usize,
-        const INVALIDATION_CAPACITY: usize,
-    >(
+    pub(crate) fn publisher<'publisher, const CANDIDATE_CAPACITY: usize>(
         &'publisher mut self,
         address_space: crate::memory::address_region::AddressSpaceKey,
         region: crate::memory::address_region::RegionKey,
@@ -99,29 +104,20 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             RANGE_CAPACITY,
             ROLE_CAPACITY,
             CANDIDATE_CAPACITY,
-            ENTRY_CAPACITY,
-            INVALIDATION_CAPACITY,
+            LIVE_JOURNAL_ENTRIES,
+            LIVE_JOURNAL_INVALIDATIONS,
         >,
         crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
     > {
         self.session
-            .publisher::<CANDIDATE_CAPACITY, ENTRY_CAPACITY, INVALIDATION_CAPACITY>(
-                address_space,
-                region,
-                candidates,
-            )
+            .publisher::<CANDIDATE_CAPACITY>(address_space, region, candidates)
     }
 
     #[allow(
         clippy::type_complexity,
         reason = "the publisher and its coherency domain share the session's one borrow"
     )]
-    pub(crate) fn publisher_with_coherency<
-        'publisher,
-        const CANDIDATE_CAPACITY: usize,
-        const ENTRY_CAPACITY: usize,
-        const INVALIDATION_CAPACITY: usize,
-    >(
+    pub(crate) fn publisher_with_coherency<'publisher, const CANDIDATE_CAPACITY: usize>(
         &'publisher mut self,
         address_space: crate::memory::address_region::AddressSpaceKey,
         region: crate::memory::address_region::RegionKey,
@@ -134,8 +130,8 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 RANGE_CAPACITY,
                 ROLE_CAPACITY,
                 CANDIDATE_CAPACITY,
-                ENTRY_CAPACITY,
-                INVALIDATION_CAPACITY,
+                LIVE_JOURNAL_ENTRIES,
+                LIVE_JOURNAL_INVALIDATIONS,
             >,
             &'publisher crate::memory::address_region::AddressSpaceCoherency<
                 { crate::cpu::CPU_CAPACITY },
@@ -143,12 +139,11 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ),
         crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
     > {
-        self.session
-            .publisher_with_coherency::<CANDIDATE_CAPACITY, ENTRY_CAPACITY, INVALIDATION_CAPACITY>(
-                address_space,
-                region,
-                candidates,
-            )
+        self.session.publisher_with_coherency::<CANDIDATE_CAPACITY>(
+            address_space,
+            region,
+            candidates,
+        )
     }
 }
 
@@ -557,6 +552,8 @@ pub(crate) struct LiveProcessAddressSpace<
     >,
     pub(super) roles: &'borrow mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     pub(super) target: TrackedActiveTarget<'borrow>,
+    /// The journal every publisher of this session stages into (D7).
+    pub(super) journal: &'borrow mut LiveJournalStorage,
     pub(super) _root: core::marker::PhantomData<&'root mut ()>,
 }
 
@@ -1212,12 +1209,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         unsafe_code,
         reason = "the live session binds authority-issued identities to its exact pin-aware serialized architecture root"
     )]
-    pub(crate) fn publisher<
-        'publisher,
-        const CANDIDATE_CAPACITY: usize,
-        const ENTRY_CAPACITY: usize,
-        const INVALIDATION_CAPACITY: usize,
-    >(
+    pub(crate) fn publisher<'publisher, const CANDIDATE_CAPACITY: usize>(
         &'publisher mut self,
         address_space: crate::memory::address_region::AddressSpaceKey,
         region: crate::memory::address_region::RegionKey,
@@ -1229,8 +1221,8 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             RANGE_CAPACITY,
             ROLE_CAPACITY,
             CANDIDATE_CAPACITY,
-            ENTRY_CAPACITY,
-            INVALIDATION_CAPACITY,
+            LIVE_JOURNAL_ENTRIES,
+            LIVE_JOURNAL_INVALIDATIONS,
         >,
         crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
     > {
@@ -1241,6 +1233,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let identity = self.identity;
         let roles = &mut *self.roles;
         let target = &mut self.target;
+        let journal = &mut *self.journal;
         // SAFETY: this session owns the exact active root, role manager and
         // pin-aware serialized target; E5 supplies authority-issued identities.
         unsafe {
@@ -1253,6 +1246,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 roles,
                 target,
                 candidates,
+                journal,
             )
         }
     }
@@ -1265,12 +1259,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         unsafe_code,
         reason = "the live session binds authority-issued identities to its exact pin-aware serialized architecture root"
     )]
-    pub(crate) fn publisher_with_coherency<
-        'publisher,
-        const CANDIDATE_CAPACITY: usize,
-        const ENTRY_CAPACITY: usize,
-        const INVALIDATION_CAPACITY: usize,
-    >(
+    pub(crate) fn publisher_with_coherency<'publisher, const CANDIDATE_CAPACITY: usize>(
         &'publisher mut self,
         address_space: crate::memory::address_region::AddressSpaceKey,
         region: crate::memory::address_region::RegionKey,
@@ -1283,8 +1272,8 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 RANGE_CAPACITY,
                 ROLE_CAPACITY,
                 CANDIDATE_CAPACITY,
-                ENTRY_CAPACITY,
-                INVALIDATION_CAPACITY,
+                LIVE_JOURNAL_ENTRIES,
+                LIVE_JOURNAL_INVALIDATIONS,
             >,
             &'publisher crate::memory::address_region::AddressSpaceCoherency<
                 { crate::cpu::CPU_CAPACITY },
@@ -1303,6 +1292,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let identity = self.identity;
         let roles = &mut *self.roles;
         let target = &mut self.target;
+        let journal = &mut *self.journal;
         // SAFETY: the immutable coherency borrow is disjoint from the mutable
         // role/target fields. This session still owns the exact root and its
         // pin-aware serialized publisher for the complete returned lifetime.
@@ -1315,6 +1305,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 roles,
                 target,
                 candidates,
+                journal,
             )
         }?;
         Ok((publisher, coherency))

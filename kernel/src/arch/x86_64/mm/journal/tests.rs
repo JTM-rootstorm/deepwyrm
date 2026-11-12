@@ -79,7 +79,7 @@ fn mutation(table: u64, index: usize, expected: u64, replacement: u64) -> EntryM
 fn journal_is_invisible_until_atomic_child_first_publication() {
     let mut target = FakeTarget::default();
     let page = VirtualPage::new(0x4000).unwrap();
-    let mut journal = PageTableJournal::<_, 4, 1>::new(&mut target);
+    let mut journal = PageTableJournal::<_, 4, 1>::new(&mut target, storage());
     let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
     plan.push_mutation(mutation(0x1000, 0, 0, 0x2003));
     plan.push_mutation(mutation(0x2000, 0, 0, 0x3003));
@@ -100,7 +100,7 @@ fn apply_failure_and_late_conflict_leave_the_target_unchanged() {
         fail_apply: true,
         ..FakeTarget::default()
     };
-    let mut journal = PageTableJournal::<_, 2, 1>::new(&mut target);
+    let mut journal = PageTableJournal::<_, 2, 1>::new(&mut target, storage());
     let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
     plan.push_mutation(mutation(0x1000, 0, 0, 0x2003));
     journal.commit(&plan).unwrap();
@@ -111,7 +111,7 @@ fn apply_failure_and_late_conflict_leave_the_target_unchanged() {
     target.fail_apply = false;
     target.read_count = 0;
     target.mutate_on_read = Some((2, (0x1000, 0), 7));
-    let mut journal = PageTableJournal::<_, 2, 1>::new(&mut target);
+    let mut journal = PageTableJournal::<_, 2, 1>::new(&mut target, storage());
     journal.commit(&plan).unwrap();
     assert_eq!(journal.publish(), Err(PageTableJournalError::Conflict));
     assert_eq!(target.entries.get(&(0x1000, 0)), Some(&7));
@@ -120,10 +120,92 @@ fn apply_failure_and_late_conflict_leave_the_target_unchanged() {
 }
 
 #[test]
+fn table_candidates_cover_a_mapping_at_any_alignment() {
+    let counts =
+        |byte_len| table_candidates_for(byte_len, 16).map(|levels| levels.map(|(_, count)| count));
+    // One page, or anything up to 2 MiB: two tables per level, as the six
+    // fixed candidates were.
+    assert_eq!(counts(4096), Some([2, 2, 2]));
+    assert_eq!(counts(2 << 20), Some([2, 2, 2]));
+    // 16 MiB, a job's whole budget, unaligned: nine PTs.
+    assert_eq!(counts(16 << 20), Some([2, 2, 9]));
+    // 64 MiB would need 33 PTs: more than the pool holds.
+    assert_eq!(counts(64 << 20), None);
+    assert_eq!(counts(u64::MAX), None);
+}
+
+#[test]
+fn a_failed_plan_restores_the_existing_entries_it_changed() {
+    // The rollback keeps only the existing entries a plan changes (D7: the
+    // storage is too large to copy per plan). A second plan that rewrites
+    // a staged entry and then runs out of capacity must leave that entry's
+    // staged value, not its rewrite.
+    let mut target = FakeTarget::default();
+    let page = VirtualPage::new(0x4000).unwrap();
+    let storage = storage::<1, 1>();
+    let mut journal = PageTableJournal::new(&mut target, storage);
+    let mut first = MutationPlan::empty(FrameAddress(0x1000), page);
+    first.push_mutation(mutation(0x1000, 0, 0, 0x2003));
+    journal.commit(&first).unwrap();
+    let mut second = MutationPlan::empty(FrameAddress(0x1000), page);
+    second.push_mutation(mutation(0x1000, 0, 0x2003, 0x2007));
+    second.push_mutation(mutation(0x2000, 0, 0, 0x3003));
+    assert_eq!(
+        journal.commit(&second),
+        Err(CommitError::TableClaimRejected)
+    );
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 0), Ok(0x2003));
+    journal.publish().unwrap();
+    assert_eq!(target.entries.get(&(0x1000, 0)), Some(&0x2003));
+    assert_eq!(target.entries.get(&(0x2000, 0)), None);
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "exercises the in-place initializer the live journal's static storage uses"
+)]
+fn storage_initialized_in_place_is_an_empty_journal() {
+    let mut slot = std::boxed::Box::new(core::mem::MaybeUninit::<JournalStorage<2, 1>>::uninit());
+    // SAFETY: the box holds room for exactly one `JournalStorage<2, 1>`.
+    unsafe { JournalStorage::init_in_place(slot.as_mut_ptr()) };
+    // SAFETY: `init_in_place` initialized it.
+    let storage = unsafe { slot.assume_init_mut() };
+    let mut target = FakeTarget::default();
+    let page = VirtualPage::new(0x4000).unwrap();
+    let mut journal = PageTableJournal::new(&mut target, storage);
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 0), Ok(0));
+    let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
+    plan.push_mutation(mutation(0x1000, 0, 0, 0x2003));
+    journal.commit(&plan).unwrap();
+    journal.publish().unwrap();
+    assert_eq!(target.entries.get(&(0x1000, 0)), Some(&0x2003));
+    assert_eq!(target.invalidated, [0x4000]);
+}
+
+#[test]
+fn reused_storage_starts_an_empty_journal() {
+    let mut target = FakeTarget::default();
+    let page = VirtualPage::new(0x4000).unwrap();
+    let mut storage = JournalStorage::<2, 1>::new();
+    let mut journal = PageTableJournal::new(&mut target, &mut storage);
+    let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
+    plan.push_mutation(mutation(0x1000, 0, 0, 0x2003));
+    journal.commit(&plan).unwrap();
+    // Dropped unpublished: the next journal on the same storage sees none
+    // of it.
+    let mut journal = PageTableJournal::new(&mut target, &mut storage);
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 0), Ok(0));
+    journal.publish().unwrap();
+    assert!(target.entries.is_empty());
+    assert!(target.applied.is_empty());
+}
+
+#[test]
 fn capacity_failure_rolls_back_the_entire_plan_overlay() {
     let mut target = FakeTarget::default();
     let page = VirtualPage::new(0x4000).unwrap();
-    let mut journal = PageTableJournal::<_, 1, 1>::new(&mut target);
+    let mut journal = PageTableJournal::<_, 1, 1>::new(&mut target, storage());
     let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
     plan.push_mutation(mutation(0x1000, 0, 0, 0x2003));
     plan.push_mutation(mutation(0x2000, 0, 0, 0x3003));
@@ -178,6 +260,7 @@ fn owned_journal_claims_candidate_chain_only_after_target_publication() {
 
     let mut journal = OwnedPageTableJournal::<_, 1, 16, 3, 8, 1>::new(
         &mut target,
+        storage(),
         &mut roles,
         root,
         limit,
@@ -275,6 +358,7 @@ fn owned_journal_upgrades_shared_supervisor_ancestors_without_exposing_the_leaf(
     let user_page = VirtualPage::new(0x400000).unwrap();
     let mut journal = OwnedPageTableJournal::<_, 1, 24, 3, 8, 1>::new(
         &mut target,
+        storage(),
         &mut roles,
         root,
         limit,
@@ -364,6 +448,7 @@ fn owned_journal_restores_candidate_grants_when_atomic_target_rejects() {
 
     let mut journal = OwnedPageTableJournal::<_, 1, 16, 3, 8, 1>::new(
         &mut target,
+        storage(),
         &mut roles,
         root,
         limit,
@@ -443,6 +528,7 @@ fn owned_journal_derives_writability_from_the_leaf_replacement() {
     {
         let mut journal = OwnedPageTableJournal::<_, 1, 16, 3, 8, 1>::new(
             &mut target,
+            storage(),
             &mut roles,
             root,
             limit,
@@ -469,6 +555,7 @@ fn owned_journal_derives_writability_from_the_leaf_replacement() {
     {
         let mut journal = OwnedPageTableJournal::<_, 1, 16, 3, 8, 1>::new(
             &mut target,
+            storage(),
             &mut roles,
             root,
             limit,
@@ -495,6 +582,7 @@ fn owned_journal_derives_writability_from_the_leaf_replacement() {
     {
         let mut journal = OwnedPageTableJournal::<_, 1, 16, 3, 8, 1>::new(
             &mut target,
+            storage(),
             &mut roles,
             root,
             limit,
@@ -561,6 +649,7 @@ fn publisher_construction_rejects_mechanically_detectable_binding_mismatches() {
                 &mut roles,
                 &mut target,
                 &mut candidates,
+                storage(),
             )
         },
         Err(X86AddressSpacePublishError::Identity)
@@ -575,6 +664,7 @@ fn publisher_construction_rejects_mechanically_detectable_binding_mismatches() {
                 &mut roles,
                 &mut target,
                 &mut candidates,
+                storage(),
             )
         },
         Err(X86AddressSpacePublishError::Identity)
@@ -589,6 +679,7 @@ fn publisher_construction_rejects_mechanically_detectable_binding_mismatches() {
                 &mut roles,
                 &mut target,
                 &mut candidates,
+                storage(),
             )
         },
         Err(X86AddressSpacePublishError::Identity)
@@ -615,6 +706,7 @@ fn publisher_construction_rejects_mechanically_detectable_binding_mismatches() {
                 &mut roles,
                 &mut target,
                 &mut candidates,
+                storage(),
             )
         },
         Err(X86AddressSpacePublishError::FrameRole(_))
@@ -691,6 +783,7 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
                 &mut roles,
                 &mut target,
                 &mut candidates,
+                storage(),
             )
         }
         .unwrap();
@@ -737,6 +830,7 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
                 &mut roles,
                 &mut target,
                 &mut candidates,
+                storage(),
             )
         }
         .unwrap();
@@ -953,6 +1047,7 @@ fn one_page_map_unmap_rounds_never_accumulate_publisher_capacity() {
             &mut roles,
             &mut target,
             &mut candidates,
+            storage(),
         )
     }
     .unwrap();
@@ -1071,6 +1166,7 @@ fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_b
             &mut roles,
             &mut target,
             &mut candidates,
+            storage(),
         )
     }
     .unwrap();
@@ -1163,6 +1259,7 @@ fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_b
             &mut roles,
             &mut target,
             &mut candidates,
+            storage(),
         )
     }
     .unwrap();
@@ -1304,6 +1401,7 @@ fn two_bound_publishers_map_same_va_to_distinct_root_local_frames() {
                 &mut roles,
                 &mut target,
                 &mut candidates_a,
+                storage(),
             )
         }
         .unwrap();
@@ -1342,6 +1440,7 @@ fn two_bound_publishers_map_same_va_to_distinct_root_local_frames() {
                 &mut roles,
                 &mut target,
                 &mut candidates_b,
+                storage(),
             )
         }
         .unwrap();
@@ -1403,6 +1502,7 @@ fn two_bound_publishers_map_same_va_to_distinct_root_local_frames() {
                 &mut roles,
                 &mut target,
                 &mut no_candidates,
+                storage(),
             )
         },
         Err(X86AddressSpacePublishError::Identity)
@@ -1465,4 +1565,10 @@ fn the_publisher_capacity_walls_each_name_a_distinct_resource() {
         assert!(!error.is_capacity_error());
         assert_eq!(error.capacity_resource(), None);
     }
+}
+
+/// A journal's storage for one test, leaked so it outlives the journal.
+fn storage<const ENTRY_CAPACITY: usize, const INVALIDATION_CAPACITY: usize>()
+-> &'static mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY> {
+    std::boxed::Box::leak(std::boxed::Box::new(JournalStorage::new()))
 }

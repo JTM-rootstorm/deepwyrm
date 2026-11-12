@@ -81,6 +81,7 @@ pub(crate) struct X86AddressSpacePublisher<
     roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     pub(super) target: &'a mut T,
     candidates: &'a mut [Option<TableCandidateGrant>; CANDIDATE_CAPACITY],
+    storage: &'a mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
 }
 
 impl<
@@ -143,6 +144,7 @@ where
         roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
         target: &'a mut T,
         candidates: &'a mut [Option<TableCandidateGrant>; CANDIDATE_CAPACITY],
+        storage: &'a mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
     ) -> Result<Self, X86AddressSpacePublishError<T::Error>> {
         if !address_space.same_domain(region)
             || root.frame().address() != root_identity.physical_start()
@@ -161,6 +163,7 @@ where
             roles,
             target,
             candidates,
+            storage,
         })
     }
 
@@ -181,6 +184,7 @@ where
             INVALIDATION_CAPACITY,
         >::new(
             self.target,
+            self.storage,
             self.roles,
             self.root_identity,
             self.root.physical_limit(),

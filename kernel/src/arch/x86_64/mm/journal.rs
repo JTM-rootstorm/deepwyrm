@@ -10,8 +10,9 @@
 //! acknowledgements complete.
 
 use super::{
-    CommitError, EntryAssertion, EntryMutation, FrameAddress, MutationPlan, PageTableTransaction,
-    PhysicalAddressLimit, VirtualPage, decode_intermediate, decode_intermediate_any,
+    CommitError, EntryAssertion, EntryMutation, FrameAddress, MAX_MUTATIONS, MAX_PATH_ASSERTIONS,
+    MutationPlan, PageTableTransaction, PhysicalAddressLimit, VirtualPage, decode_intermediate,
+    decode_intermediate_any,
 };
 use crate::memory::address_region::{
     AddressSpaceKey, AddressSpacePublisher, Mapping, RegionKey, publisher_seal,
@@ -136,12 +137,103 @@ const EMPTY_ENTRY: EntryState = EntryState {
     written: false,
 };
 
+#[allow(
+    dead_code,
+    reason = "outside tests, only the live paging state (guest builds) creates journal storage"
+)]
 const EMPTY_PAGE: VirtualPage = VirtualPage(0);
+#[allow(
+    dead_code,
+    reason = "outside tests, only the live paging state (guest builds) creates journal storage"
+)]
 const EMPTY_WRITE: JournalWrite = JournalWrite {
     table: FrameAddress(0),
     index: 0,
     value: 0,
 };
+
+/// The arrays a journal stages into and publishes from. A journal borrows
+/// them rather than owning them, so one large enough for a whole job-sized
+/// mapping never lives on a kernel stack (Deepwyrm D7): the live paging state
+/// keeps one in static storage, used only beneath the paging lock P.
+pub(crate) struct JournalStorage<const ENTRY_CAPACITY: usize, const INVALIDATION_CAPACITY: usize> {
+    entries: [EntryState; ENTRY_CAPACITY],
+    invalidations: [VirtualPage; INVALIDATION_CAPACITY],
+    /// `publish`'s revalidated entry values, by entry.
+    actual: [u64; ENTRY_CAPACITY],
+    /// `publish`'s write batch.
+    writes: [JournalWrite; ENTRY_CAPACITY],
+}
+
+#[allow(
+    dead_code,
+    reason = "outside tests, only the live paging state (guest builds) creates journal storage"
+)]
+impl<const ENTRY_CAPACITY: usize, const INVALIDATION_CAPACITY: usize>
+    JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>
+{
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [EMPTY_ENTRY; ENTRY_CAPACITY],
+            invalidations: [EMPTY_PAGE; INVALIDATION_CAPACITY],
+            actual: [0; ENTRY_CAPACITY],
+            writes: [EMPTY_WRITE; ENTRY_CAPACITY],
+        }
+    }
+
+    /// Initializes storage in place, so no whole-value temporary exists on
+    /// the caller's stack.
+    ///
+    /// # Safety
+    ///
+    /// `storage` is valid for writes of one whole `Self`.
+    #[allow(
+        unsafe_code,
+        reason = "zero-fills the storage in place; all-zero bytes are its empty value"
+    )]
+    pub(crate) unsafe fn init_in_place(storage: *mut Self) {
+        // SAFETY: the caller makes `storage` valid for writes of one `Self`. Every field is an
+        // array of integers, integer newtypes and one `bool`, so all-zero bytes are a valid value,
+        // and exactly `EMPTY_ENTRY`, `EMPTY_PAGE`, `EMPTY_WRITE` and 0.
+        unsafe { storage.write_bytes(0, 1) }
+    }
+}
+
+/// The page tables a new mapping of `byte_len` bytes may have to create, by
+/// level, for a map to prepare as candidates (Deepwyrm D7). A range touches at
+/// most one more table at each level than it spans, since it need not start
+/// on a table boundary, so a page needs six and 16 MiB thirteen. `None` when
+/// they would not fit `capacity`.
+#[allow(
+    dead_code,
+    reason = "outside tests, only the live map syscall (guest builds) sizes candidates"
+)]
+pub(crate) fn table_candidates_for(
+    byte_len: u64,
+    capacity: usize,
+) -> Option<[(TableLevel, usize); 3]> {
+    const PT_SPAN: u64 = 512 * BASE_PAGE_SIZE;
+    const PD_SPAN: u64 = 512 * PT_SPAN;
+    const PDPT_SPAN: u64 = 512 * PD_SPAN;
+    let tables = |span: u64| -> Option<usize> {
+        usize::try_from(byte_len.div_ceil(span))
+            .ok()?
+            .checked_add(1)
+    };
+    let levels = [
+        (TableLevel::Pdpt, tables(PDPT_SPAN)?),
+        (TableLevel::Pd, tables(PD_SPAN)?),
+        (TableLevel::Pt, tables(PT_SPAN)?),
+    ];
+    let total = levels
+        .iter()
+        .try_fold(0_usize, |total, (_, count)| total.checked_add(*count))?;
+    (total <= capacity).then_some(levels)
+}
+
+/// The existing entries one staged plan may change: each assertion and each
+/// mutation touches at most one.
+const UNDO_CAPACITY: usize = MAX_PATH_ASSERTIONS + MAX_MUTATIONS;
 
 /// One unpublished journal over an exclusively borrowed atomic target.
 pub(crate) struct PageTableJournal<
@@ -151,10 +243,15 @@ pub(crate) struct PageTableJournal<
     const INVALIDATION_CAPACITY: usize,
 > {
     target: &'a mut T,
-    entries: [EntryState; ENTRY_CAPACITY],
+    storage: &'a mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
     entry_count: usize,
-    invalidations: [VirtualPage; INVALIDATION_CAPACITY],
     invalidation_count: usize,
+    /// While a plan stages, the entries below this count existed before it,
+    /// and `undo` keeps the first value of each one it changes, so a failed
+    /// plan restores them without copying the whole journal.
+    undo_base: Option<usize>,
+    undo: [(usize, EntryState); UNDO_CAPACITY],
+    undo_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,6 +340,7 @@ where
 {
     pub(crate) fn new(
         target: &'target mut T,
+        storage: &'target mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
         roles: &'a mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
         root: TableIdentity,
         physical_limit: PhysicalAddressLimit,
@@ -253,7 +351,7 @@ where
             return Err(FrameRoleError::WrongRole);
         }
         Ok(Self {
-            journal: PageTableJournal::new(target),
+            journal: PageTableJournal::new(target, storage),
             roles,
             root,
             physical_limit,
@@ -713,21 +811,28 @@ impl<'a, T, const ENTRY_CAPACITY: usize, const INVALIDATION_CAPACITY: usize>
 where
     T: AtomicPageTableTarget,
 {
-    pub(crate) fn new(target: &'a mut T) -> Self {
+    /// An empty journal staging into `storage`, whatever it held before.
+    pub(crate) fn new(
+        target: &'a mut T,
+        storage: &'a mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
+    ) -> Self {
         Self {
             target,
-            entries: [EMPTY_ENTRY; ENTRY_CAPACITY],
+            storage,
             entry_count: 0,
-            invalidations: [EMPTY_PAGE; INVALIDATION_CAPACITY],
             invalidation_count: 0,
+            undo_base: None,
+            undo: [(0, EMPTY_ENTRY); UNDO_CAPACITY],
+            undo_count: 0,
         }
     }
 
     /// Revalidates all original observations and atomically publishes the
     /// complete journal. The target remains unchanged on every returned error.
     pub(crate) fn publish(&mut self) -> Result<(), PageTableJournalError<T::Error>> {
-        let mut actual = [0_u64; ENTRY_CAPACITY];
-        for (index, entry) in self.entries[..self.entry_count].iter().copied().enumerate() {
+        let storage = &mut *self.storage;
+        for index in 0..self.entry_count {
+            let entry = storage.entries[index];
             let value = self
                 .target
                 .read_entry(entry.table, entry.index)
@@ -735,27 +840,26 @@ where
             if value & entry.compare_mask != entry.expected & entry.compare_mask {
                 return Err(PageTableJournalError::Conflict);
             }
-            actual[index] = value;
+            storage.actual[index] = value;
         }
 
-        let mut writes = [EMPTY_WRITE; ENTRY_CAPACITY];
         let mut write_count = 0;
         for index in (0..self.entry_count).rev() {
-            let entry = self.entries[index];
+            let entry = storage.entries[index];
             if !entry.written {
                 continue;
             }
-            writes[write_count] = JournalWrite {
+            storage.writes[write_count] = JournalWrite {
                 table: entry.table,
                 index: entry.index,
-                value: entry.replacement | (actual[index] & entry.preserve_mask),
+                value: entry.replacement | (storage.actual[index] & entry.preserve_mask),
             };
             write_count += 1;
         }
         self.target
             .apply(
-                &writes[..write_count],
-                &self.invalidations[..self.invalidation_count],
+                &storage.writes[..write_count],
+                &storage.invalidations[..self.invalidation_count],
             )
             .map_err(PageTableJournalError::Access)
     }
@@ -768,7 +872,7 @@ where
         if index >= ENTRY_COUNT {
             return Err(PageTableJournalError::InvalidIndex);
         }
-        if let Some(entry) = self.entries[..self.entry_count]
+        if let Some(entry) = self.storage.entries[..self.entry_count]
             .iter()
             .find(|entry| entry.table == table && entry.index == index)
         {
@@ -780,19 +884,46 @@ where
     }
 
     fn stage_plan(&mut self, plan: &MutationPlan) -> Result<(), PageTableJournalError<T::Error>> {
-        let original_entries = self.entries;
         let original_entry_count = self.entry_count;
-        let original_invalidations = self.invalidations;
         let original_invalidation_count = self.invalidation_count;
+        self.undo_base = Some(original_entry_count);
+        self.undo_count = 0;
 
         let result = self.stage_plan_inner(plan);
+        self.undo_base = None;
         if result.is_err() {
-            self.entries = original_entries;
+            // Entries and invalidations added by the plan are dropped by the
+            // counts; existing entries it changed get their first values back.
+            while self.undo_count != 0 {
+                self.undo_count -= 1;
+                let (slot, entry) = self.undo[self.undo_count];
+                self.storage.entries[slot] = entry;
+            }
             self.entry_count = original_entry_count;
-            self.invalidations = original_invalidations;
             self.invalidation_count = original_invalidation_count;
         }
         result
+    }
+
+    /// Keeps `slot`'s current value for the staging plan's rollback, if the
+    /// slot existed before the plan and this is its first change.
+    fn remember(&mut self, slot: usize) -> Result<(), PageTableJournalError<T::Error>> {
+        let Some(base) = self.undo_base else {
+            return Ok(());
+        };
+        if slot >= base
+            || self.undo[..self.undo_count]
+                .iter()
+                .any(|(kept, _)| *kept == slot)
+        {
+            return Ok(());
+        }
+        if self.undo_count == UNDO_CAPACITY {
+            return Err(PageTableJournalError::Capacity);
+        }
+        self.undo[self.undo_count] = (slot, self.storage.entries[slot]);
+        self.undo_count += 1;
+        Ok(())
     }
 
     fn stage_plan_inner(
@@ -805,11 +936,11 @@ where
         for mutation in plan.mutations().iter().copied() {
             self.stage_mutation(mutation)?;
         }
-        if !self.invalidations[..self.invalidation_count].contains(&plan.page()) {
+        if !self.storage.invalidations[..self.invalidation_count].contains(&plan.page()) {
             if self.invalidation_count == INVALIDATION_CAPACITY {
                 return Err(PageTableJournalError::Capacity);
             }
-            self.invalidations[self.invalidation_count] = plan.page();
+            self.storage.invalidations[self.invalidation_count] = plan.page();
             self.invalidation_count += 1;
         }
         Ok(())
@@ -848,7 +979,8 @@ where
             mutation.compare_mask(),
             logical,
         )?;
-        let entry = &mut self.entries[slot];
+        self.remember(slot)?;
+        let entry = &mut self.storage.entries[slot];
         if entry.written {
             entry.replacement =
                 mutation.replacement() | (entry.replacement & mutation.preserve_mask());
@@ -870,16 +1002,18 @@ where
         compare_mask: u64,
         logical: u64,
     ) -> Result<usize, PageTableJournalError<T::Error>> {
-        if let Some(slot) = self.entries[..self.entry_count]
+        if let Some(slot) = self.storage.entries[..self.entry_count]
             .iter()
             .position(|entry| entry.table == table && entry.index == index)
         {
-            let entry = &mut self.entries[slot];
+            let entry = self.storage.entries[slot];
             if !entry.written {
                 let overlap = entry.compare_mask & compare_mask;
                 if (entry.expected ^ expected) & overlap != 0 {
                     return Err(PageTableJournalError::Conflict);
                 }
+                self.remember(slot)?;
+                let entry = &mut self.storage.entries[slot];
                 entry.expected = (entry.expected & entry.compare_mask) | (expected & compare_mask);
                 entry.compare_mask |= compare_mask;
             }
@@ -889,7 +1023,7 @@ where
             return Err(PageTableJournalError::Capacity);
         }
         let slot = self.entry_count;
-        self.entries[slot] = EntryState {
+        self.storage.entries[slot] = EntryState {
             table,
             index,
             expected,

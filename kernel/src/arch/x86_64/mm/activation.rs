@@ -17,11 +17,11 @@ use crate::memory::frame_roles::{
 use crate::memory::physical::PhysicalRange;
 
 use super::super::VirtualPage;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-use super::super::journal::PageTableJournal;
 use super::super::journal::{
     AtomicPageTableTarget, JournalWrite, target_seal as journal_target_seal,
 };
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use super::super::journal::{JournalStorage, PageTableJournal};
 use super::super::{
     ACCESSED, AddressError, CACHE_DISABLE, DIRTY, FrameAddress, GLOBAL, HUGE, NO_EXECUTE,
     PAGE_SIZE, PERMITTED_ENTRY_FLAGS, PRESENT, PageTableRoot, PagingCapabilities, SOFTWARE_HIGH,
@@ -587,7 +587,17 @@ pub(crate) struct ActiveDeepPaging<A> {
         AddressSpaceRootBindings<LIVE_ADDRESS_SPACE_CAPACITY, { crate::cpu::CPU_CAPACITY }>,
     #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     kernel_execution_roots: KernelExecutionRoots<{ crate::cpu::CPU_CAPACITY }>,
+    /// The journal every live publisher stages into (Deepwyrm D7), lent to
+    /// one session at a time, so the paging lock P serializes its use.
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+    journal: &'static mut user_access::LiveJournalStorage,
 }
+
+/// The live journal's storage: the kernel's one live paging state takes it
+/// once, when it activates.
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+static LIVE_JOURNAL: crate::one_shot::OneShotStorage<user_access::LiveJournalStorage> =
+    crate::one_shot::OneShotStorage::new();
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[derive(Debug, Eq, PartialEq)]
@@ -1706,7 +1716,8 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Err(_) => return Err(LiveActiveTargetError::InvalidIndex),
         };
         let mut scratch = self.target.current_scratch_target()?;
-        let mut journal = PageTableJournal::<_, 4, 1>::new(&mut scratch);
+        let mut storage = JournalStorage::<4, 1>::new();
+        let mut journal = PageTableJournal::<_, 4, 1>::new(&mut scratch, &mut storage);
         let result = self.root.retire_architecture_bootstrap_identity_page(
             &mut journal,
             page,
@@ -2285,6 +2296,7 @@ mod live_sessions {
                     pins: &self.user_pins,
                     address_space,
                 },
+                journal: &mut *self.journal,
                 _root: core::marker::PhantomData,
             }
         }
@@ -2542,6 +2554,21 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             root_bindings: AddressSpaceRootBindings::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             kernel_execution_roots: KernelExecutionRoots::new(),
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+            journal: {
+                #[allow(
+                    unsafe_code,
+                    reason = "zero-fills the journal storage in place, with no stack temporary"
+                )]
+                // SAFETY: `init_in_place` hands the closure the storage's one pointer, valid for
+                // writes of a whole `LiveJournalStorage`, which `JournalStorage::init_in_place`
+                // fully initializes and does not read.
+                unsafe {
+                    LIVE_JOURNAL.init_in_place(|storage| {
+                        crate::arch::x86_64::mm::JournalStorage::init_in_place(storage)
+                    })
+                }
+            },
         }
     }
 }
