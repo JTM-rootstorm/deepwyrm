@@ -8,6 +8,8 @@
 use core::mem::MaybeUninit;
 use deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE;
 
+use super::growable::GrowableStore;
+
 /// The only frame size supported during DW0-C bootstrap allocation.
 pub const BASE_PAGE_SIZE: u64 = DW_BOOT_BASE_PAGE_SIZE as u64;
 
@@ -238,7 +240,9 @@ pub const fn free_range_bound(candidates: usize, reservations: usize, live_runs:
 pub(super) struct PhysicalFrameAllocator<const RANGE_CAPACITY: usize> {
     initial: [PageRange; RANGE_CAPACITY],
     initial_len: usize,
-    free: [PageRange; RANGE_CAPACITY],
+    /// Starts as `RANGE_CAPACITY` inline ranges; [`Self::adopt_free_list`]
+    /// moves it into RAM sized for the grown role table (DW2 M2 §5.3).
+    free: GrowableStore<PageRange, RANGE_CAPACITY>,
     free_len: usize,
     limit: PhysicalAddressLimit,
 }
@@ -257,7 +261,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         let mut allocator = Self {
             initial: [EMPTY_RANGE; RANGE_CAPACITY],
             initial_len: 0,
-            free: [EMPTY_RANGE; RANGE_CAPACITY],
+            free: GrowableStore::new(EMPTY_RANGE),
             free_len: 0,
             limit,
         };
@@ -277,7 +281,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         }
 
         allocator.initial[..allocator.free_len]
-            .copy_from_slice(&allocator.free[..allocator.free_len]);
+            .copy_from_slice(&allocator.free.as_slice()[..allocator.free_len]);
         allocator.initial_len = allocator.free_len;
         Ok(allocator)
     }
@@ -306,11 +310,10 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         let destination = slot.as_mut_ptr();
         unsafe {
             let initial = core::ptr::addr_of_mut!((*destination).initial).cast::<PageRange>();
-            let free = core::ptr::addr_of_mut!((*destination).free).cast::<PageRange>();
             for index in 0..RANGE_CAPACITY {
                 initial.add(index).write(EMPTY_RANGE);
-                free.add(index).write(EMPTY_RANGE);
             }
+            GrowableStore::init_in_place(core::ptr::addr_of_mut!((*destination).free), EMPTY_RANGE);
             core::ptr::addr_of_mut!((*destination).initial_len).write(0);
             core::ptr::addr_of_mut!((*destination).free_len).write(0);
             core::ptr::addr_of_mut!((*destination).limit).write(limit);
@@ -327,7 +330,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
                 allocator.subtract(PageRange::cover(reservation, limit)?)?;
             }
             allocator.initial[..allocator.free_len]
-                .copy_from_slice(&allocator.free[..allocator.free_len]);
+                .copy_from_slice(&allocator.free.as_slice()[..allocator.free_len]);
             allocator.initial_len = allocator.free_len;
             Ok(allocator)
         }
@@ -374,16 +377,16 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         let byte_len = page_count
             .checked_mul(BASE_PAGE_SIZE)
             .ok_or(PhysicalMemoryError::AddressOverflow)?;
-        let index = self.free[..self.free_len]
+        let index = self.free.as_slice()[..self.free_len]
             .iter()
             .position(|range| range.end - range.start >= byte_len)
             .ok_or(PhysicalMemoryError::NoFramesAvailable)?;
-        let start = self.free[index].start;
+        let start = self.free.as_slice()[index].start;
         let end = start
             .checked_add(byte_len)
             .ok_or(PhysicalMemoryError::AddressOverflow)?;
-        self.free[index].start = end;
-        if self.free[index].start == self.free[index].end {
+        self.free.as_mut_slice()[index].start = end;
+        if self.free.as_slice()[index].start == self.free.as_slice()[index].end {
             self.remove_free(index);
         }
         Ok(PageRange { start, end })
@@ -410,7 +413,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             .checked_mul(BASE_PAGE_SIZE)
             .ok_or(PhysicalMemoryError::AddressOverflow)?;
         let ceiling = exclusive_ceiling.min(self.limit.exclusive());
-        let index = self.free[..self.free_len]
+        let index = self.free.as_slice()[..self.free_len]
             .iter()
             .position(|range| {
                 range
@@ -420,15 +423,15 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
                     .is_some_and(|available| available >= byte_len)
             })
             .ok_or(PhysicalMemoryError::NoFramesAvailable)?;
-        let start = self.free[index].start;
+        let start = self.free.as_slice()[index].start;
         let end = start
             .checked_add(byte_len)
             .ok_or(PhysicalMemoryError::AddressOverflow)?;
 
         // `index` was selected only when this exact run ended at or below the
         // ceiling and inside the free range. Mutate only after that proof.
-        self.free[index].start = end;
-        if self.free[index].start == self.free[index].end {
+        self.free.as_mut_slice()[index].start = end;
+        if self.free.as_slice()[index].start == self.free.as_slice()[index].end {
             self.remove_free(index);
         }
         Ok(PageRange { start, end })
@@ -444,7 +447,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         {
             return Err(PhysicalMemoryError::InvalidFrame);
         }
-        if self.free[..self.free_len]
+        if self.free.as_slice()[..self.free_len]
             .iter()
             .any(|free| free.overlaps(range))
         {
@@ -453,9 +456,25 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         self.insert_free(range)
     }
 
+    /// The ranges the free list needs to grow to so that, with the initial
+    /// ranges, it bounds `live_runs` live runs ([`free_range_bound`]).
+    pub(super) fn free_list_capacity_for(&self, live_runs: usize) -> usize {
+        free_range_bound(self.initial_len, 0, live_runs)
+    }
+
+    /// Moves the free list into `larger` (DW2 M2 §5.3). Refuses, returning
+    /// `larger`, unless it is longer than the inline list and this is the
+    /// first move.
+    pub(super) fn adopt_free_list(
+        &mut self,
+        larger: &'static mut [PageRange],
+    ) -> Result<(), &'static mut [PageRange]> {
+        self.free.adopt(larger, EMPTY_RANGE)
+    }
+
     /// Number of currently available frames.
     pub(super) fn available_frames(&self) -> u64 {
-        self.free[..self.free_len]
+        self.free.as_slice()[..self.free_len]
             .iter()
             .fold(0_u64, |total, range| total + range.page_count())
     }
@@ -478,6 +497,10 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         })
     }
 
+    pub(super) fn initial_page_ranges(&self) -> &[PageRange] {
+        &self.initial[..self.initial_len]
+    }
+
     pub(super) fn contains_initial(&self, range: PageRange) -> bool {
         self.initial[..self.initial_len]
             .iter()
@@ -491,7 +514,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     }
 
     pub(super) fn overlaps_free(&self, range: PageRange) -> bool {
-        self.free[..self.free_len]
+        self.free.as_slice()[..self.free_len]
             .iter()
             .any(|free| free.overlaps(range))
     }
@@ -499,7 +522,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     fn subtract(&mut self, reservation: PageRange) -> Result<(), PhysicalMemoryError> {
         let mut index = 0;
         while index < self.free_len {
-            let free = self.free[index];
+            let free = self.free.as_slice()[index];
             if !free.overlaps(reservation) {
                 index += 1;
                 continue;
@@ -509,15 +532,15 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
                 continue;
             }
             if free.start < reservation.start && reservation.end < free.end {
-                if self.free_len == RANGE_CAPACITY {
+                if self.free_len == self.free.len() {
                     return Err(PhysicalMemoryError::CapacityExceeded);
                 }
                 self.shift_right(index + 1);
-                self.free[index] = PageRange {
+                self.free.as_mut_slice()[index] = PageRange {
                     start: free.start,
                     end: reservation.start,
                 };
-                self.free[index + 1] = PageRange {
+                self.free.as_mut_slice()[index + 1] = PageRange {
                     start: reservation.end,
                     end: free.end,
                 };
@@ -526,9 +549,9 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
                 continue;
             }
             if reservation.start <= free.start {
-                self.free[index].start = reservation.end;
+                self.free.as_mut_slice()[index].start = reservation.end;
             } else {
-                self.free[index].end = reservation.start;
+                self.free.as_mut_slice()[index].end = reservation.start;
             }
             index += 1;
         }
@@ -541,35 +564,35 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             return Ok(());
         }
         let mut insertion = 0;
-        while insertion < self.free_len && self.free[insertion].start < range.start {
+        while insertion < self.free_len && self.free.as_slice()[insertion].start < range.start {
             insertion += 1;
         }
-        if insertion > 0 && self.free[insertion - 1].end > range.start {
+        if insertion > 0 && self.free.as_slice()[insertion - 1].end > range.start {
             return Err(PhysicalMemoryError::DoubleFree);
         }
-        if insertion < self.free_len && range.end > self.free[insertion].start {
+        if insertion < self.free_len && range.end > self.free.as_slice()[insertion].start {
             return Err(PhysicalMemoryError::DoubleFree);
         }
-        if insertion > 0 && self.free[insertion - 1].end == range.start {
-            self.free[insertion - 1].end = range.end;
+        if insertion > 0 && self.free.as_slice()[insertion - 1].end == range.start {
+            self.free.as_mut_slice()[insertion - 1].end = range.end;
             if insertion < self.free_len
-                && self.free[insertion - 1].end == self.free[insertion].start
+                && self.free.as_slice()[insertion - 1].end == self.free.as_slice()[insertion].start
             {
-                let right = self.free[insertion];
-                self.free[insertion - 1].end = right.end;
+                let right = self.free.as_slice()[insertion];
+                self.free.as_mut_slice()[insertion - 1].end = right.end;
                 self.remove_free(insertion);
             }
             return Ok(());
         }
-        if insertion < self.free_len && range.end == self.free[insertion].start {
-            self.free[insertion].start = range.start;
+        if insertion < self.free_len && range.end == self.free.as_slice()[insertion].start {
+            self.free.as_mut_slice()[insertion].start = range.start;
             return Ok(());
         }
-        if self.free_len == RANGE_CAPACITY {
+        if self.free_len == self.free.len() {
             return Err(PhysicalMemoryError::CapacityExceeded);
         }
         self.shift_right(insertion);
-        self.free[insertion] = range;
+        self.free.as_mut_slice()[insertion] = range;
         self.free_len += 1;
         Ok(())
     }
@@ -588,17 +611,16 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     }
 
     fn shift_right(&mut self, index: usize) {
-        for position in (index..self.free_len).rev() {
-            self.free[position + 1] = self.free[position];
-        }
+        let len = self.free_len;
+        self.free.as_mut_slice().copy_within(index..len, index + 1);
     }
 
     fn remove_free(&mut self, index: usize) {
-        for position in index..self.free_len - 1 {
-            self.free[position] = self.free[position + 1];
-        }
+        let len = self.free_len;
+        let free = self.free.as_mut_slice();
+        free.copy_within(index + 1..len, index);
+        free[len - 1] = EMPTY_RANGE;
         self.free_len -= 1;
-        self.free[self.free_len] = EMPTY_RANGE;
     }
 }
 

@@ -13,7 +13,8 @@ use crate::memory::address_region::{
     AddressSpaceCoherency, AddressSpaceCoherencyError, AddressSpaceKey, Residency, ResidencyWitness,
 };
 use crate::memory::frame_roles::{
-    EmptyTableHierarchyCandidate, FrameRoleError, FrameRoleManager, TableIdentity, TableLevel,
+    EmptyTableHierarchyCandidate, EmptyTableHierarchyGrant, FrameRoleError, FrameRoleManager,
+    TableIdentity, TableLevel,
 };
 use crate::memory::physical::PhysicalAddressLimit;
 use crate::memory::usercopy::{AddressSpaceTeardownReservation, UserPinTracker};
@@ -264,23 +265,19 @@ impl PreparedKernelRootEntry {
 #[must_use = "executed AP kernel-root entry must commit its CPU-private token"]
 pub(crate) struct ExecutedKernelRootEntry(PreparedKernelRootEntry);
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the bounded recursive walk carries distinct target, role, proof, physical-limit, and atomic-batch authorities"
-)]
+/// Observes every table below `parent` (whose frame is `table`) for an
+/// empty-hierarchy proof, top-down, refusing any mapped page.
 fn observe_empty_owned_subtree<
     T: AtomicPageTableTarget,
     const RANGES: usize,
     const ROLES: usize,
 >(
     target: &mut T,
-    roles: &FrameRoleManager<RANGES, ROLES>,
-    hierarchy: &mut EmptyTableHierarchyCandidate<ROLES>,
+    roles: &mut FrameRoleManager<RANGES, ROLES>,
+    hierarchy: &mut EmptyTableHierarchyCandidate,
     parent: TableIdentity,
     table: FrameAddress,
     physical_limit: PhysicalAddressLimit,
-    disconnects: &mut [JournalWrite; ROLES],
-    disconnect_count: &mut usize,
 ) -> Result<(), RootBindingError> {
     for index in 0..512 {
         let entry = target
@@ -307,23 +304,58 @@ fn observe_empty_owned_subtree<
         roles
             .observe_empty_table_child(hierarchy, parent, child)
             .map_err(RootBindingError::FrameRole)?;
-        observe_empty_owned_subtree(
-            target,
-            roles,
-            hierarchy,
-            child,
-            child_frame,
-            physical_limit,
-            disconnects,
-            disconnect_count,
-        )?;
-        let write = disconnects
-            .get_mut(*disconnect_count)
-            .ok_or(RootBindingError::RootMismatch)?;
-        *write = JournalWrite::new(table, index, 0);
-        *disconnect_count += 1;
+        observe_empty_owned_subtree(target, roles, hierarchy, child, child_frame, physical_limit)?;
     }
     Ok(())
+}
+
+/// Reclaims `table` and every table below it, children first, after the
+/// root has disconnected them (DW2 M2 §5.3). The walk reads the same
+/// entries the observation walk proved; nothing changed them since, so a
+/// mismatch is a broken invariant.
+///
+/// # Safety
+///
+/// As [`FrameRoleManager::reclaim_preflighted_table`]: the hierarchy is
+/// disconnected from its root and no CPU can reach it.
+#[allow(
+    unsafe_code,
+    reason = "forwards the disconnected-hierarchy contract to per-table reclaim"
+)]
+unsafe fn reclaim_disconnected_subtree<
+    T: AtomicPageTableTarget,
+    const RANGES: usize,
+    const ROLES: usize,
+>(
+    target: &mut T,
+    roles: &mut FrameRoleManager<RANGES, ROLES>,
+    hierarchy: &mut EmptyTableHierarchyGrant,
+    table: TableIdentity,
+    physical_limit: PhysicalAddressLimit,
+) {
+    if let Some(child_level) = table.level().child() {
+        let frame = FrameAddress::new(table.physical_start(), physical_limit)
+            .unwrap_or_else(|_| panic!("a proved table frame stays valid"));
+        for index in 0..512 {
+            let entry = target
+                .read_entry(frame, index)
+                .unwrap_or_else(|_| panic!("a proved table stays readable"));
+            if entry == 0 {
+                continue;
+            }
+            let child_frame = decode_intermediate(entry, true, physical_limit)
+                .unwrap_or_else(|_| panic!("a proved table entry stays valid"));
+            let child = roles
+                .table_identity(table.owner(), child_level, child_frame.address())
+                .unwrap_or_else(|error| panic!("a proved child table disappeared: {error:?}"));
+            // SAFETY: forwarded from this function's contract.
+            unsafe {
+                reclaim_disconnected_subtree(target, roles, hierarchy, child, physical_limit);
+            }
+        }
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { roles.reclaim_preflighted_table(hierarchy, table) };
 }
 
 struct RootBinding<const CPUS: usize> {
@@ -940,7 +972,12 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         let mut hierarchy = roles
             .begin_empty_table_hierarchy(binding.identity)
             .map_err(RootBindingError::FrameRole)?;
-        let mut disconnects = [JournalWrite::new(root.frame(), 0, 0); ROLES];
+        // Only the root's own low-half entries are cleared: that disconnects
+        // every table below it at once. The tables are then reclaimed by
+        // walking them again, which needs no journal since no CPU can reach
+        // them (DW2 M2 §5.3).
+        let mut disconnects = [JournalWrite::new(root.frame(), 0, 0); 256];
+        let mut children = [None; 256];
         let mut disconnect_count = 0;
         for index in 0..256 {
             let entry = target
@@ -968,16 +1005,12 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 child,
                 child_frame,
                 root.physical_limit(),
-                &mut disconnects,
-                &mut disconnect_count,
             )?;
-            let write = disconnects
-                .get_mut(disconnect_count)
-                .ok_or(RootBindingError::RootMismatch)?;
-            *write = JournalWrite::new(root.frame(), index, 0);
+            disconnects[disconnect_count] = JournalWrite::new(root.frame(), index, 0);
+            children[disconnect_count] = Some(child);
             disconnect_count += 1;
         }
-        let hierarchy = roles
+        let mut hierarchy = roles
             .finish_empty_table_hierarchy(hierarchy)
             .map_err(RootBindingError::FrameRole)?;
         target
@@ -991,7 +1024,20 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
         let permit = barrier
             .try_complete()
             .unwrap_or_else(|_| panic!("zero-resident teardown barrier became incomplete"));
-        let empty_root = unsafe { roles.reclaim_preflighted_empty_table_hierarchy(hierarchy) };
+        for child in children[..disconnect_count].iter().flatten() {
+            // SAFETY: the root's low half is cleared and the barrier above
+            // proved no CPU resident, so nothing reaches these tables.
+            unsafe {
+                reclaim_disconnected_subtree(
+                    target,
+                    roles,
+                    &mut hierarchy,
+                    *child,
+                    root.physical_limit(),
+                );
+            }
+        }
+        let empty_root = roles.finish_preflighted_hierarchy(hierarchy);
         unsafe {
             roles.reclaim_preflighted_empty_table_root(empty_root);
         }

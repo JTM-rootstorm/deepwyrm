@@ -1,5 +1,8 @@
+extern crate std;
+
 use super::super::physical::PhysicalAddressLimit;
 use super::*;
+use std::{boxed::Box, vec, vec::Vec};
 
 type TestManager = FrameRoleManager<2, 16>;
 
@@ -259,8 +262,11 @@ fn exact_empty_hierarchy_proof_reclaims_descendants_bottom_up() {
     roles
         .observe_empty_table_child(&mut hierarchy, pd, pt)
         .unwrap();
-    let hierarchy = roles.finish_empty_table_hierarchy(hierarchy).unwrap();
-    let empty_root = unsafe { roles.reclaim_preflighted_empty_table_hierarchy(hierarchy) };
+    let mut hierarchy = roles.finish_empty_table_hierarchy(hierarchy).unwrap();
+    for table in [pt, pd, pdpt] {
+        unsafe { roles.reclaim_preflighted_table(&mut hierarchy, table) };
+    }
+    let empty_root = roles.finish_preflighted_hierarchy(hierarchy);
     unsafe { roles.reclaim_preflighted_empty_table_root(empty_root) };
 
     assert_eq!(roles.available_frames(), initial);
@@ -647,6 +653,7 @@ fn transition_table_set_import_is_atomic_and_exact() {
     assert_eq!(imported.len(), 1);
     let record = capacity_limited
         .roles
+        .as_slice()
         .iter()
         .filter_map(|slot| slot.record)
         .find(|record| record.range.start == 0x20_000)
@@ -671,6 +678,7 @@ fn transition_table_set_import_is_atomic_and_exact() {
     for index in 0..2 {
         let record = roles
             .roles
+            .as_slice()
             .iter()
             .filter_map(|slot| slot.record)
             .find(|record| record.range.start == 0x30_000 + (index as u64) * BASE_PAGE_SIZE)
@@ -851,5 +859,215 @@ fn a_manager_sized_by_the_free_range_bound_never_fails_a_free() {
         Err(FrameRoleError::Physical(
             PhysicalMemoryError::CapacityExceeded
         ))
+    );
+}
+
+/// A leaked, 8-aligned buffer standing in for the direct-mapped run a grown
+/// role table lives in.
+fn grown_run(bytes: u64) -> *mut u8 {
+    let words = usize::try_from(bytes.div_ceil(8)).unwrap();
+    Box::leak(vec![0_u64; words].into_boxed_slice())
+        .as_mut_ptr()
+        .cast()
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the host model hands the manager a leaked buffer as its grown run"
+)]
+fn grow(roles: &mut TestManager) -> RoleTableLayout {
+    let layout = roles.grown_layout().unwrap();
+    let grant = roles.allocate(layout.page_count()).unwrap();
+    // SAFETY: the leaked buffer is 8-aligned, at least the run's size, and
+    // used by nothing else.
+    unsafe { roles.adopt_storage(grant, grown_run(layout.page_count() * BASE_PAGE_SIZE)) }.unwrap();
+    layout
+}
+
+/// The slot an identity names.
+fn slot_number(identity: FrameRoleIdentity) -> usize {
+    (identity.raw as u32 - 1) as usize
+}
+
+#[test]
+fn a_freed_slot_is_reused_with_the_next_generation_and_a_spent_one_retires() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let first = roles.allocate(1).unwrap();
+    let slot = slot_number(first.identity);
+    roles.cancel_allocation(first).unwrap();
+    let second = roles.allocate(1).unwrap();
+    assert_eq!(slot_number(second.identity), slot);
+    assert_ne!(second.identity, FrameRoleIdentity::EMPTY);
+    roles.cancel_allocation(second).unwrap();
+
+    // A slot at its last generation is used once more, then never again.
+    roles.roles.as_mut_slice()[slot].generation = u32::MAX - 1;
+    let last = roles.allocate(1).unwrap();
+    assert_eq!(slot_number(last.identity), slot);
+    roles.cancel_allocation(last).unwrap();
+    let after = roles.allocate(1).unwrap();
+    assert_ne!(slot_number(after.identity), slot);
+    roles.cancel_allocation(after).unwrap();
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn growth_keeps_identities_adds_slots_and_indexes_tables() {
+    // 2 MiB of allocator RAM: one slot more than the 16 boot slots.
+    let mut roles = manager(BASE_PAGE_SIZE, 512);
+    let owner = roles.create_table_owner().unwrap();
+    let root = allocate_zeroed(&mut roles, 1);
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let kept = roles.allocate(1).unwrap();
+
+    let layout = grow(&mut roles);
+    assert_eq!(layout.slot_count(), 17);
+    assert_eq!(roles.roles.len(), 17);
+    assert_eq!(roles.validate_allocation(&kept), Ok(()));
+    assert_eq!(roles.validate_table_identity(root), Ok(()));
+    assert_eq!(
+        roles.table_identity(owner, TableLevel::Pml4, root.physical_start()),
+        Ok(root)
+    );
+    assert_eq!(roles.check_invariants(), Ok(()));
+
+    // Every slot is usable: fill the grown table, then one more is refused.
+    let mut held = Vec::new();
+    while let Ok(grant) = roles.allocate(1) {
+        held.push(grant);
+    }
+    assert_eq!(
+        held.len() + 3,
+        17,
+        "root, kept and the run hold three slots"
+    );
+    assert_eq!(roles.allocate(1), Err(FrameRoleError::Capacity));
+
+    // A table committed after growth is found through the start index.
+    let freed = held.pop().unwrap();
+    roles.cancel_allocation(freed).unwrap();
+    let pdpt = allocate_zeroed(&mut roles, 1);
+    let pdpt = roles.prepare_table(pdpt, owner, TableLevel::Pdpt).unwrap();
+    let pdpt = roles.commit_table(pdpt, Some(root)).unwrap();
+    assert_eq!(
+        roles.table_identity(owner, TableLevel::Pdpt, pdpt.physical_start()),
+        Ok(pdpt)
+    );
+    assert_eq!(
+        roles.table_identity(owner, TableLevel::Pd, pdpt.physical_start()),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.table_identity(
+            owner,
+            TableLevel::Pdpt,
+            pdpt.physical_start() + BASE_PAGE_SIZE
+        ),
+        Err(FrameRoleError::WrongRole)
+    );
+    for grant in held {
+        roles.cancel_allocation(grant).unwrap();
+    }
+    roles.cancel_allocation(kept).unwrap();
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn the_grown_free_list_holds_more_holes_than_the_boot_list() {
+    // The boot free list has 2 ranges; growth sizes it by the slot count.
+    let mut roles = manager(BASE_PAGE_SIZE, 512);
+    grow(&mut roles);
+    let mut grants = Vec::new();
+    for _ in 0..8 {
+        grants.push(roles.allocate(1).unwrap());
+    }
+    // Freeing every other run leaves four holes at once.
+    let mut kept = Vec::new();
+    for (index, grant) in grants.into_iter().enumerate() {
+        if index % 2 == 0 {
+            roles.cancel_allocation(grant).unwrap();
+        } else {
+            kept.push(grant);
+        }
+    }
+    assert_eq!(roles.check_invariants(), Ok(()));
+    for grant in kept {
+        roles.cancel_allocation(grant).unwrap();
+    }
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model offers the manager runs it must refuse"
+)]
+fn growth_refuses_a_short_run_a_misaligned_base_and_a_second_move() {
+    // 32 MiB: the start index alone needs several pages.
+    let mut roles = manager(BASE_PAGE_SIZE, 8192);
+    let layout = roles.grown_layout().unwrap();
+    assert!(layout.page_count() > 1);
+    let short = roles.allocate(layout.page_count() - 1).unwrap();
+    let base = grown_run(layout.page_count() * BASE_PAGE_SIZE);
+    // SAFETY: the buffer is large enough; the grant is too short.
+    let short = unsafe { roles.adopt_storage(short, base) }.unwrap_err();
+    assert_eq!(short.error(), FrameRoleError::WrongRole);
+    roles.cancel_allocation(short.into_grant()).unwrap();
+
+    let grant = roles.allocate(layout.page_count()).unwrap();
+    // SAFETY: refused before any write: the base is not 8-aligned.
+    let misaligned = unsafe { roles.adopt_storage(grant, base.wrapping_add(4)) }.unwrap_err();
+    assert_eq!(misaligned.error(), FrameRoleError::WrongRole);
+    let grant = misaligned.into_grant();
+    // SAFETY: an 8-aligned buffer of the run's size, used by nothing else.
+    unsafe { roles.adopt_storage(grant, base) }.unwrap();
+
+    let again = roles.allocate(layout.page_count()).unwrap();
+    // SAFETY: refused before any write: the table already moved.
+    let again = unsafe { roles.adopt_storage(again, grown_run(layout.bytes)) }.unwrap_err();
+    assert_eq!(again.error(), FrameRoleError::WrongRole);
+    roles.cancel_allocation(again.into_grant()).unwrap();
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_role_change_during_a_hierarchy_proof_invalidates_it() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let owner = roles.create_table_owner().unwrap();
+    let root = allocate_zeroed(&mut roles, 1);
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    let pdpt = allocate_zeroed(&mut roles, 1);
+    let pdpt = roles.prepare_table(pdpt, owner, TableLevel::Pdpt).unwrap();
+    let pdpt = roles.commit_table(pdpt, Some(root)).unwrap();
+
+    let mut hierarchy = roles.begin_empty_table_hierarchy(root).unwrap();
+    roles
+        .observe_empty_table_child(&mut hierarchy, root, pdpt)
+        .unwrap();
+    // A new table appears after the walk saw everything.
+    let pd = allocate_zeroed(&mut roles, 1);
+    let pd = roles.prepare_table(pd, owner, TableLevel::Pd).unwrap();
+    let pd = roles.commit_table(pd, Some(pdpt)).unwrap();
+    assert!(matches!(
+        roles.finish_empty_table_hierarchy(hierarchy),
+        Err(FrameRoleError::InvalidTableParent)
+    ));
+
+    // A fresh proof that misses the new table is refused by count.
+    let mut partial = roles.begin_empty_table_hierarchy(root).unwrap();
+    roles
+        .observe_empty_table_child(&mut partial, root, pdpt)
+        .unwrap();
+    assert!(matches!(
+        roles.finish_empty_table_hierarchy(partial),
+        Err(FrameRoleError::InvalidTableParent)
+    ));
+    // A child observed before its parent is refused.
+    let mut unordered = roles.begin_empty_table_hierarchy(root).unwrap();
+    assert_eq!(
+        roles.observe_empty_table_child(&mut unordered, pdpt, pd),
+        Err(FrameRoleError::InvalidTableParent)
     );
 }

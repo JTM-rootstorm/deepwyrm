@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use super::boot_map::BootstrapMemoryWitness;
 use super::boot_map::{BootMapError, BootstrapReservation, SanitizedBootMap};
+use super::growable::GrowableStore;
 use super::physical::{
     BASE_PAGE_SIZE, PageRange, PhysicalFrameAllocator, PhysicalMemoryError, PhysicalRange,
 };
@@ -159,20 +160,27 @@ pub(crate) struct EmptyTableRootGrant {
 /// Move-only preflight state for one exact owned page-table hierarchy.
 ///
 /// Architecture teardown observes every reachable low-half table top-down.
-/// The role manager records observed slots without exposing role identities or
-/// permitting reclamation until the complete owner graph has been matched.
+/// The role manager marks each observed slot with this proof's epoch, so a
+/// slot seen twice is an alias, and counts them; no array sized by the role
+/// table is needed (DW2 M2 §5.3). The proof is bound to the manager's role
+/// version: any role change in between invalidates it.
 #[must_use = "an empty hierarchy candidate must be finished or abandoned"]
-pub(crate) struct EmptyTableHierarchyCandidate<const ROLE_CAPACITY: usize> {
+pub(crate) struct EmptyTableHierarchyCandidate {
     root: TableIdentity,
-    observed: [bool; ROLE_CAPACITY],
+    epoch: u64,
+    version: u64,
+    observed: u32,
 }
 
 /// Move-only proof that every committed table owned by one PML4 was observed
-/// in an empty, exact-parent architecture walk.
+/// in an empty, exact-parent architecture walk: the observed count equals the
+/// root's count of committed descendant tables.
 #[must_use = "an empty hierarchy proof must be consumed only after architecture retirement"]
-pub(crate) struct EmptyTableHierarchyGrant<const ROLE_CAPACITY: usize> {
+pub(crate) struct EmptyTableHierarchyGrant {
     root: TableIdentity,
-    levels: [Option<TableLevel>; ROLE_CAPACITY],
+    epoch: u64,
+    version: u64,
+    remaining: u32,
 }
 
 impl TableIdentity {
@@ -246,6 +254,8 @@ pub(crate) enum FrameRoleKind {
         module_index: u32,
     },
     ExternalDeviceMmio,
+    /// The run holding the grown role table itself (DW2 M2 §5.3).
+    RoleTableStorage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,6 +278,7 @@ enum FrameRole {
         module_index: u32,
     },
     ExternalDeviceMmio,
+    RoleTableStorage,
 }
 
 impl FrameRole {
@@ -295,6 +306,7 @@ impl FrameRole {
                 FrameRoleKind::ExternalImmutableModule { module_index }
             }
             Self::ExternalDeviceMmio => FrameRoleKind::ExternalDeviceMmio,
+            Self::RoleTableStorage => FrameRoleKind::RoleTableStorage,
         }
     }
 }
@@ -309,12 +321,22 @@ struct RoleRecord {
 struct RoleSlot {
     generation: u32,
     record: Option<RoleRecord>,
+    /// The epoch of the last empty-hierarchy proof that observed this table.
+    mark: u64,
+    /// On a committed PML4: how many committed tables below it its owner has.
+    tables: u32,
 }
 
 const EMPTY_ROLE_SLOT: RoleSlot = RoleSlot {
     generation: 0,
     record: None,
+    mark: 0,
+    tables: 0,
 };
+
+/// Role slots the grown table has beyond the boot table, per page of
+/// allocator RAM: one per 2 MiB (DW2 M2 §5.3).
+const GROWN_SLOT_PAGES: u64 = 512;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AllocationGrant {
@@ -507,11 +529,51 @@ impl StagedTableCommit {
 }
 
 /// The sole dynamic allocator and physical-role registry.
+///
+/// It starts with `ROLE_CAPACITY` slots and `RANGE_CAPACITY` free ranges held
+/// inline. Once the direct map is active, [`Self::adopt_storage`] moves the
+/// slots, the free-slot stack and the free list into one run of RAM sized
+/// from installed memory, and adds an index from each allocator page to the
+/// role starting there (DW2 large-memory plan, M2 §5.3).
 pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     domain: u64,
     allocator: PhysicalFrameAllocator<RANGE_CAPACITY>,
-    roles: [RoleSlot; ROLE_CAPACITY],
+    roles: GrowableStore<RoleSlot, ROLE_CAPACITY>,
+    /// Free slot numbers; the last of the first `free_slot_count` is used
+    /// next. A slot whose generation is spent is never returned to it.
+    free_slots: GrowableStore<u32, ROLE_CAPACITY>,
+    free_slot_count: usize,
+    /// After growth: for each allocator page, in initial-range order, one
+    /// plus the slot of the dynamic role starting at that page, or zero.
+    starts: Option<&'static mut [u32]>,
     next_table_owner: u64,
+    next_epoch: u64,
+    /// Changes whenever any role record changes; binds hierarchy proofs.
+    version: u64,
+}
+
+/// Where each part of the grown role table lies in its run, in bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RoleTableLayout {
+    slots: usize,
+    free_slots_offset: usize,
+    starts_offset: usize,
+    starts: usize,
+    ranges_offset: usize,
+    ranges: usize,
+    bytes: u64,
+}
+
+impl RoleTableLayout {
+    /// Pages the run needs.
+    pub(crate) const fn page_count(&self) -> u64 {
+        self.bytes.div_ceil(BASE_PAGE_SIZE)
+    }
+
+    /// Role slots the grown table holds.
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.slots
+    }
 }
 
 #[cfg(test)]

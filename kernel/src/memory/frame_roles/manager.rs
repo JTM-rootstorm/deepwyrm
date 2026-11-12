@@ -11,12 +11,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 current.checked_add(1).filter(|next| *next != 0)
             })
             .map_err(|_| FrameRoleError::ManagerDomainExhausted)?;
-        Ok(Self {
+        let mut manager = Self {
             domain,
             allocator,
-            roles: [EMPTY_ROLE_SLOT; ROLE_CAPACITY],
+            roles: GrowableStore::new(EMPTY_ROLE_SLOT),
+            free_slots: GrowableStore::new(0),
+            free_slot_count: 0,
+            starts: None,
             next_table_owner: 1,
-        })
+            next_epoch: 1,
+            version: 0,
+        };
+        manager.fill_boot_free_slots()?;
+        Ok(manager)
+    }
+
+    /// Every boot slot is free; slot 0 is used first.
+    fn fill_boot_free_slots(&mut self) -> Result<(), FrameRoleError> {
+        u32::try_from(ROLE_CAPACITY).map_err(|_| FrameRoleError::Capacity)?;
+        for (position, entry) in self.free_slots.as_mut_slice().iter_mut().enumerate() {
+            *entry = (ROLE_CAPACITY - 1 - position) as u32;
+        }
+        self.free_slot_count = ROLE_CAPACITY;
+        Ok(())
     }
 
     /// Creates the kernel's sole dynamic frame owner from a consumed map.
@@ -81,15 +98,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             })?;
         unsafe {
             core::ptr::addr_of_mut!((*destination).domain).write(domain);
-            let roles = core::ptr::addr_of_mut!((*destination).roles).cast::<RoleSlot>();
-            for index in 0..ROLE_CAPACITY {
-                roles.add(index).write(EMPTY_ROLE_SLOT);
-            }
+            GrowableStore::init_in_place(
+                core::ptr::addr_of_mut!((*destination).roles),
+                EMPTY_ROLE_SLOT,
+            );
+            GrowableStore::init_in_place(core::ptr::addr_of_mut!((*destination).free_slots), 0);
+            core::ptr::addr_of_mut!((*destination).free_slot_count).write(0);
+            core::ptr::addr_of_mut!((*destination).starts).write(None);
             core::ptr::addr_of_mut!((*destination).next_table_owner).write(1);
-            Ok((
-                &mut *destination,
-                BootstrapMemoryWitness::new(map, reservations),
-            ))
+            core::ptr::addr_of_mut!((*destination).next_epoch).write(1);
+            core::ptr::addr_of_mut!((*destination).version).write(0);
+            let manager = &mut *destination;
+            manager
+                .fill_boot_free_slots()
+                .map_err(FrameRoleInitializationError::Role)?;
+            Ok((manager, BootstrapMemoryWitness::new(map, reservations)))
         }
     }
 
@@ -97,13 +120,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (slot, generation) = self.next_slot()?;
         let identity = self.identity(slot, generation)?;
         let range = self.allocator.allocate_run(page_count)?;
-        self.roles[slot] = RoleSlot {
+        self.occupy(
+            slot,
             generation,
-            record: Some(RoleRecord {
+            RoleRecord {
                 range,
                 role: FrameRole::AllocatedUninitialized,
-            }),
-        };
+            },
+        );
         Ok(AllocationGrant { identity, range })
     }
 
@@ -125,13 +149,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let range = self
             .allocator
             .allocate_run_below(page_count, exclusive_ceiling)?;
-        self.roles[slot] = RoleSlot {
+        self.occupy(
+            slot,
             generation,
-            record: Some(RoleRecord {
+            RoleRecord {
                 range,
                 role: FrameRole::AllocatedUninitialized,
-            }),
-        };
+            },
+        );
         Ok(AllocationGrant { identity, range })
     }
 
@@ -305,7 +330,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Ok(slot) => slot,
             Err(error) => return Err(GrantTransitionError::new(error, grant)),
         };
-        if self.roles[slot].record
+        if self.roles.as_slice()[slot].record
             != Some(RoleRecord {
                 range: grant.range,
                 role: FrameRole::TableCandidate {
@@ -319,6 +344,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if grant.level == TableLevel::Pml4
             && self
                 .roles
+                .as_slice()
                 .iter()
                 .enumerate()
                 .filter(|(other_slot, _)| *other_slot != slot)
@@ -403,14 +429,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             "staged table commit became invalid before publication"
         );
         let grant = staged.grant;
-        self.roles[staged.slot].record = Some(RoleRecord {
-            range: grant.range,
-            role: FrameRole::PageTable {
-                owner: grant.owner,
-                level: grant.level,
-                parent: staged.parent,
+        // Every committed table below a root counts toward that root, which
+        // is how an empty-hierarchy proof knows it saw them all.
+        if let Some(parent) = staged.parent {
+            let root = self
+                .root_slot_of(parent)
+                .expect("a validated parent table leads to its root");
+            let root = &mut self.roles.as_mut_slice()[root];
+            root.tables = root
+                .tables
+                .checked_add(1)
+                .expect("a root's table count stays below the slot count");
+        }
+        self.replace_record(
+            staged.slot,
+            RoleRecord {
+                range: grant.range,
+                role: FrameRole::PageTable {
+                    owner: grant.owner,
+                    level: grant.level,
+                    parent: staged.parent,
+                },
             },
-        });
+        );
         TableIdentity {
             role: grant.identity,
             owner: grant.owner,
@@ -455,26 +496,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         physical_start: u64,
     ) -> Result<TableIdentity, FrameRoleError> {
         self.validate_owner(owner)?;
-        let (slot, _) = self
-            .roles
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, entry)| entry.record.map(|record| (slot, record)))
-            .find(|(_, record)| {
-                record.range.start == physical_start
-                    && record.range.page_count() == 1
-                    && matches!(
-                        record.role,
-                        FrameRole::PageTable {
-                            owner: record_owner,
-                            level: record_level,
-                            ..
-                        } if record_owner == owner && record_level == level
-                    )
-            })
+        // Page tables are dynamic roles, so the start index finds them.
+        let slot = self
+            .dynamic_slot_at(physical_start)
             .ok_or(FrameRoleError::WrongRole)?;
+        let entry = self.roles.as_slice()[slot];
+        let record = entry.record.ok_or(FrameRoleError::WrongRole)?;
+        if !(record.range.start == physical_start
+            && record.range.page_count() == 1
+            && matches!(
+                record.role,
+                FrameRole::PageTable {
+                    owner: record_owner,
+                    level: record_level,
+                    ..
+                } if record_owner == owner && record_level == level
+            ))
+        {
+            return Err(FrameRoleError::WrongRole);
+        }
         Ok(TableIdentity {
-            role: self.identity(slot, self.roles[slot].generation)?,
+            role: self.identity(slot, entry.generation)?,
             owner,
             level,
             physical_start,
@@ -507,81 +549,89 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Starts an architecture-attested empty-hierarchy preflight for one exact
     /// committed PML4. Descendants must subsequently be observed top-down.
     pub(crate) fn begin_empty_table_hierarchy(
-        &self,
+        &mut self,
         root: TableIdentity,
-    ) -> Result<EmptyTableHierarchyCandidate<ROLE_CAPACITY>, FrameRoleError> {
+    ) -> Result<EmptyTableHierarchyCandidate, FrameRoleError> {
         self.validate_table_identity(root)?;
         if root.level != TableLevel::Pml4 {
             return Err(FrameRoleError::WrongRole);
         }
-        let mut observed = [false; ROLE_CAPACITY];
-        observed[self.slot(root.role)?] = true;
-        Ok(EmptyTableHierarchyCandidate { root, observed })
+        let epoch = self.next_epoch;
+        self.next_epoch = epoch
+            .checked_add(1)
+            .ok_or(FrameRoleError::InvariantViolation)?;
+        let slot = self.slot(root.role)?;
+        self.roles.as_mut_slice()[slot].mark = epoch;
+        Ok(EmptyTableHierarchyCandidate {
+            root,
+            epoch,
+            version: self.version,
+            observed: 0,
+        })
     }
 
     /// Records one exact child discovered by the architecture walk. Requiring
     /// the parent to have already been observed makes the proof structurally
-    /// top-down; rejecting duplicate slots catches same-frame aliases.
+    /// top-down; rejecting a slot observed twice catches same-frame aliases.
     pub(crate) fn observe_empty_table_child(
-        &self,
-        candidate: &mut EmptyTableHierarchyCandidate<ROLE_CAPACITY>,
+        &mut self,
+        candidate: &mut EmptyTableHierarchyCandidate,
         parent: TableIdentity,
         child: TableIdentity,
     ) -> Result<(), FrameRoleError> {
+        if candidate.version != self.version {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
         self.validate_table_identity(candidate.root)?;
         if candidate.root.owner != parent.owner || candidate.root.owner != child.owner {
             return Err(FrameRoleError::InvalidTableParent);
         }
         let parent_slot = self.slot(parent.role)?;
-        if !candidate.observed[parent_slot] {
+        if self.roles.as_slice()[parent_slot].mark != candidate.epoch {
             return Err(FrameRoleError::InvalidTableParent);
         }
         self.validate_table_child(parent, child)?;
         let child_slot = self.slot(child.role)?;
-        if candidate.observed[child_slot] {
+        if self.roles.as_slice()[child_slot].mark == candidate.epoch {
             return Err(FrameRoleError::InvalidTableParent);
         }
-        candidate.observed[child_slot] = true;
+        self.roles.as_mut_slice()[child_slot].mark = candidate.epoch;
+        candidate.observed = candidate
+            .observed
+            .checked_add(1)
+            .ok_or(FrameRoleError::InvalidTableParent)?;
         Ok(())
     }
 
     /// Seals the hierarchy proof only when the architecture walk accounted for
-    /// every committed table carrying the root owner's identity. This rejects
-    /// disconnected role records as well as aliases in the live graph.
+    /// every committed table below the root. Each observed table was a
+    /// distinct committed table of the root's owner below it, and none changed
+    /// since (the role version), so when their number equals the root's count
+    /// they are exactly that set: no disconnected table record is left over.
     pub(crate) fn finish_empty_table_hierarchy(
         &self,
-        candidate: EmptyTableHierarchyCandidate<ROLE_CAPACITY>,
-    ) -> Result<EmptyTableHierarchyGrant<ROLE_CAPACITY>, FrameRoleError> {
+        candidate: EmptyTableHierarchyCandidate,
+    ) -> Result<EmptyTableHierarchyGrant, FrameRoleError> {
+        if candidate.version != self.version {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
         self.validate_table_identity(candidate.root)?;
-        let mut levels = [None; ROLE_CAPACITY];
-        for (slot, role_slot) in self.roles.iter().enumerate() {
-            match role_slot.record {
-                Some(RoleRecord {
-                    role: FrameRole::PageTable { owner, level, .. },
-                    ..
-                }) if owner == candidate.root.owner => {
-                    if !candidate.observed[slot]
-                        || (level == TableLevel::Pml4 && slot != self.slot(candidate.root.role)?)
-                    {
-                        return Err(FrameRoleError::InvalidTableParent);
-                    }
-                    levels[slot] = Some(level);
-                }
-                _ if candidate.observed[slot] => {
-                    return Err(FrameRoleError::InvalidTableParent);
-                }
-                _ => {}
-            }
+        let root = self.roles.as_slice()[self.slot(candidate.root.role)?];
+        if root.mark != candidate.epoch || root.tables != candidate.observed {
+            return Err(FrameRoleError::InvalidTableParent);
         }
         Ok(EmptyTableHierarchyGrant {
             root: candidate.root,
-            levels,
+            epoch: candidate.epoch,
+            version: candidate.version,
+            remaining: candidate.observed,
         })
     }
 
-    /// Reclaims all preflighted descendants bottom-up after the architecture
-    /// root has atomically disconnected its low half. The returned root grant
-    /// remains gated by the existing retired/nonresident root reclaim API.
+    /// Reclaims one table the proof observed, after the architecture root has
+    /// atomically disconnected its low half. Architecture teardown walks the
+    /// disconnected hierarchy again and reclaims each table after its
+    /// children; any order would do, since nothing can reach them.
     ///
     /// # Safety
     ///
@@ -593,67 +643,98 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         unsafe_code,
         reason = "architecture residency and atomic root disconnection are outside the target-independent role manager"
     )]
-    pub(crate) unsafe fn reclaim_preflighted_empty_table_hierarchy(
+    pub(crate) unsafe fn reclaim_preflighted_table(
         &mut self,
-        grant: EmptyTableHierarchyGrant<ROLE_CAPACITY>,
-    ) -> EmptyTableRootGrant {
-        for level in [TableLevel::Pt, TableLevel::Pd, TableLevel::Pdpt] {
-            for slot in 0..ROLE_CAPACITY {
-                if grant.levels[slot] != Some(level) {
-                    continue;
-                }
-                let Some(record) = self.roles[slot].record else {
-                    panic!("preflighted empty hierarchy role disappeared before reclaim");
-                };
-                let FrameRole::PageTable {
+        grant: &mut EmptyTableHierarchyGrant,
+        table: TableIdentity,
+    ) {
+        assert_eq!(
+            grant.version, self.version,
+            "a role changed during preflighted hierarchy reclaim"
+        );
+        let slot = self
+            .slot(table.role)
+            .unwrap_or_else(|error| panic!("preflighted table disappeared: {error:?}"));
+        let entry = self.roles.as_slice()[slot];
+        let Some(RoleRecord {
+            range,
+            role:
+                FrameRole::PageTable {
                     owner,
-                    level: record_level,
-                    parent,
-                } = record.role
-                else {
-                    panic!("preflighted empty hierarchy role changed before reclaim");
-                };
-                if owner != grant.root.owner || record_level != level {
-                    panic!("preflighted empty hierarchy owner or level drifted before reclaim");
-                }
-                let parent = parent.unwrap_or_else(|| {
-                    panic!("preflighted empty hierarchy descendant lost its parent")
-                });
-                let parent_record = self
-                    .record(parent)
-                    .unwrap_or_else(|error| panic!("preflighted parent disappeared: {error:?}"));
-                if !matches!(
-                    parent_record.role,
-                    FrameRole::PageTable {
-                        owner: parent_owner,
-                        level: parent_level,
-                        ..
-                    } if parent_owner == grant.root.owner
-                        && parent_level.child() == Some(record_level)
-                ) {
-                    panic!("preflighted empty hierarchy parent drifted before reclaim");
-                }
-                let identity = self
-                    .identity(slot, self.roles[slot].generation)
-                    .expect("preflighted empty hierarchy identity remains representable");
-                self.cancel(
-                    identity,
-                    record.range,
-                    FrameRole::PageTable {
-                        owner,
-                        level: record_level,
-                        parent: Some(parent),
-                    },
-                )
-                .unwrap_or_else(|error| {
-                    panic!("preflighted empty hierarchy reclaim drifted: {error:?}")
-                });
-            }
+                    level,
+                    parent: Some(parent),
+                },
+        }) = entry.record
+        else {
+            panic!("preflighted table is not a committed child table");
+        };
+        if entry.mark != grant.epoch
+            || owner != grant.root.owner
+            || level != table.level
+            || range.start != table.physical_start
+        {
+            panic!("table was not observed by this hierarchy proof");
         }
+        grant.remaining = grant
+            .remaining
+            .checked_sub(1)
+            .expect("a proof reclaims no more tables than it observed");
+        let root = self
+            .slot(grant.root.role)
+            .expect("the hierarchy root outlives its tables");
+        let root = &mut self.roles.as_mut_slice()[root];
+        root.tables = root
+            .tables
+            .checked_sub(1)
+            .expect("a root counts every table below it");
+        self.cancel(
+            table.role,
+            range,
+            FrameRole::PageTable {
+                owner,
+                level,
+                parent: Some(parent),
+            },
+        )
+        .unwrap_or_else(|error| panic!("preflighted table reclaim drifted: {error:?}"));
+        grant.version = self.version;
+    }
+
+    /// Ends hierarchy reclaim once every observed table is reclaimed. The
+    /// returned root grant remains gated by the retired/nonresident root
+    /// reclaim API.
+    pub(crate) fn finish_preflighted_hierarchy(
+        &self,
+        grant: EmptyTableHierarchyGrant,
+    ) -> EmptyTableRootGrant {
+        assert_eq!(
+            (grant.remaining, grant.version),
+            (0, self.version),
+            "preflighted hierarchy reclaim left tables or saw a role change"
+        );
         self.prepare_empty_table_root(grant.root)
             .unwrap_or_else(|error| {
                 panic!("retired hierarchy root did not become empty: {error:?}")
             })
+    }
+
+    /// The slot of the PML4 above committed table `identity` (or its own).
+    fn root_slot_of(&self, mut identity: FrameRoleIdentity) -> Result<usize, FrameRoleError> {
+        for _ in 0..4 {
+            let slot = self.slot(identity)?;
+            match self.roles.as_slice()[slot].record.map(|record| record.role) {
+                Some(FrameRole::PageTable {
+                    level: TableLevel::Pml4,
+                    ..
+                }) => return Ok(slot),
+                Some(FrameRole::PageTable {
+                    parent: Some(parent),
+                    ..
+                }) => identity = parent,
+                _ => return Err(FrameRoleError::InvalidTableParent),
+            }
+        }
+        Err(FrameRoleError::InvalidTableParent)
     }
 
     /// Reclaims one dynamically allocated, committed PML4 only after its
@@ -674,17 +755,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if root.level != TableLevel::Pml4 {
             return Err(FrameRoleError::WrongRole);
         }
-        if self
-            .roles
-            .iter()
-            .filter_map(|slot| slot.record)
-            .any(|record| {
-                matches!(
-                    record.role,
-                    FrameRole::PageTable { parent: Some(parent), .. } if parent == root.role
-                )
-            })
-        {
+        if self.roles.as_slice()[self.slot(root.role)?].tables != 0 {
             return Err(FrameRoleError::InvalidTableParent);
         }
         Ok(())
@@ -783,26 +854,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut slots = [usize::MAX; 3];
         let mut generations = [0_u32; 3];
         let mut identities = [FrameRoleIdentity::EMPTY; 3];
-        let mut selected = 0;
-        for (slot, role) in self.roles.iter().enumerate() {
-            if role.record.is_some() {
-                continue;
-            }
-            let generation = role
-                .generation
-                .checked_add(1)
-                .filter(|next| *next != 0)
-                .ok_or(FrameRoleError::GenerationExhausted)?;
-            slots[selected] = slot;
-            generations[selected] = generation;
-            identities[selected] = self.identity(slot, generation)?;
-            selected += 1;
-            if selected == 3 {
-                break;
-            }
-        }
-        if selected != 3 {
-            return Err(FrameRoleError::Capacity);
+        // The three slots on top of the free-slot stack, in the order
+        // publication occupies them.
+        for depth in 0..3 {
+            let (slot, generation) = self.free_slot(depth)?;
+            slots[depth] = slot;
+            generations[depth] = generation;
+            identities[depth] = self.identity(slot, generation)?;
         }
         Ok(StagedKernelImageRoles {
             domain: self.domain,
@@ -832,7 +890,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         );
         for index in 0..3 {
             assert!(
-                staged.slots[index] < ROLE_CAPACITY
+                self.free_slot(index) == Ok((staged.slots[index], staged.generations[index]))
                     && !staged.slots[..index].contains(&staged.slots[index])
                     && !staged.ranges[..index]
                         .iter()
@@ -840,25 +898,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     && self.validate_external_pages(staged.ranges[index]).is_ok()
                     && self.identity(staged.slots[index], staged.generations[index])
                         == Ok(staged.identities[index])
-                    && staged.identities[index].domain == self.domain
-                    && self.roles[staged.slots[index]].record.is_none()
-                    && self.roles[staged.slots[index]]
-                        .generation
-                        .checked_add(1)
-                        .is_some_and(|generation| generation == staged.generations[index]),
+                    && staged.identities[index].domain == self.domain,
                 "staged kernel image role changed before publication"
             );
         }
         for index in 0..3 {
-            self.roles[staged.slots[index]] = RoleSlot {
-                generation: staged.generations[index],
-                record: Some(RoleRecord {
+            self.occupy(
+                staged.slots[index],
+                staged.generations[index],
+                RoleRecord {
                     range: staged.ranges[index],
                     role: FrameRole::External(ExternalFrameRole::KernelImage {
                         segment: staged.segments[index],
                     }),
-                }),
-            };
+                },
+            );
         }
         KernelImageRoleSet {
             _identities: staged.identities,
@@ -905,37 +959,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             table_indices[index] = u32::try_from(index).map_err(|_| FrameRoleError::Capacity)?;
         }
 
-        let mut selected = 0;
-        for (slot, role) in self.roles.iter().enumerate() {
-            if role.record.is_some() {
-                continue;
-            }
-            let generation = role
-                .generation
-                .checked_add(1)
-                .filter(|next| *next != 0)
-                .ok_or(FrameRoleError::GenerationExhausted)?;
-            slots[selected] = slot;
-            generations[selected] = generation;
-            selected += 1;
-            if selected == frames.len() {
-                break;
-            }
-        }
-        if selected != frames.len() {
-            return Err(FrameRoleError::Capacity);
+        for depth in 0..frames.len() {
+            let (slot, generation) = self.free_slot(depth)?;
+            slots[depth] = slot;
+            generations[depth] = generation;
         }
 
         for index in 0..frames.len() {
-            self.roles[slots[index]] = RoleSlot {
-                generation: generations[index],
-                record: Some(RoleRecord {
+            self.occupy(
+                slots[index],
+                generations[index],
+                RoleRecord {
                     range: ranges[index],
                     role: FrameRole::External(ExternalFrameRole::TransitionTable {
                         table_index: table_indices[index],
                     }),
-                }),
-            };
+                },
+            );
         }
         Ok(TransitionTableRoleSet {
             _domain: self.domain,
@@ -1101,6 +1141,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<(), FrameRoleError> {
         let page = PageRange::from_page_count(physical_start, 1, self.allocator.physical_limit())?;
         self.roles
+            .as_slice()
             .iter()
             .filter_map(|slot| slot.record)
             .find(|record| record.range.contains(page))
@@ -1133,17 +1174,173 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.allocator.initial_ranges()
     }
 
+    /// The run the grown role table needs: one slot per 2 MiB of allocator
+    /// RAM beyond the boot slots, its free-slot stack, a start index entry
+    /// per allocator page, and the free list sized by `free_range_bound`
+    /// (DW2 M2 §5.3).
+    pub(crate) fn grown_layout(&self) -> Result<RoleTableLayout, FrameRoleError> {
+        let frames = self.allocator.initial_frames();
+        let slots = usize::try_from(frames.div_ceil(GROWN_SLOT_PAGES))
+            .ok()
+            .and_then(|extra| ROLE_CAPACITY.checked_add(extra))
+            .filter(|slots| u32::try_from(*slots).is_ok_and(|slots| slots < u32::MAX))
+            .ok_or(FrameRoleError::Capacity)?;
+        let starts = usize::try_from(frames).map_err(|_| FrameRoleError::Capacity)?;
+        let ranges = self.allocator.free_list_capacity_for(slots);
+        let align = |offset: usize| offset.checked_next_multiple_of(8);
+        let after = |offset: usize, count: usize, size: usize| {
+            count
+                .checked_mul(size)
+                .and_then(|bytes| offset.checked_add(bytes))
+                .and_then(align)
+        };
+        let free_slots_offset =
+            after(0, slots, core::mem::size_of::<RoleSlot>()).ok_or(FrameRoleError::Capacity)?;
+        let starts_offset = after(free_slots_offset, slots, core::mem::size_of::<u32>())
+            .ok_or(FrameRoleError::Capacity)?;
+        let ranges_offset = after(starts_offset, starts, core::mem::size_of::<u32>())
+            .ok_or(FrameRoleError::Capacity)?;
+        let bytes = after(ranges_offset, ranges, core::mem::size_of::<PageRange>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(FrameRoleError::Capacity)?;
+        Ok(RoleTableLayout {
+            slots,
+            free_slots_offset,
+            starts_offset,
+            starts,
+            ranges_offset,
+            ranges,
+            bytes,
+        })
+    }
+
+    /// Moves the role table, the free-slot stack and the free list into the
+    /// run `grant` names, which `base` maps, and builds the start index there
+    /// (DW2 M2 §5.3). Slot numbers and generations are kept, so every issued
+    /// identity stays valid. The run itself takes a permanent role. Every
+    /// check happens before anything changes; on an error the grant comes
+    /// back and the manager is as it was.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the start of a writable, 8-byte-aligned mapping of
+    /// exactly the run `grant` names, used by nothing else for the rest of
+    /// the kernel's life.
+    #[allow(
+        unsafe_code,
+        reason = "the grown role table lives in RAM the caller maps; the manager carves typed slices from it"
+    )]
+    pub(crate) unsafe fn adopt_storage(
+        &mut self,
+        grant: AllocationGrant,
+        base: *mut u8,
+    ) -> Result<(), GrantTransitionError<AllocationGrant>> {
+        let layout = match self.grown_layout() {
+            Ok(layout) => layout,
+            Err(error) => return Err(GrantTransitionError::new(error, grant)),
+        };
+        let valid = self.validate_allocation(&grant).is_ok()
+            && grant.byte_len() >= layout.bytes
+            && !self.roles.is_adopted()
+            && self.starts.is_none()
+            && layout.slots > ROLE_CAPACITY
+            && layout.ranges > RANGE_CAPACITY
+            && (base as usize).is_multiple_of(8);
+        if !valid {
+            return Err(GrantTransitionError::new(FrameRoleError::WrongRole, grant));
+        }
+        let slot = self
+            .slot(grant.identity)
+            .expect("a validated allocation has a live slot");
+        // SAFETY: the caller maps `grant`'s whole run at `base`, writable and
+        // unused; every part lies inside `layout.bytes`, at most its length,
+        // and starts 8-aligned. Each part is fully written before a slice of
+        // it is made.
+        let (slots, free_slots, starts, ranges) = unsafe {
+            (
+                Self::carve(base, 0, layout.slots, EMPTY_ROLE_SLOT),
+                Self::carve(base, layout.free_slots_offset, layout.slots, 0_u32),
+                Self::carve(base, layout.starts_offset, layout.starts, 0_u32),
+                Self::carve(
+                    base,
+                    layout.ranges_offset,
+                    layout.ranges,
+                    PageRange::empty(),
+                ),
+            )
+        };
+        self.replace_record(
+            slot,
+            RoleRecord {
+                range: grant.range,
+                role: FrameRole::RoleTableStorage,
+            },
+        );
+        self.roles
+            .adopt(slots, EMPTY_ROLE_SLOT)
+            .unwrap_or_else(|_| panic!("the checked role table adoption failed"));
+        self.free_slots
+            .adopt(free_slots, 0)
+            .unwrap_or_else(|_| panic!("the checked free-slot adoption failed"));
+        // The new slots go on top of the free ones, lowest on top.
+        let old_free = self.free_slot_count;
+        let new_free = layout.slots - ROLE_CAPACITY;
+        for (position, entry) in self.free_slots.as_mut_slice()[old_free..old_free + new_free]
+            .iter_mut()
+            .enumerate()
+        {
+            *entry = (layout.slots - 1 - position) as u32;
+        }
+        self.free_slot_count = old_free + new_free;
+        self.allocator
+            .adopt_free_list(ranges)
+            .unwrap_or_else(|_| panic!("the checked free-list adoption failed"));
+        self.starts = Some(starts);
+        for slot in 0..self.roles.len() {
+            if let Some(record) = self.roles.as_slice()[slot].record {
+                self.set_start(record, slot);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `count` copies of `fill` at `base + offset` and returns them
+    /// as a slice.
+    ///
+    /// # Safety
+    ///
+    /// `[base + offset, + count * size_of::<T>())` must be writable,
+    /// aligned for `T`, unused by anything else, and live for ever.
+    #[allow(
+        unsafe_code,
+        reason = "carves one typed part of the grown role table's run"
+    )]
+    unsafe fn carve<T: Copy>(
+        base: *mut u8,
+        offset: usize,
+        count: usize,
+        fill: T,
+    ) -> &'static mut [T] {
+        unsafe {
+            let start = base.add(offset).cast::<T>();
+            for index in 0..count {
+                start.add(index).write(fill);
+            }
+            core::slice::from_raw_parts_mut(start, count)
+        }
+    }
+
     pub(crate) fn available_frames(&self) -> u64 {
         self.allocator.available_frames()
     }
 
     pub(crate) fn check_invariants(&self) -> Result<(), FrameRoleError> {
         let mut dynamic_pages = 0_u64;
-        for (left_index, left) in self.roles.iter().enumerate() {
+        for (left_index, left) in self.roles.as_slice().iter().enumerate() {
             let Some(left) = left.record else {
                 continue;
             };
-            for right in self.roles[left_index + 1..]
+            for right in self.roles.as_slice()[left_index + 1..]
                 .iter()
                 .filter_map(|slot| slot.record)
             {
@@ -1180,16 +1377,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         replacement: FrameRole,
     ) -> Result<(), FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self.roles[slot]
+        let record = self.roles.as_slice()[slot]
             .record
             .ok_or(FrameRoleError::InvalidGrant)?;
         if record.range != range || record.role != expected {
             return Err(FrameRoleError::WrongRole);
         }
-        self.roles[slot].record = Some(RoleRecord {
-            range,
-            role: replacement,
-        });
+        self.replace_record(
+            slot,
+            RoleRecord {
+                range,
+                role: replacement,
+            },
+        );
         Ok(())
     }
 
@@ -1200,14 +1400,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         expected: FrameRole,
     ) -> Result<(), FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self.roles[slot]
+        let record = self.roles.as_slice()[slot]
             .record
             .ok_or(FrameRoleError::InvalidGrant)?;
         if record.range != range || record.role != expected || !record.role.is_dynamic() {
             return Err(FrameRoleError::WrongRole);
         }
         self.allocator.free_run(range)?;
-        self.roles[slot].record = None;
+        self.vacate(slot);
         Ok(())
     }
 
@@ -1249,6 +1449,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         if self
             .roles
+            .as_slice()
             .iter()
             .filter_map(|slot| slot.record)
             .any(|record| record.range.overlaps(pages))
@@ -1265,6 +1466,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<FrameRoleIdentity, FrameRoleError> {
         if self
             .roles
+            .as_slice()
             .iter()
             .filter_map(|slot| slot.record)
             .any(|record| record.range.overlaps(range))
@@ -1273,25 +1475,131 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let (slot, generation) = self.next_slot()?;
         let identity = self.identity(slot, generation)?;
-        self.roles[slot] = RoleSlot {
-            generation,
-            record: Some(RoleRecord { range, role }),
-        };
+        self.occupy(slot, generation, RoleRecord { range, role });
         Ok(identity)
     }
 
     fn next_slot(&self) -> Result<(usize, u32), FrameRoleError> {
-        let slot = self
-            .roles
-            .iter()
-            .position(|slot| slot.record.is_none())
+        self.free_slot(0)
+    }
+
+    /// The free slot `depth` places below the top of the free-slot stack,
+    /// with the generation it would take. Changes nothing.
+    fn free_slot(&self, depth: usize) -> Result<(usize, u32), FrameRoleError> {
+        let position = self
+            .free_slot_count
+            .checked_sub(depth + 1)
             .ok_or(FrameRoleError::Capacity)?;
-        let generation = self.roles[slot]
+        let slot = self.free_slots.as_slice()[position] as usize;
+        let entry = self.roles.as_slice()[slot];
+        if entry.record.is_some() {
+            return Err(FrameRoleError::InvariantViolation);
+        }
+        let generation = entry
             .generation
             .checked_add(1)
             .filter(|next| *next != 0)
             .ok_or(FrameRoleError::GenerationExhausted)?;
         Ok((slot, generation))
+    }
+
+    /// Publishes `record` in the slot on top of the free-slot stack, which
+    /// must be `slot`.
+    fn occupy(&mut self, slot: usize, generation: u32, record: RoleRecord) {
+        let top = self
+            .free_slot_count
+            .checked_sub(1)
+            .expect("an occupied slot came from the free-slot stack");
+        assert_eq!(
+            self.free_slots.as_slice()[top] as usize,
+            slot,
+            "slots are occupied from the top of the free-slot stack"
+        );
+        self.free_slot_count = top;
+        self.roles.as_mut_slice()[slot] = RoleSlot {
+            generation,
+            record: Some(record),
+            mark: 0,
+            tables: 0,
+        };
+        self.set_start(record, slot);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Replaces the record of a live slot with the same range.
+    fn replace_record(&mut self, slot: usize, record: RoleRecord) {
+        self.roles.as_mut_slice()[slot].record = Some(record);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Empties a live slot and returns it to the free-slot stack unless its
+    /// generation is spent.
+    fn vacate(&mut self, slot: usize) {
+        let entry = &mut self.roles.as_mut_slice()[slot];
+        let record = entry.record.take().expect("a vacated slot was live");
+        entry.mark = 0;
+        entry.tables = 0;
+        let retired = entry.generation == u32::MAX;
+        self.clear_start(record);
+        if !retired {
+            let position = self.free_slot_count;
+            self.free_slots.as_mut_slice()[position] = slot as u32;
+            self.free_slot_count = position + 1;
+        }
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// The start index position of `physical_start`, a page of allocator RAM.
+    fn start_position(&self, physical_start: u64) -> Option<usize> {
+        let mut base = 0_u64;
+        for range in self.allocator.initial_page_ranges() {
+            if range.start <= physical_start && physical_start < range.end {
+                return usize::try_from(base + (physical_start - range.start) / BASE_PAGE_SIZE)
+                    .ok();
+            }
+            base += range.page_count();
+        }
+        None
+    }
+
+    fn set_start(&mut self, record: RoleRecord, slot: usize) {
+        if !record.role.is_dynamic() {
+            return;
+        }
+        let Some(position) = self.start_position(record.range.start) else {
+            return;
+        };
+        if let Some(starts) = self.starts.as_deref_mut() {
+            starts[position] = slot as u32 + 1;
+        }
+    }
+
+    fn clear_start(&mut self, record: RoleRecord) {
+        if !record.role.is_dynamic() {
+            return;
+        }
+        let Some(position) = self.start_position(record.range.start) else {
+            return;
+        };
+        if let Some(starts) = self.starts.as_deref_mut() {
+            starts[position] = 0;
+        }
+    }
+
+    /// The slot of the dynamic role starting at `physical_start`: through
+    /// the start index once grown, by scanning the boot table before.
+    fn dynamic_slot_at(&self, physical_start: u64) -> Option<usize> {
+        match self.starts.as_deref() {
+            Some(starts) => {
+                let position = self.start_position(physical_start)?;
+                (starts[position] as usize).checked_sub(1)
+            }
+            None => self.roles.as_slice().iter().position(|entry| {
+                entry.record.is_some_and(|record| {
+                    record.role.is_dynamic() && record.range.start == physical_start
+                })
+            }),
+        }
     }
 
     fn identity(&self, slot: usize, generation: u32) -> Result<FrameRoleIdentity, FrameRoleError> {
@@ -1316,7 +1624,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .ok_or(FrameRoleError::InvalidGrant)?,
         )
         .map_err(|_| FrameRoleError::InvalidGrant)?;
-        let entry = self.roles.get(slot).ok_or(FrameRoleError::InvalidGrant)?;
+        let entry = self
+            .roles
+            .as_slice()
+            .get(slot)
+            .ok_or(FrameRoleError::InvalidGrant)?;
         if generation == 0 || entry.generation != generation || entry.record.is_none() {
             return Err(FrameRoleError::InvalidGrant);
         }
@@ -1325,7 +1637,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn record(&self, identity: FrameRoleIdentity) -> Result<RoleRecord, FrameRoleError> {
         let slot = self.slot(identity)?;
-        self.roles[slot].record.ok_or(FrameRoleError::InvalidGrant)
+        self.roles.as_slice()[slot]
+            .record
+            .ok_or(FrameRoleError::InvalidGrant)
     }
 
     fn validate_owner(&self, owner: TableOwnerKey) -> Result<(), FrameRoleError> {
@@ -1339,7 +1653,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let grant = &staged.grant;
         self.validate_owner(grant.owner)?;
         if self.slot(grant.identity)? != staged.slot
-            || self.roles[staged.slot].record
+            || self.roles.as_slice()[staged.slot].record
                 != Some(RoleRecord {
                     range: grant.range,
                     role: FrameRole::TableCandidate {
@@ -1355,6 +1669,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             (TableLevel::Pml4, None) => {
                 if self
                     .roles
+                    .as_slice()
                     .iter()
                     .enumerate()
                     .filter(|(slot, _)| *slot != staged.slot)

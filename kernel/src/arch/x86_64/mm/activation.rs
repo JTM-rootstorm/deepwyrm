@@ -1867,6 +1867,43 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .virtual_address(frame.address(), PAGE_SIZE)
     }
 
+    /// Moves the frame-role table into a run of RAM sized from installed
+    /// memory, reached through the direct map (DW2 M2 §5.3), and returns
+    /// its slot count. The early BSP is the only CPU running.
+    #[allow(
+        unsafe_code,
+        reason = "the direct map is the role table's only mapping of the run the manager allocated"
+    )]
+    pub(crate) fn grow_frame_roles(&mut self) -> Result<usize, LiveActiveTargetError> {
+        let roles = &mut *self.target.roles;
+        let layout = roles
+            .grown_layout()
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        let grant = roles
+            .allocate(layout.page_count())
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        let Some(base) =
+            self.target.scratch_bindings.direct.and_then(|direct| {
+                direct.virtual_address(grant.physical_start(), grant.byte_len())
+            })
+        else {
+            roles
+                .cancel_allocation(grant)
+                .unwrap_or_else(|_| panic!("role table rollback lost allocation authority"));
+            return Err(LiveActiveTargetError::InvalidIndex);
+        };
+        // SAFETY: the direct map maps the whole run read-write at `base`
+        // (page-aligned), and the run is this fresh allocation, which the
+        // manager keeps for good; nothing else maps or uses it.
+        unsafe { roles.adopt_storage(grant, base as *mut u8) }.map_err(|failure| {
+            roles
+                .cancel_allocation(failure.into_grant())
+                .unwrap_or_else(|_| panic!("role table rollback lost allocation authority"));
+            LiveActiveTargetError::InvalidIndex
+        })?;
+        Ok(layout.slot_count())
+    }
+
     pub(crate) fn install_kernel_mmio_page(
         &mut self,
         frame: FrameAddress,

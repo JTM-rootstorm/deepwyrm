@@ -9,5 +9,7 @@
 pub mod boot_map;
 #[path = "frame_roles.rs"]
 pub(crate) mod frame_roles;
+#[path = "growable.rs"]
+mod growable;
 #[path = "physical.rs"]
 pub mod physical;

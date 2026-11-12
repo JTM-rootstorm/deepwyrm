@@ -2879,8 +2879,11 @@ fn empty_child_hierarchy_is_retired_bottom_up_and_nonempty_rejection_is_retryabl
         0,
         "the child low half must be disconnected"
     );
-    assert_eq!(target.entries[&(pdpt.physical_start(), 0)], 0);
-    assert_eq!(target.entries[&(pd.physical_start(), 2)], 0);
+    // Only the root's entries are cleared: the tables below are reclaimed
+    // by walking them again, unreachable, with their entries left as they
+    // were (DW2 M2 §5.3).
+    assert_ne!(target.entries[&(pdpt.physical_start(), 0)], 0);
+    assert_ne!(target.entries[&(pd.physical_start(), 2)], 0);
     assert_eq!(
         target.entries[&(identity.physical_start(), 256)],
         supervisor_sentinel,

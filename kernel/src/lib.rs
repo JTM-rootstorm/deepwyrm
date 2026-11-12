@@ -366,6 +366,11 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             )
         }
         .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
+        // The boot role table holds 4096 roles; with the direct map active,
+        // it moves into RAM sized from installed memory (DW2 M2 §5.3).
+        let role_slots = active_paging
+            .grow_frame_roles()
+            .unwrap_or_else(|error| panic!("failed to grow the frame-role table: {error:?}"));
         let pm_timer = {
             let workspace = unsafe {
                 let slot = &mut *BOOTSTRAP_ACPI_WORKSPACE.slot();
@@ -749,6 +754,29 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             "cpu",
             arch::x86_64::syscall::supervisor_protections_record(),
         );
+        #[cfg(not(feature = "test-support"))]
+        {
+            let mut record = *b"frame-role slots=00000000000000000000";
+            let digits = &mut record[17..];
+            let mut value = role_slots;
+            for digit in digits.iter_mut().rev() {
+                *digit = b'0' + (value % 10) as u8;
+                value /= 10;
+            }
+            let first = digits
+                .iter()
+                .position(|digit| *digit != b'0')
+                .unwrap_or(digits.len() - 1);
+            let mut message = [0_u8; 37];
+            let length = 17 + digits.len() - first;
+            message[..17].copy_from_slice(&record[..17]);
+            message[17..length].copy_from_slice(&record[17 + first..]);
+            if let Ok(message) = core::str::from_utf8(&message[..length]) {
+                let _ = debug::emit_early_record(debug::DiagnosticLevel::Info, "memory", message);
+            }
+        }
+        #[cfg(feature = "test-support")]
+        let _ = role_slots;
         #[cfg(feature = "test-support")]
         match test_support::BUILD_GUEST_TEST {
             #[cfg(deepwyrm_memory_guest)]
