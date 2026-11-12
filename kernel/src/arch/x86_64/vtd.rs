@@ -19,6 +19,7 @@ const REG_GLOBAL_STATUS: u32 = 0x1c;
 const REG_ROOT_TABLE_ADDRESS: u32 = 0x20;
 const REG_CONTEXT_COMMAND: u32 = 0x28;
 const REG_FAULT_STATUS: u32 = 0x34;
+const REG_QUEUE_HEAD: u32 = 0x80;
 const REG_QUEUE_TAIL: u32 = 0x88;
 const REG_QUEUE_ADDRESS: u32 = 0x90;
 const REG_INTERRUPT_TABLE_ADDRESS: u32 = 0xb8;
@@ -41,6 +42,9 @@ const IOTLB_INVALIDATE: u64 = 1 << 63;
 const IOTLB_GLOBAL: u64 = 1 << 60;
 const IOTLB_DRAIN_READS: u64 = 1 << 49;
 const IOTLB_DRAIN_WRITES: u64 = 1 << 48;
+
+/// RTADDR.TTM, bits 11:10: the root-table mode; 0 is the legacy format.
+const ROOT_TABLE_MODE: u64 = 0b11 << 10;
 
 const EXTENDED_COHERENT: u64 = 1;
 const EXTENDED_QUEUED_INVALIDATION: u64 = 1 << 1;
@@ -90,8 +94,10 @@ pub(crate) enum VtdError {
     UnsupportedVersion(u32),
     /// The IOTLB invalidation register lies outside the mapped page.
     IotlbOutsideRegisterPage(u32),
-    /// Firmware left translation on; the kernel will not inherit its tables.
-    FirmwareTranslationEnabled,
+    /// Firmware left translation on in a root-table mode other than the
+    /// legacy one (RTADDR.TTM, given); the kernel will not switch modes
+    /// while translation is on.
+    FirmwareRootTableMode(u64),
     /// The root table is not page-aligned or beyond the unit's address width.
     InvalidRootTable(u64),
     /// The unit never acknowledged a command.
@@ -256,9 +262,10 @@ pub(crate) struct InvalidationQueue {
 /// Turns queued invalidation on for one unit that already translates DMA
 /// (`enable_default_deny`), over the zeroed one-page queue frame `queue`.
 /// Wait descriptors report completion in entry `status_index` of
-/// `status_frame`, which no other unit uses. A unit that inherits queued
-/// invalidation, interrupt remapping or compatibility-format pass-through from
-/// firmware is refused before anything is written.
+/// `status_frame`, which no other unit uses. `enable_default_deny` has turned
+/// off any queued invalidation, interrupt remapping or compatibility format
+/// firmware left on; a unit still showing one is refused before anything is
+/// written.
 pub(crate) fn enable_queued_invalidation<R: VtdRegisters, M: tables::TableMemory>(
     registers: &mut R,
     memory: &mut M,
@@ -453,8 +460,8 @@ pub(crate) fn interrupts_remapped() -> bool {
 }
 
 /// Checks, by reads alone, that the unit's register page holds a VT-d unit
-/// the kernel can drive: everything `enable_default_deny` checks before its
-/// first write. A page that decodes to nothing reads all ones, which no
+/// the kernel can drive: everything about the unit's identity that
+/// `enable_default_deny` checks before its first write. A page that decodes to nothing reads all ones, which no
 /// defined version, capability or extended-capability value is (their
 /// reserved bits read zero); one that reads zeros, or any other non-VT-d
 /// value, fails the version or feature checks. Linux treats such a unit as
@@ -487,6 +494,16 @@ pub(crate) fn every_unit_probes<'a, R: VtdRegisters + 'a>(
 /// Points the unit at the all-zero `root_table`, invalidates its context and
 /// IOTLB caches, and enables translation. On success every DMA through this
 /// unit is blocked.
+///
+/// A unit firmware left running is taken over (review N8). Interrupt
+/// remapping and compatibility format are turned off, then queued
+/// invalidation once its queue has drained, since register-based
+/// invalidation needs it off; the kernel turns both on again over its own
+/// tables (`remap_interrupts`). If translation is on, the root pointer is
+/// replaced and the caches invalidated with translation left on, so DMA goes
+/// from firmware's tables straight to blocked and never passes through
+/// untranslated. Translation left on in a non-legacy root-table mode is
+/// refused before anything is written.
 pub(crate) fn enable_default_deny<R: VtdRegisters>(
     registers: &mut R,
     root_table: u64,
@@ -501,8 +518,12 @@ pub(crate) fn enable_default_deny<R: VtdRegisters>(
         return Err(VtdError::InvalidRootTable(root_table));
     }
     if registers.read32(REG_GLOBAL_STATUS) & GLOBAL_TRANSLATION_ENABLE != 0 {
-        return Err(VtdError::FirmwareTranslationEnabled);
+        let mode = registers.read64(REG_ROOT_TABLE_ADDRESS) & ROOT_TABLE_MODE;
+        if mode != 0 {
+            return Err(VtdError::FirmwareRootTableMode(mode));
+        }
     }
+    release_firmware_interrupt_state(registers)?;
     if extended_capability & EXTENDED_COHERENT == 0 {
         registers.flush_cpu_caches();
     }
@@ -581,6 +602,41 @@ fn iotlb_register(extended_capability: u64) -> Result<u32, VtdError> {
         return Err(VtdError::IotlbOutsideRegisterPage(register));
     }
     Ok(register)
+}
+
+/// Turns off interrupt remapping, compatibility-format interrupts and queued
+/// invalidation that firmware left on, in that order (as Linux does): the
+/// queue is turned off only once the unit has consumed every descriptor.
+fn release_firmware_interrupt_state<R: VtdRegisters>(registers: &mut R) -> Result<(), VtdError> {
+    let status = registers.read32(REG_GLOBAL_STATUS);
+    let interrupts = GLOBAL_INTERRUPT_REMAPPING | GLOBAL_COMPATIBILITY_INTERRUPTS;
+    if status & interrupts != 0 {
+        clear_command(registers, interrupts, "interrupt-remapping disable")?;
+    }
+    if status & GLOBAL_QUEUED_INVALIDATION != 0 {
+        poll(
+            || registers.read64(REG_QUEUE_HEAD) == registers.read64(REG_QUEUE_TAIL),
+            "firmware invalidation-queue drain",
+        )?;
+        clear_command(
+            registers,
+            GLOBAL_QUEUED_INVALIDATION,
+            "queued-invalidation disable",
+        )?;
+    }
+    Ok(())
+}
+
+/// Clears persistent global command `bits` and waits for their status bits
+/// to clear.
+fn clear_command<R: VtdRegisters>(
+    registers: &mut R,
+    bits: u32,
+    what: &'static str,
+) -> Result<(), VtdError> {
+    let status = registers.read32(REG_GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATUS & !bits;
+    registers.write32(REG_GLOBAL_COMMAND, status);
+    poll(|| registers.read32(REG_GLOBAL_STATUS) & bits == 0, what)
 }
 
 /// Issues one global command and waits for its status bit.

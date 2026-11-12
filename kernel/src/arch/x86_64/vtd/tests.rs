@@ -24,9 +24,18 @@ struct Unit {
     root: u64,
     context: u64,
     iotlb: u64,
+    /// The firmware invalidation queue's head and tail.
+    queue_head: u64,
+    queue_tail: u64,
     responsive: bool,
     log: Vec<Write>,
 }
+
+/// Persistent global command bits a responsive unit mirrors into its status.
+const PERSISTENT_COMMANDS: u32 = GLOBAL_TRANSLATION_ENABLE
+    | GLOBAL_QUEUED_INVALIDATION
+    | GLOBAL_INTERRUPT_REMAPPING
+    | GLOBAL_COMPATIBILITY_INTERRUPTS;
 
 impl Unit {
     fn q35() -> Self {
@@ -38,6 +47,8 @@ impl Unit {
             root: 0,
             context: 0,
             iotlb: 0,
+            queue_head: 0,
+            queue_tail: 0,
             responsive: true,
             log: vec![],
         }
@@ -65,9 +76,14 @@ impl VtdRegisters for Unit {
         if value & GLOBAL_SET_ROOT_TABLE != 0 {
             self.status |= GLOBAL_SET_ROOT_TABLE;
         }
-        if value & GLOBAL_TRANSLATION_ENABLE != 0 {
-            self.status |= GLOBAL_TRANSLATION_ENABLE;
+        if value & GLOBAL_QUEUED_INVALIDATION == 0 && self.status & GLOBAL_QUEUED_INVALIDATION != 0
+        {
+            assert_eq!(
+                self.queue_head, self.queue_tail,
+                "the queue is disabled only when drained"
+            );
         }
+        self.status = (self.status & !PERSISTENT_COMMANDS) | (value & PERSISTENT_COMMANDS);
     }
 
     fn read64(&mut self, offset: u32) -> u64 {
@@ -76,6 +92,9 @@ impl VtdRegisters for Unit {
             REG_EXTENDED_CAPABILITY => self.extended,
             REG_CONTEXT_COMMAND => self.context,
             IOTLB => self.iotlb,
+            REG_ROOT_TABLE_ADDRESS => self.root,
+            REG_QUEUE_HEAD => self.queue_head,
+            REG_QUEUE_TAIL => self.queue_tail,
             _ => panic!("unexpected 64-bit read at {offset:#x}"),
         }
     }
@@ -83,7 +102,14 @@ impl VtdRegisters for Unit {
     fn write64(&mut self, offset: u32, value: u64) {
         self.log.push(Write::W64(offset, value));
         match offset {
-            REG_ROOT_TABLE_ADDRESS => self.root = value,
+            REG_ROOT_TABLE_ADDRESS => {
+                assert_eq!(
+                    self.status & GLOBAL_QUEUED_INVALIDATION,
+                    0,
+                    "register invalidation needs the queue off"
+                );
+                self.root = value;
+            }
             // A responsive unit finishes invalidations at once.
             REG_CONTEXT_COMMAND => self.context = if self.responsive { 0 } else { value },
             IOTLB => self.iotlb = if self.responsive { 0 } else { value },
@@ -121,8 +147,8 @@ fn translation_is_enabled_over_an_empty_root_table_after_both_invalidations() {
 #[test]
 fn persistent_status_is_kept_and_one_shot_bits_are_not_replayed() {
     let mut unit = Unit::q35();
-    // Queued invalidation enabled (bit 26), a persistent status bit.
-    unit.status = 1 << 26;
+    // Bit 28, a persistent status bit the kernel does not take over.
+    unit.status = 1 << 28;
     enable_default_deny(&mut unit, ROOT, 39).unwrap();
     let commands: Vec<u32> = unit
         .log
@@ -135,8 +161,8 @@ fn persistent_status_is_kept_and_one_shot_bits_are_not_replayed() {
     assert_eq!(
         commands,
         [
-            GLOBAL_SET_ROOT_TABLE | 1 << 26,
-            GLOBAL_TRANSLATION_ENABLE | 1 << 26
+            GLOBAL_SET_ROOT_TABLE | 1 << 28,
+            GLOBAL_TRANSLATION_ENABLE | 1 << 28
         ]
     );
 }
@@ -161,15 +187,101 @@ fn drain_bits_follow_the_capabilities() {
     );
 }
 
+fn commands(unit: &Unit) -> Vec<u32> {
+    unit.log
+        .iter()
+        .filter_map(|write| match write {
+            Write::W32(REG_GLOBAL_COMMAND, value) => Some(*value),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Translation firmware left on is taken over without ever being turned
+/// off: the root pointer is replaced and both caches invalidated while it
+/// stays on, so DMA goes from firmware's tables straight to blocked (N8).
 #[test]
-fn firmware_translation_is_refused_without_touching_the_unit() {
+fn firmware_translation_is_taken_over_without_turning_it_off() {
     let mut unit = Unit::q35();
     unit.status = GLOBAL_TRANSLATION_ENABLE;
+    unit.root = 0x5000;
+    enable_default_deny(&mut unit, ROOT, 39).unwrap();
+    assert_eq!(
+        unit.log,
+        [
+            Write::W64(REG_ROOT_TABLE_ADDRESS, ROOT),
+            Write::W32(
+                REG_GLOBAL_COMMAND,
+                GLOBAL_TRANSLATION_ENABLE | GLOBAL_SET_ROOT_TABLE
+            ),
+            Write::W64(REG_CONTEXT_COMMAND, CONTEXT_INVALIDATE | CONTEXT_GLOBAL),
+            Write::W64(
+                IOTLB,
+                IOTLB_INVALIDATE | IOTLB_GLOBAL | IOTLB_DRAIN_READS | IOTLB_DRAIN_WRITES
+            ),
+            Write::W32(REG_GLOBAL_COMMAND, GLOBAL_TRANSLATION_ENABLE),
+        ]
+    );
+    assert_eq!(unit.root, ROOT);
+    assert_ne!(unit.status & GLOBAL_TRANSLATION_ENABLE, 0);
+}
+
+/// Translation left on in another root-table mode is refused untouched.
+#[test]
+fn firmware_translation_in_another_table_mode_is_refused_without_touching_the_unit() {
+    let mut unit = Unit::q35();
+    unit.status = GLOBAL_TRANSLATION_ENABLE;
+    unit.root = 0x5000 | 1 << 10;
     assert_eq!(
         enable_default_deny(&mut unit, ROOT, 39),
-        Err(VtdError::FirmwareTranslationEnabled)
+        Err(VtdError::FirmwareRootTableMode(1 << 10))
     );
     assert!(unit.log.is_empty());
+}
+
+/// Interrupt remapping, compatibility format and queued invalidation left on
+/// by firmware are turned off in that order, the queue only once drained,
+/// before the root pointer is set; translation is never turned off (N8).
+#[test]
+fn firmware_interrupt_state_is_turned_off_before_the_root_is_set() {
+    let mut unit = Unit::q35();
+    unit.status = GLOBAL_TRANSLATION_ENABLE
+        | GLOBAL_QUEUED_INVALIDATION
+        | GLOBAL_INTERRUPT_REMAPPING
+        | GLOBAL_COMPATIBILITY_INTERRUPTS;
+    unit.queue_head = 0x40;
+    unit.queue_tail = 0x40;
+    enable_default_deny(&mut unit, ROOT, 39).unwrap();
+    assert_eq!(
+        commands(&unit),
+        [
+            GLOBAL_TRANSLATION_ENABLE | GLOBAL_QUEUED_INVALIDATION,
+            GLOBAL_TRANSLATION_ENABLE,
+            GLOBAL_TRANSLATION_ENABLE | GLOBAL_SET_ROOT_TABLE,
+            GLOBAL_TRANSLATION_ENABLE,
+        ]
+    );
+    assert_eq!(
+        unit.status & !GLOBAL_SET_ROOT_TABLE,
+        GLOBAL_TRANSLATION_ENABLE
+    );
+    assert_eq!(unit.root, ROOT);
+}
+
+/// A firmware queue that never drains is never turned off, and the unit's
+/// root and translation are left alone.
+#[test]
+fn a_firmware_queue_that_never_drains_times_out_before_the_root_is_set() {
+    let mut unit = Unit::q35();
+    unit.status = GLOBAL_TRANSLATION_ENABLE | GLOBAL_QUEUED_INVALIDATION;
+    unit.root = 0x5000;
+    unit.queue_tail = 0x10;
+    assert_eq!(
+        enable_default_deny(&mut unit, ROOT, 39),
+        Err(VtdError::Timeout("firmware invalidation-queue drain"))
+    );
+    assert!(unit.log.is_empty());
+    assert_eq!(unit.root, 0x5000);
 }
 
 #[test]
