@@ -32,6 +32,9 @@ pub(crate) const GLOBAL_SET_INTERRUPT_TABLE: u32 = 1 << 24;
 /// Compatibility-format interrupts pass through untranslated. Never set.
 pub(crate) const GLOBAL_COMPATIBILITY_INTERRUPTS: u32 = 1 << 23;
 const FAULT_QUEUE_ERROR: u32 = 1 << 4;
+/// FSTS.IQE, ICE and ITE (write 1 to clear): each halts the invalidation
+/// queue until cleared.
+const FAULT_QUEUE_HALTED: u32 = 0b111 << 4;
 /// Status bits that persist; one-shot command bits must not be written back.
 /// This is the mask the VT-d specification's command programming note uses.
 const GLOBAL_PERSISTENT_STATUS: u32 = 0x96ff_ffff;
@@ -604,25 +607,46 @@ fn iotlb_register(extended_capability: u64) -> Result<u32, VtdError> {
     Ok(register)
 }
 
-/// Turns off interrupt remapping, compatibility-format interrupts and queued
-/// invalidation that firmware left on, in that order (as Linux does): the
-/// queue is turned off only once the unit has consumed every descriptor.
+/// Turns off compatibility-format interrupts, interrupt remapping and
+/// queued invalidation that firmware left on, in that order and one field
+/// per GCMD write (VT-d §10.4.4 serializes field changes); interrupt
+/// remapping goes off before the queue, as Linux does. A running queue is
+/// turned off only once the unit has consumed every descriptor; one that an
+/// invalidation error (FSTS.IQE, ICE or ITE) has halted fetches nothing more,
+/// so it is turned off without waiting. Any such error is then cleared, or
+/// it would halt the kernel's own queue (N8 review).
 fn release_firmware_interrupt_state<R: VtdRegisters>(registers: &mut R) -> Result<(), VtdError> {
     let status = registers.read32(REG_GLOBAL_STATUS);
-    let interrupts = GLOBAL_INTERRUPT_REMAPPING | GLOBAL_COMPATIBILITY_INTERRUPTS;
-    if status & interrupts != 0 {
-        clear_command(registers, interrupts, "interrupt-remapping disable")?;
-    }
-    if status & GLOBAL_QUEUED_INVALIDATION != 0 {
-        poll(
-            || registers.read64(REG_QUEUE_HEAD) == registers.read64(REG_QUEUE_TAIL),
-            "firmware invalidation-queue drain",
+    if status & GLOBAL_COMPATIBILITY_INTERRUPTS != 0 {
+        clear_command(
+            registers,
+            GLOBAL_COMPATIBILITY_INTERRUPTS,
+            "compatibility-format disable",
         )?;
+    }
+    if status & GLOBAL_INTERRUPT_REMAPPING != 0 {
+        clear_command(
+            registers,
+            GLOBAL_INTERRUPT_REMAPPING,
+            "interrupt-remapping disable",
+        )?;
+    }
+    let halted = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_HALTED;
+    if status & GLOBAL_QUEUED_INVALIDATION != 0 {
+        if halted == 0 {
+            poll(
+                || registers.read64(REG_QUEUE_HEAD) == registers.read64(REG_QUEUE_TAIL),
+                "firmware invalidation-queue drain",
+            )?;
+        }
         clear_command(
             registers,
             GLOBAL_QUEUED_INVALIDATION,
             "queued-invalidation disable",
         )?;
+    }
+    if halted != 0 {
+        registers.write32(REG_FAULT_STATUS, halted);
     }
     Ok(())
 }

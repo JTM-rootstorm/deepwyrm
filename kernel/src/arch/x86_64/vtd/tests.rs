@@ -27,6 +27,8 @@ struct Unit {
     /// The firmware invalidation queue's head and tail.
     queue_head: u64,
     queue_tail: u64,
+    /// FSTS; queue errors are write-1-to-clear.
+    fault: u32,
     responsive: bool,
     log: Vec<Write>,
 }
@@ -49,6 +51,7 @@ impl Unit {
             iotlb: 0,
             queue_head: 0,
             queue_tail: 0,
+            fault: 0,
             responsive: true,
             log: vec![],
         }
@@ -60,13 +63,27 @@ impl VtdRegisters for Unit {
         match offset {
             REG_VERSION => self.version,
             REG_GLOBAL_STATUS => self.status,
+            REG_FAULT_STATUS => self.fault,
             _ => panic!("unexpected 32-bit read at {offset:#x}"),
         }
     }
 
     fn write32(&mut self, offset: u32, value: u32) {
         self.log.push(Write::W32(offset, value));
-        assert_eq!(offset, REG_GLOBAL_COMMAND, "only GCMD is written 32-bit");
+        if offset == REG_FAULT_STATUS {
+            self.fault &= !value;
+            return;
+        }
+        assert_eq!(
+            offset, REG_GLOBAL_COMMAND,
+            "only GCMD and FSTS are written 32-bit"
+        );
+        // VT-d §10.4.4: one control field changes per write.
+        let changed = (self.status ^ value) & PERSISTENT_COMMANDS;
+        assert!(
+            changed.count_ones() <= 1,
+            "GCMD write {value:#x} changes several fields"
+        );
         if !self.responsive {
             if value & GLOBAL_WRITE_BUFFER_FLUSH != 0 {
                 self.status |= GLOBAL_WRITE_BUFFER_FLUSH;
@@ -78,10 +95,13 @@ impl VtdRegisters for Unit {
         }
         if value & GLOBAL_QUEUED_INVALIDATION == 0 && self.status & GLOBAL_QUEUED_INVALIDATION != 0
         {
-            assert_eq!(
-                self.queue_head, self.queue_tail,
-                "the queue is disabled only when drained"
-            );
+            // A queue an error halted fetches nothing more.
+            if self.fault & FAULT_QUEUE_HALTED == 0 {
+                assert_eq!(
+                    self.queue_head, self.queue_tail,
+                    "the queue is disabled only when drained"
+                );
+            }
         }
         self.status = (self.status & !PERSISTENT_COMMANDS) | (value & PERSISTENT_COMMANDS);
     }
@@ -255,6 +275,7 @@ fn firmware_interrupt_state_is_turned_off_before_the_root_is_set() {
     assert_eq!(
         commands(&unit),
         [
+            GLOBAL_TRANSLATION_ENABLE | GLOBAL_QUEUED_INVALIDATION | GLOBAL_INTERRUPT_REMAPPING,
             GLOBAL_TRANSLATION_ENABLE | GLOBAL_QUEUED_INVALIDATION,
             GLOBAL_TRANSLATION_ENABLE,
             GLOBAL_TRANSLATION_ENABLE | GLOBAL_SET_ROOT_TABLE,
@@ -266,6 +287,53 @@ fn firmware_interrupt_state_is_turned_off_before_the_root_is_set() {
         GLOBAL_TRANSLATION_ENABLE
     );
     assert_eq!(unit.root, ROOT);
+}
+
+/// Interrupt remapping or compatibility format left on alone is turned off
+/// alone, one field per write.
+#[test]
+fn a_single_firmware_interrupt_field_is_turned_off_alone() {
+    for field in [GLOBAL_INTERRUPT_REMAPPING, GLOBAL_COMPATIBILITY_INTERRUPTS] {
+        let mut unit = Unit::q35();
+        unit.status = field;
+        enable_default_deny(&mut unit, ROOT, 39).unwrap();
+        assert_eq!(
+            commands(&unit),
+            [0, GLOBAL_SET_ROOT_TABLE, GLOBAL_TRANSLATION_ENABLE]
+        );
+        assert_eq!(unit.status & field, 0);
+    }
+}
+
+/// A firmware queue an invalidation error has halted is turned off without
+/// waiting for a drain that cannot come, and the error is cleared so the
+/// kernel's own queue is not halted by it (N8 review).
+#[test]
+fn a_halted_firmware_queue_is_turned_off_and_its_error_cleared() {
+    let mut unit = Unit::q35();
+    unit.status = GLOBAL_QUEUED_INVALIDATION;
+    unit.queue_head = 0x10;
+    unit.queue_tail = 0x20;
+    // IQE, plus primary fault overflow (bit 0), which is not the kernel's to
+    // clear here.
+    unit.fault = FAULT_QUEUE_ERROR | 1;
+    enable_default_deny(&mut unit, ROOT, 39).unwrap();
+    assert_eq!(unit.status & GLOBAL_QUEUED_INVALIDATION, 0);
+    assert_eq!(unit.fault, 1, "only the queue errors are cleared");
+    assert!(
+        unit.log
+            .contains(&Write::W32(REG_FAULT_STATUS, FAULT_QUEUE_ERROR))
+    );
+    assert_eq!(unit.root, ROOT);
+}
+
+/// A stale queue error with no queue on is cleared too.
+#[test]
+fn a_stale_queue_error_is_cleared_without_a_queue() {
+    let mut unit = Unit::q35();
+    unit.fault = 0b111 << 4;
+    enable_default_deny(&mut unit, ROOT, 39).unwrap();
+    assert_eq!(unit.fault, 0);
 }
 
 /// A firmware queue that never drains is never turned off, and the unit's
