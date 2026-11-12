@@ -505,22 +505,23 @@ fn local_cpu_resists_rogue_data_cache_load() -> bool {
     let vendor = __cpuid(0);
     // "GenuineIntel" in EBX, EDX, ECX.
     let intel = vendor.ebx == 0x756e_6547 && vendor.edx == 0x4965_6e69 && vendor.ecx == 0x6c65_746e;
-    let arch_capabilities = (vendor.eax >= 7
-        && __cpuid_count(7, 0).edx & CPUID7_EDX_ARCH_CAPABILITIES != 0)
-        .then(|| {
-            let (low, high): (u32, u32);
-            // SAFETY: [ASM] CPUID reports the MSR; RDMSR at CPL0 reads it and has no other effect.
-            unsafe {
-                core::arch::asm!(
-                    "rdmsr",
-                    in("ecx") MSR_ARCH_CAPABILITIES,
-                    out("eax") low,
-                    out("edx") high,
-                    options(nomem, nostack, preserves_flags)
-                );
-            }
-            u64::from(high) << 32 | u64::from(low)
-        });
+    // Only Intel CPUs can be affected, so only they need the MSR.
+    let arch_capabilities =
+        (intel && vendor.eax >= 7 && __cpuid_count(7, 0).edx & CPUID7_EDX_ARCH_CAPABILITIES != 0)
+            .then(|| {
+                let (low, high): (u32, u32);
+                // SAFETY: [ASM] CPUID reports the MSR; RDMSR at CPL0 reads it and has no other effect.
+                unsafe {
+                    core::arch::asm!(
+                        "rdmsr",
+                        in("ecx") MSR_ARCH_CAPABILITIES,
+                        out("eax") low,
+                        out("edx") high,
+                        options(nomem, nostack, preserves_flags)
+                    );
+                }
+                u64::from(high) << 32 | u64::from(low)
+            });
     cpu_resists_rogue_data_cache_load(intel, arch_capabilities)
 }
 
