@@ -272,3 +272,28 @@ fn a_fresh_thread_starts_with_null_selectors_and_fs_base_zero() {
             .all(|byte| *byte == 0)
     );
 }
+
+#[test]
+fn every_cpu_turns_on_the_smep_and_smap_it_has() {
+    assert_eq!(supervisor_protections(0), 0);
+    assert_eq!(supervisor_protections(CPUID7_EBX_SMEP), CR4_SMEP);
+    assert_eq!(supervisor_protections(CPUID7_EBX_SMAP), CR4_SMAP);
+    assert_eq!(supervisor_protections(u32::MAX), CR4_SMEP | CR4_SMAP);
+    // Unrelated leaf-7 features enable nothing.
+    assert_eq!(
+        supervisor_protections(!(CPUID7_EBX_SMEP | CPUID7_EBX_SMAP)),
+        0
+    );
+}
+
+#[test]
+fn a_cleared_protection_is_caught_and_the_fp_policy_keeps_them() {
+    let both = CR4_SMEP | CR4_SMAP;
+    let cr4 = normalize_cr4_for_user_fp(CR4_PAE, FpSaveMode::Fxsave) | both;
+    assert!(cr4_enforces_supervisor_protections(cr4, both));
+    assert!(!cr4_enforces_supervisor_protections(cr4 & !CR4_SMAP, both));
+    assert!(!cr4_enforces_supervisor_protections(cr4 & !CR4_SMEP, both));
+    assert!(cr4_enforces_supervisor_protections(CR4_PAE, 0));
+    // The FP normalization keeps both bits, so the boundary check holds.
+    assert_eq!(normalize_cr4_for_user_fp(cr4, FpSaveMode::Fxsave), cr4);
+}

@@ -328,6 +328,9 @@ pub(crate) enum SyscallInstallError {
     InterruptsEnabled,
     FsgsbaseNotCleared,
     FpSimdPolicyNotEnforced,
+    /// The CPU has a different set of SMEP and SMAP than the first CPU,
+    /// or one of them did not stay set.
+    SupervisorProtections,
     /// The CPU cannot run psABI user code, or chose a different FP save mode
     /// than the bootstrap CPU.
     FpMode(FpPolicyError),
@@ -473,13 +476,53 @@ fn live_user_fp_is_enforced() -> bool {
     cr0_enforces_user_fp(cr0)
         && crate::arch::x86_64::user_state::current_fp_mode()
             .is_some_and(|mode| cr4_enforces_user_fp(cr4, mode))
+        && crate::arch::x86_64::user_state::cr4_enforces_supervisor_protections(
+            cr4,
+            published_supervisor_protections(),
+        )
+}
+
+/// The SMEP and SMAP bits every CPU runs with, as the first CPU to install
+/// its syscall boundary found them; [`PROTECTIONS_UNSET`] before that.
+static SUPERVISOR_PROTECTIONS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(PROTECTIONS_UNSET);
+const PROTECTIONS_UNSET: u64 = u64::MAX;
+
+/// This CPU's SMEP and SMAP, from CPUID leaf 7.
+fn local_supervisor_protections() -> u64 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    if __cpuid(0).eax < 7 {
+        return 0;
+    }
+    crate::arch::x86_64::user_state::supervisor_protections(__cpuid_count(7, 0).ebx)
+}
+
+/// The protections every CPU agreed on, or none before any CPU installed.
+fn published_supervisor_protections() -> u64 {
+    match SUPERVISOR_PROTECTIONS.load(Ordering::Acquire) {
+        PROTECTIONS_UNSET => 0,
+        protections => protections,
+    }
 }
 
 #[allow(
     unsafe_code,
-    reason = "CR4 normalization keeps FSGSBASE off (E4), turns on the user FP state the save mode needs (D2) and clears every bit outside the kept set"
+    reason = "CR4 normalization keeps FSGSBASE off (E4), turns on the user FP state the save mode needs (D2) and clears every bit outside the kept set, and sets SMEP and SMAP (DW2 M2)"
 )]
 unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError> {
+    // Every CPU runs with the same protections: a CPU lacking one the first
+    // CPU has fails its install, before any user code runs on it.
+    let protections = local_supervisor_protections();
+    match SUPERVISOR_PROTECTIONS.compare_exchange(
+        PROTECTIONS_UNSET,
+        protections,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(published) if published == protections => {}
+        Err(_) => return Err(SyscallInstallError::SupervisorProtections),
+    }
     let before: u64;
     // SAFETY: [ASM] side-effect-free CR4 read; the only caller has already checked CPL0.
     unsafe {
@@ -489,13 +532,14 @@ unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError
             options(nomem, nostack, preserves_flags)
         );
     }
-    let expected = normalize_cr4_for_user_fp(before, mode);
+    let expected = normalize_cr4_for_user_fp(before, mode) | protections;
     if before != expected {
         // SAFETY: [ASM] keeps only the `CR4_KEPT` bits as found (so PAE, LA57, PCIDE, VMXE and SMXE,
         // whose change could fault, never change), sets OSFXSR/OSXMMEXCPT, and OSXSAVE exactly
         // when the CPU has XSAVE (`plan_fp_mode`). Every bit it clears may be cleared at any time
         // outside VMX/SMX operation. No kernel code uses RD/WR{FS,GS}BASE, SSE, protection keys,
-        // CET, FRED, LASS or LAM.
+        // CET, FRED, LASS or LAM. SMEP and SMAP are set where the CPU has them: the kernel
+        // neither executes nor touches user pages (it copies through the direct map).
         unsafe {
             core::arch::asm!(
                 "mov cr4, {}",
@@ -518,6 +562,10 @@ unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError
     }
     if observed != expected || !cr4_enforces_user_fp(observed, mode) {
         return Err(SyscallInstallError::FpSimdPolicyNotEnforced);
+    }
+    if !crate::arch::x86_64::user_state::cr4_enforces_supervisor_protections(observed, protections)
+    {
+        return Err(SyscallInstallError::SupervisorProtections);
     }
     Ok(())
 }
@@ -681,8 +729,9 @@ pub(crate) fn current_cpu_index_for_scheduler_request() -> Option<usize> {
 
 /// Observes the carrier-local condition required before an e1 stop safe point:
 /// native dispatch has released every usercopy-capable adapter borrow, and the
-/// architectural AC flag remains clear.  This deliberately does not use
-/// CR4.SMAP: DW0-C keeps SMAP disabled by contract.
+/// architectural AC flag remains clear. The kernel never sets AC: it copies
+/// user memory through the direct map, so SMAP, where the CPU has it, is
+/// never lifted (DW2 M2).
 pub(crate) fn current_native_usercopy_is_quiescent() -> bool {
     let Some(cpu_index) = current_cpu_index_for_diagnostics() else {
         return false;

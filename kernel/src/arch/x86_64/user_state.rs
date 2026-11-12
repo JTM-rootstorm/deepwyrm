@@ -156,6 +156,31 @@ pub(crate) const fn normalize_cr4_for_user_fp(cr4: u64, mode: FpSaveMode) -> u64
     }
 }
 
+/// CPUID.(EAX=7,ECX=0):EBX: supervisor-mode execution prevention.
+pub(crate) const CPUID7_EBX_SMEP: u32 = 1 << 7;
+/// CPUID.(EAX=7,ECX=0):EBX: supervisor-mode access prevention.
+pub(crate) const CPUID7_EBX_SMAP: u32 = 1 << 20;
+
+/// The CR4 supervisor protections a CPU whose leaf-7 EBX is `leaf7_ebx`
+/// runs with (DW2 M2): SMEP and SMAP, each when the CPU has it. The kernel
+/// never executes or touches user pages: it copies user memory through the
+/// direct map, so it never needs STAC, and AC stays clear.
+pub(crate) const fn supervisor_protections(leaf7_ebx: u32) -> u64 {
+    let mut protections = 0;
+    if leaf7_ebx & CPUID7_EBX_SMEP != 0 {
+        protections |= CR4_SMEP;
+    }
+    if leaf7_ebx & CPUID7_EBX_SMAP != 0 {
+        protections |= CR4_SMAP;
+    }
+    protections
+}
+
+/// Whether `cr4` holds every one of `protections`.
+pub(crate) const fn cr4_enforces_supervisor_protections(cr4: u64, protections: u64) -> bool {
+    cr4 & protections == protections
+}
+
 pub(crate) const fn cr0_enforces_user_fp(cr0: u64) -> bool {
     cr0 & (CR0_EMULATION | CR0_TASK_SWITCHED) == 0
         && cr0 & (CR0_MONITOR_COPROCESSOR | CR0_NUMERIC_ERROR)

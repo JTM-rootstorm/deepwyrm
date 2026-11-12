@@ -466,6 +466,8 @@ struct LiveUserWalk {
     user: bool,
     writable: bool,
     executable: bool,
+    /// The frame the leaf maps.
+    physical: u64,
 }
 
 /// Pin-aware atomic target over the live x86 scratch publisher.
@@ -604,14 +606,30 @@ impl OwnedLiveUserOutput {
     }
 }
 
-pub(crate) struct PinnedLiveUserPages<'tracker> {
-    _pin: UserRangePin<'tracker, E5_USER_PIN_CAPACITY>,
+/// A pinned, preflighted range and the session that copies it through the
+/// direct map.
+pub(crate) struct PinnedLiveUserPages<
+    'session,
+    'borrow,
+    'root,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
+    _pin: UserRangePin<'borrow, E5_USER_PIN_CAPACITY>,
     range: UserRange,
+    space: &'session mut LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
 }
 
-pub(crate) struct PinnedLiveUserBatch<'tracker> {
-    _pins: [Option<UserRangePin<'tracker, E5_USER_PIN_CAPACITY>>; 3],
+pub(crate) struct PinnedLiveUserBatch<
+    'session,
+    'borrow,
+    'root,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+> {
+    _pins: [Option<UserRangePin<'borrow, E5_USER_PIN_CAPACITY>>; 3],
     ranges: [Option<UserRange>; 3],
+    space: &'session mut LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
 }
 
 impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> UserPageAccess
@@ -619,7 +637,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
 {
     type Error = LiveUserAccessError;
     type Pinned<'a>
-        = PinnedLiveUserPages<'borrow>
+        = PinnedLiveUserPages<'a, 'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
     where
         Self: 'a;
 
@@ -634,7 +652,11 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
                 return Err(error);
             }
         }
-        Ok(PinnedLiveUserPages { _pin: pin, range })
+        Ok(PinnedLiveUserPages {
+            _pin: pin,
+            range,
+            space: self,
+        })
     }
 }
 
@@ -642,7 +664,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
     for LiveProcessAddressSpace<'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     type PinnedBatch<'a>
-        = PinnedLiveUserBatch<'borrow>
+        = PinnedLiveUserBatch<'a, 'borrow, 'root, RANGE_CAPACITY, ROLE_CAPACITY>
     where
         Self: 'a;
 
@@ -673,6 +695,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Us
         Ok(PinnedLiveUserBatch {
             _pins: pins,
             ranges,
+            space: self,
         })
     }
 }
@@ -700,7 +723,9 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Ow
     }
 }
 
-impl PinnedLiveUserPages<'_> {
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    PinnedLiveUserPages<'_, '_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
     fn assert_exact_copy_range(&self, range: UserRange, byte_len: usize) {
         assert_eq!(
             range, self.range,
@@ -714,7 +739,9 @@ impl PinnedLiveUserPages<'_> {
     }
 }
 
-impl PinnedUserPages for PinnedLiveUserPages<'_> {
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PinnedUserPages
+    for PinnedLiveUserPages<'_, '_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
     type Error = LiveUserAccessError;
 
     fn preflight(&mut self, chunk: UserPageChunk) -> Result<(), Self::Error> {
@@ -731,34 +758,20 @@ impl PinnedUserPages for PinnedLiveUserPages<'_> {
         Ok(())
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "the range pin remains active and live-root preflight proved every source page readable before exact copy"
-    )]
     fn read_exact(&mut self, range: UserRange, destination: &mut [u8]) {
         self.assert_exact_copy_range(range, destination.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                range.start() as *const u8,
-                destination.as_mut_ptr(),
-                destination.len(),
-            );
-        }
+        self.space.read_user(range.start(), destination);
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "the range pin remains active and live-root preflight proved every destination page writable before exact copy"
-    )]
     fn write_exact(&mut self, range: UserRange, source: &[u8]) {
         self.assert_exact_copy_range(range, source.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(source.as_ptr(), range.start() as *mut u8, source.len());
-        }
+        self.space.write_user(range.start(), source);
     }
 }
 
-impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PinnedUserBatchPages
+    for PinnedLiveUserBatch<'_, '_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
     type Error = LiveUserAccessError;
 
     fn preflight(&mut self, index: usize, chunk: UserPageChunk) -> Result<(), Self::Error> {
@@ -781,10 +794,6 @@ impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
         Ok(())
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "all batch ranges remain pinned and live-root preflight proved every destination page writable before exact copy"
-    )]
     fn write_exact(&mut self, index: usize, range: UserRange, source: &[u8]) {
         let allowed = self
             .ranges
@@ -796,9 +805,7 @@ impl PinnedUserBatchPages for PinnedLiveUserBatch<'_> {
         assert!(range.end_exclusive() <= allowed.end_exclusive());
         assert_eq!(range.access(), allowed.access());
         assert_eq!(u64::try_from(source.len()).ok(), Some(range.byte_len()));
-        unsafe {
-            core::ptr::copy_nonoverlapping(source.as_ptr(), range.start() as *mut u8, source.len());
-        }
+        self.space.write_user(range.start(), source);
     }
 }
 
@@ -937,7 +944,14 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(LiveUserAccessError::Permission);
         }
-        let atomic = unsafe { core::sync::atomic::AtomicU32::from_ptr(start as *mut u32) };
+        let walk = self.walk_leaf(start)?;
+        let page = self
+            .direct_page(walk.physical)
+            .ok_or(LiveUserAccessError::MissingOrInvalid)?;
+        let address = page + (start & (PAGE_SIZE - 1));
+        // SAFETY: an aligned word of a pinned user page, through the direct
+        // map: the same memory the user maps, so the same atomic object.
+        let atomic = unsafe { core::sync::atomic::AtomicU32::from_ptr(address as *mut u32) };
         Ok(atomic.load(core::sync::atomic::Ordering::Acquire))
     }
 
@@ -1000,10 +1014,8 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(LiveUserAccessError::Pin)
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "the detached tracker token keeps the fully preflighted destination mapping stable across syscall suspension"
-    )]
+    /// The detached tracker token keeps the fully preflighted destination
+    /// mapping stable across syscall suspension.
     pub(crate) fn commit_owned_output(
         &mut self,
         output: OwnedLiveUserOutput,
@@ -1026,9 +1038,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         assert_eq!(end_exclusive, output.range.end_exclusive());
         assert_eq!(start, output.token.start());
         assert_eq!(end_exclusive, output.token.end_exclusive());
-        unsafe {
-            core::ptr::copy_nonoverlapping(source.as_ptr(), start as *mut u8, source.len());
-        }
+        self.write_user(start, source);
         self.target
             .pins
             .release_owned(output.address_space, output.token)
@@ -1086,6 +1096,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             user,
             writable,
             executable,
+            physical: entry & physical_mask(self.selected_root().capabilities),
         })
     }
 
@@ -1114,7 +1125,82 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(LiveUserAccessError::Permission);
         }
+        // The kernel copies through the direct map, never through the user
+        // address (DW2 M2, which turns SMAP on): a page that is not RAM the
+        // allocator owns, such as a device's registers, cannot be copied to
+        // or from.
+        if self.direct_page(walk.physical).is_none() {
+            return Err(LiveUserAccessError::MissingOrInvalid);
+        }
         Ok(())
+    }
+
+    /// The direct-map address of the frame at `physical`.
+    fn direct_page(&self, physical: u64) -> Option<u64> {
+        self.target
+            .scratch
+            .direct?
+            .virtual_address(physical, PAGE_SIZE)
+    }
+
+    /// Runs `copy` over each piece of `[start, start + length)` that lies in
+    /// one user page, with the direct-map address of that piece and its
+    /// offset into the range. Every page must have passed preflight under a
+    /// pin that is still held, so its mapping cannot have changed and the
+    /// walk cannot fail.
+    fn for_each_user_piece(
+        &mut self,
+        start: u64,
+        length: usize,
+        mut copy: impl FnMut(u64, usize, usize),
+    ) {
+        let mut done = 0_usize;
+        while done < length {
+            let address = start + done as u64;
+            let in_page = (address & (PAGE_SIZE - 1)) as usize;
+            let take = (PAGE_SIZE as usize - in_page).min(length - done);
+            let walk = self.walk_leaf(address).unwrap_or_else(|error| {
+                panic!("pinned user page drifted after preflight: {error:?}")
+            });
+            let page = self
+                .direct_page(walk.physical)
+                .unwrap_or_else(|| panic!("pinned user page left the direct map"));
+            copy(page + in_page as u64, done, take);
+            done += take;
+        }
+    }
+
+    /// Copies `destination.len()` bytes from preflighted, pinned user memory
+    /// at `start`.
+    #[allow(
+        unsafe_code,
+        reason = "each piece is a pinned, preflighted user page reached through the direct map"
+    )]
+    fn read_user(&mut self, start: u64, destination: &mut [u8]) {
+        let pointer = destination.as_mut_ptr();
+        self.for_each_user_piece(start, destination.len(), |from, offset, length| {
+            // SAFETY: `from` is `length` bytes of one direct-mapped frame and
+            // `offset + length` lies inside `destination`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(from as *const u8, pointer.add(offset), length);
+            }
+        });
+    }
+
+    /// Copies `source` into preflighted, pinned, writable user memory at
+    /// `start`.
+    #[allow(
+        unsafe_code,
+        reason = "each piece is a pinned, preflighted writable user page reached through the direct map"
+    )]
+    fn write_user(&mut self, start: u64, source: &[u8]) {
+        self.for_each_user_piece(start, source.len(), |to, offset, length| {
+            // SAFETY: `to` is `length` bytes of one direct-mapped frame and
+            // `offset + length` lies inside `source`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(source.as_ptr().add(offset), to as *mut u8, length);
+            }
+        });
     }
 
     #[allow(

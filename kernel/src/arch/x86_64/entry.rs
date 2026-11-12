@@ -31,7 +31,9 @@ pub(crate) extern "sysv64" fn dw_kernel_rust_entry(boot_info_physical: u64) -> !
 /// Wyrmroot preserves unrelated incoming CR4/RFLAGS state and does not promise
 /// SMAP or AC clear. Deepwyrm therefore clears exactly CR4.SMAP and RFLAGS.AC
 /// before any C1/C2 assumption while retaining every other bit, including IF.
-/// Later live observations fail closed if either bit drifts back.
+/// Later live observations fail closed if either bit drifts back. Once the
+/// deep root and its direct map are live, each CPU's syscall-boundary install
+/// turns SMAP (and SMEP) on for good (DW2 M2); AC stays clear.
 ///
 /// # Safety
 ///
