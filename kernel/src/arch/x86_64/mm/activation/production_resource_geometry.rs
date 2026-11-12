@@ -242,8 +242,9 @@ const STORAGE_WAITS: usize = STORAGE_DRIVERS * 6
 /// holds one as its namespace.
 const JOB_NAMESPACE_WAITS: usize = 1;
 /// Each file or directory a job holds open is a node vfsd or a filesystem
-/// waits on: every pair the job may create but its sleeper (W9).
-const JOB_OPEN_NODE_WAITS: usize = JOB_OWN_CHANNEL_PAIRS - 1;
+/// waits on. Nothing keeps a pair back for sleeping, so every pair the job
+/// may create can be a node (W9; review 2026-11-12, L2).
+const JOB_OPEN_NODE_WAITS: usize = JOB_OWN_CHANNEL_PAIRS;
 pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS
     + ADDED_EXIT_WAITS
     + LIVE_SHELL_JOBS * (JOB_OWN_WAITS + JOB_NAMESPACE_WAITS + JOB_OPEN_NODE_WAITS)
@@ -382,7 +383,7 @@ mod tests {
         assert_eq!(REGISTRY_PEAK, 346);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
         assert_eq!(STORAGE_WAITS, 55);
-        assert_eq!(WAIT_PEAK, 140);
+        assert_eq!(WAIT_PEAK, 144);
         assert_eq!(BOOTFS_ENTRY_PEAK, 17);
     }
 
