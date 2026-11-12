@@ -214,7 +214,11 @@ and the request dies with the claim it names, so a Thread that blocks or
 switches first leaves nothing pending. The bound above still holds: the
 preempted Thread's turn continues on its rest, and the woken Thread's time
 shrinks by what it runs. A wake on another CPU takes effect at that CPU's next
-syscall or timer return; there is no reschedule IPI to a busy CPU.
+syscall or timer return; there is no reschedule IPI to a busy CPU, and a
+CPL3-origin device interrupt does not pass that boundary. The preempted
+Thread's quantum ticket is not cancelled in the time service: the incoming
+Thread's arm replaces it, and if it fires first it is a stale ticket, which
+`publish_quantum_expiry` treats as a harmless rescan (review 2026-11-12, Low).
 
 If no peer is locally runnable, quantum expiry may retain the current Thread,
 clear the consumed reschedule request, and arm a fresh quantum. It still records
