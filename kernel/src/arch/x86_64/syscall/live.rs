@@ -754,6 +754,26 @@ pub(crate) fn current_native_usercopy_is_quiescent() -> bool {
     NATIVE_USERCOPY_WINDOW[cpu_index].load(Ordering::Acquire) == 0 && rflags & RFLAGS_AC == 0
 }
 
+/// Whether RFLAGS.AC is clear on this CPU, as every kernel entry leaves it.
+pub(crate) fn kernel_alignment_flag_is_clear() -> bool {
+    let rflags: u64;
+    #[allow(
+        unsafe_code,
+        reason = "PUSHFQ/POP observes the current CPU flag word without changing it"
+    )]
+    // SAFETY: [ASM] PUSHFQ/POP writes only below RSP (no `nostack`, no red zone); no Rust-visible
+    // memory is touched.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) rflags,
+            options(nomem, preserves_flags)
+        );
+    }
+    rflags & RFLAGS_AC == 0
+}
+
 /// Confirms that this CPU reached Rust through its own guarded rendezvous
 /// reaper stack rather than the interrupted Thread or entry stack.
 pub(crate) fn current_cpu_is_on_terminal_reaper_stack() -> bool {

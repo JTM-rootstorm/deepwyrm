@@ -1650,6 +1650,11 @@ pub(crate) fn service_current_scheduler_quantum_deadline() -> Result<bool, LiveT
 )]
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
+    // Every entry stub clears RFLAGS.AC, which user code may set, so SMAP
+    // holds in this handler (DW2 M2). Fail closed if one did not.
+    if !crate::arch::x86_64::syscall::kernel_alignment_flag_is_clear() {
+        panic!("timer interrupt handler entered with RFLAGS.AC set");
+    }
     if !crate::arch::x86_64::idle::live_idle_wake_is_healthy() {
         halt_forever();
     }
