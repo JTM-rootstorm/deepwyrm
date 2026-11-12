@@ -331,6 +331,9 @@ pub(crate) enum SyscallInstallError {
     /// The CPU has a different set of SMEP and SMAP than the first CPU,
     /// or one of them did not stay set.
     SupervisorProtections,
+    /// The CPU is affected by Meltdown (an Intel CPU without RDCL_NO), so
+    /// user code could read the direct map (DW2 M2).
+    RogueDataCacheLoad,
     /// The CPU cannot run psABI user code, or chose a different FP save mode
     /// than the bootstrap CPU.
     FpMode(FpPolicyError),
@@ -488,6 +491,39 @@ static SUPERVISOR_PROTECTIONS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(PROTECTIONS_UNSET);
 const PROTECTIONS_UNSET: u64 = u64::MAX;
 
+/// Whether this CPU keeps supervisor-only pages from user code under
+/// speculation (`cpu_resists_rogue_data_cache_load`).
+#[allow(
+    unsafe_code,
+    reason = "RDMSR of IA32_ARCH_CAPABILITIES, which CPUID says exists"
+)]
+fn local_cpu_resists_rogue_data_cache_load() -> bool {
+    use crate::arch::x86_64::user_state::{
+        CPUID7_EDX_ARCH_CAPABILITIES, MSR_ARCH_CAPABILITIES, cpu_resists_rogue_data_cache_load,
+    };
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let vendor = __cpuid(0);
+    // "GenuineIntel" in EBX, EDX, ECX.
+    let intel = vendor.ebx == 0x756e_6547 && vendor.edx == 0x4965_6e69 && vendor.ecx == 0x6c65_746e;
+    let arch_capabilities = (vendor.eax >= 7
+        && __cpuid_count(7, 0).edx & CPUID7_EDX_ARCH_CAPABILITIES != 0)
+        .then(|| {
+            let (low, high): (u32, u32);
+            // SAFETY: [ASM] CPUID reports the MSR; RDMSR at CPL0 reads it and has no other effect.
+            unsafe {
+                core::arch::asm!(
+                    "rdmsr",
+                    in("ecx") MSR_ARCH_CAPABILITIES,
+                    out("eax") low,
+                    out("edx") high,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+            u64::from(high) << 32 | u64::from(low)
+        });
+    cpu_resists_rogue_data_cache_load(intel, arch_capabilities)
+}
+
 /// This CPU's SMEP and SMAP, from CPUID leaf 7.
 fn local_supervisor_protections() -> u64 {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
@@ -523,6 +559,11 @@ fn published_supervisor_protections() -> u64 {
     reason = "CR4 normalization keeps FSGSBASE off (E4), turns on the user FP state the save mode needs (D2) and clears every bit outside the kept set, and sets SMEP and SMAP (DW2 M2)"
 )]
 unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError> {
+    // Every root maps all allocator RAM supervisor-only and there is no
+    // KPTI, so a Meltdown-affected CPU never runs user code.
+    if !local_cpu_resists_rogue_data_cache_load() {
+        return Err(SyscallInstallError::RogueDataCacheLoad);
+    }
     // Every CPU runs with the same protections: a CPU lacking one the first
     // CPU has fails its install, before any user code runs on it.
     let protections = local_supervisor_protections();

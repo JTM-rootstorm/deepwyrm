@@ -297,3 +297,18 @@ fn a_cleared_protection_is_caught_and_the_fp_policy_keeps_them() {
     // The FP normalization keeps both bits, so the boundary check holds.
     assert_eq!(normalize_cr4_for_user_fp(cr4, FpSaveMode::Fxsave), cr4);
 }
+
+#[test]
+fn only_intel_cpus_without_rdcl_no_are_refused() {
+    assert!(cpu_resists_rogue_data_cache_load(false, None));
+    assert!(cpu_resists_rogue_data_cache_load(false, Some(0)));
+    assert!(!cpu_resists_rogue_data_cache_load(true, None));
+    assert!(!cpu_resists_rogue_data_cache_load(
+        true,
+        Some(!ARCH_CAPABILITIES_RDCL_NO)
+    ));
+    assert!(cpu_resists_rogue_data_cache_load(
+        true,
+        Some(ARCH_CAPABILITIES_RDCL_NO)
+    ));
+}

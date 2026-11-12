@@ -156,6 +156,33 @@ pub(crate) const fn normalize_cr4_for_user_fp(cr4: u64, mode: FpSaveMode) -> u64
     }
 }
 
+/// CPUID.(EAX=7,ECX=0):EDX: the IA32_ARCH_CAPABILITIES MSR exists.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) const CPUID7_EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
+/// IA32_ARCH_CAPABILITIES.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) const MSR_ARCH_CAPABILITIES: u32 = 0x10a;
+/// IA32_ARCH_CAPABILITIES: the CPU is not affected by rogue data cache load
+/// (Meltdown).
+pub(crate) const ARCH_CAPABILITIES_RDCL_NO: u64 = 1 << 0;
+
+/// Whether a CPU keeps supervisor-only pages from user code under
+/// speculation, which the direct map relies on: every root maps all of
+/// allocator RAM, and Deepwyrm has no KPTI (DW2 M2 review R1; Mike,
+/// 2026-11-12: refuse affected CPUs). Only Intel CPUs are affected, and an
+/// Intel CPU is accepted only when it reports RDCL_NO.
+/// `arch_capabilities` is `None` when the CPU has no such MSR.
+pub(crate) const fn cpu_resists_rogue_data_cache_load(
+    intel: bool,
+    arch_capabilities: Option<u64>,
+) -> bool {
+    match arch_capabilities {
+        _ if !intel => true,
+        Some(capabilities) => capabilities & ARCH_CAPABILITIES_RDCL_NO != 0,
+        None => false,
+    }
+}
+
 /// CPUID.(EAX=7,ECX=0):EBX: supervisor-mode execution prevention.
 pub(crate) const CPUID7_EBX_SMEP: u32 = 1 << 7;
 /// CPUID.(EAX=7,ECX=0):EBX: supervisor-mode access prevention.

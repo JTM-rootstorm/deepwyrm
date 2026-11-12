@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is in progress: the direct map, usercopy through it, and SMEP/SMAP are done (§5); the RAM-sized role table is designed (§5.3) and not started.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is in progress: the direct map, usercopy through it, and SMEP/SMAP are done (§5); the RAM-sized role table is designed (§5.3) and approved by Mike (2026-11-12), not started.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -72,6 +72,27 @@ Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into sca
 - **New refusal:** preflight refuses a user page with no direct-map address, such as mapped device registers.
 - **SMEP and SMAP:** each CPU turns them on, where it has them, when it installs its syscall boundary. The first CPU's set is recorded, and a CPU with a different set fails its install. The IF-clear boundary check also requires the recorded bits to stay set. AC is never set, because no STAC window exists.
 - **dev-boot CPU:** dev-boot now gives the guest `qemu64,+pdpe1gb,+smep,+smap`.
+
+### 5.2a Security review of 5.1–5.2
+
+**Reviewer:** Claude Opus 5.5 (low effort), 2026-11-12, at Deepwyrm `fb395be` and `7e2d64c` (base `ae3c872`) and Wyrmroot `6e0f0e6`. Method: code reading plus the host unit tests; no guest runs. No Critical defect.
+
+- **D1 (High, confirmed): fixed.**
+  - The defect: user code may set RFLAGS.AC, interrupt delivery keeps it, and only SYSCALL cleared it. So interrupt and exception handlers entered from such a thread ran with SMAP lifted. Before M2, it also let an e1 stop rendezvous halt the CPU on its AC check.
+  - The fix: every stub now clears AC (`e57eb60`).
+  - The regression test: the timer handler fails closed on AC (`b5670ea`), and `bin/cpu-hog` spins with AC set (Wyrmroot `6c5170f`). With the check but without the stub fix, dev-boot stopped on "timer interrupt handler entered with RFLAGS.AC set"; with the fix it passes.
+- **R1 (High risk), Meltdown: resolved by Mike's decision (2026-11-12) to refuse affected CPUs.**
+  - The risk: every root maps all allocator RAM supervisor-only, and there is no KPTI. Before M2 the kernel image was already exposed the same way.
+  - The decision: an Intel CPU without RDCL_NO in IA32_ARCH_CAPABILITIES fails its syscall-boundary install, before any user code runs. KPTI would be needed only to support such CPUs.
+- **R2 (Low), indirect SMAP evidence: fixed.** The kernel reports on serial which protections every CPU runs with. dev-boot requires `smep and smap on`, and the guest CPU has both. A CPU without SMEP or SMAP still boots, without that protection, and the serial line says so.
+- **R3 (Low), accepted:** the AP trampoline page has a writable direct-map alias. Its executable identity mapping is retired once the APs park.
+- **R4 (Low), accepted:** 1 GiB pages are gated on the bootstrap CPU's CPUID only. Every CPU in one machine reports the same paging features.
+- **R5 (Low), accepted:** a memory map fragmented enough to exceed 2048 tables stops the boot; it is not unsafe. The quadratic edge lookup affects only boot time.
+- **R6 (Low), accepted:** a large leaf could straddle an MTRR boundary only inside one usable range, and usable RAM is write-back throughout.
+- **R7 (Low), intended:** usercopy refuses user pages that are not allocator RAM.
+- **R8 (Low): fixed.** The layout check now tests a kernel segment's whole interval.
+- **R9 (Low): fixed.** Two stale comments.
+- **R10 (Low), accepted:** the guest-test-only usercopy in `activation/test_support.rs` still uses user addresses. It is in no product, and under SMAP it would fault loudly, not silently.
 
 ### 5.3 The RAM-sized role table (not started)
 
