@@ -699,7 +699,10 @@ fn a_page_that_is_not_a_usable_unit_fails_the_probe_without_writes() {
         assert!(probe_unit(&mut units[1]).is_err(), "case {case}");
         assert!(units.iter().all(|unit| unit.log.is_empty()), "case {case}");
         // enable_default_deny refuses it the same way before any write.
-        assert!(enable_default_deny(&mut units[1], ROOT, 39).is_err());
+        assert!(
+            enable_default_deny(&mut units[1], ROOT, 39).is_err(),
+            "case {case}"
+        );
         assert!(units[1].log.is_empty(), "case {case}");
     }
 }

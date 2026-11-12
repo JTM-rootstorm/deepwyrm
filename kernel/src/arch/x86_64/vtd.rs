@@ -606,9 +606,12 @@ fn poll(mut done: impl FnMut() -> bool, what: &'static str) -> Result<(), VtdErr
 
 /// Takes over every DMAR unit at boot, before any device driver exists.
 ///
-/// No DMAR is a supported platform: the kernel then admits no device DMA. A
-/// DMAR the kernel cannot take over completely stops the boot, so a machine
-/// never runs with some units translating and others passing DMA through.
+/// No DMAR is a supported platform: the kernel then admits no device DMA.
+/// Nor is a DMAR with a unit that fails [`probe_unit`], which is ignored
+/// ([`VtdBootState::Unusable`]) before any unit is written. A DMAR whose
+/// units all pass but which the kernel then cannot take over completely
+/// stops the boot, so a machine never runs with some units translating and
+/// others passing DMA through.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     active: &mut crate::arch::x86_64::mm::ActiveDeepPaging<
@@ -624,9 +627,9 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     };
     let physical_limit = active.root().physical_limit();
     // Map every unit, which closes every unit's page to BARs, then check
-    // that each is a VT-d unit the kernel can drive, all before any unit or table is touched: if one
-    // does not, the DMAR is ignored as a whole and nothing is left half set
-    // up.
+    // that each is a VT-d unit the kernel can drive, all before any unit or
+    // table is touched: if one is not, the DMAR is ignored as a whole and
+    // nothing is left half set up.
     let mut bases = [0_u64; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
     for (base, unit) in bases.iter_mut().zip(snapshot.units()) {
         let frame = FrameAddress::new(unit.register_base(), physical_limit)
