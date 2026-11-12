@@ -91,9 +91,15 @@ value = 7
 doc = "task_group_limit class: Concurrently registered wait items of blocked wait_one/wait_many calls."
 
 [[constant]]
-name = "DW_TASK_GROUP_LIMIT_CLASS_COUNT"
+name = "DW_TASK_GROUP_LIMIT_MEMORY_PAGES"
 type = "u32"
 value = 8
+doc = "task_group_limit class: 4 KiB pages of RAM-backed MemoryObjects, live or finalizing; device-register objects weigh nothing."
+
+[[constant]]
+name = "DW_TASK_GROUP_LIMIT_CLASS_COUNT"
+type = "u32"
+value = 9
 doc = "Number of task_group_limit classes; every class value is below it."
 
 [[constant]]
@@ -648,7 +654,7 @@ arg1 = "reason|DwTerminationReason|in|NONE|NONE"
 name = "task_group_limit"
 number = 0x00010003
 phase = "DW1-D"
-doc = "Lower one class's limit on a task group. A limit bounds the live objects (or registered waits) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry."
+doc = "Lower one class's limit on a task group. A limit bounds the live objects (or registered waits, or RAM-backed MemoryObject pages) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry."
 arg0 = "task_group|DwHandle|in|TASK_GROUP|MODIFY"
 arg1 = "class|u32|in|NONE|NONE"
 arg2 = "limit|u32|in|NONE|NONE"

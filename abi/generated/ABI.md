@@ -233,7 +233,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_TASK_GROUP_LIMIT_PROCESS` | `u32` | `5` | task_group_limit class: Process objects. |
 | `DW_TASK_GROUP_LIMIT_TASK_GROUP` | `u32` | `6` | task_group_limit class: Child TaskGroup objects. |
 | `DW_TASK_GROUP_LIMIT_WAIT` | `u32` | `7` | task_group_limit class: Concurrently registered wait items of blocked wait_one/wait_many calls. |
-| `DW_TASK_GROUP_LIMIT_CLASS_COUNT` | `u32` | `8` | Number of task_group_limit classes; every class value is below it. |
+| `DW_TASK_GROUP_LIMIT_MEMORY_PAGES` | `u32` | `8` | task_group_limit class: 4 KiB pages of RAM-backed MemoryObjects, live or finalizing; device-register objects weigh nothing. |
+| `DW_TASK_GROUP_LIMIT_CLASS_COUNT` | `u32` | `9` | Number of task_group_limit classes; every class value is below it. |
 | `DW_TASK_GROUP_LIMIT_UNLIMITED` | `u32` | `4294967295` | The initial limit of every class in every task group. |
 | `DW_ATOMIC_WAKE_ALL` | `u32` | `4294967295` | Wake every waiter eligible for atomic_wake. |
 | `DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT` | `u64` | `1` | Discovery identity for the complete DeviceResource and Interrupt runtime; kernels report this bit only after the DW1-D runtime gate is reached. |
@@ -724,7 +725,7 @@ Recursively terminate a task group and its descendants. In DW0-E callers must su
 
 ### `0x00010003` `task_group_limit` (DW1-D)
 
-Lower one class's limit on a task group. A limit bounds the live objects (or registered waits) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry.
+Lower one class's limit on a task group. A limit bounds the live objects (or registered waits, or RAM-backed MemoryObject pages) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|

@@ -680,6 +680,40 @@ fn admit_objects<
     Ok(tag)
 }
 
+/// Admits one RAM-backed MemoryObject of `pages` pages for `process`: one
+/// object under the object class, and its pages under the page class (D6),
+/// against the same tag. Runs before any frame is taken.
+fn admit_memory_object<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+    pages: u64,
+) -> Result<crate::task::quota::ChargeTag, DwStatus> {
+    let tag = admit_objects(
+        registry,
+        tasks,
+        process,
+        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
+        1,
+    )?;
+    let needed = usize::try_from(pages).map_err(|_| DW_STATUS_NO_RESOURCES)?;
+    tasks
+        .admit_quota(
+            &tag,
+            crate::task::quota::MEMORY_PAGES_CLASS,
+            needed,
+            |group| registry.charged_pages(group),
+        )
+        .map_err(quota_status)?;
+    Ok(tag)
+}
+
 /// Refuses creation into a TaskGroup or Process outside the creator's
 /// limited subtree (F4 residual: limits must follow what a limited process
 /// creates). `target` is the tag the created thing will be charged with.
@@ -8673,15 +8707,9 @@ pub(crate) fn memory_object_quota_allows<
     registry: &ObjectRegistry<OBJECTS>,
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     process: ProcessKey,
+    pages: u64,
 ) -> bool {
-    admit_objects(
-        registry,
-        tasks,
-        process,
-        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
-        1,
-    )
-    .is_ok()
+    admit_memory_object(registry, tasks, process, pages).is_ok()
 }
 
 /// MemoryObjectCreate. One combined access provides the detached output pin
@@ -8728,13 +8756,8 @@ pub(crate) fn memory_object_create_owned<
         Ok(output) => output,
         Err(_) => return DW_STATUS_BAD_ADDRESS,
     };
-    let charge = match admit_objects(
-        registry,
-        tasks,
-        current_process,
-        deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT,
-        1,
-    ) {
+    let page_count = byte_len / u64::from(DW_BASE_PAGE_SIZE);
+    let charge = match admit_memory_object(registry, tasks, current_process, page_count) {
         Ok(charge) => charge,
         Err(status) => {
             // Any early backing stays with the access for the caller's
@@ -8743,7 +8766,6 @@ pub(crate) fn memory_object_create_owned<
             return status;
         }
     };
-    let page_count = byte_len / u64::from(DW_BASE_PAGE_SIZE);
     let creation = match registry.create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT) {
         Ok(creation) => creation,
         Err(ObjectRegistryError::Capacity | ObjectRegistryError::ReferenceCountExhausted) => {
@@ -8806,6 +8828,9 @@ pub(crate) fn memory_object_create_owned<
         )
     });
     charge_created(registry, reference.id(), charge);
+    registry
+        .set_charge_pages(reference.id(), page_count)
+        .unwrap_or_else(|error| panic!("fresh MemoryObject rejected its page charge: {error:?}"));
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
             match install_created_handle(table, registry, reference, requested_rights, cleanup) {

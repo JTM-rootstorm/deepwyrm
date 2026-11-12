@@ -115,8 +115,16 @@ const REPLACEMENT_GENERATIONS: usize = 1;
 const LIVE_SHELL_JOBS: usize = 4;
 /// The wait items one job may register itself, enough for a small
 /// wait-many. Wyrmroot limits each job's TaskGroup to this with
-/// `task_group_limit`, and to no objects of its own.
+/// `task_group_limit`.
 const JOB_OWN_WAITS: usize = 4;
+/// The MemoryObjects one job may create itself, for `mmap` (root
+/// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W9). Their RAM is bounded separately by
+/// the job's MEMORY_PAGES limit (D6), which no pool here counts.
+const JOB_OWN_MEMORY_OBJECTS: usize = 4;
+/// The Channel pairs one job may create itself: one for sleeping and one per
+/// file it holds open through vfsd (W9). The server end moves to vfsd but
+/// stays charged to the job.
+const JOB_OWN_CHANNEL_PAIRS: usize = 5;
 /// The mapping leases one job can hold. Its TaskGroup limits leave it one
 /// Process, which has one root region of `REGION_SLOTS` mapping slots, and
 /// it may map an object it holds into every slot. The lease pool is sized for
@@ -161,7 +169,7 @@ pub(super) const HANDLE_PEAK: usize = INIT_BASELINE_HANDLES
     + LIVE_SHELL_JOBS * JOB_HELD_HANDLES;
 pub(super) const MEMORY_PEAK: usize = BASELINE_MEMORY
     + REPLACEMENT_GENERATIONS * RESIDENT_IMAGE_OBJECTS
-    + LIVE_SHELL_JOBS * JOB_IMAGE_OBJECTS
+    + LIVE_SHELL_JOBS * (JOB_IMAGE_OBJECTS + JOB_OWN_MEMORY_OBJECTS)
     + 1; // Loader scratch view, open until the child mapping is installed.
 pub(super) const MAPPING_PEAK: usize =
     MEMORY_PEAK + LIVE_SHELL_JOBS * (JOB_REGION_MAPPINGS - JOB_IMAGE_OBJECTS);
@@ -183,8 +191,9 @@ pub(super) const BASELINE_CHANNEL_PAIRS: usize = 17 + STORAGE_CHANNEL_PAIRS;
 /// before the outgoing generation's peers have closed.
 const REPLACEMENT_CHANNEL_PAIRS: usize = 3;
 /// Three stream pairs, one startup pair and, for a job launched from a file,
-/// its namespace connection to vfsd (Wyrmroot WRLP 1.13), per live job.
-const JOB_CHANNEL_PAIRS: usize = 3 + 1 + 1;
+/// its namespace connection to vfsd (Wyrmroot WRLP 1.13), per live job, and
+/// the pairs the job may create itself.
+const JOB_CHANNEL_PAIRS: usize = 3 + 1 + 1 + JOB_OWN_CHANNEL_PAIRS;
 pub(super) const CHANNEL_PAIR_PEAK: usize =
     BASELINE_CHANNEL_PAIRS + REPLACEMENT_CHANNEL_PAIRS + LIVE_SHELL_JOBS * JOB_CHANNEL_PAIRS;
 /// Conservative: both endpoints of every pair above are charged, rather than
@@ -359,15 +368,15 @@ mod tests {
         assert_eq!(RESIDENT_IMAGES, 13);
         assert_eq!(STORAGE_MEMORY, 9);
         assert_eq!(BASELINE_MEMORY, 49);
-        assert_eq!(MEMORY_PEAK, 65);
-        assert_eq!(MAPPING_PEAK, 93);
+        assert_eq!(MEMORY_PEAK, 81);
+        assert_eq!(MAPPING_PEAK, 109);
         assert_eq!(LIVE_PROCESSES, 18);
         assert_eq!(LIVE_TASK_GROUPS, 21);
         assert_eq!(LIVE_IDENTITY_PEAK, 21);
         assert_eq!(STORAGE_CHANNEL_PAIRS, 32);
-        assert_eq!(CHANNEL_PAIR_PEAK, 72);
-        assert_eq!(CHANNEL_ENDPOINT_PEAK, 144);
-        assert_eq!(REGISTRY_PEAK, 290);
+        assert_eq!(CHANNEL_PAIR_PEAK, 92);
+        assert_eq!(CHANNEL_ENDPOINT_PEAK, 184);
+        assert_eq!(REGISTRY_PEAK, 346);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
         assert_eq!(STORAGE_WAITS, 55);
         assert_eq!(WAIT_PEAK, 124);

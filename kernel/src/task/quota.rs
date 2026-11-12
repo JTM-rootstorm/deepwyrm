@@ -15,7 +15,8 @@
 //! another group nor escape its live ancestors, which it also names.
 
 use deepwyrm_abi::{
-    DW_TASK_GROUP_LIMIT_CLASS_COUNT, DW_TASK_GROUP_LIMIT_UNLIMITED, DW_TASK_GROUP_LIMIT_WAIT,
+    DW_TASK_GROUP_LIMIT_CLASS_COUNT, DW_TASK_GROUP_LIMIT_MEMORY_PAGES,
+    DW_TASK_GROUP_LIMIT_UNLIMITED, DW_TASK_GROUP_LIMIT_WAIT,
 };
 
 pub(crate) use crate::object::charge::{ChargeTag, object_class};
@@ -23,10 +24,14 @@ pub(crate) use crate::object::charge::{ChargeTag, object_class};
 pub(crate) const LIMIT_CLASSES: usize = DW_TASK_GROUP_LIMIT_CLASS_COUNT as usize;
 pub(crate) const UNLIMITED: u32 = DW_TASK_GROUP_LIMIT_UNLIMITED;
 pub(crate) const WAIT_CLASS: usize = DW_TASK_GROUP_LIMIT_WAIT as usize;
+/// The page-weighted class (D6): usage is the sum of the RAM-backed
+/// MemoryObject pages charged to a group, not a count of objects.
+pub(crate) const MEMORY_PAGES_CLASS: usize = DW_TASK_GROUP_LIMIT_MEMORY_PAGES as usize;
 
 const _: () = {
     assert!(WAIT_CLASS == 7);
-    assert!(LIMIT_CLASSES == 8);
+    assert!(MEMORY_PAGES_CLASS == 8);
+    assert!(LIMIT_CLASSES == 9);
 };
 
 /// Why a quota admission refused.
@@ -74,6 +79,15 @@ mod tests {
             (DW_OBJECT_TYPE_TASK_GROUP, DW_TASK_GROUP_LIMIT_TASK_GROUP),
         ] {
             assert_eq!(object_class(object_type), Some(class as usize));
+        }
+    }
+
+    #[test]
+    fn the_page_and_wait_classes_are_no_object_type_s_class() {
+        for object_type in 0..64 {
+            let class = object_class(deepwyrm_abi::DwObjectType(object_type));
+            assert_ne!(class, Some(MEMORY_PAGES_CLASS));
+            assert_ne!(class, Some(WAIT_CLASS));
         }
     }
 }

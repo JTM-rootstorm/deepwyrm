@@ -231,6 +231,9 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     slots: [ObjectSlot; CAPACITY],
     /// Per slot, the limited TaskGroups its creator was charged to.
     tags: [charge::ChargeTag; CAPACITY],
+    /// Per slot, its weight under the page class: the pages of a RAM-backed
+    /// MemoryObject, zero for everything else. Reset with the tag.
+    pages: [u64; CAPACITY],
 }
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
@@ -239,6 +242,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             domain: mint_registry_domain(),
             slots: [EMPTY_SLOT; CAPACITY],
             tags: [charge::ChargeTag::EMPTY; CAPACITY],
+            pages: [0; CAPACITY],
         }
     }
 
@@ -275,6 +279,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
                 continue;
             };
             self.tags[slot] = charge::ChargeTag::EMPTY;
+            self.pages[slot] = 0;
             self.slots[slot] = ObjectSlot {
                 generation,
                 state: SlotState::Live(LiveObject {
@@ -309,6 +314,42 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         }
         self.tags[slot] = tag;
         Ok(())
+    }
+
+    /// Records a live object's weight under the page class (D6). Like the
+    /// tag, it lives exactly as long as the slot.
+    pub(crate) fn set_charge_pages(
+        &mut self,
+        id: ObjectId,
+        pages: u64,
+    ) -> Result<(), ObjectRegistryError> {
+        let slot = self.reference_slot(id)?;
+        let generation = decode_object_id(id.raw)
+            .ok_or(ObjectRegistryError::StaleReference)?
+            .1;
+        if self.slots[slot].generation != generation
+            || !matches!(self.slots[slot].state, SlotState::Live(_))
+        {
+            return Err(ObjectRegistryError::StaleReference);
+        }
+        self.pages[slot] = pages;
+        Ok(())
+    }
+
+    /// Pages of live and finalizing objects charged to `group`. A
+    /// finalizing MemoryObject still holds its frames, so it still counts.
+    pub(crate) fn charged_pages(&self, group: ObjectId) -> usize {
+        self.slots
+            .iter()
+            .zip(&self.tags)
+            .zip(&self.pages)
+            .filter(|((slot, tag), _)| {
+                matches!(slot.state, SlotState::Live(_) | SlotState::Finalizing(_))
+                    && tag.names(group)
+            })
+            .fold(0usize, |total, (_, &pages)| {
+                total.saturating_add(usize::try_from(pages).unwrap_or(usize::MAX))
+            })
     }
 
     /// Live and finalizing objects of `class` charged to `group`.

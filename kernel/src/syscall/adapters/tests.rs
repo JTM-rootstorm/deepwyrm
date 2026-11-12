@@ -14269,6 +14269,130 @@ fn wait_admission_follows_handle_resolution() {
     );
 }
 
+/// D6: the page class weighs a MemoryObject by its pages. A group at its
+/// page limit refuses a larger object before any frame is taken, admits one
+/// that fits, and gets the pages back once the object finalizes. The object
+/// count alone would have admitted every request here.
+#[test]
+fn memory_object_pages_are_limited_and_released() {
+    use deepwyrm_abi::{DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE};
+
+    let (mut registry, mut tasks, _root, jobs, process, _) = limited_fixture();
+    let mut backing = TestBacking::new();
+    let mut memory = MemoryObjectAuthority::<4, 4>::new();
+    let rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0);
+    let mut cleanup = CleanupQueue::<32>::new();
+    let out = DwUserAddress(BASE + 0x100);
+    let range = output_range(out, 8, 8).unwrap();
+    let attempt = |registry: &mut ObjectRegistry<32>,
+                   tasks: &mut Tasks,
+                   backing: &mut TestBacking,
+                   memory: &mut MemoryObjectAuthority<4, 4>,
+                   cleanup: &mut CleanupQueue<32>,
+                   pages: u64| {
+        let early = backing.allocate_zeroed_backing(pages);
+        let mut access = DeferredMemoryObjectAccess::new(
+            crate::memory::usercopy::DeferredUserOutput::new(Some(range)),
+            pages,
+            Some(early),
+        );
+        let status = memory_object_create_owned(
+            &mut access,
+            registry,
+            memory,
+            tasks,
+            process,
+            pages * 4096,
+            0,
+            rights,
+            out,
+            cleanup,
+        );
+        let (output, unused) = access.into_parts();
+        let handle = output
+            .written()
+            .map(|bytes| DwHandle(u64::from_le_bytes(bytes.try_into().unwrap())));
+        if let Some(unused) = unused {
+            backing.rollback_object_backing(unused);
+        }
+        (status, handle)
+    };
+
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 3)
+        .unwrap();
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 3));
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 4));
+    let (status, two) = attempt(
+        &mut registry,
+        &mut tasks,
+        &mut backing,
+        &mut memory,
+        &mut cleanup,
+        2,
+    );
+    assert_eq!(status, DW_STATUS_SUCCESS);
+    let two = two.expect("handle written");
+    // Two of three pages are used: two more do not fit, one does.
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 2));
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 1));
+    let handles = tasks.process_handle_count(process).unwrap();
+    let (status, written) = attempt(
+        &mut registry,
+        &mut tasks,
+        &mut backing,
+        &mut memory,
+        &mut cleanup,
+        2,
+    );
+    assert_eq!(status, DW_STATUS_NO_RESOURCES);
+    assert!(written.is_none());
+    assert_eq!(tasks.process_handle_count(process).unwrap(), handles);
+    let (status, one) = attempt(
+        &mut registry,
+        &mut tasks,
+        &mut backing,
+        &mut memory,
+        &mut cleanup,
+        1,
+    );
+    assert_eq!(status, DW_STATUS_SUCCESS);
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 1));
+
+    // Finalizing returns the pages. (Closed newest first: the fixture's
+    // frame allocator keeps one free range.)
+    let mut close = |registry: &mut ObjectRegistry<32>,
+                     tasks: &mut Tasks,
+                     backing: &mut TestBacking,
+                     handle: DwHandle| {
+        assert_eq!(
+            handle_close(registry, tasks, process, handle, &mut cleanup),
+            DW_STATUS_SUCCESS
+        );
+        while let Some(release) = cleanup.pop() {
+            let finalization = memory.take_finalization(release).unwrap();
+            assert!(
+                crate::memory::object::complete_memory_finalization(
+                    registry,
+                    &mut backing.roles,
+                    finalization,
+                )
+                .is_none()
+            );
+        }
+    };
+    close(
+        &mut registry,
+        &mut tasks,
+        &mut backing,
+        one.expect("handle written"),
+    );
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 1));
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 2));
+    close(&mut registry, &mut tasks, &mut backing, two);
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 3));
+}
+
 /// F4 residual: when the live facade's early quota check refused and left
 /// no frames, but usage fell before the adapter's own admission, the request
 /// fails with NO_RESOURCES instead of reaching for backing that is absent.
@@ -14287,7 +14411,7 @@ fn a_quota_refused_early_backing_fails_closed() {
         Some(Err(DW_STATUS_NO_RESOURCES)),
     );
     let handles = tasks.process_handle_count(process).unwrap();
-    assert!(memory_object_quota_allows(&registry, &tasks, process));
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 1));
     assert_eq!(
         memory_object_create_owned(
             &mut access,

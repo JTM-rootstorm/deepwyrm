@@ -533,8 +533,10 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_TASK_GROUP_LIMIT_TASK_GROUP ((uint32_t)(6))
 /* task_group_limit class: Concurrently registered wait items of blocked wait_one/wait_many calls. */
 #define DW_TASK_GROUP_LIMIT_WAIT ((uint32_t)(7))
+/* task_group_limit class: 4 KiB pages of RAM-backed MemoryObjects, live or finalizing; device-register objects weigh nothing. */
+#define DW_TASK_GROUP_LIMIT_MEMORY_PAGES ((uint32_t)(8))
 /* Number of task_group_limit classes; every class value is below it. */
-#define DW_TASK_GROUP_LIMIT_CLASS_COUNT ((uint32_t)(8))
+#define DW_TASK_GROUP_LIMIT_CLASS_COUNT ((uint32_t)(9))
 /* The initial limit of every class in every task group. */
 #define DW_TASK_GROUP_LIMIT_UNLIMITED ((uint32_t)(4294967295))
 /* Wake every waiter eligible for atomic_wake. */
@@ -646,7 +648,7 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_SYSCALL_TASK_GROUP_CREATE ((DwSyscallId)(UINT32_C(0x00010001)))
 /* Recursively terminate a task group and its descendants. In DW0-E callers must supply DW_TERMINATION_AUTHORIZED; descendants record DW_TERMINATION_TASK_GROUP_TEARDOWN. */
 #define DW_SYSCALL_TASK_GROUP_TERMINATE ((DwSyscallId)(UINT32_C(0x00010002)))
-/* Lower one class's limit on a task group. A limit bounds the live objects (or registered waits) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry. */
+/* Lower one class's limit on a task group. A limit bounds the live objects (or registered waits, or RAM-backed MemoryObject pages) created by processes anywhere in the group's subtree after it is set; creation beyond it fails with NO_RESOURCES. A limit can only be lowered: a value above the current limit fails with INVALID_ARGUMENT, as does an unknown class. At most four limited task groups may lie on any process's ancestry. */
 #define DW_SYSCALL_TASK_GROUP_LIMIT ((DwSyscallId)(UINT32_C(0x00010003)))
 /* DW0-F activation: create a process using DwProcessCreateArgsV1 and atomically install its bootstrap Channel; DW0-E implements only the reusable internal process-construction core. */
 #define DW_SYSCALL_PROCESS_CREATE ((DwSyscallId)(UINT32_C(0x00010010)))

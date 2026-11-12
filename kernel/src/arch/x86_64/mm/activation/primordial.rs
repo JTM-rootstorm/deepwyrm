@@ -923,7 +923,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 let prepared = runtime.prepare_guard_free_usercopy();
                 // Frames are allocated only for a request its quota admits
                 // now; the adapter's admission under the next hold decides.
-                let allows = backing_pages.is_none() || runtime.memory_object_quota_allows();
+                let allows =
+                    backing_pages.is_none_or(|pages| runtime.memory_object_quota_allows(pages));
                 (prepared, allows)
             })
         else {
@@ -7783,13 +7784,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// Whether the scheduled process may create one more MemoryObject now;
-    /// asked before frames are allocated (F4 residual).
-    fn memory_object_quota_allows(&self) -> bool {
+    /// Whether the scheduled process may create one more MemoryObject of
+    /// `pages` pages now; asked before frames are allocated (F4 residual,
+    /// D6), so a request over its page limit never takes or zeroes frames.
+    fn memory_object_quota_allows(&self, pages: u64) -> bool {
         crate::syscall::memory_object_quota_allows(
             &self.core.registry,
             &self.core.tasks,
             self.own.scheduled().process,
+            pages,
         )
     }
 
