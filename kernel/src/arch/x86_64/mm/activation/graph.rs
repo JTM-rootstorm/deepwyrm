@@ -75,6 +75,60 @@ pub(super) enum InactiveGraphError<E> {
     ExtraLeaf,
     MappingMismatch,
     InvalidScratchPath,
+    /// The direct map's leaves do not cover its ranges exactly.
+    DirectMapCoverage,
+}
+
+/// What one present entry in the direct map's slots is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirectEntry {
+    /// A table whose span holds direct-mapped memory.
+    Table,
+    /// A leaf of this many bytes.
+    Leaf(u64),
+}
+
+/// Checks one present entry at `depth` (3 for the PML4) that maps
+/// `virtual_page` in the direct map's slots: a leaf must have the exact
+/// direct-map flags, map `virtual_page - DIRECT_MAP_BASE`, lie inside one of
+/// the map's ranges, and be a 1 GiB page only when the CPU has them; a table
+/// must cover some mapped memory.
+pub(super) fn validate_direct_entry<E>(
+    map: &crate::arch::x86_64::mm::direct_map::DirectMap,
+    entry: u64,
+    depth: u8,
+    virtual_page: u64,
+    capabilities: PagingCapabilities,
+) -> Result<DirectEntry, InactiveGraphError<E>> {
+    use crate::arch::x86_64::mm::direct_map::{
+        DIRECT_MAP_BASE, DIRECT_MAP_LARGE_FLAGS, DIRECT_MAP_PAGE_FLAGS,
+    };
+    let span = PAGE_SIZE << (9 * u32::from(depth));
+    let physical = virtual_page
+        .checked_sub(DIRECT_MAP_BASE)
+        .ok_or(InactiveGraphError::InvalidEntry)?;
+    if depth == 0 || entry & HUGE != 0 {
+        let flags = match depth {
+            0 => DIRECT_MAP_PAGE_FLAGS,
+            1 => DIRECT_MAP_LARGE_FLAGS,
+            2 if map.gigabyte_pages() => DIRECT_MAP_LARGE_FLAGS,
+            _ => return Err(InactiveGraphError::InvalidEntry),
+        };
+        if entry & !(physical_mask(capabilities) | HARDWARE_MUTABLE) != flags {
+            return Err(InactiveGraphError::InvalidEntry);
+        }
+        if entry & physical_mask(capabilities) != physical {
+            return Err(InactiveGraphError::MappingMismatch);
+        }
+        if !map.contains(physical, span) {
+            return Err(InactiveGraphError::ExtraLeaf);
+        }
+        return Ok(DirectEntry::Leaf(span));
+    }
+    if !map.overlaps(physical, span) {
+        return Err(InactiveGraphError::ExtraTable);
+    }
+    Ok(DirectEntry::Table)
 }
 
 #[derive(Clone, Copy)]
@@ -710,6 +764,18 @@ pub(super) fn validate_inactive_graph_with_workspace<
     let scratch_slots = scratch
         .slots()
         .ok_or(InactiveGraphError::InvalidScratchPath)?;
+    let direct = scratch.direct;
+    if direct.is_some()
+        && (segments.iter().any(|segment| {
+            crate::arch::x86_64::mm::direct_map::in_direct_map_region(segment.start)
+                || crate::arch::x86_64::mm::direct_map::in_direct_map_region(segment.end - 1)
+        }) || scratch_slots.iter().any(|slot| {
+            crate::arch::x86_64::mm::direct_map::in_direct_map_region(slot.window_page)
+        }))
+    {
+        return Err(InactiveGraphError::InvalidSegmentLayout);
+    }
+    let mut direct_bytes = 0_u64;
     let ap_trampoline_page = if let Some(ap_trampoline) = ap_trampoline {
         roles
             .validate_architecture_bootstrap(ap_trampoline)
@@ -780,9 +846,23 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 }
                 continue;
             }
+            let virtual_page = entry_virtual_address(node.virtual_prefix, index, depth);
+            let direct_table = match direct {
+                Some(map)
+                    if crate::arch::x86_64::mm::direct_map::in_direct_map_region(virtual_page) =>
+                {
+                    match validate_direct_entry(map, entry, depth, virtual_page, capabilities)? {
+                        DirectEntry::Leaf(bytes) => {
+                            direct_bytes += bytes;
+                            continue;
+                        }
+                        DirectEntry::Table => true,
+                    }
+                }
+                _ => false,
+            };
             let mapped = validate_present_entry(entry, capabilities, depth == 0)
                 .map_err(|_| InactiveGraphError::InvalidEntry)?;
-            let virtual_page = entry_virtual_address(node.virtual_prefix, index, depth);
             if depth == 0 {
                 if let Some(slot) = scratch_slots
                     .iter()
@@ -823,15 +903,17 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 return Err(InactiveGraphError::InvalidEntry);
             }
             let child_level = node.level.child().ok_or(InactiveGraphError::InvalidEntry)?;
-            if !scratch_slots.iter().any(|slot| {
-                subtree_is_required_with_bootstrap(
-                    virtual_page,
-                    depth - 1,
-                    segments,
-                    slot.window_page,
-                    ap_trampoline_page,
-                )
-            }) {
+            if !direct_table
+                && !scratch_slots.iter().any(|slot| {
+                    subtree_is_required_with_bootstrap(
+                        virtual_page,
+                        depth - 1,
+                        segments,
+                        slot.window_page,
+                        ap_trampoline_page,
+                    )
+                })
+            {
                 return Err(InactiveGraphError::ExtraTable);
             }
             let child = roles
@@ -852,6 +934,9 @@ pub(super) fn validate_inactive_graph_with_workspace<
         }
     }
 
+    if direct.is_some_and(|map| direct_bytes != map.mapped_bytes()) {
+        return Err(InactiveGraphError::DirectMapCoverage);
+    }
     for slot in scratch_slots {
         validate_scratch_path(
             access,
@@ -873,6 +958,10 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 return Err(InactiveGraphError::MappingMismatch);
             }
             let transition_physical = transition & physical_mask(capabilities);
+            // The image has no direct-map alias, so no writable one.
+            if direct.is_some_and(|map| map.overlaps(transition_physical, PAGE_SIZE)) {
+                return Err(InactiveGraphError::MappingMismatch);
+            }
             kernel_roles
                 .validate_kernel_page(transition_physical, segment.frame_role())
                 .map_err(InactiveGraphError::FrameRole)?;

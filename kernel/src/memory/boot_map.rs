@@ -6,7 +6,6 @@
 //! exact physical ranges which an architecture-owned transition must keep out
 //! of the frame allocator.
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT;
 use deepwyrm_abi::{
     DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_INFO_V1_SIZE, DW_BOOT_MEMORY_KIND_ACPI_NVS,
@@ -15,7 +14,6 @@ use deepwyrm_abi::{
     DwBootMemoryRangeV1,
 };
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use crate::boot::MAX_BOOT_MODULE_ENTRIES;
 use crate::boot::{
     BootInfoValidationError, BootPhysicalRange, MAX_BOOT_MEMORY_MAP_ENTRIES, ValidatedBootInfo,
@@ -33,7 +31,6 @@ pub const MAX_SANITIZED_USABLE_RANGES: usize = MAX_BOOT_MEMORY_MAP_ENTRIES;
 /// Maximum complete reservation set emitted by a structurally valid V1
 /// handoff: three fixed tables, every module and transition table, plus four
 /// optional singleton ranges.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) const MAX_BOOTSTRAP_RESERVATIONS: usize =
     3 + MAX_BOOT_MODULE_ENTRIES + DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as usize + 4;
 

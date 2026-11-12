@@ -1127,6 +1127,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_or(true, |pages| self.validate_external_pages(pages).is_err())
     }
 
+    /// Every range the allocator may ever hand out, in address order: the
+    /// memory the direct map covers (DW2 M2).
+    pub(crate) fn allocator_ranges(&self) -> impl Iterator<Item = PhysicalRange> + '_ {
+        self.allocator.initial_ranges()
+    }
+
     pub(crate) fn available_frames(&self) -> u64 {
         self.allocator.available_frames()
     }

@@ -1,5 +1,12 @@
-//! The live VT-d binding for DMA domains: a boot-time table pool mapped
-//! strong-uncacheable, the remapping units, and one lock over both.
+//! The live VT-d binding for DMA domains: a boot-time table pool in the
+//! write-back direct map, the remapping units, and one lock over both.
+//!
+//! A unit whose page walks do not snoop CPU caches (ECAP.C clear) reads and
+//! writes memory behind them, so the pool flushes the line of every entry it
+//! writes, before the unit can be told to look, and of every entry it reads,
+//! so a status the unit wrote is read from memory (VT-d §6.6, as Linux's
+//! `clflush_cache_range` does). The direct map is the frames' only mapping,
+//! so no frame has two memory types.
 
 use super::{
     DMA_DOMAINS, DMA_MAPPINGS_PER_DOMAIN, DmaDomains, DmaError, DmaHardware, DmaService, DomainPins,
@@ -16,7 +23,7 @@ pub(crate) use super::VTD_TABLE_POOL_FRAMES as TABLE_POOL_FRAMES;
 // The allocation bitmap is one u64.
 const _: () = assert!(TABLE_POOL_FRAMES <= 64);
 
-/// Fixed frames, each with its permanent kernel UC/NX address.
+/// Fixed frames, each with its direct-map address.
 pub(crate) struct LiveTablePool {
     physical: [u64; TABLE_POOL_FRAMES],
     virtual_: [u64; TABLE_POOL_FRAMES],
@@ -34,7 +41,7 @@ impl LiveTablePool {
         }
     }
 
-    /// Adds one zeroed frame mapped UC at `virtual_address`.
+    /// Adds one zeroed frame, direct mapped at `virtual_address`.
     pub(crate) fn add(&mut self, physical: u64, virtual_address: u64) {
         assert!(self.count < TABLE_POOL_FRAMES, "VT-d table pool overfilled");
         self.physical[self.count] = physical;
@@ -58,7 +65,7 @@ impl LiveTablePool {
 
 #[allow(
     unsafe_code,
-    reason = "pool frames are permanently mapped UC/NX kernel pages owned only by this pool"
+    reason = "pool frames are direct-mapped kernel pages owned only by this pool"
 )]
 impl TableMemory for LiveTablePool {
     fn allocate(&mut self) -> Option<u64> {
@@ -80,13 +87,42 @@ impl TableMemory for LiveTablePool {
     }
 
     fn read(&self, table: u64, index: usize) -> u64 {
-        // SAFETY: an aligned entry inside one allocated pool frame.
-        unsafe { core::ptr::read_volatile(self.entry_address(table, index) as *const u64) }
+        let address = self.entry_address(table, index);
+        // SAFETY: an aligned entry inside one allocated pool frame. The line
+        // is flushed first, so the read comes from memory.
+        unsafe {
+            flush_line(address);
+            core::ptr::read_volatile(address as *const u64)
+        }
     }
 
     fn write(&mut self, table: u64, index: usize, value: u64) {
-        // SAFETY: an aligned entry inside one allocated pool frame.
-        unsafe { core::ptr::write_volatile(self.entry_address(table, index) as *mut u64, value) }
+        let address = self.entry_address(table, index);
+        // SAFETY: an aligned entry inside one allocated pool frame. The
+        // flush puts the write in memory before anything later.
+        unsafe {
+            core::ptr::write_volatile(address as *mut u64, value);
+            flush_line(address);
+        }
+    }
+}
+
+/// Writes back and drops the cache line holding `address`, and orders it
+/// before every later load and store.
+///
+/// # Safety
+///
+/// `address` must be mapped.
+#[allow(unsafe_code, reason = "CLFLUSH and MFENCE of a pool entry")]
+unsafe fn flush_line(address: u64) {
+    // SAFETY: the caller's mapped address; CLFLUSH is in every x86_64 CPU.
+    unsafe {
+        core::arch::asm!(
+            "clflush [{}]",
+            "mfence",
+            in(reg) address,
+            options(nostack, preserves_flags),
+        );
     }
 }
 

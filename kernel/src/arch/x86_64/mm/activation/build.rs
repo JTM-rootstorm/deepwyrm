@@ -47,8 +47,28 @@ fn ensure_leaf_table<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     edges: &mut [Option<BuildEdge>; MAX_DEEP_TABLE_FRAMES],
     edge_count: &mut usize,
 ) -> Result<TableIdentity, DeepRootBuildError> {
+    ensure_table(mapper, roles, owner, root, page, 0, edges, edge_count)
+}
+
+/// The table that holds the leaf of level `leaf_level` (0 for 4 KiB, 1 for
+/// 2 MiB, 2 for 1 GiB) mapping `page`, created with its parents as needed.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the builder threads its mapper, roles, owner and edge workspace explicitly"
+)]
+fn ensure_table<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    mapper: &mut LiveTransitionMapper,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    owner: TableOwnerKey,
+    root: TableIdentity,
+    page: u64,
+    leaf_level: u8,
+    edges: &mut [Option<BuildEdge>; MAX_DEEP_TABLE_FRAMES],
+    edge_count: &mut usize,
+) -> Result<TableIdentity, DeepRootBuildError> {
     let mut parent = root;
-    for level in (1..=3).rev() {
+    for level in (u64::from(leaf_level) + 1..=3).rev() {
         let index = ((page >> (12 + level * 9)) & 0x1ff) as usize;
         if let Some(edge) = edges[..*edge_count]
             .iter()
@@ -83,10 +103,67 @@ fn ensure_leaf_table<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         *edge_count += 1;
         parent = child;
     }
-    if parent.level() != TableLevel::Pt {
+    let expected = match leaf_level {
+        0 => TableLevel::Pt,
+        1 => TableLevel::Pd,
+        2 => TableLevel::Pdpt,
+        _ => return Err(DeepRootBuildError::MappingMismatch),
+    };
+    if parent.level() != expected {
         return Err(DeepRootBuildError::MappingMismatch);
     }
     Ok(parent)
+}
+
+/// Fills the kernel's direct map from the allocator's ranges and maps every
+/// one of its leaves into the inactive root (DW2 M2).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the one-shot direct-map storage is zero-filled in place, a valid empty map"
+)]
+fn build_direct_map<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    mapper: &mut LiveTransitionMapper,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    owner: TableOwnerKey,
+    root: TableIdentity,
+    edges: &mut [Option<BuildEdge>; MAX_DEEP_TABLE_FRAMES],
+    edge_count: &mut usize,
+) -> Result<&'static crate::arch::x86_64::mm::direct_map::DirectMap, DeepRootBuildError> {
+    use crate::arch::x86_64::mm::direct_map::{self, DIRECT_MAP, DirectMap};
+    let slot = DIRECT_MAP.take();
+    // SAFETY: every field of `DirectMap` is an integer or a bool, so all
+    // zeros is a valid, empty map; the slot is this storage's one owner's.
+    let map: &'static mut DirectMap = unsafe {
+        core::ptr::write_bytes(slot.as_mut_ptr(), 0, 1);
+        slot.assume_init_mut()
+    };
+    map.fill(
+        roles.allocator_ranges(),
+        direct_map::cpu_has_gigabyte_pages(),
+    )
+    .map_err(DeepRootBuildError::DirectMap)?;
+    let map: &'static DirectMap = map;
+    for &(start, end) in map.ranges() {
+        for leaf in direct_map::leaves(start, end, map.gigabyte_pages()) {
+            let page = leaf.virtual_address();
+            let table = ensure_table(
+                mapper, roles, owner, root, page, leaf.level, edges, edge_count,
+            )?;
+            let index = ((page >> (12 + 9 * u32::from(leaf.level))) & 0x1ff) as usize;
+            if mapper
+                .read_owned_table_entry(roles, table, index)
+                .map_err(|_| DeepRootBuildError::Transition)?
+                != 0
+            {
+                return Err(DeepRootBuildError::MappingMismatch);
+            }
+            mapper
+                .write_owned_table_entry(roles, table, index, leaf.entry())
+                .map_err(|_| DeepRootBuildError::Transition)?;
+        }
+    }
+    Ok(map)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -371,7 +448,7 @@ pub(super) fn build_and_bind_deep_root<
             edges,
             &mut edge_count,
         )?;
-        let scratch = PerCpuScratchBindings::new(DeepScratchBinding {
+        let mut scratch = PerCpuScratchBindings::new(DeepScratchBinding {
             window_page,
             control_page,
             pt: scratch_pt,
@@ -407,6 +484,16 @@ pub(super) fn build_and_bind_deep_root<
                 )
                 .map_err(|_| DeepRootBuildError::Transition)?;
         }
+
+        let direct = build_direct_map(
+            &mut mapper,
+            roles,
+            owner,
+            root_identity,
+            edges,
+            &mut edge_count,
+        )?;
+        scratch = scratch.with_direct_map(direct);
 
         // SAFETY: every table is allocator-owned, fully zeroed, typed to this
         // one owner, and reachable only from the still-inactive root built by

@@ -387,7 +387,7 @@ fn test_ist_layout(guard_page: u64) -> IstStackLayout {
     }
 }
 
-const FIXTURE_TEXT: u64 = 0xffff_8000_0000_0000;
+const FIXTURE_TEXT: u64 = 0xffff_ffff_8000_0000;
 const FIXTURE_RODATA: u64 = FIXTURE_TEXT + PAGE_SIZE;
 const FIXTURE_DATA: u64 = FIXTURE_RODATA + PAGE_SIZE;
 const FIXTURE_SCRATCH: u64 = 0xffff_ff00_0000_0000;
@@ -398,7 +398,7 @@ const FIXTURE_WRITABLE_PAGES: u64 =
 
 struct GraphFixture {
     access: FakeGraphAccess,
-    roles: FrameRoleManager<1, 16>,
+    roles: FrameRoleManager<1, 32>,
     staged: StagedKernelImageRoles,
     root: TableIdentity,
     kernel_tables: [u64; 4],
@@ -467,7 +467,7 @@ fn graph_fixture() -> GraphFixture {
         },
     ];
     let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
-    let mut roles = synthetic_frame_role_manager::<1, 16>(0x8000, 12);
+    let mut roles = synthetic_frame_role_manager::<1, 32>(0x8000, 28);
     let owner = roles.create_table_owner().unwrap();
     let root = commit_table(&mut roles, owner, TableLevel::Pml4, None);
     let kernel_pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
@@ -681,6 +681,7 @@ fn fake_active_scratch(
     fail_install_attempt: Option<usize>,
 ) -> ActiveScratchTarget<FakeActiveScratchIo> {
     ActiveScratchTarget {
+        direct: None,
         scratch: ScratchBinding {
             cpu: CpuIndex::BOOTSTRAP,
             window_page: FIXTURE_SCRATCH,
@@ -757,6 +758,7 @@ fn wrong_cpu_empty_apply_rejects_before_the_scratch_leaf_load() {
     .for_cpu(CpuIndex::BOOTSTRAP)
     .unwrap();
     let mut target = ActiveScratchTarget {
+        direct: None,
         scratch: slot,
         io: FakeActiveScratchIo {
             current_cpu: CpuIndex::new(1).unwrap(),
@@ -957,11 +959,7 @@ fn active_scratch_installs_every_uc_nx_mmio_leaf_then_refuses_without_consuming_
 }
 
 #[test]
-fn every_vtd_table_pool_frame_has_a_permanent_leaf_and_every_cpu_slot_fits() {
-    assert_eq!(
-        VTD_TABLE_POOL_LEAF_COUNT,
-        crate::device::dma::VTD_TABLE_POOL_FRAMES as u64
-    );
+fn every_cpu_scratch_slot_fits() {
     // All CPU slots share one 2 MiB page table and must stay clear of its
     // last two entries.
     assert!(PerCpuScratchBindings::SLOT_PAGES * crate::cpu::CPU_CAPACITY as u64 <= 0x1fe);
@@ -1483,11 +1481,8 @@ fn graph_rejects_wrong_table_role_or_parent_level() {
 fn graph_rejects_duplicate_or_cyclic_table_reachability() {
     let mut fixture = graph_fixture();
     fixture.access.inactive.insert(
-        (
-            fixture.root.physical_start(),
-            page_index(FIXTURE_SCRATCH, 3),
-        ),
-        fixture.kernel_tables[1] | PRESENT | WRITABLE,
+        (fixture.root.physical_start(), page_index(FIXTURE_TEXT, 3)),
+        fixture.scratch_tables[1] | PRESENT | WRITABLE,
     );
     assert_eq!(
         fixture.validate(),
@@ -1534,16 +1529,26 @@ fn graph_capacity_rejects_before_any_leaf_or_scratch_access() {
         },
     ];
     let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
-    let mut roles = synthetic_frame_role_manager::<1, 300>(0x8000, 257);
+    // More PDs under the text segment's PDPTs than the walk may queue.
+    const PDPTS: usize = MAX_DEEP_TABLE_FRAMES / 512 + 1;
+    const TABLES: usize = 1 + PDPTS * 513;
+    let mut roles = synthetic_frame_role_manager::<1, { TABLES + 8 }>(0x100_0000, TABLES as u64);
     let owner = roles.create_table_owner().unwrap();
     let root = commit_table(&mut roles, owner, TableLevel::Pml4, None);
     let mut access = FakeGraphAccess::default();
-    for index in 0..256 {
-        let child = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
+    for index in 0..PDPTS {
+        let pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
         access.inactive.insert(
             (root.physical_start(), 256 + index),
-            child.physical_start() | PRESENT | WRITABLE,
+            pdpt.physical_start() | PRESENT | WRITABLE,
         );
+        for pd_index in 0..512 {
+            let pd = commit_table(&mut roles, owner, TableLevel::Pd, Some(pdpt));
+            access.inactive.insert(
+                (pdpt.physical_start(), pd_index),
+                pd.physical_start() | PRESENT | WRITABLE,
+            );
+        }
     }
     let staged = unsafe {
         roles.stage_kernel_image_roles([
@@ -3051,4 +3056,344 @@ fn terminal_reaper_schedules_work_published_after_deferred_retirement() {
         let _ = registry.release_handle(reference).unwrap();
     }
     let _ = registry.release_internal(root_owner).unwrap();
+}
+
+mod direct_map_graph {
+    //! The graph check over the direct map (DW2 M2): the builder's exact
+    //! shape is accepted and every drift is refused.
+
+    use super::*;
+    use crate::arch::x86_64::mm::direct_map::{DirectMap, ONE_GIB, TWO_MIB, leaves};
+
+    /// 4 KiB leaves at both ends of the first range, two 2 MiB leaves, and
+    /// one GiB when the map may use 1 GiB pages.
+    fn map(gigabyte_pages: bool) -> &'static DirectMap {
+        let ranges = [
+            PhysicalRange::new(0x1000, 0x9e000).unwrap(),
+            PhysicalRange::new(0x40_0000, 2 * TWO_MIB).unwrap(),
+            PhysicalRange::new(ONE_GIB, ONE_GIB).unwrap(),
+        ];
+        std::boxed::Box::leak(std::boxed::Box::new(
+            DirectMap::from_ranges(ranges)
+                .unwrap()
+                .with_gigabyte_pages(gigabyte_pages),
+        ))
+    }
+
+    /// Writes `map`'s leaves into the fixture's root as the builder does,
+    /// committing each table it needs, and returns the leaf entries' cells.
+    fn install(fixture: &mut GraphFixture, map: &DirectMap) -> Vec<((u64, usize), u64)> {
+        let owner = fixture.root.owner();
+        let mut tables: BTreeMap<(u64, usize), TableIdentity> = BTreeMap::new();
+        let mut cells = Vec::new();
+        for &(start, end) in map.ranges() {
+            for leaf in leaves(start, end, map.gigabyte_pages()) {
+                let virtual_address = leaf.virtual_address();
+                let mut parent = fixture.root;
+                for level in (usize::from(leaf.level) + 1..=3).rev() {
+                    let index = page_index(virtual_address, level);
+                    let key = (parent.physical_start(), index);
+                    parent = match tables.get(&key) {
+                        Some(table) => *table,
+                        None => {
+                            let child = commit_table(
+                                &mut fixture.roles,
+                                owner,
+                                parent.level().child().unwrap(),
+                                Some(parent),
+                            );
+                            fixture
+                                .access
+                                .inactive
+                                .insert(key, child.physical_start() | PRESENT | WRITABLE);
+                            tables.insert(key, child);
+                            child
+                        }
+                    };
+                }
+                let cell = (
+                    parent.physical_start(),
+                    page_index(virtual_address, usize::from(leaf.level)),
+                );
+                fixture.access.inactive.insert(cell, leaf.entry());
+                cells.push((cell, leaf.entry()));
+            }
+        }
+        cells
+    }
+
+    fn validate(
+        fixture: &mut GraphFixture,
+        map: Option<&'static DirectMap>,
+    ) -> Result<(), InactiveGraphError<()>> {
+        let mut pending = std::boxed::Box::new([None; MAX_DEEP_TABLE_FRAMES]);
+        let mut visited = std::boxed::Box::new([0; MAX_DEEP_TABLE_FRAMES]);
+        let scratch = PerCpuScratchBindings::new(DeepScratchBinding {
+            window_page: FIXTURE_SCRATCH,
+            control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+            pt: fixture.scratch_pt,
+        });
+        validate_inactive_graph_with_workspace(
+            &mut fixture.access,
+            &fixture.roles,
+            &fixture.staged,
+            None,
+            fixture.root,
+            FrameAddress::new(
+                fixture.transition_tables[0],
+                fixture.capabilities.physical_limit(),
+            )
+            .unwrap(),
+            match map {
+                Some(map) => scratch.with_direct_map(map),
+                None => scratch,
+            },
+            &fixture.segments,
+            fixture.ist,
+            &[],
+            fixture.privilege_entry,
+            fixture.capabilities,
+            &mut pending,
+            &mut visited,
+        )
+    }
+
+    #[test]
+    fn the_builders_shape_is_accepted_with_and_without_gigabyte_pages() {
+        for gigabyte_pages in [true, false] {
+            let mut fixture = graph_fixture();
+            let map = map(gigabyte_pages);
+            let cells = install(&mut fixture, map);
+            assert!(cells.iter().any(|(_, entry)| entry & HUGE != 0));
+            assert_eq!(validate(&mut fixture, Some(map)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn direct_map_tables_are_extra_when_the_root_has_no_map() {
+        let mut fixture = graph_fixture();
+        install(&mut fixture, map(true));
+        assert_eq!(
+            validate(&mut fixture, None),
+            Err(InactiveGraphError::ExtraTable)
+        );
+    }
+
+    #[test]
+    fn a_gigabyte_leaf_is_refused_when_the_cpu_lacks_them() {
+        let mut fixture = graph_fixture();
+        install(&mut fixture, map(true));
+        assert_eq!(
+            validate(&mut fixture, Some(map(false))),
+            Err(InactiveGraphError::InvalidEntry)
+        );
+    }
+
+    #[test]
+    fn every_permission_or_cache_drift_on_a_leaf_is_refused() {
+        for (index, drift) in [
+            (0, USER),
+            (0, GLOBAL),
+            (0, WRITE_THROUGH),
+            (0, CACHE_DISABLE),
+            (0, SOFTWARE_LOW),
+            (2, USER),
+            (2, CACHE_DISABLE),
+        ] {
+            let mut fixture = graph_fixture();
+            let map = map(true);
+            let cells = install(&mut fixture, map);
+            let (cell, entry) = cells[if index == 0 { 0 } else { cells.len() - 1 }];
+            fixture.access.inactive.insert(cell, entry | drift);
+            assert_eq!(
+                validate(&mut fixture, Some(map)),
+                Err(InactiveGraphError::InvalidEntry),
+                "drift {drift:#x}"
+            );
+        }
+        for (clear, large) in [(NO_EXECUTE, false), (WRITABLE, false), (NO_EXECUTE, true)] {
+            let mut fixture = graph_fixture();
+            let map = map(true);
+            let cells = install(&mut fixture, map);
+            let (cell, entry) = if large {
+                *cells.last().unwrap()
+            } else {
+                cells[0]
+            };
+            fixture.access.inactive.insert(cell, entry & !clear);
+            assert_eq!(
+                validate(&mut fixture, Some(map)),
+                Err(InactiveGraphError::InvalidEntry)
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_mapping_another_frame_is_refused() {
+        let mut fixture = graph_fixture();
+        let map = map(true);
+        let cells = install(&mut fixture, map);
+        let (cell, entry) = cells[1];
+        fixture.access.inactive.insert(cell, entry + PAGE_SIZE);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::MappingMismatch)
+        );
+        // A large leaf with its PAT bit (bit 12) set maps another type.
+        let mut fixture = graph_fixture();
+        let cells = install(&mut fixture, map);
+        let (cell, entry) = *cells.last().unwrap();
+        fixture.access.inactive.insert(cell, entry | (1 << 12));
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::MappingMismatch)
+        );
+    }
+
+    #[test]
+    fn a_missing_leaf_leaves_the_map_short() {
+        let mut fixture = graph_fixture();
+        let map = map(true);
+        let cells = install(&mut fixture, map);
+        fixture.access.inactive.remove(&cells[3].0);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::DirectMapCoverage)
+        );
+    }
+
+    #[test]
+    fn a_leaf_outside_the_ranges_is_refused() {
+        let mut fixture = graph_fixture();
+        let map = map(true);
+        let cells = install(&mut fixture, map);
+        // Page zero is never allocator memory; its slot is in the same PT.
+        let (cell, _) = cells[0];
+        fixture
+            .access
+            .inactive
+            .insert((cell.0, 0), PRESENT | WRITABLE | NO_EXECUTE);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::ExtraLeaf)
+        );
+        // A 2 MiB leaf over the first range would reach past its end.
+        let mut fixture = graph_fixture();
+        let cells = install(&mut fixture, map);
+        let pd_cell = cells
+            .iter()
+            .find(|(_, entry)| entry & HUGE != 0 && entry & 0x000f_ffff_ffff_f000 == 0x40_0000)
+            .map(|(cell, _)| *cell)
+            .unwrap();
+        fixture.access.inactive.insert(
+            (pd_cell.0, pd_cell.1 + 2),
+            (0x40_0000 + 2 * TWO_MIB) | HUGE | PRESENT | WRITABLE | NO_EXECUTE,
+        );
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::ExtraLeaf)
+        );
+    }
+
+    #[test]
+    fn a_map_over_the_kernel_image_is_refused() {
+        let mut fixture = graph_fixture();
+        // The fixture's image lies at 0x20_0000..0x24_0000 or so.
+        let map: &'static DirectMap = std::boxed::Box::leak(std::boxed::Box::new(
+            DirectMap::from_ranges([PhysicalRange::new(0x20_0000, PAGE_SIZE).unwrap()]).unwrap(),
+        ));
+        install(&mut fixture, map);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::MappingMismatch)
+        );
+    }
+}
+
+mod direct_map_access {
+    //! Live frame access over the direct map (DW2 M2).
+
+    use super::*;
+    use crate::arch::x86_64::mm::direct_map::{DIRECT_MAP_BASE, DirectMap};
+
+    fn target_with_map(scratch_pt: TableIdentity) -> ActiveScratchTarget<FakeActiveScratchIo> {
+        let map: &'static DirectMap = std::boxed::Box::leak(std::boxed::Box::new(
+            DirectMap::from_ranges([PhysicalRange::new(0x10_0000, 0x10_0000).unwrap()]).unwrap(),
+        ));
+        let mut target = fake_active_scratch(scratch_pt, None);
+        target.direct = Some(map);
+        target
+    }
+
+    fn touched_the_window(target: &ActiveScratchTarget<FakeActiveScratchIo>) -> bool {
+        target.io.events.iter().any(|event| {
+            matches!(
+                event,
+                ScratchIoEvent::CompareExchange { .. } | ScratchIoEvent::Invalidate(_)
+            )
+        })
+    }
+
+    #[test]
+    fn a_direct_mapped_table_is_read_and_written_in_place_without_a_leaf() {
+        let fixture = graph_fixture();
+        let mut target = target_with_map(fixture.scratch_pt);
+        let table = FrameAddress::new(0x15_0000, fixture.capabilities.physical_limit()).unwrap();
+        let cell = DIRECT_MAP_BASE + 0x15_0000 + 7 * 8;
+        target.io.memory.insert(cell, 0x1234);
+        assert_eq!(target.read_location(table, 7), Ok(0x1234));
+        assert_eq!(target.write_location(table, 7, 0x5678), Ok(()));
+        assert_eq!(target.io.memory.get(&cell), Some(&0x5678));
+        assert!(!touched_the_window(&target));
+        // A whole journal applies the same way.
+        let writes = [JournalWrite::new(table, 9, 0x9abc)];
+        assert_eq!(target.apply(&writes, &[]), Ok(()));
+        assert_eq!(
+            target.io.memory.get(&(DIRECT_MAP_BASE + 0x15_0000 + 9 * 8)),
+            Some(&0x9abc)
+        );
+        assert!(!touched_the_window(&target));
+    }
+
+    #[test]
+    fn a_frame_outside_the_map_still_goes_through_the_window() {
+        let fixture = graph_fixture();
+        let mut target = target_with_map(fixture.scratch_pt);
+        let table = FrameAddress::new(0x30_0000, fixture.capabilities.physical_limit()).unwrap();
+        assert_eq!(target.read_location(table, 0), Ok(0));
+        assert!(touched_the_window(&target));
+    }
+
+    #[test]
+    fn the_shared_scratch_pt_stays_reserved_even_when_direct_mapped() {
+        let fixture = graph_fixture();
+        let mut target = target_with_map(fixture.scratch_pt);
+        let pt = FrameAddress::new(
+            fixture.scratch_pt.physical_start(),
+            fixture.capabilities.physical_limit(),
+        )
+        .unwrap();
+        assert_eq!(
+            target.write_location(pt, 0, 1),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+    }
+
+    #[test]
+    fn direct_mapped_ram_never_gets_an_uncached_alias() {
+        let fixture = graph_fixture();
+        let mut target = target_with_map(fixture.scratch_pt);
+        let ram = FrameAddress::new(0x1f_f000, fixture.capabilities.physical_limit()).unwrap();
+        assert_eq!(
+            target.install_mmio_frame(ram),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+        assert_eq!(
+            target.with_temporary_mmio_frame(ram, |_| ()),
+            Err(LiveActiveTargetError::ReservedScratchEntry)
+        );
+        assert!(!touched_the_window(&target));
+        let device = FrameAddress::new(0xfee0_0000, fixture.capabilities.physical_limit()).unwrap();
+        assert!(target.install_mmio_frame(device).is_ok());
+    }
 }

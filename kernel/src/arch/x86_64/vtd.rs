@@ -733,7 +733,8 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     }
     let ceiling = 1_u64 << snapshot.host_address_width();
     // Every table the units will ever walk comes from one fixed pool of
-    // zeroed frames, each mapped UC for the life of the machine.
+    // zeroed frames, reached through the write-back direct map; the pool
+    // flushes each line it touches, for units that do not snoop.
     let mut pool = crate::device::dma::live::LiveTablePool::new();
     for _ in 0..crate::device::dma::live::TABLE_POOL_FRAMES {
         let grant = active
@@ -742,17 +743,15 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
         let physical = grant.physical_start();
         let frame =
             FrameAddress::new(physical, physical_limit).map_err(|_| VtdBootError::Mapping)?;
-        let mapped = active
-            .install_kernel_mmio_page(frame)
-            .map_err(|_| VtdBootError::Mapping)?;
+        let mapped = active.direct_map_page(frame).ok_or(VtdBootError::Mapping)?;
         // Pool frames are never freed: translation stays on for good.
         core::mem::forget(grant);
         pool.add(physical, mapped);
     }
-    // The frames were zeroed through the write-back scratch window, so dirty
-    // lines may still be cached. Write them back now, before any entry goes
-    // through the UC aliases; a later eviction would otherwise overwrite a
-    // table entry. Only the BSP runs here, so no other cache holds them.
+    // The frames were zeroed through the write-back direct map, so dirty
+    // lines may still be cached. Write them back now, before a unit that
+    // does not snoop reads them. Only the BSP runs here, so no other cache
+    // holds them.
     write_back_and_invalidate_caches();
     let root = tables::TableMemory::allocate(&mut pool).ok_or(VtdBootError::RootTable)?;
     let context = tables::TableMemory::allocate(&mut pool).ok_or(VtdBootError::RootTable)?;

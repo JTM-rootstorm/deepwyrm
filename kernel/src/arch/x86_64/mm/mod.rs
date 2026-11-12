@@ -1,7 +1,8 @@
 //! Transactional four-level x86_64 page-table policy.
 //!
-//! This module deliberately does not assume a permanent direct map. Physical
-//! table access and publication are injected through [`PageTableTransaction`].
+//! Physical table access and publication are injected through
+//! [`PageTableTransaction`]; after activation the live backend reaches
+//! allocator frames through the direct map ([`direct_map`], DW2 M2).
 //! The transaction backend is the only component allowed to publish entries:
 //! it must serialize the owned root, authenticate and claim every new table
 //! frame as zeroed and exclusive, revalidate the complete journal, apply it,
@@ -15,6 +16,7 @@ use crate::memory::physical::{BASE_PAGE_SIZE, PhysicalAddressLimit};
 
 pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
 
+pub(crate) mod direct_map;
 mod journal;
 pub(crate) mod transition;
 

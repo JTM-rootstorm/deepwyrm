@@ -470,6 +470,14 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             .fold(0_u64, |total, range| total + range.page_count())
     }
 
+    /// The ranges the allocator may ever hand out, in address order.
+    pub(super) fn initial_ranges(&self) -> impl Iterator<Item = PhysicalRange> + '_ {
+        self.initial[..self.initial_len].iter().map(|range| {
+            PhysicalRange::new(range.start, range.end - range.start)
+                .expect("an initial range is a valid nonempty range")
+        })
+    }
+
     pub(super) fn contains_initial(&self, range: PageRange) -> bool {
         self.initial[..self.initial_len]
             .iter()

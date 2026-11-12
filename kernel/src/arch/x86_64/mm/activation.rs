@@ -130,13 +130,9 @@ const ENTRY_COUNT: usize = 512;
 // The unit count is `acpi::dmar::MAX_DMAR_UNITS`; a DMAR with more units is
 // refused at parse time, and running out of leaves stops the boot.
 const VTD_UNIT_MMIO_LEAF_COUNT: u64 = 8;
-// Each frame of the VT-d table pool (`device::dma::VTD_TABLE_POOL_FRAMES`;
-// a test keeps the two equal) is RAM the kernel reaches only through its own
-// permanent UC/NX leaf, so a unit that does not snoop CPU caches still sees
-// every table write.
-const VTD_TABLE_POOL_LEAF_COUNT: u64 = 64;
-const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 =
-    2 + VTD_UNIT_MMIO_LEAF_COUNT + VTD_TABLE_POOL_LEAF_COUNT;
+// RAM never gets one of these leaves: the VT-d table pool is reached through
+// the direct map (DW2 M2), and a UC leaf over direct-mapped RAM is refused.
+const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2 + VTD_UNIT_MMIO_LEAF_COUNT;
 // Mapping-stability pins are a kernel-global resource shared by every live
 // Process address space.  A designated-VM trace proved that the former capacity
 // of eight rejected the ninth actor load after seven blocked receives retained
@@ -159,7 +155,10 @@ const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // bindings and Process identities cannot drift apart.
 #[cfg(deepwyrm_production_product)]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;
-const MAX_DEEP_TABLE_FRAMES: usize = 256;
+// The image, the scratch window and the trampoline need a few tables; the
+// direct map needs at most a PT and a PD at each end of each range plus one
+// PD per GiB it maps without 1 GiB pages (DW2 M2).
+const MAX_DEEP_TABLE_FRAMES: usize = 2048;
 const ADDRESS_OFFSET_MASK: u64 = PAGE_SIZE - 1;
 const HARDWARE_MUTABLE: u64 = ACCESSED | DIRTY;
 const MIN_ACTIVATION_STACK_HEADROOM: u64 = PAGE_SIZE;
@@ -217,6 +216,9 @@ pub(super) struct DeepScratchBinding {
 #[derive(Clone, Copy)]
 pub(super) struct PerCpuScratchBindings {
     base: DeepScratchBinding,
+    /// The kernel's direct map, once the deep root has one (DW2 M2). Live
+    /// targets reach allocator frames through it instead of a scratch leaf.
+    direct: Option<&'static crate::arch::x86_64::mm::direct_map::DirectMap>,
 }
 
 /// One CPU-private scratch leaf/control pair.  It is deliberately distinct
@@ -234,7 +236,17 @@ impl PerCpuScratchBindings {
     const SLOT_PAGES: u64 = 2 + PER_CPU_SCRATCH_MMIO_LEAF_COUNT;
 
     fn new(base: DeepScratchBinding) -> Self {
-        Self { base }
+        Self { base, direct: None }
+    }
+
+    fn with_direct_map(
+        self,
+        direct: &'static crate::arch::x86_64::mm::direct_map::DirectMap,
+    ) -> Self {
+        Self {
+            direct: Some(direct),
+            ..self
+        }
     }
 
     fn for_cpu(self, cpu: crate::cpu::CpuIndex) -> Option<ScratchBinding> {
@@ -280,6 +292,7 @@ impl PerCpuScratchBindings {
             .ok_or(LiveActiveTargetError::InvalidIndex)?;
         Ok(ActiveScratchTarget {
             scratch,
+            direct: self.direct,
             io,
             poisoned: false,
             _not_send_sync: core::marker::PhantomData,
@@ -327,6 +340,7 @@ pub(crate) enum DeepRootBuildError {
     FrameRole(FrameRoleError),
     Transition,
     Root(AddressError),
+    DirectMap(crate::arch::x86_64::mm::direct_map::DirectMapError),
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -641,6 +655,8 @@ pub(crate) struct LiveActivePagingTarget<
 
 pub(crate) struct ActiveScratchTarget<I> {
     scratch: ScratchBinding,
+    /// Allocator frames are reached here, without touching a leaf.
+    direct: Option<&'static crate::arch::x86_64::mm::direct_map::DirectMap>,
     io: I,
     poisoned: bool,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
@@ -660,6 +676,12 @@ pub(crate) trait ActiveScratchIo {
     fn store(&mut self, address: u64, value: u64);
     fn compare_exchange(&mut self, address: u64, current: u64, new: u64) -> Result<(), u64>;
     fn invalidate(&mut self, virtual_address: u64);
+    /// Zeroes the page at `address`.
+    fn zero_page(&mut self, address: u64) {
+        for index in 0..ENTRY_COUNT as u64 {
+            self.store(address + index * 8, 0);
+        }
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -767,6 +789,19 @@ impl ActiveScratchIo for LiveActiveScratchIo {
             );
         }
     }
+    fn zero_page(&mut self, address: u64) {
+        // SAFETY: `address` is a whole direct-map page of an allocator
+        // frame the caller owns; `rep stosq` writes exactly its 512 words.
+        unsafe {
+            core::arch::asm!(
+                "rep stosq",
+                inout("rdi") address => _,
+                inout("rcx") ENTRY_COUNT as u64 => _,
+                in("rax") 0_u64,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -813,6 +848,19 @@ impl ActiveScratchIo for BootstrapActiveScratchIo {
             );
         }
     }
+    fn zero_page(&mut self, address: u64) {
+        // SAFETY: `address` is a whole direct-map page of an allocator
+        // frame the caller owns; `rep stosq` writes exactly its 512 words.
+        unsafe {
+            core::arch::asm!(
+                "rep stosq",
+                inout("rdi") address => _,
+                inout("rcx") ENTRY_COUNT as u64 => _,
+                in("rax") 0_u64,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }
 
 impl<I: ActiveScratchIo> journal_target_seal::Sealed for ActiveScratchTarget<I> {}
@@ -840,6 +888,20 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
 
     fn mmio_leaf_index(&self, slot: u64) -> usize {
         ((self.mmio_page(slot) >> 12) & 0x1ff) as usize
+    }
+
+    /// The direct-map address of `length` bytes of `frame` at `offset`,
+    /// when the frame is RAM the allocator owns.
+    fn direct_address(&self, frame: FrameAddress, offset: u64, length: u64) -> Option<u64> {
+        self.direct?
+            .virtual_address(frame.address().checked_add(offset)?, length)
+    }
+
+    /// Whether any byte of `frame` is direct-mapped RAM, which must never
+    /// get a second, uncached mapping.
+    fn is_direct_mapped(&self, frame: FrameAddress) -> bool {
+        self.direct
+            .is_some_and(|direct| direct.overlaps(frame.address(), PAGE_SIZE))
     }
 
     fn scratch_leaf_address(&self) -> u64 {
@@ -880,6 +942,15 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
     ) -> Result<u64, LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
         self.require_owning_cpu()?;
+        if frame.address() != self.scratch.pt.physical_start()
+            && let Some(address) = self.direct_address(frame, (index as u64) * 8, 8)
+        {
+            let result = self.io.load(address);
+            if let Some(value) = replacement {
+                self.io.store(address, value);
+            }
+            return Ok(result);
+        }
         let (base, installed) = if frame.address() == self.scratch.pt.physical_start() {
             (self.scratch.control_page, None)
         } else {
@@ -909,6 +980,10 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         self.require_owning_cpu()?;
         if frame.address() == self.scratch.pt.physical_start() {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
+        }
+        if let Some(address) = self.direct_address(frame, 0, PAGE_SIZE) {
+            self.io.zero_page(address);
+            return Ok(());
         }
         let installed = frame.address() | PRESENT | WRITABLE | NO_EXECUTE;
         let leaf = self.scratch_leaf_address();
@@ -945,6 +1020,17 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
         if destination.is_empty() {
+            return Ok(());
+        }
+        if let Some(address) = self.direct_address(frame, offset as u64, destination.len() as u64) {
+            // SAFETY: the bytes lie inside one direct-mapped allocator frame.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    address as *const u8,
+                    destination.as_mut_ptr(),
+                    destination.len(),
+                );
+            }
             return Ok(());
         }
         let installed = frame.address() | PRESENT | NO_EXECUTE;
@@ -987,6 +1073,14 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         if source.is_empty() {
             return Ok(());
         }
+        if let Some(address) = self.direct_address(frame, offset as u64, source.len() as u64) {
+            // SAFETY: the bytes lie inside one direct-mapped allocator frame
+            // the caller exclusively owns.
+            unsafe {
+                core::ptr::copy_nonoverlapping(source.as_ptr(), address as *mut u8, source.len());
+            }
+            return Ok(());
+        }
         let installed = frame.address() | PRESENT | WRITABLE | NO_EXECUTE;
         let leaf = self.scratch_leaf_address();
         if self.io.compare_exchange(leaf, 0, installed).is_err() {
@@ -1007,7 +1101,9 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
     fn install_mmio_frame(&mut self, frame: FrameAddress) -> Result<u64, LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
         self.require_owning_cpu()?;
-        if frame.address() == self.scratch.pt.physical_start() {
+        // RAM the direct map holds write-back never gets an uncached alias:
+        // two memory types for one frame are undefined (SDM 11.12.4).
+        if frame.address() == self.scratch.pt.physical_start() || self.is_direct_mapped(frame) {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
         let installed =
@@ -1034,7 +1130,9 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
     ) -> Result<T, LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
         self.require_owning_cpu()?;
-        if frame.address() == self.scratch.pt.physical_start() {
+        // RAM the direct map holds write-back never gets an uncached alias:
+        // two memory types for one frame are undefined (SDM 11.12.4).
+        if frame.address() == self.scratch.pt.physical_start() || self.is_direct_mapped(frame) {
             return Err(LiveActiveTargetError::ReservedScratchEntry);
         }
         let installed =
@@ -1758,6 +1856,15 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         end.checked_sub(start)
             .and_then(|len| crate::memory::physical::PhysicalRange::new(start, len).ok())
             .map_or(true, |range| self.target.roles.owns_any(range))
+    }
+
+    /// The direct-map address of one whole frame of allocator RAM, such as
+    /// an architecture frame the kernel keeps for good (DW2 M2).
+    pub(crate) fn direct_map_page(&self, frame: FrameAddress) -> Option<u64> {
+        self.target
+            .scratch_bindings
+            .direct?
+            .virtual_address(frame.address(), PAGE_SIZE)
     }
 
     pub(crate) fn install_kernel_mmio_page(
