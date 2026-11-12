@@ -631,14 +631,16 @@ fn release_firmware_interrupt_state<R: VtdRegisters>(registers: &mut R) -> Resul
             "interrupt-remapping disable",
         )?;
     }
-    let halted = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_HALTED;
+    let mut halted = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_HALTED;
     if status & GLOBAL_QUEUED_INVALIDATION != 0 {
-        if halted == 0 {
-            poll(
-                || registers.read64(REG_QUEUE_HEAD) == registers.read64(REG_QUEUE_TAIL),
-                "firmware invalidation-queue drain",
-            )?;
-        }
+        // An error raised while draining halts the queue too.
+        poll(
+            || {
+                halted = registers.read32(REG_FAULT_STATUS) & FAULT_QUEUE_HALTED;
+                halted != 0 || registers.read64(REG_QUEUE_HEAD) == registers.read64(REG_QUEUE_TAIL)
+            },
+            "firmware invalidation-queue drain",
+        )?;
         clear_command(
             registers,
             GLOBAL_QUEUED_INVALIDATION,

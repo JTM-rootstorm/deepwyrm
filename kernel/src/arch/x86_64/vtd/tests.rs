@@ -71,6 +71,13 @@ impl VtdRegisters for Unit {
     fn write32(&mut self, offset: u32, value: u32) {
         self.log.push(Write::W32(offset, value));
         if offset == REG_FAULT_STATUS {
+            // Clearing IQE with the queue on would refetch the failed
+            // descriptor.
+            assert_eq!(
+                self.status & GLOBAL_QUEUED_INVALIDATION,
+                0,
+                "queue errors are cleared only with the queue off"
+            );
             self.fault &= !value;
             return;
         }
@@ -325,6 +332,44 @@ fn a_halted_firmware_queue_is_turned_off_and_its_error_cleared() {
             .contains(&Write::W32(REG_FAULT_STATUS, FAULT_QUEUE_ERROR))
     );
     assert_eq!(unit.root, ROOT);
+}
+
+/// A queue error raised while firmware's queue drains ends the wait at once.
+#[test]
+fn a_queue_error_during_the_drain_ends_the_wait() {
+    struct Halting(Unit, u32);
+    impl VtdRegisters for Halting {
+        fn read32(&mut self, offset: u32) -> u32 {
+            if offset == REG_FAULT_STATUS {
+                // Clear on the first look, halted from the second on.
+                self.1 += 1;
+                if self.1 == 2 {
+                    self.0.fault |= FAULT_QUEUE_ERROR;
+                }
+            }
+            self.0.read32(offset)
+        }
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.0.write32(offset, value)
+        }
+        fn read64(&mut self, offset: u32) -> u64 {
+            self.0.read64(offset)
+        }
+        fn write64(&mut self, offset: u32, value: u64) {
+            self.0.write64(offset, value)
+        }
+        fn flush_cpu_caches(&mut self) {
+            self.0.flush_cpu_caches()
+        }
+    }
+    let mut unit = Unit::q35();
+    unit.status = GLOBAL_QUEUED_INVALIDATION;
+    unit.queue_head = 0x10;
+    unit.queue_tail = 0x20;
+    let mut halting = Halting(unit, 0);
+    enable_default_deny(&mut halting, ROOT, 39).unwrap();
+    assert_eq!(halting.0.status & GLOBAL_QUEUED_INVALIDATION, 0);
+    assert_eq!(halting.0.fault, 0);
 }
 
 /// A stale queue error with no queue on is cleared too.
