@@ -777,3 +777,26 @@ fn device_mmio_imports_are_writable_permanent_and_exclusive() {
     assert_eq!(error.error(), FrameRoleError::WrongRole);
     assert_eq!(error.into_grant().kind(), ObjectBackingKind::DeviceMmio);
 }
+
+/// The DMAR register check counts allocator candidates and every role record
+/// as kernel memory, and nothing outside them (review N3).
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model never dereferences synthetic physical memory"
+)]
+fn owns_any_covers_allocator_candidates_and_role_records() {
+    let mut roles = manager(0x10_0000, 16);
+    let page = |start| PhysicalRange::new(start, BASE_PAGE_SIZE).unwrap();
+    assert!(roles.owns_any(page(0x10_0000)));
+    assert!(roles.owns_any(page(0x10_f000)));
+    assert!(!roles.owns_any(page(0x11_0000)));
+    // A module imported outside the allocator is owned from then on.
+    let module = PhysicalRange::new(0x20_0000, 2 * BASE_PAGE_SIZE).unwrap();
+    // SAFETY: a metadata-only host model with disjoint synthetic provenance.
+    unsafe { roles.import_immutable_module(module, 0) }.unwrap();
+    assert!(roles.owns_any(page(0x20_1000)));
+    assert!(!roles.owns_any(page(0x20_2000)));
+    // A sub-page range covering an owned page is owned.
+    assert!(roles.owns_any(PhysicalRange::new(0x20_0800, 16).unwrap()));
+}

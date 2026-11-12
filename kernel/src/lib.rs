@@ -494,10 +494,25 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             };
             // A remapping unit whose registers would lie in memory is not
             // one: without it no device is confined, so none gets DMA.
+            // MMIO and firmware RESERVED ranges may hold registers; handoff
+            // data and kernel-owned frames may not (review N3).
             let dmar = dmar.filter(|dmar| {
-                let sound = !dmar.units().iter().any(|unit| {
-                    let base = unit.register_base();
-                    boot_range_overlaps_non_mmio(boot_info, base, base.saturating_add(4096))
+                let sound = dmar.units().iter().all(|unit| {
+                    device::pci::firmware_register_page_admissible(
+                        unit.register_base(),
+                        (0..boot_info.memory_map().entry_count()).map(|index| {
+                            let range = boot_info.memory_range(index).ok()?;
+                            let end = range
+                                .physical_start
+                                .checked_add(range.page_count.checked_mul(4096)?)?;
+                            Some((range.physical_start, end, range.kind))
+                        }),
+                        reservations.iter().map(|reservation| {
+                            let range = reservation.range();
+                            (range.physical_start(), range.end().unwrap_or(u64::MAX))
+                        }),
+                        |start, end| active_paging.owns_physical(start, end),
+                    )
                 });
                 if !sound {
                     // The units' pages stay closed to BARs even unmapped.

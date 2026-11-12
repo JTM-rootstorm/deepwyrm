@@ -1741,6 +1741,14 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         read_physical_bytes_with_scratch(&self.root, &mut scratch, physical_start, destination)
     }
 
+    /// Whether any page of `[start, end)` is RAM the kernel accounts for
+    /// (allocator candidates, its image, modules, tables, object backing).
+    pub(crate) fn owns_physical(&self, start: u64, end: u64) -> bool {
+        end.checked_sub(start)
+            .and_then(|len| crate::memory::physical::PhysicalRange::new(start, len).ok())
+            .map_or(true, |range| self.target.roles.owns_any(range))
+    }
+
     pub(crate) fn install_kernel_mmio_page(
         &mut self,
         frame: FrameAddress,

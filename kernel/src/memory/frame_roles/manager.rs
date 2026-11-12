@@ -1118,6 +1118,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(self.record(identity)?.role.kind())
     }
 
+    /// Whether any page of `range` is RAM this manager accounts for: an
+    /// allocator candidate or any role record (kernel image, modules,
+    /// transition and page tables, object backing). A range it cannot cover
+    /// counts as owned.
+    pub(crate) fn owns_any(&self, range: PhysicalRange) -> bool {
+        PageRange::cover(range, self.allocator.physical_limit())
+            .map_or(true, |pages| self.validate_external_pages(pages).is_err())
+    }
+
     pub(crate) fn available_frames(&self) -> u64 {
         self.allocator.available_frames()
     }

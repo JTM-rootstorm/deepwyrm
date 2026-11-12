@@ -542,3 +542,56 @@ fn a_full_kernel_mmio_record_admits_no_bar() {
     }
     assert!(pages.overlaps(0xc0_0000_0000, 0xc0_0000_4000));
 }
+
+/// Firmware may put VT-d registers in RESERVED, but never on RAM, handoff
+/// data or a frame the kernel owns, even when the loader reports those as
+/// RESERVED too (review N3).
+#[test]
+fn firmware_registers_may_lie_in_reserved_but_not_in_kernel_memory() {
+    use deepwyrm_abi::{
+        DW_BOOT_MEMORY_KIND_ACPI_NVS, DW_BOOT_MEMORY_KIND_MMIO, DW_BOOT_MEMORY_KIND_RESERVED,
+        DW_BOOT_MEMORY_KIND_USABLE,
+    };
+    let map = [
+        Some((0x0010_0000, 0x7000_0000, DW_BOOT_MEMORY_KIND_USABLE)),
+        Some((0x7000_0000, 0x7800_0000, DW_BOOT_MEMORY_KIND_RESERVED)),
+        Some((0x7800_0000, 0x7900_0000, DW_BOOT_MEMORY_KIND_ACPI_NVS)),
+        Some((0xfe00_0000, 0xfe01_0000, DW_BOOT_MEMORY_KIND_MMIO)),
+        Some((0xfed9_0000, 0xfed9_2000, DW_BOOT_MEMORY_KIND_RESERVED)),
+    ];
+    let nothing_owned = |_: u64, _: u64| false;
+    let admissible = |page, handoff: &[(u64, u64)], owned: &dyn Fn(u64, u64) -> bool| {
+        firmware_register_page_admissible(page, map, handoff.iter().copied(), owned)
+    };
+    // Firmware RESERVED, MMIO, and a page the map does not describe.
+    assert!(admissible(0xfed9_0000, &[], &nothing_owned));
+    assert!(admissible(0xfed9_1000, &[], &nothing_owned));
+    assert!(admissible(0xfe00_0000, &[], &nothing_owned));
+    assert!(admissible(0xfed0_0000, &[], &nothing_owned));
+    // RAM and ACPI storage never.
+    assert!(!admissible(0x0020_0000, &[], &nothing_owned));
+    assert!(!admissible(0x7800_0000, &[], &nothing_owned));
+    // An unaligned register base is judged by its whole page.
+    assert!(!admissible(0x7800_0800, &[], &nothing_owned));
+    // Loader RESERVED: handoff data or a kernel-owned frame is refused.
+    assert!(!admissible(
+        0x7000_3000,
+        &[(0x7000_2000, 0x7000_4000)],
+        &nothing_owned
+    ));
+    assert!(admissible(
+        0x7000_5000,
+        &[(0x7000_2000, 0x7000_4000)],
+        &nothing_owned
+    ));
+    let kernel_image = |start: u64, end: u64| start < 0x7010_0000 && 0x7008_0000 < end;
+    assert!(!admissible(0x7008_0000, &[], &kernel_image));
+    assert!(admissible(0x7010_0000, &[], &kernel_image));
+    // An unreadable map entry refuses every page.
+    assert!(!firmware_register_page_admissible(
+        0xfed9_0000,
+        [None],
+        [],
+        nothing_owned
+    ));
+}

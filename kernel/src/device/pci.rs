@@ -641,6 +641,46 @@ impl KernelMmioPages {
 
 pub(crate) static KERNEL_MMIO: KernelMmioPages = KernelMmioPages::new();
 
+/// Whether firmware may place device registers (a DMAR unit's page) on the
+/// page at `page`. Every memory-map range touching it must be MMIO or
+/// RESERVED: physical firmware commonly reports chipset registers as
+/// RESERVED (review N3). The loader also reports its own allocations as
+/// RESERVED, so the page must further miss every handoff range (`handoff`)
+/// and every frame the kernel accounts for (`kernel_owned`): otherwise the
+/// kernel would map and write its own memory as registers. `map` yields
+/// `Some((start, end, kind))`, or `None` for an entry it cannot read, which
+/// refuses the page.
+pub(crate) fn firmware_register_page_admissible(
+    page: u64,
+    map: impl IntoIterator<Item = Option<(u64, u64, deepwyrm_abi::DwBootMemoryKind)>>,
+    handoff: impl IntoIterator<Item = (u64, u64)>,
+    kernel_owned: impl FnOnce(u64, u64) -> bool,
+) -> bool {
+    let start = page & !(PAGE - 1);
+    let Some(end) = start.checked_add(PAGE) else {
+        return false;
+    };
+    let touches = |range_start: u64, range_end: u64| range_start < end && start < range_end;
+    for entry in map {
+        let Some((range_start, range_end, kind)) = entry else {
+            return false;
+        };
+        if touches(range_start, range_end)
+            && kind != deepwyrm_abi::DW_BOOT_MEMORY_KIND_MMIO
+            && kind != deepwyrm_abi::DW_BOOT_MEMORY_KIND_RESERVED
+        {
+            return false;
+        }
+    }
+    if handoff
+        .into_iter()
+        .any(|(range_start, range_end)| touches(range_start, range_end))
+    {
+        return false;
+    }
+    !kernel_owned(start, end)
+}
+
 /// Clears memory decoding and bus mastering of the function behind boot
 /// resource `resource_id`, if one was probed. Runs whenever a DeviceResource
 /// finalizes, before its lease returns, so the next driver never inherits a
