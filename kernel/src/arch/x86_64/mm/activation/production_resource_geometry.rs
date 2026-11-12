@@ -145,10 +145,11 @@ pub(super) const LIVE_IDENTITY_PEAK: usize = if LIVE_PROCESSES > LIVE_TASK_GROUP
 };
 
 /// Loader stages are additive to the caller's existing handles and one new
-/// attempt TaskGroup. Stream INIT staging retains at most three transferred
-/// endpoints. Scratch memory closes before ThreadCreate. ChannelReduce briefly
+/// attempt TaskGroup. Stream INIT staging retains at most four transferred
+/// endpoints: three streams and, for a file job, its namespace (Wyrmroot WRLP
+/// 1.13). Scratch memory closes before ThreadCreate. ChannelReduce briefly
 /// needs the broad and reduced parent handles together with the child endpoint.
-const STREAM_JOB_LOADER_HANDLES: usize = 1 + 3 + 1 + 2 + 1;
+const STREAM_JOB_LOADER_HANDLES: usize = 1 + 4 + 1 + 2 + 1;
 /// A devmgr replacement duplicates the resource-domain handle with sender-side
 /// rights, holds the reduced handle it will MOVE, and retains the outgoing
 /// generation's Process until it is reaped.
@@ -181,8 +182,9 @@ pub(super) const BASELINE_CHANNEL_PAIRS: usize = 17 + STORAGE_CHANNEL_PAIRS;
 /// A replacement generation brings its startup, control and publication pairs
 /// before the outgoing generation's peers have closed.
 const REPLACEMENT_CHANNEL_PAIRS: usize = 3;
-/// Three stream pairs and one startup pair per live job.
-const JOB_CHANNEL_PAIRS: usize = 3 + 1;
+/// Three stream pairs, one startup pair and, for a job launched from a file,
+/// its namespace connection to vfsd (Wyrmroot WRLP 1.13), per live job.
+const JOB_CHANNEL_PAIRS: usize = 3 + 1 + 1;
 pub(super) const CHANNEL_PAIR_PEAK: usize =
     BASELINE_CHANNEL_PAIRS + REPLACEMENT_CHANNEL_PAIRS + LIVE_SHELL_JOBS * JOB_CHANNEL_PAIRS;
 /// Conservative: both endpoints of every pair above are charged, rather than
@@ -227,8 +229,13 @@ const STORAGE_WAITS: usize = STORAGE_DRIVERS * 6
     + (2 + 2 + 2 + 2)
     + STORAGE_DRIVERS
     + STORAGE_SERVICES;
-pub(super) const WAIT_PEAK: usize =
-    INTERACTIVE_GRAPH_WAITS + ADDED_EXIT_WAITS + LIVE_SHELL_JOBS * JOB_OWN_WAITS + STORAGE_WAITS;
+/// vfsd waits on every client connection it serves, and each live file job
+/// holds one as its namespace.
+const JOB_NAMESPACE_WAITS: usize = 1;
+pub(super) const WAIT_PEAK: usize = INTERACTIVE_GRAPH_WAITS
+    + ADDED_EXIT_WAITS
+    + LIVE_SHELL_JOBS * (JOB_OWN_WAITS + JOB_NAMESPACE_WAITS)
+    + STORAGE_WAITS;
 
 // Wyrmroot owns the archive parser, whose selected record limit is 4096.
 // The product archive (`wyrmroot_bootfs::product`) holds thirteen
@@ -347,8 +354,8 @@ mod tests {
     fn production_peaks_are_the_documented_arithmetic() {
         assert_eq!(INIT_STORAGE_HANDLES, 26);
         assert_eq!(INIT_BASELINE_HANDLES, 47);
-        assert_eq!(STREAM_JOB_LOADER_HANDLES, 8);
-        assert_eq!(HANDLE_PEAK, 72);
+        assert_eq!(STREAM_JOB_LOADER_HANDLES, 9);
+        assert_eq!(HANDLE_PEAK, 73);
         assert_eq!(RESIDENT_IMAGES, 13);
         assert_eq!(STORAGE_MEMORY, 9);
         assert_eq!(BASELINE_MEMORY, 49);
@@ -358,12 +365,12 @@ mod tests {
         assert_eq!(LIVE_TASK_GROUPS, 21);
         assert_eq!(LIVE_IDENTITY_PEAK, 21);
         assert_eq!(STORAGE_CHANNEL_PAIRS, 32);
-        assert_eq!(CHANNEL_PAIR_PEAK, 68);
-        assert_eq!(CHANNEL_ENDPOINT_PEAK, 136);
-        assert_eq!(REGISTRY_PEAK, 282);
+        assert_eq!(CHANNEL_PAIR_PEAK, 72);
+        assert_eq!(CHANNEL_ENDPOINT_PEAK, 144);
+        assert_eq!(REGISTRY_PEAK, 290);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
         assert_eq!(STORAGE_WAITS, 55);
-        assert_eq!(WAIT_PEAK, 120);
+        assert_eq!(WAIT_PEAK, 124);
         assert_eq!(BOOTFS_ENTRY_PEAK, 17);
     }
 
