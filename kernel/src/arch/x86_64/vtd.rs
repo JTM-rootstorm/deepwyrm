@@ -101,6 +101,9 @@ pub(crate) enum VtdError {
     FirmwareInterruptState(u32),
     /// The unit rejected an invalidation descriptor.
     QueueError,
+    /// The capability or extended-capability register reads all ones:
+    /// nothing decodes the page.
+    NotResponding,
 }
 
 /// Aligned register access to one remapping unit.
@@ -449,16 +452,36 @@ pub(crate) fn interrupts_remapped() -> bool {
     INTERRUPTS_REMAPPED.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Whether anything answers at the unit's register page, by reads only.
-/// A page that decodes to nothing reads all ones, and no defined VT-d
-/// version, capability or extended-capability value is all ones (their
-/// reserved bits read zero). Linux treats such a unit as absent too. Without
-/// this check the all-ones values would fail `enable_default_deny` and the
-/// boot with it (review N6).
-pub(crate) fn unit_responds<R: VtdRegisters>(registers: &mut R) -> bool {
-    registers.read32(REG_VERSION) != u32::MAX
-        && registers.read64(REG_CAPABILITY) != u64::MAX
-        && registers.read64(REG_EXTENDED_CAPABILITY) != u64::MAX
+/// Checks, by reads alone, that the unit's register page holds a VT-d unit
+/// the kernel can drive: everything `enable_default_deny` checks before its
+/// first write. A page that decodes to nothing reads all ones, which no
+/// defined version, capability or extended-capability value is (their
+/// reserved bits read zero); one that reads zeros, or any other non-VT-d
+/// value, fails the version or feature checks. Linux treats such a unit as
+/// absent too (reviews N6, N7).
+pub(crate) fn probe_unit<R: VtdRegisters>(
+    registers: &mut R,
+) -> Result<(u32, u64, UnitFeatures), VtdError> {
+    let version = registers.read32(REG_VERSION);
+    if version == u32::MAX || (version >> 4) & 0xf == 0 {
+        return Err(VtdError::UnsupportedVersion(version));
+    }
+    let capability = registers.read64(REG_CAPABILITY);
+    let extended_capability = registers.read64(REG_EXTENDED_CAPABILITY);
+    if capability == u64::MAX || extended_capability == u64::MAX {
+        return Err(VtdError::NotResponding);
+    }
+    let features = UnitFeatures::read(capability, extended_capability)?;
+    Ok((version, extended_capability, features))
+}
+
+/// Whether every unit passes [`probe_unit`]. The boot runs this over every
+/// mapped unit before it writes to any: if one fails, the DMAR is ignored
+/// rather than the boot failed.
+pub(crate) fn every_unit_probes<'a, R: VtdRegisters + 'a>(
+    units: impl IntoIterator<Item = &'a mut R>,
+) -> bool {
+    units.into_iter().all(|unit| probe_unit(unit).is_ok())
 }
 
 /// Points the unit at the all-zero `root_table`, invalidates its context and
@@ -469,13 +492,7 @@ pub(crate) fn enable_default_deny<R: VtdRegisters>(
     root_table: u64,
     host_address_width: u8,
 ) -> Result<VtdUnitState, VtdError> {
-    let version = registers.read32(REG_VERSION);
-    if (version >> 4) & 0xf == 0 {
-        return Err(VtdError::UnsupportedVersion(version));
-    }
-    let capability = registers.read64(REG_CAPABILITY);
-    let extended_capability = registers.read64(REG_EXTENDED_CAPABILITY);
-    let features = UnitFeatures::read(capability, extended_capability)?;
+    let (version, extended_capability, features) = probe_unit(registers)?;
     if !root_table.is_multiple_of(4096)
         || root_table == 0
         || host_address_width >= 64
@@ -607,7 +624,7 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
     };
     let physical_limit = active.root().physical_limit();
     // Map every unit, which closes every unit's page to BARs, then check
-    // that each answers, all before any unit or table is touched: if one
+    // that each is a VT-d unit the kernel can drive, all before any unit or table is touched: if one
     // does not, the DMAR is ignored as a whole and nothing is left half set
     // up.
     let mut bases = [0_u64; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
@@ -618,10 +635,16 @@ pub(crate) fn initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY
             .install_kernel_mmio_page(frame)
             .map_err(|_| VtdBootError::Mapping)?;
     }
-    for base in bases.iter().copied().take(snapshot.units().len()) {
-        if !unit_responds(&mut LiveVtdMmio::new(base)?) {
-            return Ok(VtdBootState::Unresponsive);
-        }
+    let mut probes: [Option<LiveVtdMmio>; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS] =
+        [const { None }; crate::arch::x86_64::acpi::dmar::MAX_DMAR_UNITS];
+    for (probe, base) in probes
+        .iter_mut()
+        .zip(bases.iter().copied().take(snapshot.units().len()))
+    {
+        *probe = Some(LiveVtdMmio::new(base)?);
+    }
+    if !every_unit_probes(probes.iter_mut().flatten()) {
+        return Ok(VtdBootState::Unusable);
     }
     let ceiling = 1_u64 << snapshot.host_address_width();
     // Every table the units will ever walk comes from one fixed pool of
@@ -762,9 +785,10 @@ fn write_back_and_invalidate_caches() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VtdBootState {
     Absent,
-    /// A unit's register page reads all ones: the DMAR is ignored, so no
-    /// device is confined and none gets DMA.
-    Unresponsive,
+    /// A unit's register page fails [`probe_unit`] (it reads all ones,
+    /// zeros or another non-VT-d value): the DMAR is ignored, so no device
+    /// is confined and none gets DMA.
+    Unusable,
     /// `dma_domains` says whether every unit can give a function a 4-level
     /// domain, so `dma_map` is available.
     DefaultDeny {

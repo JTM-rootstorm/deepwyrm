@@ -669,29 +669,37 @@ fn interrupt_remapping_needs_both_remapping_and_queued_invalidation() {
     }
 }
 
-/// A register page that decodes to nothing reads all ones; the unit counts as
-/// absent, judged by reads alone, instead of as translation left on by
-/// firmware (review N6).
+/// A register page that is not a VT-d unit the kernel can drive (all ones:
+/// nothing decodes it; all zeros; any other value failing the version or
+/// feature checks) makes the whole set of units fail the probe, judged by
+/// reads alone with nothing written to any unit (reviews N6, N7).
 #[test]
-fn a_unit_reading_all_ones_does_not_respond_and_is_never_written() {
-    let mut unit = Unit::q35();
-    assert!(unit_responds(&mut unit));
-    for floated in 0..3 {
-        let mut unit = Unit::q35();
-        match floated {
-            0 => unit.version = u32::MAX,
-            1 => unit.capability = u64::MAX,
-            _ => unit.extended = u64::MAX,
-        }
-        assert!(!unit_responds(&mut unit));
-        assert!(unit.log.is_empty());
+fn a_page_that_is_not_a_usable_unit_fails_the_probe_without_writes() {
+    let mut good = [Unit::q35(), Unit::q35()];
+    assert!(every_unit_probes(good.iter_mut()));
+    let unusable: [fn(&mut Unit); 6] = [
+        |unit| unit.version = u32::MAX,
+        |unit| unit.capability = u64::MAX,
+        |unit| unit.extended = u64::MAX,
+        |unit| {
+            unit.version = 0;
+            unit.capability = 0;
+            unit.extended = 0;
+        },
+        |unit| unit.version = 0x0f,
+        // An IOTLB register beyond the mapped page.
+        |unit| unit.extended = 0x3ff << EXTENDED_IOTLB_OFFSET_SHIFT,
+    ];
+    for (case, corrupt) in unusable.iter().enumerate() {
+        // The bad unit is second: the first, good one is probed too, and
+        // neither is written.
+        let mut units = [Unit::q35(), Unit::q35()];
+        corrupt(&mut units[1]);
+        assert!(!every_unit_probes(units.iter_mut()), "case {case}");
+        assert!(probe_unit(&mut units[1]).is_err(), "case {case}");
+        assert!(units.iter().all(|unit| unit.log.is_empty()), "case {case}");
+        // enable_default_deny refuses it the same way before any write.
+        assert!(enable_default_deny(&mut units[1], ROOT, 39).is_err());
+        assert!(units[1].log.is_empty(), "case {case}");
     }
-    // Without the probe the same page would fail the boot: here on the
-    // all-ones IOTLB offset, which lies outside the register page.
-    let mut floating = Unit::q35();
-    floating.version = u32::MAX;
-    floating.capability = u64::MAX;
-    floating.extended = u64::MAX;
-    floating.status = u32::MAX;
-    assert!(enable_default_deny(&mut floating, ROOT, 39).is_err());
 }
