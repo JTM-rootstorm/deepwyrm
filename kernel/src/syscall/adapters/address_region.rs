@@ -607,6 +607,7 @@ where
         memory_object,
         args,
         protection,
+        args.byte_len.0,
         held,
     ) {
         Ok(address) => {
@@ -643,6 +644,7 @@ pub(crate) fn address_region_map_model<
     memory_object: DwHandle,
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
+    room: u64,
     held: &mut HeldReleases<OBJECTS>,
 ) -> Result<u64, DwStatus>
 where
@@ -762,13 +764,14 @@ where
             )
             .map(|releases| (args.requested_address.0, releases))
     } else {
-        region.map_anywhere(
+        region.map_anywhere_with_room(
             memory,
             registry,
             publisher,
             authorization,
             args.memory_object_offset.0,
             args.byte_len.0,
+            room,
             protection,
         )
     };
@@ -818,6 +821,7 @@ pub(crate) fn address_region_map_prepared_model<
     memory_object: DwHandle,
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
+    room: u64,
     held: &mut HeldReleases<OBJECTS>,
 ) -> Result<u64, DwStatus>
 where
@@ -835,6 +839,7 @@ where
         memory_object,
         args,
         protection,
+        room,
         held,
     )
 }

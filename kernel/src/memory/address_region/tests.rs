@@ -1547,3 +1547,113 @@ fn a_residency_witness_is_valid_only_for_its_live_epoch() {
     assert_eq!(coherency.validate_residency(again.witness()), Ok(()));
     coherency.leave_after_local_flush(again).unwrap();
 }
+
+/// DW2 M4b: a map, protect or unmap made in steps leaves the slots and
+/// leases one step would. Pieces of one object that continue each other
+/// in address, offset, authority and protection merge; anything else
+/// stays apart.
+#[test]
+fn pieces_that_continue_each_other_merge_into_one_mapping() {
+    let mut objects = TestObjects::<2, 8>::new();
+    let object = object(&mut objects, Protection::READ_WRITE);
+    // Two slots: four separate pieces could not fit.
+    let mut region = region::<2>(PAGE_SIZE, PAGE_SIZE * 8);
+    let mut publisher = FakePublisher::for_region(&region);
+    for step in 0..4 {
+        let authorization = authorization(&mut objects, object, &region, Protection::READ_WRITE);
+        test_map(
+            &mut region,
+            &mut objects,
+            &mut publisher,
+            PAGE_SIZE * (1 + 2 * step),
+            authorization,
+            PAGE_SIZE * 2 * step,
+            PAGE_SIZE * 2,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    }
+    let only = |region: &AddressRegion<2>| {
+        let mut mappings = region.mappings().iter().flatten();
+        let mapping = *mappings.next().unwrap();
+        assert!(mappings.next().is_none());
+        (mapping.virtual_start(), mapping.byte_len())
+    };
+    assert_eq!(only(&region), (PAGE_SIZE, PAGE_SIZE * 8));
+    assert_eq!(objects.active_lease_count(), 1);
+
+    // A protect in two steps splits, then merges again.
+    test_protect(
+        &mut region,
+        &mut objects,
+        &mut publisher,
+        PAGE_SIZE,
+        PAGE_SIZE * 4,
+        Protection::READ,
+    )
+    .unwrap();
+    assert_eq!(region.mappings().iter().flatten().count(), 2);
+    test_protect(
+        &mut region,
+        &mut objects,
+        &mut publisher,
+        PAGE_SIZE * 5,
+        PAGE_SIZE * 4,
+        Protection::READ,
+    )
+    .unwrap();
+    assert_eq!(only(&region), (PAGE_SIZE, PAGE_SIZE * 8));
+    assert_eq!(objects.active_lease_count(), 1);
+
+    // Unmapping the middle splits it into two mappings with a lease each.
+    test_unmap(
+        &mut region,
+        &mut objects,
+        &mut publisher,
+        PAGE_SIZE * 3,
+        PAGE_SIZE * 2,
+    )
+    .unwrap();
+    assert_eq!(region.mappings().iter().flatten().count(), 2);
+    assert_eq!(objects.active_lease_count(), 2);
+
+    // The hole refilled from the wrong object offset, or with another
+    // protection, continues neither side: with both slots used it is
+    // refused.
+    for (offset, protection) in [
+        (0, Protection::READ),
+        (PAGE_SIZE * 2, Protection::READ_WRITE),
+    ] {
+        let authorization = authorization(&mut objects, object, &region, Protection::READ_WRITE);
+        assert_eq!(
+            test_map(
+                &mut region,
+                &mut objects,
+                &mut publisher,
+                PAGE_SIZE * 3,
+                authorization,
+                offset,
+                PAGE_SIZE * 2,
+                protection,
+            ),
+            Err(AddressSpaceTransactionError::Model(
+                AddressRegionError::Capacity
+            ))
+        );
+    }
+    // From the right offset with the same protection it joins both sides.
+    let authorization = authorization(&mut objects, object, &region, Protection::READ_WRITE);
+    test_map(
+        &mut region,
+        &mut objects,
+        &mut publisher,
+        PAGE_SIZE * 3,
+        authorization,
+        PAGE_SIZE * 2,
+        PAGE_SIZE * 2,
+        Protection::READ,
+    )
+    .unwrap();
+    assert_eq!(only(&region), (PAGE_SIZE, PAGE_SIZE * 8));
+    assert_eq!(objects.active_lease_count(), 1);
+}

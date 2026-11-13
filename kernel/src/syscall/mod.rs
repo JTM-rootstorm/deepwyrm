@@ -12,6 +12,16 @@ mod abi_bytes;
 pub(crate) use abi_bytes::EncodedObjectInfo;
 mod adapters;
 mod f_services;
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only the live family-G facade runs calls in steps"
+    )
+)]
+mod region_steps;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use region_steps::{MapStep, RegionSteps};
 
 #[allow(
     unused_imports,

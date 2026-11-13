@@ -464,11 +464,43 @@ pub(crate) struct AddressRegion<const SLOTS: usize> {
     mappings: [Option<Mapping>; SLOTS],
 }
 
+/// Whether `right` continues `left` exactly: next in both the address
+/// space and the object, with the same authority and protection.
+fn continues(left: MappingSpec, right: MappingSpec) -> bool {
+    left.address_space == right.address_space
+        && left.region == right.region
+        && left.object == right.object
+        && left.mapping_authority == right.mapping_authority
+        && left.protection == right.protection
+        && left.virtual_start.checked_add(left.byte_len) == Some(right.virtual_start)
+        && left.object_offset.checked_add(left.byte_len) == Some(right.object_offset)
+}
+
+/// Stages `mapping`, first merging it with every staged mapping it
+/// continues or that continues it. A change made in several steps (DW2
+/// M4b) then occupies the slots one step would.
 fn push_spec<const SLOTS: usize>(
     staged: &mut [Option<MappingSpec>; SLOTS],
     length: &mut usize,
     mapping: MappingSpec,
 ) -> Result<(), AddressRegionError> {
+    let mut mapping = mapping;
+    while let Some(index) = staged[..*length].iter().position(|staged| {
+        staged.is_some_and(|staged| continues(staged, mapping) || continues(mapping, staged))
+    }) {
+        let joined = staged[index].expect("a found mapping is staged");
+        let (left, right) = if continues(joined, mapping) {
+            (joined, mapping)
+        } else {
+            (mapping, joined)
+        };
+        mapping = MappingSpec {
+            byte_len: left.byte_len + right.byte_len,
+            ..left
+        };
+        *length -= 1;
+        staged[index] = staged[*length].take();
+    }
     if *length == SLOTS {
         return Err(AddressRegionError::Capacity);
     }

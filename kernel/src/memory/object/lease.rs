@@ -195,14 +195,18 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                         .as_ref()
                         .is_some_and(|record| record.pin.id() == object_id)
             });
-            let pin_source = if let Some(released_position) = released_source {
-                released_used[released_position] = true;
-                PendingPinSource::Released(released_position)
-            } else if !authorization_used
+            // The map's authorization goes to the first lease of its object,
+            // so it is used even when the new piece merges into an existing
+            // mapping (DW2 M4b); a pin it displaces is surplus. Pins of one
+            // object are interchangeable.
+            let pin_source = if !authorization_used
                 && authorization.is_some_and(|authorization| authorization.object_id() == object_id)
             {
                 authorization_used = true;
                 PendingPinSource::Authorization
+            } else if let Some(released_position) = released_source {
+                released_used[released_position] = true;
+                PendingPinSource::Released(released_position)
             } else {
                 let source = (0..released.len())
                     .find(|released_position| {

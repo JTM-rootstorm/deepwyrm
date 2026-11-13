@@ -145,13 +145,6 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         }
         let mut staged = self.current_specs();
         let length = self.mapping_count();
-        if length == SLOTS {
-            return Err(authorization_failure(
-                registry,
-                authorization,
-                AddressRegionError::Capacity,
-            ));
-        }
         let candidate = MappingSpec {
             address_space: self.address_space,
             region: self.region,
@@ -173,13 +166,16 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 AddressRegionError::Overlap,
             ));
         }
-        staged[length] = Some(candidate);
+        let mut staged_len = length;
+        if let Err(error) = push_spec(&mut staged, &mut staged_len, candidate) {
+            return Err(authorization_failure(registry, authorization, error));
+        }
         self.commit_specs(
             authority,
             registry,
             publisher,
             &staged,
-            length + 1,
+            staged_len,
             Some(authorization),
         )
     }
@@ -211,6 +207,51 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         (u64, MappingFinalReleases<REGISTRY_OBJECTS>),
         AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
     > {
+        self.map_anywhere_with_room(
+            authority,
+            registry,
+            publisher,
+            authorization,
+            object_offset,
+            byte_len,
+            byte_len,
+            protection,
+        )
+    }
+
+    /// `map_anywhere`, at the lowest address with `room` bytes free, of
+    /// which it maps the first `byte_len`: the first step of a map made in
+    /// steps places the whole map (DW2 M4b).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the allocator-chosen variant mirrors the explicit fixed-map authority contract"
+    )]
+    pub(crate) fn map_anywhere_with_room<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        P: AddressSpacePublisher,
+    >(
+        &mut self,
+        authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        publisher: &mut P,
+        authorization: MapAuthorization,
+        object_offset: u64,
+        byte_len: u64,
+        room: u64,
+        protection: Protection,
+    ) -> Result<
+        (u64, MappingFinalReleases<REGISTRY_OBJECTS>),
+        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
+    > {
+        if room < byte_len || !room.is_multiple_of(PAGE_SIZE) {
+            return Err(authorization_failure(
+                registry,
+                authorization,
+                AddressRegionError::Unaligned,
+            ));
+        }
         if byte_len == 0 {
             return Err(authorization_failure(
                 registry,
@@ -244,7 +285,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         };
         let mut candidate = self.start;
         for _ in 0..SLOTS {
-            let candidate_end = match candidate.checked_add(byte_len) {
+            let candidate_end = match candidate.checked_add(room) {
                 Some(end) => end,
                 None => {
                     return Err(authorization_failure(
