@@ -1988,9 +1988,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             else {
                 continue;
             };
+            let cpu = self.cpu;
             let mut next = buffer.address & !(PAGE_SIZE - 1);
             while next < end {
                 match self.with_synchronized_runtime_at_safe_point(|runtime| {
+                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                        runtime.service_pending_timer_expiries_on_bootstrap();
+                    }
                     runtime.fill_in_user_range(&mut next, end, buffer.write)
                 }) {
                     Err(()) => return Some(Err(())),
@@ -1999,22 +2003,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             }
         }
-        // `dma_map` maps frames, not leaves: commit its range first (§8.6).
+        // `dma_map` maps frames, not leaves: commit its range first (§8.6),
+        // but only for a caller whose resource `dma_map` would accept and
+        // who could map the object (review M6-1). Each step checks again.
         if let NativeSyscallRequest::DmaMap {
+            resource,
             memory_object,
             offset,
             byte_len,
+            access,
             ..
         } = request
         {
+            let cpu = self.cpu;
             let mut next = offset;
             loop {
                 match self.with_synchronized_runtime_at_safe_point(|runtime| {
+                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                        runtime.service_pending_timer_expiries_on_bootstrap();
+                    }
+                    let process = runtime.own.scheduled().process;
+                    let Some(required) = crate::syscall::dma_map_commit_rights(
+                        &mut runtime.core.registry,
+                        &mut runtime.core.tasks,
+                        &runtime.core.shared.device_resources,
+                        process,
+                        resource,
+                        access,
+                    ) else {
+                        return Ok(true);
+                    };
                     runtime.commit_on_demand_step(
                         memory_object,
                         offset,
                         byte_len,
-                        deepwyrm_abi::DW_RIGHT_READ,
+                        required,
                         &mut next,
                     )
                 }) {
@@ -8943,25 +8966,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(_) => return Outcome::Unserved,
             }
         };
-        // Admit both before taking a frame (§8.4).
-        if (cost != 0
-            && crate::syscall::admit_charged_pages(
-                &self.core.registry,
-                &self.core.tasks,
-                object,
-                cost,
-            )
-            .is_err())
-            || (tables != 0
-                && crate::syscall::admit_charged_pages(
-                    &self.core.registry,
-                    &self.core.tasks,
-                    process.object_id(),
-                    tables,
-                )
-                .is_err())
-        {
-            return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
+        // Admit both, together, before taking a frame (§8.4). Only a quota
+        // refusal is exhaustion; the object and Process are live here.
+        match crate::syscall::admit_charged_pages_together(
+            &self.core.registry,
+            &self.core.tasks,
+            (object, cost),
+            (process.object_id(), tables),
+        ) {
+            Ok(()) => {}
+            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
+                return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
+            }
+            Err(_) => return Outcome::Unserved,
         }
         if cost != 0 {
             match session.commit_on_demand_page(backing, page) {
@@ -9003,11 +9020,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             else {
                 panic!("an on-demand fault's publisher was refused after its lookup");
             };
-            publisher
-                .publish_touched_leaf(&mapping, address)
-                .unwrap_or_else(|error| {
-                    panic!("an on-demand fault could not publish its leaf: {error:?}")
-                })
+            publisher.publish_touched_leaf(&mapping, address)
+        };
+        // A leaf already present that is not exactly this page's leaf is not
+        // a race this serves: the fault ends as before. Only a page
+        // committed in this hold could not have had one.
+        let published = match published {
+            Ok(published) => published,
+            Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Map(
+                crate::arch::x86_64::mm::MapError::FrameMismatch,
+            )) if cost == 0 => {
+                for candidate in candidates.iter_mut().filter_map(Option::take) {
+                    session.recycle_table_candidate(candidate);
+                }
+                return Outcome::Unserved;
+            }
+            Err(error) => panic!("an on-demand fault could not publish its leaf: {error:?}"),
         };
         let unused = candidates.iter().flatten().count() as u64;
         for candidate in candidates.iter_mut().filter_map(Option::take) {

@@ -827,6 +827,33 @@ impl PageTableRoot {
         access: &mut A,
         page: VirtualPage,
     ) -> Result<Option<FrameAddress>, MapError<A::Error>> {
+        Ok(self
+            .present_leaf_entry(access, page)?
+            .map(|(frame, _)| frame))
+    }
+
+    /// Whether the present leaf at `page` is exactly the leaf `map_page`
+    /// would write for `frame` with `permissions`, ignoring the accessed and
+    /// dirty bits the CPU sets. `None` when no leaf is present. Tables above
+    /// a user leaf are always present, writable and executable, so a leaf
+    /// that matches grants every access `permissions` allows.
+    pub fn present_leaf_matches<A: PageTableTransaction>(
+        &self,
+        access: &mut A,
+        page: VirtualPage,
+        frame: FrameAddress,
+        permissions: MappingPermissions,
+    ) -> Result<Option<bool>, MapError<A::Error>> {
+        Ok(self
+            .present_leaf_entry(access, page)?
+            .map(|(_, entry)| entry & !(ACCESSED | DIRTY) == leaf_entry(frame, permissions)))
+    }
+
+    fn present_leaf_entry<A: PageTableTransaction>(
+        &self,
+        access: &mut A,
+        page: VirtualPage,
+    ) -> Result<Option<(FrameAddress, u64)>, MapError<A::Error>> {
         validate_page_half(page)?;
         let user = page.is_user_half();
         let mut current = self.frame;
@@ -853,7 +880,7 @@ impl PageTableRoot {
         if old == 0 {
             return Ok(None);
         }
-        decode_leaf(old, user, self.physical_limit()).map(Some)
+        decode_leaf(old, user, self.physical_limit()).map(|frame| Some((frame, old)))
     }
 
     fn walk_leaf<A: PageTableTransaction>(

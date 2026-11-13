@@ -14501,6 +14501,56 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
     );
     assert!(memory_object_quota_allows(&registry, &tasks, process, 3));
     assert!(!memory_object_quota_allows(&registry, &tasks, process, 4));
+    // A fault's page and tables share the group: each fits alone, the sum
+    // does not (review M6-4).
+    let object_id = |registry: &mut ObjectRegistry<32>, tasks: &mut Tasks| {
+        memory_object_commit_target(
+            registry,
+            tasks,
+            &memory,
+            process,
+            handle,
+            0,
+            4096,
+            deepwyrm_abi::DW_RIGHT_MAP,
+        )
+        .unwrap()
+        .unwrap()
+        .1
+    };
+    let charged = object_id(&mut registry, &mut tasks);
+    // A live Process is charged to its group, as a created one is.
+    let process_tag = tasks.charge_tag(process).unwrap();
+    registry
+        .set_charge_tag(process.object_id(), process_tag)
+        .unwrap();
+    let room = (0..=4)
+        .rev()
+        .find(|&pages| memory_object_quota_allows(&registry, &tasks, process, pages))
+        .unwrap() as u64;
+    assert!(room >= 2);
+    for (pages, tables, admitted) in [
+        (room, 1, false),
+        (1, room, false),
+        (room - 1, 1, true),
+        (0, room, true),
+    ] {
+        assert!(admit_charged_pages(&registry, &tasks, charged, pages.min(room)).is_ok());
+        assert_eq!(
+            admit_charged_pages_together(
+                &registry,
+                &tasks,
+                (charged, pages),
+                (process.object_id(), tables),
+            )
+            .is_ok(),
+            admitted,
+            "{pages} pages and {tables} tables with {room} free"
+        );
+    }
+    registry
+        .set_charge_tag(process.object_id(), crate::task::quota::ChargeTag::EMPTY)
+        .unwrap();
 
     // Ranges are checked as a map's are.
     for (offset, byte_len) in [

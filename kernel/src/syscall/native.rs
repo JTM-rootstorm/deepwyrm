@@ -243,11 +243,21 @@ pub(crate) struct UserBuffer {
 impl NativeSyscallRequest {
     /// The user buffers this request copies, as its arguments declare them,
     /// so on-demand pages under them can be filled in before any copy (DW2
-    /// M6 §8.6). Every request is listed, so a new syscall must say.
+    /// M6 §8.6). Every request is listed, so a new syscall must say. Each
+    /// length is capped at the most the syscall ever copies, so a caller's
+    /// length cannot make the fill-in walk more than that (review M6-2).
     pub(crate) fn user_buffers(&self) -> [Option<UserBuffer>; 3] {
         use deepwyrm_abi::{
-            DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE,
-            DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE,
+            DW_ABI_INFO_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_CHANNEL_MAX_HANDLES,
+            DW_CHANNEL_MAX_PAYLOAD, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE,
+            DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+            DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE,
+            DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_RESULT_V1_SIZE,
+        };
+        const INFO_MAX: u64 = {
+            let object = super::abi_bytes::MAX_OBJECT_INFO_BYTES as u64;
+            let abi = DW_ABI_INFO_V1_SIZE as u64;
+            if object > abi { object } else { abi }
         };
         let out = |address: DwUserAddress, byte_len: u64| {
             Some(UserBuffer {
@@ -263,7 +273,8 @@ impl NativeSyscallRequest {
                 write: false,
             })
         };
-        let records = |count: u32, size: u32| u64::from(count) * u64::from(size);
+        let records = |count: u32, max: u32, size: u32| u64::from(count.min(max)) * u64::from(size);
+        let capped = |len: u64, max: u32| len.min(u64::from(max));
         match *self {
             Self::AbiGetInfo {
                 out_info,
@@ -275,7 +286,11 @@ impl NativeSyscallRequest {
                 out_size,
                 out_required_size,
                 ..
-            } => [out(out_info, out_size), out(out_required_size, 8), None],
+            } => [
+                out(out_info, out_size.min(INFO_MAX)),
+                out(out_required_size, 8),
+                None,
+            ],
             Self::HandleDuplicate { out_handle, .. }
             | Self::TaskGroupCreate { out_handle, .. }
             | Self::MemoryObjectCreate { out_handle, .. } => [out(out_handle, 8), None, None],
@@ -299,14 +314,29 @@ impl NativeSyscallRequest {
                 args_size,
                 out_result,
                 result_size,
-            } => [input(args, args_size), out(out_result, result_size), None],
-            Self::ThreadStart { args, args_size } => [input(args, args_size), None, None],
+            } => [
+                input(args, capped(args_size, DW_PROCESS_CREATE_ARGS_V1_SIZE)),
+                out(
+                    out_result,
+                    capped(result_size, DW_PROCESS_CREATE_RESULT_V1_SIZE),
+                ),
+                None,
+            ],
+            Self::ThreadStart { args, args_size } => [
+                input(args, capped(args_size, DW_THREAD_START_ARGS_V1_SIZE)),
+                None,
+                None,
+            ],
             Self::AddressRegionMap {
                 args,
                 args_size,
                 out_address,
                 ..
-            } => [input(args, args_size), out(out_address, 8), None],
+            } => [
+                input(args, capped(args_size, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE)),
+                out(out_address, 8),
+                None,
+            ],
             Self::ChannelCreate {
                 out_endpoint0,
                 out_endpoint1,
@@ -319,10 +349,14 @@ impl NativeSyscallRequest {
                 transfer_count,
                 ..
             } => [
-                input(bytes, u64::from(byte_len)),
+                input(bytes, capped(u64::from(byte_len), DW_CHANNEL_MAX_PAYLOAD)),
                 input(
                     transfers,
-                    records(transfer_count, DW_HANDLE_TRANSFER_V1_SIZE),
+                    records(
+                        transfer_count,
+                        DW_CHANNEL_MAX_HANDLES,
+                        DW_HANDLE_TRANSFER_V1_SIZE,
+                    ),
                 ),
                 None,
             ],
@@ -334,10 +368,17 @@ impl NativeSyscallRequest {
                 out_result,
                 ..
             } => [
-                out(out_bytes, u64::from(byte_capacity)),
+                out(
+                    out_bytes,
+                    capped(u64::from(byte_capacity), DW_CHANNEL_MAX_PAYLOAD),
+                ),
                 out(
                     out_handles,
-                    records(handle_capacity, DW_RECEIVED_HANDLE_INFO_V1_SIZE),
+                    records(
+                        handle_capacity,
+                        DW_CHANNEL_MAX_HANDLES,
+                        DW_RECEIVED_HANDLE_INFO_V1_SIZE,
+                    ),
                 ),
                 out(out_result, u64::from(DW_CHANNEL_RECEIVE_RESULT_V1_SIZE)),
             ],
@@ -352,7 +393,10 @@ impl NativeSyscallRequest {
                 out_result,
                 ..
             } => [
-                input(items, records(item_count, DW_WAIT_ITEM_V1_SIZE)),
+                input(
+                    items,
+                    records(item_count, DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_ITEM_V1_SIZE),
+                ),
                 out(out_result, u64::from(DW_WAIT_RESULT_V1_SIZE)),
                 None,
             ],
@@ -1399,7 +1443,7 @@ impl NativeQuantumExpiry for NoQuantumExpiry {
 pub(crate) enum UserPageFaultOutcome {
     /// A frame was committed or a leaf published: return and retry.
     Served,
-    /// The leaf was already present with that frame (a spurious fault).
+    /// Another touch published exactly this page's leaf after the fault: retry.
     AlreadyPresent,
     /// Not an on-demand page this access may touch: today's terminal fault.
     Unserved,

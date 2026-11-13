@@ -303,13 +303,19 @@ where
                 .ok_or(X86AddressSpacePublishError::FrameRole(
                     FrameRoleError::Absent,
                 ))?;
+        // Present already: another touch published it after this one
+        // faulted. It is this page's leaf only if it is exactly the leaf a
+        // publish would write; then the access retries and succeeds, since a
+        // served fault was a not-present one (DW2 M6 §8.5).
+        let frame = super::super::FrameAddress::new(physical_start, self.root.physical_limit())
+            .map_err(|_| X86AddressSpacePublishError::Map(MapError::FrameMismatch))?;
         match self
             .root
-            .present_leaf(&mut journal, page)
+            .present_leaf_matches(&mut journal, page, frame, descriptor.permissions)
             .map_err(X86AddressSpacePublishError::Map)?
         {
-            Some(frame) if frame.address() == physical_start => return Ok(false),
-            Some(_) => return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch)),
+            Some(true) => return Ok(false),
+            Some(false) => return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch)),
             None => {}
         }
         journal

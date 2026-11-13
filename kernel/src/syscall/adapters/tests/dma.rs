@@ -634,3 +634,73 @@ fn only_a_handle_that_may_drive_dma_revokes_a_foreign_domain() {
     assert_eq!(fixture.mmio_object(driver), DW_STATUS_NOT_FOUND);
     assert!(!fixture.dma.foreign_domain, "the domain was revoked");
 }
+
+/// Review M6-1: `dma_map`'s fill-in commits only for a caller whose resource
+/// `dma_map` would accept, and then needs MAP on the object as well, so a
+/// READ-only holder with a bogus resource commits nothing.
+#[test]
+fn dma_fill_in_commits_only_for_an_accepted_resource_and_a_mappable_object() {
+    let mut fixture = Fixture::new();
+    let function = fixture.function();
+    let pio = fixture.resource(
+        DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+        0,
+        DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_READ.0),
+    );
+    let unmodifiable = fixture.resource(
+        DW_DEVICE_RESOURCE_KIND_PCI_FUNCTION,
+        (2 << 3) | 1,
+        DW_RIGHT_READ,
+    );
+    let rights = |fixture: &mut Fixture, resource, access| {
+        dma_map_commit_rights(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.devices,
+            fixture.process,
+            resource,
+            access,
+        )
+    };
+    // Refusals `dma_map` itself would make: nothing is committed for them.
+    for (resource, access) in [
+        (function, 0),
+        (function, 1 << 7),
+        (DwHandle(0xdead), DW_DMA_ACCESS_DEVICE_READ),
+        (pio, DW_DMA_ACCESS_DEVICE_READ),
+        (unmodifiable, DW_DMA_ACCESS_DEVICE_READ),
+    ] {
+        assert_eq!(
+            rights(&mut fixture, resource, access),
+            None,
+            "{resource:?} {access:#x}"
+        );
+    }
+    let read = rights(&mut fixture, function, DW_DMA_ACCESS_DEVICE_READ).unwrap();
+    assert_eq!(read, DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0));
+    let write = rights(
+        &mut fixture,
+        function,
+        DW_DMA_ACCESS_DEVICE_READ | DW_DMA_ACCESS_DEVICE_WRITE,
+    )
+    .unwrap();
+    assert_eq!(
+        write,
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0)
+    );
+    // A READ-only handle cannot have its object committed by a DMA map.
+    let object = fixture.object(1, DW_RIGHT_READ);
+    assert_eq!(
+        memory_object_commit_target(
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.memory,
+            fixture.process,
+            object,
+            0,
+            4096,
+            read,
+        ),
+        Err(deepwyrm_abi::DW_STATUS_ACCESS_DENIED)
+    );
+}

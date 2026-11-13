@@ -2559,6 +2559,56 @@ pub(crate) fn admit_charged_pages<
         .map_err(quota_status)
 }
 
+/// Admits `first.1` pages against `first.0`'s tag and `second.1` against
+/// `second.0`'s together (DW2 M6 §8.4): a group both tags share must have
+/// room for the sum, not for each alone. A fault's page and its page tables
+/// are admitted this way.
+pub(crate) fn admit_charged_pages_together<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    first: (crate::object::ObjectId, u64),
+    second: (crate::object::ObjectId, u64),
+) -> Result<(), DwStatus> {
+    let (first_tag, _) = registry.charge(first.0).map_err(|_| DW_STATUS_BAD_STATE)?;
+    let (second_tag, _) = registry.charge(second.0).map_err(|_| DW_STATUS_BAD_STATE)?;
+    let first_needed = usize::try_from(first.1).map_err(|_| DW_STATUS_NO_RESOURCES)?;
+    let second_needed = usize::try_from(second.1).map_err(|_| DW_STATUS_NO_RESOURCES)?;
+    if first_needed != 0 {
+        tasks
+            .admit_quota(
+                &first_tag,
+                crate::task::quota::MEMORY_PAGES_CLASS,
+                first_needed,
+                |group| registry.charged_pages(group),
+            )
+            .map_err(quota_status)?;
+    }
+    if second_needed != 0 {
+        tasks
+            .admit_quota(
+                &second_tag,
+                crate::task::quota::MEMORY_PAGES_CLASS,
+                second_needed,
+                |group| {
+                    let shared = first_tag.groups().any(|first| first == group);
+                    registry.charged_pages(group).saturating_add(if shared {
+                        first_needed
+                    } else {
+                        0
+                    })
+                },
+            )
+            .map_err(quota_status)?;
+    }
+    Ok(())
+}
+
 /// Adds `frames` admitted frames to the object's page weight.
 pub(crate) fn record_charged_pages<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
@@ -2629,6 +2679,41 @@ fn dma_resource<
         return Err(DW_STATUS_NOT_SUPPORTED);
     }
     Ok((id, boot_id, (address.device() << 3) | address.function()))
+}
+
+/// Whether `dma_map`'s own checks on the resource would pass, and the rights
+/// it then needs on the MemoryObject with MAP added, so its fill-in commits
+/// an on-demand range only for a caller that holds a usable DMA resource and
+/// could map and touch the object (DW2 M6 §8.6, review M6-1). `None` leaves
+/// the refusal to `dma_map`. Nothing is changed here.
+pub(crate) fn dma_map_commit_rights<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const RESOURCES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resources: &DeviceResourceAuthority<RESOURCES>,
+    current_process: ProcessKey,
+    resource: DwHandle,
+    access: u32,
+) -> Option<DwRights> {
+    if access == 0 || access & !deepwyrm_abi::DW_DMA_ACCESS_SUPPORTED_MASK != 0 {
+        return None;
+    }
+    let (_, boot_id, _) =
+        dma_resource(registry, tasks, resources, current_process, resource).ok()?;
+    if bars_held_by_other(Some(boot_id), current_process) {
+        return None;
+    }
+    let mut required = deepwyrm_abi::DW_RIGHT_READ.0 | deepwyrm_abi::DW_RIGHT_MAP.0;
+    if access & deepwyrm_abi::DW_DMA_ACCESS_DEVICE_WRITE != 0 {
+        required |= deepwyrm_abi::DW_RIGHT_WRITE.0;
+    }
+    Some(DwRights(required))
 }
 
 /// `dma_map` (storage K4): maps pages of a page-backed MemoryObject into the

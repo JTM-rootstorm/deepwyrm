@@ -479,3 +479,106 @@ fn user_buffers_are_the_copied_ranges() {
         [buffer(0x6000, 4, false), buffer(0x7000, 4, true), None]
     );
 }
+
+/// Review M6-2: a caller's length never makes the fill-in walk more than
+/// the syscall can copy.
+#[test]
+fn user_buffers_are_capped_at_what_the_syscall_copies() {
+    use deepwyrm_abi::{
+        DW_ABI_INFO_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_CHANNEL_MAX_HANDLES,
+        DW_CHANNEL_MAX_PAYLOAD, DW_HANDLE_TRANSFER_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE,
+        DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE,
+        DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_MANY_MAX_ITEMS,
+    };
+    let huge = 1_u64 << 47;
+    let lengths = |request: NativeSyscallRequest| {
+        request
+            .user_buffers()
+            .map(|buffer| buffer.map(|buffer| buffer.byte_len))
+    };
+    let info = lengths(NativeSyscallRequest::AbiGetInfo {
+        out_info: DwUserAddress(0x1000),
+        out_size: huge,
+        out_required_size: DwUserAddress(0x2000),
+    });
+    assert_eq!(info, [Some(u64::from(DW_ABI_INFO_V1_SIZE)), Some(8), None]);
+    let object_info = lengths(NativeSyscallRequest::ObjectGetInfoV1 {
+        handle: DwHandle(1),
+        topic: 0,
+        out_info: DwUserAddress(0x1000),
+        out_size: huge,
+        out_required_size: DwUserAddress(0x2000),
+    });
+    assert_eq!(object_info[0], Some(64));
+    let create = lengths(NativeSyscallRequest::ProcessCreate {
+        args: DwUserAddress(0x1000),
+        args_size: huge,
+        out_result: DwUserAddress(0x2000),
+        result_size: huge,
+    });
+    assert_eq!(
+        create,
+        [
+            Some(u64::from(DW_PROCESS_CREATE_ARGS_V1_SIZE)),
+            Some(u64::from(DW_PROCESS_CREATE_RESULT_V1_SIZE)),
+            None
+        ]
+    );
+    let start = lengths(NativeSyscallRequest::ThreadStart {
+        args: DwUserAddress(0x1000),
+        args_size: huge,
+    });
+    assert_eq!(start[0], Some(u64::from(DW_THREAD_START_ARGS_V1_SIZE)));
+    let map = lengths(NativeSyscallRequest::AddressRegionMap {
+        address_region: DwHandle(1),
+        memory_object: DwHandle(2),
+        args: DwUserAddress(0x1000),
+        args_size: huge,
+        out_address: DwUserAddress(0x2000),
+    });
+    assert_eq!(map[0], Some(u64::from(DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE)));
+    let send = lengths(NativeSyscallRequest::ChannelSend {
+        channel: DwHandle(1),
+        bytes: DwUserAddress(0x1000),
+        byte_len: u32::MAX,
+        transfers: DwUserAddress(0x2000),
+        transfer_count: u32::MAX,
+        flags: 0,
+    });
+    assert_eq!(
+        send,
+        [
+            Some(u64::from(DW_CHANNEL_MAX_PAYLOAD)),
+            Some(u64::from(
+                DW_CHANNEL_MAX_HANDLES * DW_HANDLE_TRANSFER_V1_SIZE
+            )),
+            None
+        ]
+    );
+    let receive = lengths(NativeSyscallRequest::ChannelReceive {
+        channel: DwHandle(1),
+        out_bytes: DwUserAddress(0x1000),
+        byte_capacity: u32::MAX,
+        out_handles: DwUserAddress(0x2000),
+        handle_capacity: u32::MAX,
+        out_result: DwUserAddress(0x3000),
+    });
+    assert_eq!(receive[0], Some(u64::from(DW_CHANNEL_MAX_PAYLOAD)));
+    assert_eq!(
+        receive[1],
+        Some(u64::from(
+            DW_CHANNEL_MAX_HANDLES * DW_RECEIVED_HANDLE_INFO_V1_SIZE
+        ))
+    );
+    let wait = lengths(NativeSyscallRequest::WaitMany {
+        items: DwUserAddress(0x1000),
+        item_count: u32::MAX,
+        mode: 0,
+        deadline: DwDeadline(0),
+        out_result: DwUserAddress(0x2000),
+    });
+    assert_eq!(
+        wait[0],
+        Some(u64::from(DW_WAIT_MANY_MAX_ITEMS * DW_WAIT_ITEM_V1_SIZE))
+    );
+}

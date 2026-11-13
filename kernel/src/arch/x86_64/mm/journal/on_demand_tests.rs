@@ -443,3 +443,41 @@ fn a_leaf_that_maps_another_frame_is_refused() {
         Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch))
     );
 }
+
+/// Review M6-3: a leaf already present counts as this touch's only when it
+/// is exactly the leaf a publish would write, with the accessed and dirty
+/// bits the CPU sets ignored. A served fault was a not-present one, so then
+/// the retry succeeds; a leaf that grants less is refused, not retried.
+#[test]
+fn a_present_leaf_is_the_touch_only_if_it_grants_the_mapping() {
+    const ACCESSED_DIRTY: u64 = (1 << 5) | (1 << 6);
+    const WRITABLE: u64 = 1 << 1;
+    let mut fixture = Fixture::new();
+    fixture.commit(0);
+    fixture.touch(START).unwrap();
+    let leaf_table = {
+        let physical_mask = ((1_u64 << 40) - 1) & !(BASE_PAGE_SIZE - 1);
+        let mut table = fixture.root.physical_start();
+        for level in (1..=3).rev() {
+            let index = ((START >> (12 + level * 9)) & 0x1ff) as usize;
+            table = fixture.target.entries[&(table, index)] & physical_mask;
+        }
+        table
+    };
+    let key = (leaf_table, (START >> 12) as usize & 0x1ff);
+    let published = fixture.target.entries[&key];
+    fixture
+        .target
+        .entries
+        .insert(key, published | ACCESSED_DIRTY);
+    assert_eq!(fixture.touch(START), Ok(false));
+    // The same frame, read-only, under a read-write mapping.
+    fixture.target.entries.insert(key, published & !WRITABLE);
+    assert_eq!(
+        fixture.touch(START),
+        Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch))
+    );
+    fixture.target.entries.insert(key, published);
+    assert_eq!(fixture.touch(START), Ok(false));
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}

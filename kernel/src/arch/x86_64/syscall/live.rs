@@ -1673,14 +1673,6 @@ fn end_user_page_fault<
     handoff_to_terminal_reaper::<R>(context)
 }
 
-/// The last unproductive page fault each CPU served: thread-agnostic
-/// `(rip, cr2, error)`, zero when the last one made progress (DW2 M6 §8.5's
-/// loop guard).
-static LAST_IDLE_FAULT: [[core::sync::atomic::AtomicU64; 3];
-    crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
-    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 3] };
-        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
-
 /// Serves a CPL3 page fault on an on-demand page and returns to the faulting
 /// instruction, or ends the process (DW2 M6 §8.5). Every fault the runtime
 /// does not serve ends with the record the terminal path would have built.
@@ -1713,29 +1705,12 @@ unsafe fn native_runtime_user_page_fault<
             outcome => break outcome,
         }
     };
-    let cpu = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
-    let last = LAST_IDLE_FAULT.get(cpu).unwrap_or_else(|| halt_forever());
     match outcome {
-        UserPageFaultOutcome::Served => {
-            for word in last {
-                word.store(0, Ordering::Relaxed);
-            }
-        }
-        UserPageFaultOutcome::AlreadyPresent => {
-            // Spurious once (another CPU's touch); twice at the same place
-            // with nothing done in between is a loop.
-            let key = [frame.rip, cr2, error];
-            if last
-                .iter()
-                .zip(key)
-                .all(|(word, value)| word.load(Ordering::Relaxed) == value)
-            {
-                end_user_page_fault::<R>(context, TerminalAction::UserException(record));
-            }
-            for (word, value) in last.iter().zip(key) {
-                word.store(value, Ordering::Relaxed);
-            }
-        }
+        // Served, or published by another touch since this one faulted: the
+        // leaf now grants the access. A served fault was a not-present one,
+        // so the retry either succeeds or faults on a present leaf, which is
+        // never served; it cannot loop here (DW2 M6 §8.5).
+        UserPageFaultOutcome::Served | UserPageFaultOutcome::AlreadyPresent => {}
         UserPageFaultOutcome::Unserved => {
             end_user_page_fault::<R>(context, TerminalAction::UserException(record));
         }
