@@ -261,3 +261,87 @@ Mike chose (2026-11-13) to run a large call as a chain of ordinary calls rather 
 - **R7 (Low), open:** concurrent creates can still allocate past the quota before admission, as before.
 - **Test gaps, open:** the facade loop (stop between steps, a published inner step, the output) and the snapshot capture are live-only; no test finalizes an object after a merge; no test of a zeroing step failing mid-allocation.
 
+
+## 8. M6 design: allocate on first touch (2026-11-13)
+
+Sources: this plan's §2 and §6.8, `DW0_D0_OBJECT_HANDLE_CONTRACT.md` §5–§7, `DW0_H0_SMP_CONCURRENCY_CONTRACT.md` §12, the cross-personality doctrine §8 and §13, `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`, and Deepwyrm code at `861ff86`.
+
+### 8.1 Decisions (Mike, 2026-11-13)
+
+1. **An object create flag**, not a map flag. Whether a page has a frame yet is a property of the object's backing, and every map of the object behaves the same.
+2. **The §6.8 per-object radix index, built now,** for objects created with the flag. Eager objects keep their chains.
+3. **Kernel touches fill pages in.** A syscall copy, `dma_map` and a return to userspace give a missing page a frame first, charged as a user touch would be.
+
+Admission (doctrine §13): serving a page fault is a privileged VM state transition that userspace cannot compose. Deepwyrm has no user exception delivery, and a commit syscall would leave every touch racing a fault that kills the process. The operation is native and personality-blind. Reservation and commit modes, a shared zero page and decommit stay out of the kernel until a native need passes §13 on its own.
+
+### 8.2 ABI
+
+- `DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND = 0x1` is the first create flag, and the supported mask becomes 0x1.
+  - Every page of such an object reads as zero until it is written, as today. A page gets its frame on first touch, whether that touch comes through any mapping, a syscall copy or `dma_map`.
+  - At creation the object charges one `MEMORY_OBJECT` and no pages. Each page given a frame charges one page of `MEMORY_PAGES` to the TaskGroup that created the object, whoever touched it.
+  - The charge is released when the object is finalized, as today.
+  - `byte_len` may not exceed the creating group's `MEMORY_PAGES` limit. Such an object could never be touched in full, so creating it is refused with `NO_RESOURCES`.
+- A user fault on an on-demand page that cannot be served (no quota, or no frames) terminates the process with `DW_TERMINATION_RESOURCE_POLICY`. That constant already exists and nothing uses it yet.
+  - The termination record carries the page-fault exception type and the fault address, and its detail is the status (`NO_RESOURCES` for quota, `NO_MEMORY` for frames). This keeps the cause visible to the job's supervisor, as the cause-carriage contract requires.
+  - Every other fault ends exactly as today.
+- Syscall copies that cannot fill in a page return `BAD_ADDRESS`, and `dma_map` returns `NO_MEMORY`.
+- Changing the schema changes the ABI fingerprint, so Wyrmroot repins (CLAUDE.md §7).
+
+### 8.3 Backing: the per-object index
+
+- **Structure.** An on-demand backing is a 512-way radix tree keyed by object page. The tree is sized at creation to the object's page count, at most four levels.
+  - Interior nodes are allocator pages with a new role, `BackingIndexNode { owner }`.
+  - A leaf entry names a committed page's physical frame. The frame's role is `ObjectPage { owner, object_page }`.
+  - `owner` is the index root's head, so every lookup checks each node and page against its owner and its position. A stale, foreign or misplaced entry fails, as chain walks do.
+- **Creation** allocates only the root node.
+- **Mutation.** Nodes and pages are added only under P. Lookup is at most four steps.
+- **The grant.** The object's `ObjectBackingGrant` names the root and kind `OnDemand`. Its page count is the number of committed pages, updated under P as pages are committed.
+- **Release.** Finalization walks the tree, then frees every page and node. The release check compares the pages found against the grant, as `release_chain` does.
+- **Charging the index.** Interior nodes cost about one page per 2 MiB touched. Like page tables (§7.1 R4), they are bounded by the pages committed and are not charged to the quota.
+- **Resolution.** The resolution interface (`resolve_at`, `object_segments` and the cursor) gains a third answer beside "this frame" and "corrupt": **absent**, which only an on-demand backing can return, and only for a page inside the object's size that has not been committed. Eager backings are unchanged.
+
+### 8.4 Consumers of absent pages
+
+- **Publisher.** It validates a mapping against the object's size, not its committed pages.
+  - A page that is absent publishes no entry.
+  - An unmap or protect whose old page is absent has nothing to clear or change, and a later fault takes the mapping's current protection.
+  - Map, unmap and protect stay all-or-nothing for the pages that are present.
+- **Journal.** It authorizes and rechecks a leaf only for a committed page, as now.
+- **`dma_map`.** It commits every absent page in the range first, all charged before any is allocated, then maps them. Pages stay committed after `dma_unmap`.
+- **Boot objects** (images, stacks, blobs) stay eager.
+
+### 8.5 Serving a user page fault
+
+- **Entry.** A CPL3 `#PF` whose error code says *not present* takes a returning path. As the timer entry does, it copies the interrupted frame onto the Thread's kernel stack, normalizes GS and calls a new gate. Every other CPL3 exception, and every present-page fault (protection or reserved bit), still goes straight to today's terminal path.
+- **The gate** runs at a safe point under T, then P, as a syscall would (lock order T, P; S is not needed):
+  1. Find the mapping containing CR2 in the process's root region.
+  2. Check that its object is on demand.
+  3. Check that the access the error code names (read, write or instruction fetch) is within the mapping's protection.
+  4. Admit one page against the creator's `MEMORY_PAGES`.
+  5. Find or commit the object page: allocate a frame, zero it through the direct map, and insert it into the index.
+  6. Publish the one leaf in this address space through the journal. If no step can serve the fault, it is terminal as above.
+- **Shootdown.** Going from not present to present needs none, because x86 does not cache not-present translations. Another CPU that faults on the same page finds it committed, or its leaf present, and simply returns.
+- **Return.** The gate then joins the ordinary pre-IRET path (Stop, preemption, frame validation), so a fault is also a preemption point. The frame validation's RIP and RSP checks fill in an on-demand page first, rather than refusing it.
+- **Races.** A mapping removed or protected before the gate takes T is seen as removed. The fault is then served under the new state or is terminal, as a fault on unmapped memory is today. Another address space mapping the same object faults on its own, and its fault finds the page already committed.
+- **Pins.** Pins cover present pages. Making an absent page present changes no pinned translation, so the pin tracker admits it without a mutation span.
+
+### 8.6 Syscall copies
+
+When usercopy's preflight walk finds a not-present leaf, it runs the same commit step as the gate for that page, under the locks the copy already holds (P, with T where the caller holds it), then walks again. The pin is taken after every page in the range is present. A range that cannot be filled in is `BAD_ADDRESS`, and the pages filled in before the failure stay committed.
+
+### 8.7 Steps
+
+1. **The index** in `frame_roles`: roles, allocate root, commit page, lookup with absent, release, invariant checks. Host tests.
+2. **Object, ABI and consumers:**
+   - the create flag, the schema and generated ABI, and the object kind;
+   - creation and quota per commit, and finalization;
+   - absent pages through the publisher, journal and DMA (`dma_map` refuses absent pages until step 4);
+   - the Wyrmroot repin.
+3. **The fault gate:** the `#PF` returning entry in `exceptions.S`, the gate, and the commit transaction. Then the termination reason, and frame validation filling pages in.
+4. **Kernel touches:** usercopy preflight, and `dma_map`'s commit.
+5. **A guest test** in the development tier: touch a large on-demand object sparsely, read untouched pages as zero, run out of quota on touch and observe `RESOURCE_POLICY`.
+6. **The independent security review (CLAUDE.md §1)** of the whole stage. This design gets its own review before step 1.
+
+### 8.8 Not in M6
+
+Decommit (giving pages back), a shared zero page for read-only touches, fault-around (committing neighbours), 2 MiB pages, swap, and the OOM killer (§6.7).
