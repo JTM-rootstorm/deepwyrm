@@ -479,6 +479,7 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 | R4: allocation costs runs × free ranges | §6.9a | M7 |
 | R2: a step's hold grows with the backing's run count | §7.3 | M7 |
 | R3: stepped calls never yield the CPU; creation's zeroing has no safe point | §7.3 | M8 |
+| M5's 1 GiB cap on one create, map, protect, unmap or commit (stands in for R3 until the yield exists) | §10.1 | M8 (removed with the yield) |
 | Every first touch takes the global T, and usage is a linear scan | §8.9 | M8 |
 | The fault gate, fill-in and commit step have no host tests (spurious fault, table refusal, BSP expiries during a long fill-in) | §8.11 | M8 (its lock work makes them host-testable units) |
 | Global frame exhaustion kills whichever process touches next | §8.9 | M9 |
@@ -487,47 +488,73 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 §5.2a R3 (AP trampoline's writable alias), R4 (1 GiB pages gated on the BSP's CPUID), R5 (a map needing over 2048 tables stops the boot), R6 (large leaves and MTRRs), R10 (guest-test usercopy uses user addresses); §5.3a R3 (a second proof on one root panics), R4 (O(slots) scans), R5 (`start_position` scans); §6.9a R2 (whole-table scans at boot); §7.1 R3 (a racing pin sees `Conflict` for the whole call), R4 (tables built by undone batches stay uncharged until teardown); §7.3 R1 (handles re-resolved per step), R4 (a protect in steps can refuse a W+X alias), R5 (pieces left by a stopped caller keep their leases).
 
 
-## 10. M5 design (2026-11-13)
+## 10. M5 design (2026-11-13; revised after its review, §10.7)
 
 M5 lets a job use what M2–M6 made possible. Today a job gets 16 MiB, 4 MemoryObjects and 10 mapping slots, the SDK's `mmap` serves everything from at most four eager arenas of at most 16 MiB, and nothing tells userspace how much RAM exists. Facts below come from a read-only survey (Claude Sonnet 5.5, 2026-11-13) checked against the code; byte costs are field-layout estimates to be measured in step 1.
 
 ### 10.1 Decisions
 
-- **Budget (Mike, 2026-11-13; §3 item 3):** each job's MEMORY_PAGES limit is half of the RAM free once init's resident services have started, capped by the platform config's size when one is set. Init computes it once per boot, before the first job, so every job of a boot gets the same budget.
-- **Overcommit:** four jobs at half each can promise twice the free RAM. An eager create that finds no frames fails with `NO_MEMORY` as now; an on-demand touch that finds none ends the toucher (§8.9, accepted). M9's OOM killer is the answer to both, not a smaller budget.
+- **Budget (Mike, 2026-11-13; §3 item 3):** each job's MEMORY_PAGES limit is half of the RAM free once init's resident services have started, capped by the platform config's size when one is set. Init computes it once per boot, before the first job, so every job of a boot gets the same budget. *Refinement (§10.7 finding 6, for Mike to confirm):* a resident reserve is set aside first, so the budget is half of (free − reserve), and all jobs together are held to (free − reserve) by a parent group (item 5).
+- **Overcommit (§11; for Mike to confirm, §10.7 finding 3):** four jobs at half each can promise twice what the jobs' parent group allows. An eager create past the parent's limit fails with `RESOURCE_POLICY`, and one that finds no frames fails with `NO_MEMORY`, as now. The SDK reserves on-demand memory (item 8), so, as on Linux, `malloc` of a large block rarely fails and running out shows up on touch: a job over its own budget is ended on the touch (Linux's memory-cgroup OOM kill of the job), and frame exhaustion ends the toucher until M9's killer chooses a victim instead (§8.9).
+- **Size of one call until M8 (§10.7 finding 2):** stepped calls release the locks between steps but never yield the CPU, and creation's zeroing has no safe point (§7.3 R3, M8). Until M8 the kernel refuses a create, map, protect, unmap or commit of more than 1 GiB (`MAX_UNYIELDING_CALL_PAGES`, 262,144 pages) with `INVALID_ARGUMENT`, so one call holds a CPU for about the time it takes to zero 1 GiB through the direct map (measured by probe 11). M8 removes the cap with the yield, and its exit depends on that. The SDK splits larger requests into 1 GiB objects mapped side by side.
 
 ### 10.2 Deepwyrm
 
-1. **How much RAM: a TaskGroup memory topic.** A new `object_get_info` topic, `DW_OBJECT_INFO_TOPIC_TASK_GROUP_MEMORY_V1`, on a TaskGroup handle with INSPECT, returns a 32-byte record: total allocator pages, free allocator pages, and the group's own MEMORY_PAGES limit and current usage. It is read under the locks that admission uses (P for the allocator count, T for usage), so it is the same truth admission sees. Free RAM is exposed only to holders of INSPECT on some TaskGroup, not to every caller of `abi_get_info`. A new implementation phase, as M6's commit call had.
-2. **Mapping slots: 10 → 64 per AddressRegion.** Every region has the same count, so all 32 regions pay: about 6.4 KB static per slot, about 410 KB at 64 (versus 64 KB now). The deepest map, unmap and protect path holds about 1–1.5 KB of stack per slot in `rebuild`, `commit_specs`, `prepare_replace` and `RegionSteps`, about 90 KB at 64, against the 512 KiB kernel thread stack; the stack oracles are re-measured. Moving those arrays to static storage is not needed at 64 and is not done.
-3. **Per-job MemoryObjects: 4 → 64,** with the production ledger following: `JOB_OWN_MEMORY_OBJECTS = 64`, `JOB_REGION_MAPPINGS = 64`. `MEMORY_PEAK` 81 → 321, `MAPPING_PEAK` 109 → 565, `REGISTRY_PEAK` 346 → 586; the pools become memory 384, leases 576, registry 640 (about 100–150 KB more static memory). The geometry tests that pin the old peaks change with them.
+1. **How much RAM: a TaskGroup memory topic, scoped.** A new `object_get_info` topic, `DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1`, on a TaskGroup handle with INSPECT, returns a 32-byte record: the group's own MEMORY_PAGES limit and usage, the smallest headroom (limit − usage) over the group and its limited ancestors, and the free frame count. The free frame count is filled only for the root TaskGroup (the one boot gives init); every other group gets zero there, so a job holding INSPECT on its own group learns its budget and nothing system-wide (§10.7 finding 1). Init reads it on the root group; jobs never hold a TaskGroup handle, and get their budget from init (item 5). Locking: the query holds T (as every info query does) and takes P inside it for the free count, which is the T-then-P order. Free frames are the allocator's free-range sum; admission does not read it (exhaustion is found at allocation), so the record is a snapshot, not a promise. `[[object_info]]` topics carry no phase in the schema, so the topic needs none.
+2. **Mapping slots: 10 → 64 per AddressRegion.** Every region has the same count, so all 32 regions pay: about 6.4 KB static per slot, about 410 KB at 64 (versus 64 KB now). The deepest map, unmap and protect path holds about 1–1.5 KB of stack per slot in `rebuild`, `commit_specs`, `prepare_replace` and `RegionSteps`, about 90 KB at 64, against the 512 KiB kernel thread stack; teardown may instead run on the 256 KiB reaper stack. No tool measures this today, so step 1 adds one (§10.7 finding 9): the guest kernel is built with LLVM's stack-size section, and a host test reads the kernel ELF and asserts that each of those functions' frames, summed along the deepest call chain, fits the stack it runs on with at least 25% left. If the pinned toolchain cannot emit the section, that is reported as a blocker, not skipped. Moving the arrays to static storage is not needed at 64 and is not done.
+3. **Per-job MemoryObjects: 4 → 64,** with the production ledger following: `JOB_OWN_MEMORY_OBJECTS = 64`, `JOB_REGION_MAPPINGS = 64`. `MEMORY_PEAK` 81 → 321 and `REGISTRY_PEAK` 346 → 586. A job's leases are bounded by its region's 64 slots, not by its objects plus 61, so `MAPPING_PEAK` is 53 + 4 × 64 = 309, not 565 (§10.7 finding 11). Pools: memory 384, leases 320, registry 640; the bootfs entry below raises `BOOTFS_ENTRY_PEAK` 17 → 18. Step 1 checks each against the geometry tests, which change with them.
+4. **Released on unmap (§10.7 finding 5).** M6 has no decommit, so a partial `munmap` of an on-demand mapping would keep the pages under the unmapped part charged until the object dies. For an on-demand object with no handle left (only leases, which is how the SDK holds its mappings), an unmap or a lease's split releases and uncharges the committed pages that no remaining lease covers, in the unmap's own steps. An object anyone still holds a handle to keeps its pages, since the holder may map them again. The cap above bounds the range.
+5. **The cap on one call** (§10.1), refused before any work.
 
 ### 10.3 Wyrmroot
 
-4. **Platform config:** a new bootfs entry, `system/bootstrap/platform-config-v1` (WRPC v1: magic, version, size, one `u64 job_memory_bytes_max`, zero for none, reserved fields zero; strict, bounded, fail-closed). The product builder writes it; the dev-boot product sets no cap.
-5. **Init:** after its resident roles are READY and before it accepts a job, init reads the memory topic on its own TaskGroup, computes `min(free / 2, cap)` in pages, saturated to the `u32` limit, and builds the job limit table at run time instead of the `JOB_TASK_GROUP_LIMITS` constant. `JOB_MEMORY_OBJECTS` becomes 64. The shell's `status` shows the budget.
-6. **Repin** Wyrmroot and the SDK to the new Deepwyrm together (memory `sdk-pin-follows-wyrmroot`).
+6. **Platform config:** a new bootfs entry, `system/bootstrap/platform-config-v1` (WRPC v1: magic, version, size, `u64 job_memory_bytes_max` and `u64 resident_reserve_bytes`, zero meaning none and the default respectively, reserved fields zero; strict, bounded, fail-closed). The product builder writes it; the dev-boot product sets a cap (item 11's probe needs one) and the default reserve.
+7. **Init:** after its resident roles are READY and before it accepts a job, init reads the memory topic on the root group. The reserve is `resident_reserve_bytes`, or by default the larger of 256 MiB and one eighth of free. Init creates one jobs TaskGroup under its own with MEMORY_PAGES = free − reserve, so all jobs together can never take the residents' reserve (§10.7 finding 6), and every job group is created under it. A job's budget is `min((free − reserve) / 2, cap)` in pages, saturated to `DW_TASK_GROUP_LIMIT_UNLIMITED − 1`, since the limit's maximum means unlimited (§10.7 finding 7). The job limit table is built at run time instead of the `JOB_TASK_GROUP_LIMITS` constant; `JOB_MEMORY_OBJECTS` becomes 64. **Failure is never "no cap" (§10.7 finding 8):** if the topic cannot be read, the config is missing, malformed or truncated, or free is not above the reserve, init logs the cause and uses the old 16 MiB budget, still under the jobs group. Init gives each job its budget in the job-v2 startup record (a new field), and the shell's `status` shows it.
+8. **Repin** Wyrmroot and the SDK to the new Deepwyrm together (memory `sdk-pin-follows-wyrmroot`), with Wyrmroot's consumer of the new topic constant and record in `deepwyrm-syscall`, and Wyrmroot's docs.
 
 ### 10.4 SDK
 
-7. **`mmap` by size.** An anonymous, non-fixed request of 1 MiB or more gets its own on-demand MemoryObject and mapping, so reserving costs one index page and `munmap` returns the memory. Smaller requests stay in arenas, which become on-demand too, so an arena costs only the pages touched. The 16 MiB ceiling on one allocation goes away; a request is limited by the job's budget and its free slots. `mprotect` on a dedicated mapping goes straight to the kernel; on arena pages it stays `ENOTSUP`.
-8. **Slots run out before RAM can:** the image takes 3 of 64 slots and arenas at most 4, so a program can hold about 57 large mappings at once; a partial `munmap` splits a mapping and costs a slot. Past that, `mmap` returns `ENOMEM`.
+9. **`mmap` by size.** Every anonymous mapping that does not go to an arena gets its own on-demand MemoryObject and mapping: non-fixed requests of 1 MiB or more, and every `MAP_FIXED` request (§10.7 finding 13). Reserving costs one index page, and `munmap`, whole or partial, returns what it covers (item 4). Requests over 1 GiB are split into 1 GiB objects (§10.1). `mprotect` on a dedicated mapping goes straight to the kernel and may split it, at most two more slots; on arena pages it stays `ENOTSUP`.
+10. **Arenas scale with the budget (§10.7 finding 4).** Requests under 1 MiB stay in arenas, now on-demand and reserved large (each the job's budget divided by `MAX_ARENAS`, at most 1 GiB), so small allocations are limited by the budget, not by 4 × 4 MiB. The fixed 4096-page bitmaps give way to a two-level bitmap sized at arena creation from the arena's own memory. A freed arena page is re-zeroed on reuse only if it was handed out before, so pages never touched are never committed.
+11. **Running out:** the image takes 3 of 64 slots and arenas at most 4, so a program can hold about 57 dedicated mappings at once. Past that, and when a split finds no free slot, `mmap`, `munmap` and `mprotect` return `ENOMEM`, not `EINVAL`.
 
 ### 10.5 Guest proof (`dev-boot --check --sdk`, 2 GiB guest)
 
-9. `bin/hello` reports its budget from the memory topic and checks it is half of free RAM, give or take what started in between.
-10. It maps an eager object larger than 16 MiB and touches every page, then protects and unmaps it in steps: M4's and M4b's first guest run with eager backing (§9 ledger).
-11. It times a large eager create and map and prints it, re-measuring L6's 44 ms fixed cost on the direct map (§9 ledger).
-12. A job stopped between steps of a large map leaves no lease or frame behind once it is reaped (§9 ledger: the stepped facade loop).
-13. An SDK program allocates past the old 16 MiB ceiling (one `malloc` of 256 MiB and a scattered set of small ones) and frees them, and SQLite runs as before.
+12. `bin/hello` reports the budget from its startup record and checks it against init's logged computation; init's own read of the topic is checked in the boot log against a second read of the free count and the jobs group's limit. A job's own read of the topic (if it held a group handle) returns zero free frames, tested on the host.
+13. It maps an eager object larger than 16 MiB and touches every page, then protects and unmaps it in steps: M4's and M4b's first guest run with eager backing (§9 ledger). Usage, read through `status`, drops back after the `munmap`, including after a partial one (item 4).
+14. It times a large eager create and map and prints it, re-measuring L6's 44 ms fixed cost on the direct map and the 1 GiB call bound (§9 ledger). Explaining the 44 ms, if it remains, is part of this step, not only measuring it.
+15. A job is stopped while a large map is in its steps; once it is reaped, its jobs group's usage is back to what it was and the free count (init's read) matches. That a stop landed between steps, rather than before the first, is shown by the kernel's step counter for the call in the boot log. A published inner step and its output are covered by the same probe stopping after the first step has published.
+16. An SDK program allocates past the old 16 MiB ceiling (one `malloc` of 256 MiB and more than 16 MiB of small ones) and frees them, and SQLite runs as before. A second program allocates past its budget and is ended with `RESOURCE_POLICY`; a third fills its 64 slots and gets `ENOMEM`. The dev-boot config's cap is shown to bound the budget.
 
 ### 10.6 Steps
 
-1. Deepwyrm: the memory topic (ABI, phase, adapter, live read), slots and per-job objects with the geometry, re-measured stacks; host tests; development tier.
-2. Wyrmroot and SDK repinned; the platform config entry and builder; init's run-time budget and limit table; `status`.
-3. SDK: `mmap` by size over on-demand objects; its host tests replace the arena tests.
-4. Probes 9–13 in dev-boot.
+1. Deepwyrm: the scoped memory topic, slots and per-job objects with the geometry, release on unmap, the 1 GiB call cap, and the stack-size check; host tests; development tier.
+2. Wyrmroot and SDK repinned; the platform config entry and builder; init's reserve, jobs group, run-time budget and limit table, and the startup-record field; `status`.
+3. SDK: `mmap` by size over on-demand objects, scalable arenas, the 1 GiB split and `ENOMEM`; its host tests replace the arena tests.
+4. Probes 12–16 in dev-boot.
 5. Independent security review of the stage; fixes; §9 ledger and an as-built record.
+
+### 10.7 Design review
+
+Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `988540f`, read-only. It confirmed the pool arithmetic and found six Medium and seven Low items, all taken into the design above:
+
+| # | Sev. | Finding | Disposition |
+|---|---|---|---|
+| 1 | Medium | The topic would show system-wide free RAM to any job given INSPECT on a group, and jobs hold no group handle, so probe 9 could not work | Fixed: free count only on the root group; jobs get their budget in the startup record (items 1, 7, 12) |
+| 2 | Medium | At GiB budgets, creation's zeroing and stepped calls hold a CPU for seconds without yielding (§7.3 R3, scheduled for M8) | Fixed for M5 by the 1 GiB call cap (§10.1, item 5); M8 removes it with the yield. Mike to confirm the cap |
+| 3 | Medium | With on-demand `mmap`, running out ends the job on touch instead of returning `ENOMEM` | Follows Mike's Linux-style overcommit direction (§11); Mike to confirm for the SDK (§10.1) |
+| 4 | Medium | Small allocations still capped at 4 × 4 MiB | Fixed: arenas sized from the budget, scalable bitmaps (item 10) |
+| 5 | Medium | `munmap` returned memory only when the whole object went | Fixed: release on unmap for handle-less on-demand objects (item 4); `ENOMEM` for split exhaustion (item 11) |
+| 6 | Medium | Jobs together could starve the residents | Fixed: a reserve and a jobs parent group holding all jobs to free − reserve (§10.1, item 7). Mike to confirm the change to his rule |
+| 7 | Low | Saturating to `u32::MAX` means unlimited | Fixed (item 7) |
+| 8 | Low | Init's failure behaviour unspecified | Fixed: logged fallback to 16 MiB, never no cap (item 7) |
+| 9 | Low | No tool measures the stack | Fixed: stack-size artifact check (item 2) |
+| 10 | Low | Lock order, the "same truth" claim, the phase and the topic name were wrong | Fixed (item 1) |
+| 11 | Low | `MAPPING_PEAK` overstated; `BOOTFS_ENTRY_PEAK` omitted | Fixed (item 3) |
+| 12 | Low | The probes could not prove what the §9 ledger needs, and missed the cap, `munmap` usage, slot exhaustion, over-budget and `status` | Fixed (items 12–16) |
+| 13 | Low | Large `MAP_FIXED` stayed eager | Fixed (item 9) |
+
+Risks it raised: re-zeroing never-touched arena pages (fixed, item 10); pages a failed syscall's fill-in committed stay charged until unmapped, as on Linux (Mike to accept); the registry scan per admission grows to 640 slots (already M8's, §9); 64 slots in every region's static storage (kept: per-region sizing is not worth a separate pool now); whether init needs another MemoryObject to read the config (step 2 measures it and adjusts the baseline ledger if so).
 
 ## 11. M9 direction (Mike, 2026-11-13)
 
