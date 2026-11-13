@@ -68,8 +68,58 @@ struct Fixture {
     objects: MemoryObjectAuthority<1, 4>,
     owner: InternalRef,
     region: AddressRegion<2>,
-    _spaces: AddressSpaceAuthority<1, 1>,
+    spaces: AddressSpaceAuthority<2, 2>,
     target: FakeTarget,
+    /// A second Process's root, candidates and region, swapped in by
+    /// [`Fixture::swap_process`].
+    other: Option<(
+        TableIdentity,
+        PageTableRoot,
+        [Option<TableCandidateGrant>; 3],
+        AddressRegion<2>,
+    )>,
+}
+
+/// A committed PML4 for a new table owner, and one candidate per level.
+#[allow(
+    unsafe_code,
+    reason = "the host model attests synthetic frame zeroing and root ownership"
+)]
+fn new_root(
+    roles: &mut FrameRoleManager<4, 64>,
+) -> (
+    TableIdentity,
+    PageTableRoot,
+    [Option<TableCandidateGrant>; 3],
+) {
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let owner = roles.create_table_owner().unwrap();
+    let allocation = roles.allocate(1).unwrap();
+    // SAFETY: an unused synthetic allocation is zero by construction.
+    let root = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    // SAFETY: `root` is the committed PML4 this model owns exclusively.
+    let page_tables = unsafe {
+        PageTableRoot::from_owned_root(
+            root.physical_start(),
+            PagingCapabilities {
+                physical_limit: limit,
+            },
+        )
+    }
+    .unwrap();
+    let mut candidates: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
+    for (slot, level) in [TableLevel::Pdpt, TableLevel::Pd, TableLevel::Pt]
+        .into_iter()
+        .enumerate()
+    {
+        let allocation = roles.allocate(1).unwrap();
+        // SAFETY: as for the root.
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
+    }
+    (root, page_tables, candidates)
 }
 
 impl Fixture {
@@ -80,35 +130,9 @@ impl Fixture {
         reason = "the host model attests synthetic frame zeroing and root ownership"
     )]
     fn new() -> Self {
-        let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
         let mut roles = synthetic_frame_role_manager::<4, 64>(0x1000, 32);
         roles.set_index_memory(Box::leak(Box::<Model>::default()));
-        let owner = roles.create_table_owner().unwrap();
-        let allocation = roles.allocate(1).unwrap();
-        // SAFETY: an unused synthetic allocation is zero by construction.
-        let root = unsafe { roles.assume_zeroed(allocation) }.unwrap();
-        let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
-        let root = roles.commit_table(root, None).unwrap();
-        // SAFETY: `root` is the committed PML4 this model owns exclusively.
-        let page_tables = unsafe {
-            PageTableRoot::from_owned_root(
-                root.physical_start(),
-                PagingCapabilities {
-                    physical_limit: limit,
-                },
-            )
-        }
-        .unwrap();
-        let mut candidates: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
-        for (slot, level) in [TableLevel::Pdpt, TableLevel::Pd, TableLevel::Pt]
-            .into_iter()
-            .enumerate()
-        {
-            let allocation = roles.allocate(1).unwrap();
-            // SAFETY: as for the root.
-            let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
-            candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
-        }
+        let (root, page_tables, candidates) = new_root(&mut roles);
         let grant = roles.allocate_on_demand_backing(PAGES).unwrap();
         let backing = grant.identity();
         let mut registry = ObjectRegistry::<1>::new();
@@ -125,7 +149,7 @@ impl Fixture {
             .unwrap();
         let owner = registry.creation_into_internal(creation).unwrap();
         // SAFETY: this model creates the only address-space authority it uses.
-        let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+        let mut spaces = unsafe { AddressSpaceAuthority::<2, 2>::new() };
         let address_space = spaces.create_address_space().unwrap();
         let region = spaces
             .create_region::<2>(address_space, START, 2 * SPAN)
@@ -140,12 +164,38 @@ impl Fixture {
             objects,
             owner,
             region,
-            _spaces: spaces,
+            spaces,
             target: FakeTarget::default(),
+            other: None,
         };
         fixture.map(START).unwrap();
         fixture.map(ALIAS).unwrap();
         fixture
+    }
+
+    /// Gives a second Process its own root and maps the same object at
+    /// `START` and `ALIAS` there too; it is reached by swapping it in.
+    fn add_process(&mut self) {
+        let (root, page_tables, candidates) = new_root(&mut self.roles);
+        let address_space = self.spaces.create_address_space().unwrap();
+        let region = self
+            .spaces
+            .create_region::<2>(address_space, START, 2 * SPAN)
+            .unwrap();
+        self.other = Some((root, page_tables, candidates, region));
+        self.swap_process();
+        self.map(START).unwrap();
+        self.map(ALIAS).unwrap();
+        self.swap_process();
+    }
+
+    /// Makes the other Process's root and region the ones every helper uses.
+    fn swap_process(&mut self) {
+        let other = self.other.as_mut().expect("a second process");
+        core::mem::swap(&mut self.root, &mut other.0);
+        core::mem::swap(&mut self.page_tables, &mut other.1);
+        core::mem::swap(&mut self.candidates, &mut other.2);
+        core::mem::swap(&mut self.region, &mut other.3);
     }
 
     #[allow(
@@ -479,5 +529,127 @@ fn a_present_leaf_is_the_touch_only_if_it_grants_the_mapping() {
     );
     fixture.target.entries.insert(key, published);
     assert_eq!(fixture.touch(START), Ok(false));
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// §8.6 / §8.11: two Processes map one object. Tearing one down (teardown
+/// unmaps each mapping, as `unmap_inactive_userspace` does) removes only its
+/// own leaves; the other keeps its leaves and the object keeps its frames.
+#[test]
+fn tearing_down_one_process_leaves_the_others_leaves_and_the_frames() {
+    let mut fixture = Fixture::new();
+    fixture.add_process();
+    let shared = fixture.commit(0);
+    let mine = fixture.commit(1);
+    let theirs = fixture.commit(2);
+    // Page 0 touched in both; page 1 only here; page 2 only there.
+    fixture.touch(START).unwrap();
+    fixture.touch(ALIAS + BASE_PAGE_SIZE).unwrap();
+    fixture.swap_process();
+    fixture.touch(START).unwrap();
+    fixture.touch(START + 2 * BASE_PAGE_SIZE).unwrap();
+    fixture.swap_process();
+    assert_eq!(fixture.leaf(START + 2 * BASE_PAGE_SIZE), None);
+
+    let frames = fixture.roles.on_demand_frames(fixture.backing).unwrap();
+    // Teardown of this Process, mapping by mapping.
+    assert_eq!(fixture.change(START, SPAN, None), Ok(()));
+    assert_eq!(fixture.change(ALIAS, SPAN, None), Ok(()));
+    assert_eq!(fixture.leaf(START), None);
+    assert_eq!(fixture.leaf(ALIAS + BASE_PAGE_SIZE), None);
+    assert_eq!(fixture.objects.active_lease_count(), 2);
+    assert_eq!(fixture.roles.on_demand_frames(fixture.backing), Ok(frames));
+
+    fixture.swap_process();
+    assert_eq!(fixture.leaf(START), Some((shared, true)));
+    assert_eq!(
+        fixture.leaf(START + 2 * BASE_PAGE_SIZE),
+        Some((theirs, true))
+    );
+    // A page the torn-down Process touched is committed, not mapped, here.
+    assert_eq!(fixture.leaf(START + BASE_PAGE_SIZE), None);
+    assert_eq!(fixture.touch(START + BASE_PAGE_SIZE), Ok(true));
+    assert_eq!(fixture.leaf(START + BASE_PAGE_SIZE), Some((mine, true)));
+    assert_eq!(fixture.change(START, 2 * SPAN, None), Ok(()));
+    assert_eq!(fixture.leaf(START), None);
+    assert_eq!(fixture.objects.active_lease_count(), 0);
+    assert_eq!(fixture.roles.on_demand_frames(fixture.backing), Ok(frames));
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// Touches every page at `START` and page 1 at `ALIAS`: five present
+/// leaves, more than one batch's four, so a change over both mappings
+/// publishes in two batches. Returns the four frames.
+fn touch_two_batches(fixture: &mut Fixture) -> [u64; 4] {
+    let frames = [0, 1, 2, 3].map(|page| fixture.commit(page));
+    for page in 0..PAGES {
+        fixture.touch(START + page * BASE_PAGE_SIZE).unwrap();
+    }
+    fixture.touch(ALIAS + BASE_PAGE_SIZE).unwrap();
+    frames
+}
+
+/// §8.6 / §8.11: an unmap over both mappings whose second batch fails is
+/// undone. The undo publishes no on-demand leaf (§8.6), so the pages of the
+/// undone batch are mapped again but absent until touched again; the failed
+/// batch changed nothing. No frame is lost either way.
+#[test]
+fn an_undone_unmap_of_two_mappings_leaves_touched_pages_to_be_touched_again() {
+    let mut fixture = Fixture::new();
+    let frames = touch_two_batches(&mut fixture);
+    let committed = fixture.roles.on_demand_frames(fixture.backing).unwrap();
+    fixture.target.fail_apply_at = Some(fixture.target.apply_count + 2);
+    assert!(fixture.change(START, 2 * SPAN, None).is_err());
+    fixture.target.fail_apply_at = None;
+    assert_eq!(fixture.region.mappings().iter().flatten().count(), 2);
+    assert_eq!(fixture.objects.active_lease_count(), 2);
+    assert_eq!(
+        fixture.leaf(ALIAS + BASE_PAGE_SIZE),
+        Some((frames[1], true))
+    );
+    for page in 0..PAGES {
+        let address = START + page * BASE_PAGE_SIZE;
+        assert_eq!(fixture.leaf(address), None);
+        assert_eq!(fixture.touch(address), Ok(true));
+        assert_eq!(fixture.leaf(address), Some((frames[page as usize], true)));
+    }
+    assert_eq!(
+        fixture.roles.on_demand_frames(fixture.backing),
+        Ok(committed)
+    );
+    assert_eq!(fixture.change(START, 2 * SPAN, None), Ok(()));
+    assert_eq!(fixture.objects.active_lease_count(), 0);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// §8.6 / §8.11: a protect over both mappings whose second batch fails is
+/// undone: the first batch's present leaves get their write back, the
+/// failed batch's never lost it, and absent pages stay absent.
+#[test]
+fn an_undone_protect_of_two_mappings_restores_present_leaves() {
+    let mut fixture = Fixture::new();
+    let frames = touch_two_batches(&mut fixture);
+    fixture.target.fail_apply_at = Some(fixture.target.apply_count + 2);
+    assert!(
+        fixture
+            .change(START, 2 * SPAN, Some(Protection::READ))
+            .is_err()
+    );
+    fixture.target.fail_apply_at = None;
+    for page in 0..PAGES {
+        assert_eq!(
+            fixture.leaf(START + page * BASE_PAGE_SIZE),
+            Some((frames[page as usize], true))
+        );
+    }
+    assert_eq!(
+        fixture.leaf(ALIAS + BASE_PAGE_SIZE),
+        Some((frames[1], true))
+    );
+    assert_eq!(fixture.leaf(ALIAS), None);
+    // A touch after the undo takes the restored protection.
+    assert_eq!(fixture.touch(ALIAS), Ok(true));
+    assert_eq!(fixture.leaf(ALIAS), Some((frames[0], true)));
+    assert_eq!(fixture.change(START, 2 * SPAN, None), Ok(()));
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }

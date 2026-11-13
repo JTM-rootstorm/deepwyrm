@@ -281,3 +281,38 @@ fn an_on_demand_backing_needs_its_memory_access() {
     assert!(roles.allocate_on_demand_backing(1).is_err());
     assert_eq!(roles.available_frames(), 4);
 }
+
+/// §8.11 R1: a commit step admits a range's cost once, so that cost must be
+/// exactly what committing its pages in order takes, each missing node
+/// counted once though several pages share it.
+#[test]
+fn a_range_costs_what_committing_its_pages_in_order_takes() {
+    let (mut roles, _) = manager(64);
+    let grant = roles.allocate_on_demand_backing(INDEX_MAX_PAGES).unwrap();
+    let backing = grant.identity();
+    roles.commit_on_demand_page(backing, 5).unwrap();
+    // Within one leaf around a committed page; across a leaf node's edge;
+    // across a height-2 node's edge; an empty range; all committed.
+    for (first, count) in [(0, 10), (509, 6), ((1 << 18) - 2, 4), (100, 0), (2, 6)] {
+        let cost = roles
+            .on_demand_commit_range_cost(backing, first, count)
+            .unwrap();
+        let before = roles.available_frames();
+        let taken: u64 = (first..first + count)
+            .map(|page| roles.commit_on_demand_page(backing, page).unwrap().frames)
+            .sum();
+        assert_eq!(cost, taken, "pages {first}..+{count}");
+        assert_eq!(roles.available_frames(), before - taken);
+    }
+    // A prefix costs its own share only: under the existing height-3 node,
+    // a new height-2 node and leaf, then the pages.
+    assert_eq!(
+        roles.on_demand_commit_range_cost(backing, 1 << 20, 3),
+        Ok(3 + 2)
+    );
+    assert_eq!(
+        roles.on_demand_commit_range_cost(backing, 1 << 20, 1),
+        Ok(1 + 2)
+    );
+    roles.check_invariants().unwrap();
+}

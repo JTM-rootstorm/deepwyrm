@@ -75,6 +75,19 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.session.roles.on_demand_commit_cost(backing, page)
     }
 
+    /// Frames committing `count` pages of the on-demand `backing` from
+    /// `first` would take, nodes shared between them counted once.
+    pub(crate) fn on_demand_commit_range_cost(
+        &self,
+        backing: crate::memory::frame_roles::BackingIdentity,
+        first: u64,
+        count: u64,
+    ) -> Result<u64, crate::memory::frame_roles::FrameRoleError> {
+        self.session
+            .roles
+            .on_demand_commit_range_cost(backing, first, count)
+    }
+
     /// Gives object page `page` of the on-demand `backing` a zeroed frame.
     pub(crate) fn commit_on_demand_page(
         &mut self,

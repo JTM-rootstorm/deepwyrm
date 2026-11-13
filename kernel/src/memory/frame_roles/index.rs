@@ -307,6 +307,48 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(u64::from(deepest.level) + 1)
     }
 
+    /// Frames committing every page of `[first, first + count)` one after
+    /// another would take: each absent page, and each node missing on their
+    /// paths counted once, though several pages need it. A commit step
+    /// admits this once instead of each page against the registry.
+    pub(crate) fn on_demand_commit_range_cost(
+        &self,
+        backing: BackingIdentity,
+        first: u64,
+        count: u64,
+    ) -> Result<u64, FrameRoleError> {
+        let end = first
+            .checked_add(count)
+            .ok_or(FrameRoleError::InvariantViolation)?;
+        // The node last counted at each height (1 = a leaf node): the pages
+        // run in order, so a node a page shares is the one counted last.
+        let mut counted: [Option<u64>; INDEX_MAX_COMMIT_FRAMES] = [None; INDEX_MAX_COMMIT_FRAMES];
+        let mut total = 0_u64;
+        for page in first..end {
+            let (steps, found) = self.index_walk(backing.0, page)?;
+            if found.is_some() {
+                continue;
+            }
+            let deepest = steps
+                .iter()
+                .flatten()
+                .last()
+                .ok_or(FrameRoleError::InvariantViolation)?;
+            total += 1;
+            // The deepest existing node is at height `level + 1`; nodes of
+            // heights 1..=level are missing.
+            for height in 1..=u32::from(deepest.level) {
+                let key = page >> (9 * height);
+                let slot = &mut counted[height as usize];
+                if *slot != Some(key) {
+                    *slot = Some(key);
+                    total += 1;
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Gives object page `page` of an on-demand backing a zeroed frame,
     /// with any nodes on its path. Either every frame is taken, zeroed and
     /// linked, or nothing changes. A page already committed is returned as

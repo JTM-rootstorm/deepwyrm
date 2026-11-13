@@ -613,6 +613,9 @@ type MapStep = crate::syscall::MapStep<MemoryProtection>;
 /// The largest step of a family-G call made in steps (DW2 M4b): one
 /// journal batch, so a step holds the global locks for one batch.
 const FAMILY_G_STEP_BYTES: u64 = PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE;
+/// One hold of an on-demand commit (DW2 M6 §8.2, §8.11 R1): it zeroes every
+/// frame it takes, so it is kept well below a family-G step.
+const ON_DEMAND_COMMIT_STEP_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The first hold of a family-G syscall (D1 option B3).
 #[must_use = "a family-G syscall leaves through ready_to_return, now or after its acknowledgement"]
@@ -2067,7 +2070,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// `memory_object_commit` (DW2 M6 §8.2): commits the range a step of at
-    /// most 16 MiB per hold of T and P, with a safe point between steps.
+    /// most 2 MiB per hold of T and P, with a safe point between steps.
     /// Each step resolves the handle again. A failure returns at once; the
     /// pages committed before it stay committed and charged.
     fn handle_memory_object_commit(
@@ -9097,10 +9100,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
-    /// One hold of `memory_object_commit`: commits pages from `*next` up to
-    /// one step's end, each admitted against the object's creator in this
-    /// hold and charged to its weight once committed (DW2 M6 §8.4).
-    /// `Ok(true)` when the whole range is done.
+    /// One hold of `memory_object_commit` (and of `dma_map`'s fill-in):
+    /// commits the pages from `*next` up to one commit step's end. The
+    /// step's cost is admitted against the object's creator in this hold,
+    /// all at once or, past the quota, the longest start of it that fits;
+    /// the frames taken are charged to its weight (DW2 M6 §8.4). A step is
+    /// at most 2 MiB, so a hold zeroes at most that and scans the registry
+    /// at most ten times, not once a page (§8.11 R1). `Ok(true)` when the
+    /// whole range is done.
     fn commit_on_demand_step(
         &mut self,
         memory_object: deepwyrm_abi::DwHandle,
@@ -9123,45 +9130,70 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         else {
             return Ok(true);
         };
-        // The target checked the range lies in the object.
+        // The target checked the range lies in the object and is aligned.
+        let page_size = u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
         let end = offset + byte_len;
-        let step_end = end.min(next.saturating_add(FAMILY_G_STEP_BYTES));
+        let step_end = end.min(next.saturating_add(ON_DEMAND_COMMIT_STEP_BYTES));
+        let first = *next / page_size;
+        let count = (step_end - *next) / page_size;
         let mut paging = self.paging.lock();
         let mut session = paging.page_table_mutation_session(
             self.own.active_root.as_ref().expect("active root"),
             process,
         );
-        while *next < step_end {
-            let page = *next / u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
+        let registry = &self.core.registry;
+        let tasks = &self.core.tasks;
+        let admit = |pages: u64| -> Result<u64, deepwyrm_abi::DwStatus> {
             let cost = session
-                .on_demand_commit_cost(backing, page)
+                .on_demand_commit_range_cost(backing, first, pages)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
             if cost != 0 {
-                crate::syscall::admit_charged_pages(
-                    &self.core.registry,
-                    &self.core.tasks,
-                    object,
-                    cost,
-                )?;
-                let commit = session
-                    .commit_on_demand_page(backing, page)
-                    .map_err(|error| match error {
+                crate::syscall::admit_charged_pages(registry, tasks, object, cost)?;
+            }
+            Ok(cost)
+        };
+        // The whole step, or else the longest start of it the quota admits,
+        // so a commit still fills the quota exactly: at most ten admissions.
+        let (admitted, cost, mut result) = match admit(count) {
+            Ok(cost) => (count, cost, Ok(())),
+            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
+                let (mut fits, mut fits_cost, mut refused) = (0, 0, count);
+                while refused - fits > 1 {
+                    let middle = fits + (refused - fits) / 2;
+                    match admit(middle) {
+                        Ok(cost) => (fits, fits_cost) = (middle, cost),
+                        Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => refused = middle,
+                        Err(status) => return Err(status),
+                    }
+                }
+                (fits, fits_cost, Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+            }
+            Err(status) => return Err(status),
+        };
+        let mut frames = 0;
+        for page in first..first + admitted {
+            match session.commit_on_demand_page(backing, page) {
+                Ok(commit) => frames += commit.frames,
+                Err(error) => {
+                    result = Err(match error {
                         crate::memory::frame_roles::FrameRoleError::Physical(_)
                         | crate::memory::frame_roles::FrameRoleError::Capacity
                         | crate::memory::frame_roles::FrameRoleError::InitializationFailed => {
                             deepwyrm_abi::DW_STATUS_NO_MEMORY
                         }
                         _ => DW_STATUS_BAD_STATE,
-                    })?;
-                crate::syscall::record_charged_pages(
-                    &mut self.core.registry,
-                    object,
-                    commit.frames,
-                );
+                    });
+                    break;
+                }
             }
-            *next += u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
+            *next += page_size;
         }
-        Ok(*next >= end)
+        // What was taken stays committed and charged, even after a failure.
+        debug_assert!(frames <= cost, "a commit step took more than it admitted");
+        if frames != 0 {
+            crate::syscall::record_charged_pages(&mut self.core.registry, object, frames);
+        }
+        result.map(|()| *next >= end)
     }
 
     fn map_memory(
