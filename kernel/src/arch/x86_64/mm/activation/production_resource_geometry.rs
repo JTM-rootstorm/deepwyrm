@@ -120,7 +120,7 @@ const JOB_OWN_WAITS: usize = 4;
 /// The MemoryObjects one job may create itself, for `mmap` (root
 /// `TOOLCHAIN_POSIX_LAYER_DESIGN.md` W9). Their RAM is bounded separately by
 /// the job's MEMORY_PAGES limit (D6), which no pool here counts.
-const JOB_OWN_MEMORY_OBJECTS: usize = 4;
+const JOB_OWN_MEMORY_OBJECTS: usize = 64;
 /// The Channel pairs one job may create itself: one for sleeping and one per
 /// file it holds open through vfsd (W9). The server end moves to vfsd but
 /// stays charged to the job.
@@ -128,8 +128,9 @@ const JOB_OWN_CHANNEL_PAIRS: usize = 5;
 /// The mapping leases one job can hold. Its TaskGroup limits leave it one
 /// Process, which has one root region of `REGION_SLOTS` mapping slots, and
 /// it may map an object it holds into every slot. The lease pool is sized for
-/// that, not for its image alone, so jobs cannot drain it.
-pub(super) const JOB_REGION_MAPPINGS: usize = 10;
+/// that, not for its image alone, so jobs cannot drain it. DW2 M5 raised
+/// both to 64; `primordial.rs` asserts the two are equal.
+pub(super) const JOB_REGION_MAPPINGS: usize = 64;
 /// Init holds each live job's Process, TaskGroup and launch Channel.
 const JOB_HELD_HANDLES: usize = 3;
 
@@ -171,8 +172,12 @@ pub(super) const MEMORY_PEAK: usize = BASELINE_MEMORY
     + REPLACEMENT_GENERATIONS * RESIDENT_IMAGE_OBJECTS
     + LIVE_SHELL_JOBS * (JOB_IMAGE_OBJECTS + JOB_OWN_MEMORY_OBJECTS)
     + 1; // Loader scratch view, open until the child mapping is installed.
-pub(super) const MAPPING_PEAK: usize =
-    MEMORY_PEAK + LIVE_SHELL_JOBS * (JOB_REGION_MAPPINGS - JOB_IMAGE_OBJECTS);
+/// Every object outside the jobs holds one lease; a job holds at most one
+/// per mapping slot of its one region, however many objects it has (DW2 M5
+/// design review, finding 11).
+pub(super) const MAPPING_PEAK: usize = MEMORY_PEAK
+    - LIVE_SHELL_JOBS * (JOB_IMAGE_OBJECTS + JOB_OWN_MEMORY_OBJECTS)
+    + LIVE_SHELL_JOBS * JOB_REGION_MAPPINGS;
 
 /// Selector 33's baseline for this identical resident set: primordial->init,
 /// init's five role startups, the service pairs to registryd, devmgr's
@@ -295,10 +300,10 @@ pub(super) struct Capacity {
 /// an edit to this ledger rather than a product that silently stops booting.
 pub(super) const SELECTED: Capacity = Capacity {
     handles: 96,
-    memory: 96,
-    mappings: 128,
+    memory: 384,
+    mappings: 320,
     identities: 32,
-    registry: 384,
+    registry: 640,
     channel_pairs: 96,
     waits: 160,
     evidence: 0,
@@ -356,7 +361,7 @@ mod tests {
         // figure.
         assert_eq!(SELECTED.identities, 32);
         assert_eq!(SELECTED.handles, 96);
-        assert_eq!(SELECTED.registry, 384);
+        assert_eq!(SELECTED.registry, 640);
         // Production links the ordinary arena. Only the E8 and F-closure
         // fairness builds link sixty-four stacks (`kernel_stack.rs`), and this
         // module is compiled into their host tests too.
@@ -372,15 +377,15 @@ mod tests {
         assert_eq!(RESIDENT_IMAGES, 13);
         assert_eq!(STORAGE_MEMORY, 9);
         assert_eq!(BASELINE_MEMORY, 49);
-        assert_eq!(MEMORY_PEAK, 81);
-        assert_eq!(MAPPING_PEAK, 109);
+        assert_eq!(MEMORY_PEAK, 321);
+        assert_eq!(MAPPING_PEAK, 309);
         assert_eq!(LIVE_PROCESSES, 18);
         assert_eq!(LIVE_TASK_GROUPS, 21);
         assert_eq!(LIVE_IDENTITY_PEAK, 21);
         assert_eq!(STORAGE_CHANNEL_PAIRS, 32);
         assert_eq!(CHANNEL_PAIR_PEAK, 92);
         assert_eq!(CHANNEL_ENDPOINT_PEAK, 184);
-        assert_eq!(REGISTRY_PEAK, 346);
+        assert_eq!(REGISTRY_PEAK, 586);
         assert_eq!(INTERACTIVE_GRAPH_WAITS, 39);
         assert_eq!(STORAGE_WAITS, 55);
         assert_eq!(WAIT_PEAK, 144);

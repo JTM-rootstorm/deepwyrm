@@ -107,7 +107,8 @@ const HANDLES: usize = super::production_resource_geometry::SELECTED.handles;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
-const REGION_SLOTS: usize = 10;
+/// DW2 M5: 64 mapping slots per region (plan §10.2 item 2).
+const REGION_SLOTS: usize = 64;
 const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // WYR1-F production is selected explicitly for the same reason selectors 33
 // and 34 are: the freestanding product must not inherit the bootstrap-era DW0
@@ -117,6 +118,7 @@ const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 const _: () = {
     use super::production_resource_geometry::{Capacity, SELECTED, fits};
     assert!(HANDLES == SELECTED.handles);
+    assert!(REGION_SLOTS == super::production_resource_geometry::JOB_REGION_MAPPINGS);
     assert!(MEMORY_OBJECTS == SELECTED.memory);
     assert!(MEMORY_LEASES == SELECTED.mappings);
     assert!(PROCESSES == SELECTED.identities);
