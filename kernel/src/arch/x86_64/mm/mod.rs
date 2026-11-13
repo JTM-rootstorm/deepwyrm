@@ -49,6 +49,8 @@ pub(crate) use journal::{
     AtomicPageTableTarget, JournalStorage, X86AddressSpacePublishError, X86AddressSpacePublisher,
     table_candidates_for,
 };
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use journal::{PinTrackedError, PinTrackedTarget};
 #[allow(
     unused_imports,
     reason = "the one-shot C1 claim is wired by the later bootstrap integration"

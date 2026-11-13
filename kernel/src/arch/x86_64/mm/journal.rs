@@ -22,8 +22,13 @@ use crate::memory::frame_roles::{
     TableCandidateGrant, TableCommitParent, TableIdentity, TableLevel,
 };
 
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+#[path = "journal/pin_tracked.rs"]
+mod pin_tracked;
 #[path = "journal/publisher.rs"]
 mod publisher;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use pin_tracked::{PinTrackedError, PinTrackedTarget};
 
 use crate::memory::physical::BASE_PAGE_SIZE;
 pub(crate) use publisher::{X86AddressSpacePublishError, X86AddressSpacePublisher};

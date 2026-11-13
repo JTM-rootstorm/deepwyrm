@@ -490,11 +490,9 @@ pub(crate) enum LiveUserAccessError {
     Pin(UserPinError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LiveTrackedTargetError {
-    Target(LiveActiveTargetError),
-    Pin(UserPinError),
-}
+/// The live target's errors: the scratch target's, or a pin conflict.
+pub(crate) type LiveTrackedTargetError =
+    crate::arch::x86_64::mm::PinTrackedError<LiveActiveTargetError>;
 
 #[derive(Clone, Copy)]
 struct LiveUserWalk {
@@ -510,102 +508,11 @@ struct LiveUserWalk {
 /// Actual page-table writes reserve the exact invalidation span before the
 /// underlying atomic batch begins. New user pins and mapping mutations thus
 /// exclude one another without holding the tracker spin lock across publication.
-pub(crate) struct TrackedActiveTarget<'a> {
-    pub(super) scratch: ActiveScratchTarget<LiveActiveScratchIo>,
-    pub(super) pins: &'a UserPinTracker<E5_USER_PIN_CAPACITY>,
-    pub(super) address_space: crate::memory::address_region::AddressSpaceKey,
-    /// The span a batched publication holds against pins (DW2 M4), as
-    /// `[start, end)` with its permit.
-    pub(super) span: Option<(
-        u64,
-        u64,
-        crate::memory::usercopy::UserMutationPermit<'a, E5_USER_PIN_CAPACITY>,
-    )>,
-}
-
-impl super::journal_target_seal::Sealed for TrackedActiveTarget<'_> {}
-
-#[allow(
-    unsafe_code,
-    reason = "the wrapper preserves the sealed live target's atomicity while adding range reservation before every write batch"
-)]
-unsafe impl AtomicPageTableTarget for TrackedActiveTarget<'_> {
-    type Error = LiveTrackedTargetError;
-
-    fn read_entry(&mut self, table: FrameAddress, index: usize) -> Result<u64, Self::Error> {
-        self.scratch
-            .read_entry(table, index)
-            .map_err(LiveTrackedTargetError::Target)
-    }
-
-    fn apply(
-        &mut self,
-        writes: &[JournalWrite],
-        invalidations: &[VirtualPage],
-    ) -> Result<(), Self::Error> {
-        let permit = if invalidations.is_empty() {
-            None
-        } else if let Some((span_start, span_end, _)) = &self.span {
-            // The held span already excludes pins; the batch must lie in it.
-            if invalidations
-                .iter()
-                .any(|page| page.address() < *span_start || page.address() >= *span_end)
-            {
-                return Err(LiveTrackedTargetError::Pin(
-                    UserPinError::InvalidMutationRange,
-                ));
-            }
-            None
-        } else {
-            let mut start = u64::MAX;
-            let mut end = 0_u64;
-            for page in invalidations {
-                start = start.min(page.address());
-                end = end.max(page.address().checked_add(PAGE_SIZE).ok_or(
-                    LiveTrackedTargetError::Pin(UserPinError::InvalidMutationRange),
-                )?);
-            }
-            Some(
-                self.pins
-                    .begin_mutation(self.address_space, start, end - start)
-                    .map_err(LiveTrackedTargetError::Pin)?,
-            )
-        };
-        let result = self
-            .scratch
-            .apply(writes, invalidations)
-            .map_err(LiveTrackedTargetError::Target);
-        drop(permit);
-        result
-    }
-
-    fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error> {
-        self.scratch
-            .zero_table_frame(frame)
-            .map_err(LiveTrackedTargetError::Target)
-    }
-
-    fn begin_mutation_span(&mut self, start: u64, byte_len: u64) -> Result<(), Self::Error> {
-        if self.span.is_some() {
-            return Err(LiveTrackedTargetError::Pin(UserPinError::Conflict));
-        }
-        let end = start
-            .checked_add(byte_len)
-            .ok_or(LiveTrackedTargetError::Pin(
-                UserPinError::InvalidMutationRange,
-            ))?;
-        let permit = self
-            .pins
-            .begin_mutation(self.address_space, start, byte_len)
-            .map_err(LiveTrackedTargetError::Pin)?;
-        self.span = Some((start, end, permit));
-        Ok(())
-    }
-
-    fn end_mutation_span(&mut self) {
-        self.span = None;
-    }
-}
+pub(crate) type TrackedActiveTarget<'a> = crate::arch::x86_64::mm::PinTrackedTarget<
+    'a,
+    ActiveScratchTarget<LiveActiveScratchIo>,
+    E5_USER_PIN_CAPACITY,
+>;
 
 /// E5 view of the sole active BSP address-space root.
 ///

@@ -1681,3 +1681,6 @@ mod batch;
 
 #[path = "on_demand_tests.rs"]
 mod on_demand_tests;
+
+#[path = "pin_tracked_tests.rs"]
+mod pin_tracked_tests;
