@@ -557,6 +557,8 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_OBJECT_INFO_BASIC_V1 ((uint32_t)(1))
 /* Typed object_get_info topic for process or thread termination state. */
 #define DW_OBJECT_INFO_TASK_STATE_V1 ((uint32_t)(65537))
+/* Typed object_get_info topic for a TaskGroup's MEMORY_PAGES limit, usage and headroom; free frames only on the root TaskGroup. */
+#define DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 ((uint32_t)(65538))
 /* Typed object_get_info topic for exact logical MemoryObject byte size. */
 #define DW_OBJECT_INFO_MEMORY_OBJECT_V1 ((uint32_t)(131073))
 /* Typed object_get_info topic for immutable DeviceResource identity and range metadata. */
@@ -1217,6 +1219,37 @@ DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, pio_base) == 32, "DwDeviceReso
 DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, pio_length) == 34, "DwDeviceResourceInfoV1.pio_length offset");
 DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, interrupt_source) == 36, "DwDeviceResourceInfoV1.interrupt_source offset");
 DW_STATIC_ASSERT(offsetof(DwDeviceResourceInfoV1, reserved) == 40, "DwDeviceResourceInfoV1.reserved offset");
+
+/* A TaskGroup's MEMORY_PAGES limit, its usage, the headroom left at and above it, and, on the root TaskGroup only, the free frame count. A snapshot: admission may still refuse. */
+typedef struct DwTaskGroupMemoryInfoV1 {
+    /* Byte size of this structure. */
+    uint32_t size;
+    /* Structure version; set to one. */
+    uint32_t version;
+    /* The group's own MEMORY_PAGES limit, or DW_TASK_GROUP_LIMIT_UNLIMITED. */
+    uint32_t limit;
+    /* Reserved; must be zero. */
+    uint32_t reserved0;
+    /* Pages charged to the group; zero for a group with no limit of any class, which no object's charge names. */
+    uint64_t usage;
+    /* The least MEMORY_PAGES limit minus usage over the limited groups at and above this one; all ones when none limits MEMORY_PAGES. */
+    uint64_t headroom;
+    /* Free physical frames, on the root TaskGroup only; zero on every other group. */
+    uint64_t free_pages;
+    /* Reserved; must be zero. */
+    uint64_t reserved;
+} DwTaskGroupMemoryInfoV1;
+#define DW_TASK_GROUP_MEMORY_INFO_V1_SIZE ((uint32_t)(48))
+DW_STATIC_ASSERT(sizeof(DwTaskGroupMemoryInfoV1) == 48, "DwTaskGroupMemoryInfoV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwTaskGroupMemoryInfoV1) == 8, "DwTaskGroupMemoryInfoV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, size) == 0, "DwTaskGroupMemoryInfoV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, version) == 4, "DwTaskGroupMemoryInfoV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, limit) == 8, "DwTaskGroupMemoryInfoV1.limit offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, reserved0) == 12, "DwTaskGroupMemoryInfoV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, usage) == 16, "DwTaskGroupMemoryInfoV1.usage offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, headroom) == 24, "DwTaskGroupMemoryInfoV1.headroom offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, free_pages) == 32, "DwTaskGroupMemoryInfoV1.free_pages offset");
+DW_STATIC_ASSERT(offsetof(DwTaskGroupMemoryInfoV1, reserved) == 40, "DwTaskGroupMemoryInfoV1.reserved offset");
 
 /* Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information. */
 typedef struct DwInterruptInfoV1 {

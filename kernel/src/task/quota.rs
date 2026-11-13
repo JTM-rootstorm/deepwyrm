@@ -45,6 +45,21 @@ pub(crate) enum QuotaError {
     Task,
 }
 
+/// A TaskGroup's memory budget as `DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1`
+/// reports it (DW2 M5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GroupMemoryBudget {
+    /// The group's own MEMORY_PAGES limit.
+    pub(crate) limit: u32,
+    /// Pages charged to the group.
+    pub(crate) usage: u64,
+    /// The least limit minus usage at and above the group; `u64::MAX` when
+    /// none limits MEMORY_PAGES.
+    pub(crate) headroom: u64,
+    /// Whether the group is the root TaskGroup.
+    pub(crate) root: bool,
+}
+
 /// Why `task_group_limit` refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LimitError {

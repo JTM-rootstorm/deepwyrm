@@ -965,6 +965,12 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(LiveUserAccessError::Pin)
     }
 
+    /// Free frames in the allocator now (DW2 M5's root TaskGroup memory
+    /// record). A snapshot under P: admission does not read it.
+    pub(crate) fn available_frames(&self) -> u64 {
+        self.roles.available_frames()
+    }
+
     /// Preflights a writable range and detaches its mapping-stability pin from
     /// this short address-space borrow so a blocked syscall may retain it.
     pub(crate) fn preflight_owned_output(

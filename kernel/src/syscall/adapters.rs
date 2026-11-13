@@ -1302,6 +1302,9 @@ pub(crate) const fn object_info_required_size(topic: u32) -> Option<u64> {
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => Some(DW_MEMORY_OBJECT_INFO_V1_SIZE as u64),
         DW_OBJECT_INFO_DEVICE_RESOURCE_V1 => Some(DW_DEVICE_RESOURCE_INFO_V1_SIZE as u64),
         DW_OBJECT_INFO_INTERRUPT_V1 => Some(DW_INTERRUPT_INFO_V1_SIZE as u64),
+        deepwyrm_abi::DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 => {
+            Some(deepwyrm_abi::DW_TASK_GROUP_MEMORY_INFO_V1_SIZE as u64)
+        }
         _ => None,
     }
 }

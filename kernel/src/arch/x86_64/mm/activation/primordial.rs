@@ -1217,9 +1217,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             .unwrap_or_else(|_| panic!("pinned info output discard drifted"));
                         status
                     }
-                    Ok(encoded) => crate::syscall::object_get_info_v1_copy_out(
-                        &mut user, required, &encoded, out_info, out_size,
-                    ),
+                    Ok(mut encoded) => {
+                        // DW2 M5: only the root TaskGroup's memory record
+                        // carries free frames, read here under P.
+                        if encoded.wants_free_pages() {
+                            encoded.fill_free_pages(user.available_frames());
+                        }
+                        crate::syscall::object_get_info_v1_copy_out(
+                            &mut user, required, &encoded, out_info, out_size,
+                        )
+                    }
                 }
             }
         };

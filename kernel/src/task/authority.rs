@@ -1579,6 +1579,40 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(())
     }
 
+    /// DW2 M5: `group`'s MEMORY_PAGES limit and usage, the least headroom
+    /// (limit minus usage) over the groups at and above it that limit
+    /// MEMORY_PAGES, and whether it is the root TaskGroup. `usage` is the
+    /// same count admission uses.
+    pub(crate) fn group_memory_budget(
+        &self,
+        group: ObjectId,
+        mut usage: impl FnMut(ObjectId) -> usize,
+    ) -> Result<quota::GroupMemoryBudget, TaskError> {
+        let slot = self.group_slot(TaskGroupKey(group))?;
+        let record = self.groups[slot].as_ref().expect("validated group slot");
+        let limit = record.limits[quota::MEMORY_PAGES_CLASS];
+        let root = record.parent.is_none();
+        let own_usage = u64::try_from(usage(group)).unwrap_or(u64::MAX);
+        let mut headroom = u64::MAX;
+        let mut current = Some(group);
+        while let Some(object) = current {
+            let slot = self.group_slot(TaskGroupKey(object))?;
+            let record = self.groups[slot].as_ref().expect("validated group slot");
+            let limit = record.limits[quota::MEMORY_PAGES_CLASS];
+            if limit != quota::UNLIMITED {
+                let used = u64::try_from(usage(object)).unwrap_or(u64::MAX);
+                headroom = headroom.min(u64::from(limit).saturating_sub(used));
+            }
+            current = record.parent.as_ref().map(InternalRef::id);
+        }
+        Ok(quota::GroupMemoryBudget {
+            limit,
+            usage: own_usage,
+            headroom,
+            root,
+        })
+    }
+
     /// Lowers one class's limit. Raising, or an unknown class, is refused.
     pub(crate) fn lower_group_limit(
         &mut self,

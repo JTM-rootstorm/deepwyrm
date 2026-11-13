@@ -5,13 +5,14 @@
 
 use deepwyrm_abi::{
     DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
-    DW_OBJECT_INFO_INTERRUPT_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_STATE_V1,
+    DW_OBJECT_INFO_INTERRUPT_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1,
+    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_TYPE_TASK_GROUP, DW_TASK_GROUP_MEMORY_INFO_V1_SIZE,
     DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_INTERRUPT,
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT,
     DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT,
     DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_WRONG_OBJECT_TYPE,
     DwDeviceResourceInfoV1, DwHandle, DwInterruptInfoV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
-    DwRights, DwStatus, DwTaskTerminationInfoV1,
+    DwRights, DwStatus, DwTaskGroupMemoryInfoV1, DwTaskTerminationInfoV1,
 };
 
 use crate::device::{DeviceResourceInfoProvider, InterruptInfoProvider};
@@ -27,6 +28,12 @@ pub(crate) enum ObjectInfoResult {
     MemoryObject(DwMemoryObjectInfoV1),
     DeviceResource(DwDeviceResourceInfoV1),
     Interrupt(DwInterruptInfoV1),
+    /// DW2 M5. `root` asks the caller to fill `free_pages` from the frame
+    /// allocator, which this service cannot reach (it is P's, not T's).
+    TaskGroupMemory {
+        info: DwTaskGroupMemoryInfoV1,
+        root: bool,
+    },
 }
 
 pub(crate) fn handle_close<const HANDLES: usize, const OBJECTS: usize>(
@@ -68,7 +75,7 @@ pub(crate) fn object_get_info_v1<
         None,
         handle,
         topic,
-        task_state_reserved,
+        task_info_reserved,
     )
 }
 
@@ -96,7 +103,7 @@ pub(crate) fn object_get_info_v1_with_tasks<
         None,
         handle,
         topic,
-        |resolved| task_state_info(tasks, resolved),
+        |topic, resolved, registry| task_info(tasks, topic, resolved, registry),
     )
 }
 
@@ -125,7 +132,7 @@ pub(crate) fn object_get_info_v1_with_tasks_and_devices<
         None,
         handle,
         topic,
-        |resolved| task_state_info(tasks, resolved),
+        |topic, resolved, registry| task_info(tasks, topic, resolved, registry),
     )
 }
 
@@ -159,7 +166,7 @@ pub(crate) fn object_get_info_v1_with_tasks_and_device_objects<
         Some(interrupts),
         handle,
         topic,
-        |resolved| task_state_info(tasks, resolved),
+        |topic, resolved, registry| task_info(tasks, topic, resolved, registry),
     )
 }
 
@@ -184,7 +191,7 @@ fn object_get_info_v1_impl<
     task_state: F,
 ) -> Result<ObjectInfoResult, DwStatus>
 where
-    F: FnOnce(&ResolvedHandle) -> Result<ObjectInfoResult, DwStatus>,
+    F: FnOnce(u32, &ResolvedHandle, &ObjectRegistry<OBJECTS>) -> Result<ObjectInfoResult, DwStatus>,
 {
     let resolved = table
         .lookup(registry, handle, AcceptedObjectTypes::Any, DW_RIGHT_INSPECT)
@@ -195,7 +202,9 @@ where
         DW_OBJECT_INFO_MEMORY_OBJECT_V1 => memory_info(memory, &resolved),
         DW_OBJECT_INFO_DEVICE_RESOURCE_V1 => device_resource_info(devices, &resolved),
         DW_OBJECT_INFO_INTERRUPT_V1 => interrupt_info(interrupts, &resolved),
-        DW_OBJECT_INFO_TASK_STATE_V1 => task_state(&resolved),
+        DW_OBJECT_INFO_TASK_STATE_V1 | DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 => {
+            task_state(topic, &resolved, registry)
+        }
         _ => Err(DW_STATUS_NOT_SUPPORTED),
     };
 
@@ -297,11 +306,73 @@ fn task_state_info<
     Ok(ObjectInfoResult::TaskState(info))
 }
 
-fn task_state_reserved(resolved: &ResolvedHandle) -> Result<ObjectInfoResult, DwStatus> {
-    if !matches!(
-        resolved.object_type(),
-        DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD
-    ) {
+fn task_info<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    topic: u32,
+    resolved: &ResolvedHandle,
+    registry: &ObjectRegistry<OBJECTS>,
+) -> Result<ObjectInfoResult, DwStatus> {
+    if topic == DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 {
+        task_group_memory_info(tasks, resolved, registry)
+    } else {
+        task_state_info(tasks, resolved)
+    }
+}
+
+/// DW2 M5's budget record: the group's MEMORY_PAGES limit and usage as
+/// admission counts them, and the least headroom at and above it.
+fn task_group_memory_info<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    resolved: &ResolvedHandle,
+    registry: &ObjectRegistry<OBJECTS>,
+) -> Result<ObjectInfoResult, DwStatus> {
+    if resolved.object_type() != DW_OBJECT_TYPE_TASK_GROUP {
+        return Err(DW_STATUS_WRONG_OBJECT_TYPE);
+    }
+    let budget = tasks
+        .group_memory_budget(resolved.object_id(), |group| registry.charged_pages(group))
+        .unwrap_or_else(|error| panic!("live TaskGroup handle lost its task payload: {error:?}"));
+    Ok(ObjectInfoResult::TaskGroupMemory {
+        info: DwTaskGroupMemoryInfoV1 {
+            size: DW_TASK_GROUP_MEMORY_INFO_V1_SIZE,
+            version: 1,
+            limit: budget.limit,
+            reserved0: 0,
+            usage: budget.usage,
+            headroom: budget.headroom,
+            free_pages: 0,
+            reserved: 0,
+        },
+        root: budget.root,
+    })
+}
+
+fn task_info_reserved<const OBJECTS: usize>(
+    topic: u32,
+    resolved: &ResolvedHandle,
+    _registry: &ObjectRegistry<OBJECTS>,
+) -> Result<ObjectInfoResult, DwStatus> {
+    let accepted = if topic == DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 {
+        resolved.object_type() == DW_OBJECT_TYPE_TASK_GROUP
+    } else {
+        matches!(
+            resolved.object_type(),
+            DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD
+        )
+    };
+    if !accepted {
         return Err(DW_STATUS_WRONG_OBJECT_TYPE);
     }
     Err(DW_STATUS_NOT_SUPPORTED)

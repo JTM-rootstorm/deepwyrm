@@ -654,6 +654,9 @@ pub const DW_OBJECT_INFO_BASIC_V1: u32 = 1;
 /// Typed object_get_info topic for process or thread termination state.
 pub const DW_OBJECT_INFO_TASK_STATE_V1: u32 = 65537;
 
+/// Typed object_get_info topic for a TaskGroup's MEMORY_PAGES limit, usage and headroom; free frames only on the root TaskGroup.
+pub const DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1: u32 = 65538;
+
 /// Typed object_get_info topic for exact logical MemoryObject byte size.
 pub const DW_OBJECT_INFO_MEMORY_OBJECT_V1: u32 = 131073;
 
@@ -1275,6 +1278,30 @@ pub struct DwDeviceResourceInfoV1 {
 
 pub const DW_DEVICE_RESOURCE_INFO_V1_SIZE: u32 = 48;
 
+/// A TaskGroup's MEMORY_PAGES limit, its usage, the headroom left at and above it, and, on the root TaskGroup only, the free frame count. A snapshot: admission may still refuse.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwTaskGroupMemoryInfoV1 {
+    /// Byte size of this structure.
+    pub size: u32,
+    /// Structure version; set to one.
+    pub version: u32,
+    /// The group's own MEMORY_PAGES limit, or DW_TASK_GROUP_LIMIT_UNLIMITED.
+    pub limit: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    /// Pages charged to the group; zero for a group with no limit of any class, which no object's charge names.
+    pub usage: u64,
+    /// The least MEMORY_PAGES limit minus usage over the limited groups at and above this one; all ones when none limits MEMORY_PAGES.
+    pub headroom: u64,
+    /// Free physical frames, on the root TaskGroup only; zero on every other group.
+    pub free_pages: u64,
+    /// Reserved; must be zero.
+    pub reserved: u64,
+}
+
+pub const DW_TASK_GROUP_MEMORY_INFO_V1_SIZE: u32 = 48;
+
 /// Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1722,6 +1749,16 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwDeviceResourceInfoV1, pio_length), 34);
         assert_eq!(offset_of!(DwDeviceResourceInfoV1, interrupt_source), 36);
         assert_eq!(offset_of!(DwDeviceResourceInfoV1, reserved), 40);
+        assert_eq!(size_of::<DwTaskGroupMemoryInfoV1>(), 48);
+        assert_eq!(align_of::<DwTaskGroupMemoryInfoV1>(), 8);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, size), 0);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, version), 4);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, limit), 8);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, reserved0), 12);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, usage), 16);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, headroom), 24);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, free_pages), 32);
+        assert_eq!(offset_of!(DwTaskGroupMemoryInfoV1, reserved), 40);
         assert_eq!(size_of::<DwInterruptInfoV1>(), 64);
         assert_eq!(align_of::<DwInterruptInfoV1>(), 8);
         assert_eq!(offset_of!(DwInterruptInfoV1, size), 0);
@@ -1992,6 +2029,7 @@ mod generated_layout_tests {
         assert_eq!(DW_CLOCK_BOOTTIME.0, 1);
         assert_eq!(DW_OBJECT_INFO_BASIC_V1, 1);
         assert_eq!(DW_OBJECT_INFO_TASK_STATE_V1, 65537);
+        assert_eq!(DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1, 65538);
         assert_eq!(DW_OBJECT_INFO_MEMORY_OBJECT_V1, 131073);
         assert_eq!(DW_OBJECT_INFO_DEVICE_RESOURCE_V1, 196609);
         assert_eq!(DW_OBJECT_INFO_INTERRUPT_V1, 196610);

@@ -4,11 +4,13 @@ use deepwyrm_abi::{
     DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
     DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE,
     DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE,
+    DW_TASK_GROUP_MEMORY_INFO_V1_SIZE,
     DW_TASK_TERMINATION_INFO_V1_SIZE, DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE,
     DW_WAIT_RESULT_V1_SIZE, DwAbiInfoV1, DwAddressRegionMapArgsV1, DwChannelReceiveResultV1,
     DwDeviceResourceInfoV1, DwHandle, DwHandleTransferOperation, DwHandleTransferV1,
     DwInterruptInfoV1, DwMemoryObjectInfoV1, DwObjectInfoV1, DwProcessCreateArgsV1,
-    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwTaskTerminationInfoV1,
+    DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwTaskGroupMemoryInfoV1,
+    DwTaskTerminationInfoV1,
     DwThreadStartArgsV1, DwWaitItemV1, DwWaitResultV1,
 };
 
@@ -25,7 +27,15 @@ pub(crate) const WAIT_ITEM_BYTES: usize = DW_WAIT_ITEM_V1_SIZE as usize;
 pub(crate) struct EncodedObjectInfo {
     bytes: [u8; MAX_OBJECT_INFO_BYTES],
     len: usize,
+    /// The root TaskGroup's memory record, whose `free_pages` the caller
+    /// fills from the frame allocator under P (DW2 M5).
+    wants_free_pages: bool,
 }
+
+/// Byte offset of `DwTaskGroupMemoryInfoV1::free_pages`.
+const TASK_GROUP_MEMORY_FREE_PAGES_OFFSET: usize = 32;
+
+const _: () = assert!(DW_TASK_GROUP_MEMORY_INFO_V1_SIZE as usize <= MAX_OBJECT_INFO_BYTES);
 
 impl EncodedObjectInfo {
     pub(crate) const fn bytes(&self) -> &[u8] {
@@ -34,6 +44,20 @@ impl EncodedObjectInfo {
 
     pub(crate) const fn len(&self) -> usize {
         self.len
+    }
+
+    /// Whether this is the root TaskGroup's memory record, which needs the
+    /// free frame count.
+    pub(crate) const fn wants_free_pages(&self) -> bool {
+        self.wants_free_pages
+    }
+
+    /// Fills the root TaskGroup's `free_pages`. Does nothing for any other
+    /// record, so a non-root group never reports system-wide free frames.
+    pub(crate) fn fill_free_pages(&mut self, pages: u64) {
+        if self.wants_free_pages {
+            put_u64(&mut self.bytes, TASK_GROUP_MEMORY_FREE_PAGES_OFFSET, pages);
+        }
     }
 }
 
@@ -81,6 +105,7 @@ pub(crate) fn encode_u32(value: u32) -> [u8; 4] {
 
 pub(crate) fn encode_object_info(result: ObjectInfoResult) -> EncodedObjectInfo {
     let mut bytes = [0; MAX_OBJECT_INFO_BYTES];
+    let mut wants_free_pages = false;
     let len = match result {
         ObjectInfoResult::Basic(info) => {
             encode_basic_info(&mut bytes, info);
@@ -102,8 +127,31 @@ pub(crate) fn encode_object_info(result: ObjectInfoResult) -> EncodedObjectInfo 
             encode_interrupt_info(&mut bytes, info);
             DW_INTERRUPT_INFO_V1_SIZE as usize
         }
+        ObjectInfoResult::TaskGroupMemory { info, root } => {
+            encode_task_group_memory_info(&mut bytes, info);
+            wants_free_pages = root;
+            DW_TASK_GROUP_MEMORY_INFO_V1_SIZE as usize
+        }
     };
-    EncodedObjectInfo { bytes, len }
+    EncodedObjectInfo {
+        bytes,
+        len,
+        wants_free_pages,
+    }
+}
+
+fn encode_task_group_memory_info(
+    bytes: &mut [u8; MAX_OBJECT_INFO_BYTES],
+    info: DwTaskGroupMemoryInfoV1,
+) {
+    put_u32(bytes, 0, info.size);
+    put_u32(bytes, 4, info.version);
+    put_u32(bytes, 8, info.limit);
+    put_u32(bytes, 12, info.reserved0);
+    put_u64(bytes, 16, info.usage);
+    put_u64(bytes, 24, info.headroom);
+    put_u64(bytes, TASK_GROUP_MEMORY_FREE_PAGES_OFFSET, info.free_pages);
+    put_u64(bytes, 40, info.reserved);
 }
 
 fn encode_basic_info(bytes: &mut [u8; MAX_OBJECT_INFO_BYTES], info: DwObjectInfoV1) {

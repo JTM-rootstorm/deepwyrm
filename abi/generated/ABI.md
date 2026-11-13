@@ -245,6 +245,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_CLOCK_BOOTTIME` | `DwClockId` | `1` | Reserved clock domain for future suspend-aware elapsed time. |
 | `DW_OBJECT_INFO_BASIC_V1` | `u32` | `1` | Typed object_get_info topic for basic type and rights metadata. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `u32` | `65537` | Typed object_get_info topic for process or thread termination state. |
+| `DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1` | `u32` | `65538` | Typed object_get_info topic for a TaskGroup's MEMORY_PAGES limit, usage and headroom; free frames only on the root TaskGroup. |
 | `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `u32` | `131073` | Typed object_get_info topic for exact logical MemoryObject byte size. |
 | `DW_OBJECT_INFO_DEVICE_RESOURCE_V1` | `u32` | `196609` | Typed object_get_info topic for immutable DeviceResource identity and range metadata. |
 | `DW_OBJECT_INFO_INTERRUPT_V1` | `u32` | `196610` | Typed object_get_info topic for bounded Interrupt state and generation metadata. |
@@ -513,6 +514,21 @@ Read-only immutable DeviceResource identity, lease, port range, and interrupt-so
 | 36 | `interrupt_source` | `u32` | Exact platform interrupt-source identity. |
 | 40 | `reserved` | `u64` | Reserved; must be zero. |
 
+### `DwTaskGroupMemoryInfoV1`
+
+A TaskGroup's MEMORY_PAGES limit, its usage, the headroom left at and above it, and, on the root TaskGroup only, the free frame count. A snapshot: admission may still refuse. Size 48, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Byte size of this structure. |
+| 4 | `version` | `u32` | Structure version; set to one. |
+| 8 | `limit` | `u32` | The group's own MEMORY_PAGES limit, or DW_TASK_GROUP_LIMIT_UNLIMITED. |
+| 12 | `reserved0` | `u32` | Reserved; must be zero. |
+| 16 | `usage` | `u64` | Pages charged to the group; zero for a group with no limit of any class, which no object's charge names. |
+| 24 | `headroom` | `u64` | The least MEMORY_PAGES limit minus usage over the limited groups at and above this one; all ones when none limits MEMORY_PAGES. |
+| 32 | `free_pages` | `u64` | Free physical frames, on the root TaskGroup only; zero on every other group. |
+| 40 | `reserved` | `u64` | Reserved; must be zero. |
+
 ### `DwInterruptInfoV1`
 
 Read-only Interrupt source, lifecycle, parent-resource, and bounded pending-state information. Size 64, alignment 8.
@@ -659,6 +675,7 @@ Unknown topics return `DW_STATUS_NOT_SUPPORTED`.
 |---|---|---|---|---|
 | `DW_OBJECT_INFO_BASIC_V1` | `ANY` | `DwObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Available for every live handle carrying INSPECT. |
 | `DW_OBJECT_INFO_TASK_STATE_V1` | `PROCESS,THREAD` | `DwTaskTerminationInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports structured process or thread lifecycle and termination state. |
+| `DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1` | `TASK_GROUP` | `DwTaskGroupMemoryInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports a TaskGroup's memory budget (DW2 M5). System-wide free frames are reported only through the root TaskGroup. |
 | `DW_OBJECT_INFO_MEMORY_OBJECT_V1` | `MEMORY_OBJECT` | `DwMemoryObjectInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports exact logical byte_size; mappable capacity is checked align_up(byte_size, DW_BASE_PAGE_SIZE). |
 | `DW_OBJECT_INFO_DEVICE_RESOURCE_V1` | `DEVICE_RESOURCE` | `DwDeviceResourceInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports immutable resource identity, lease generation, range, and source metadata. |
 | `DW_OBJECT_INFO_INTERRUPT_V1` | `INTERRUPT` | `DwInterruptInfoV1` | `DW_STATUS_WRONG_OBJECT_TYPE` | Reports bounded Interrupt state and exact generation correlations. |

@@ -14764,3 +14764,106 @@ fn concurrent_create_reservations_share_the_limit() {
     registry.release_reserved_pages(1);
     assert!(memory_object_quota_allows(&registry, &tasks, process, 4));
 }
+
+/// DW2 M5: the TaskGroup memory topic reports a group's own MEMORY_PAGES
+/// limit, its usage as admission counts it, and the least headroom at and
+/// above it. Only the root group's record asks for free frames, so a job
+/// given INSPECT on its own group learns nothing system-wide.
+#[test]
+fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
+    use deepwyrm_abi::{
+        DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1, DW_STATUS_WRONG_OBJECT_TYPE,
+        DW_TASK_GROUP_LIMIT_MEMORY_PAGES, DW_TASK_GROUP_LIMIT_UNLIMITED,
+    };
+
+    let memory = MemoryObjectAuthority::<1, 1>::new();
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = TaskAuthority::<3, 1, 1, 8>::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (jobs, jobs_ref) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let jobs_owner = registry.retain_internal_from_handle(&jobs_ref).unwrap();
+    let (job, job_ref) = tasks.create_child_group(&mut registry, &jobs_owner).unwrap();
+    let job_owner = registry.retain_internal_from_handle(&job_ref).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &job_owner).unwrap();
+    let root_ref = registry.internal_into_handle(root_owner).unwrap();
+    let rights = DwRights(DW_RIGHT_INSPECT.0);
+    let table = tasks.process_handles_mut(process).unwrap();
+    let root_handle = table.install(root_ref, rights).unwrap();
+    let jobs_handle = table.install(jobs_ref, rights).unwrap();
+    let job_handle = table.install(job_ref, rights).unwrap();
+    let process_handle = table.install(process_ref, rights).unwrap();
+
+    tasks
+        .lower_group_limit(jobs, DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 100)
+        .unwrap();
+    tasks
+        .lower_group_limit(job, DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 60)
+        .unwrap();
+    // Thirty pages charged to the job (and so to jobs, which its tag names).
+    let tag = tasks.charge_tag(process).unwrap();
+    registry.reserve_pages(0, tag, 30);
+
+    let query = |registry: &mut ObjectRegistry<32>, handle| {
+        object_info_query(
+            registry,
+            &memory,
+            &tasks,
+            None,
+            None,
+            process,
+            handle,
+            DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1,
+        )
+    };
+    let read = |encoded: &super::super::abi_bytes::EncodedObjectInfo| {
+        let bytes = encoded.bytes();
+        assert_eq!(bytes.len(), 48);
+        let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let u64_at = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        assert_eq!((u32_at(0), u32_at(4), u32_at(12)), (48, 1, 0));
+        assert_eq!(u64_at(40), 0);
+        (u32_at(8), u64_at(16), u64_at(24), u64_at(32))
+    };
+
+    // The job: its own limit and usage; headroom is the least of 60 - 30
+    // and 100 - 30. No free frames, even when a caller tries to fill them.
+    let mut job_info = query(&mut registry, job_handle).unwrap();
+    assert!(!job_info.wants_free_pages());
+    job_info.fill_free_pages(12_345);
+    assert_eq!(read(&job_info), (60, 30, 30, 0));
+
+    // The jobs group: 100 - 30.
+    let jobs_info = query(&mut registry, jobs_handle).unwrap();
+    assert!(!jobs_info.wants_free_pages());
+    assert_eq!(read(&jobs_info), (100, 30, 70, 0));
+
+    // The root: unlimited, never named by a charge, no headroom bound, and
+    // the only record that carries free frames.
+    let mut root_info = query(&mut registry, root_handle).unwrap();
+    assert!(root_info.wants_free_pages());
+    root_info.fill_free_pages(12_345);
+    assert_eq!(
+        read(&root_info),
+        (DW_TASK_GROUP_LIMIT_UNLIMITED, 0, u64::MAX, 12_345)
+    );
+
+    // Released usage shows at once.
+    registry.release_reserved_pages(0);
+    assert_eq!(read(&query(&mut registry, job_handle).unwrap()), (60, 0, 60, 0));
+
+    // Any other object type is refused.
+    assert_eq!(
+        query(&mut registry, process_handle).unwrap_err(),
+        DW_STATUS_WRONG_OBJECT_TYPE
+    );
+    let mut cleanup = CleanupQueue::<32>::new();
+    for handle in [process_handle, job_handle, jobs_handle, root_handle] {
+        assert_eq!(
+            handle_close(&mut registry, &mut tasks, process, handle, &mut cleanup),
+            DW_STATUS_SUCCESS
+        );
+    }
+    drop((jobs_owner, job_owner));
+}
