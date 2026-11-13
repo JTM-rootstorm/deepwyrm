@@ -526,6 +526,7 @@ where
         before: &[Mapping],
         after: &[Mapping],
     ) -> Result<(), Self::Error> {
+        self.reverted = false;
         if address_space != self.address_space || region != self.region {
             return Err(X86AddressSpacePublishError::Identity);
         }

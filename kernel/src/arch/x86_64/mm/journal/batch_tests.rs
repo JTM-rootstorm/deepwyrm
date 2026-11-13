@@ -182,6 +182,17 @@ impl Fixture {
     }
 
     fn unmap(&mut self, target: &mut FakeTarget) {
+        let (result, undone) = self.change(target, None);
+        assert_eq!(result, Ok(()));
+        assert!(!undone);
+    }
+
+    /// Unmaps the region (`None`) or protects it, as `map` reports.
+    fn change(
+        &mut self,
+        target: &mut FakeTarget,
+        protection: Option<Protection>,
+    ) -> (Result<(), X86AddressSpacePublishError<()>>, bool) {
         let mut publisher = Self::publisher(
             &mut self.roles,
             self.root,
@@ -190,18 +201,45 @@ impl Fixture {
             &self.region,
             target,
         );
-        assert!(
-            self.region
-                .unmap(
-                    &mut self.objects,
-                    &mut self.registry,
-                    &mut publisher,
-                    START,
-                    PAGES * BASE_PAGE_SIZE,
-                )
-                .unwrap_or_else(|failure| panic!("unmap failed: {:?}", failure.error()))
-                .is_empty()
-        );
+        let changed = match protection {
+            None => self.region.unmap(
+                &mut self.objects,
+                &mut self.registry,
+                &mut publisher,
+                START,
+                PAGES * BASE_PAGE_SIZE,
+            ),
+            Some(protection) => self.region.protect(
+                &mut self.objects,
+                &mut self.registry,
+                &mut publisher,
+                START,
+                PAGES * BASE_PAGE_SIZE,
+                protection,
+            ),
+        };
+        let result = match changed {
+            Ok(_releases) => Ok(()),
+            Err(failure) => match failure.error() {
+                AddressSpaceTransactionError::Publish(error) => Err(*error),
+                other => panic!("change failed outside the publisher: {other:?}"),
+            },
+        };
+        (result, publisher.failed_after_publishing())
+    }
+
+    /// `page`'s raw leaf entry, if its tables exist.
+    fn raw_leaf(&self, target: &FakeTarget, page: u64) -> Option<u64> {
+        let physical_mask = ((1_u64 << 40) - 1) & !(BASE_PAGE_SIZE - 1);
+        let mut table = self.root.physical_start();
+        for level in (1..=3).rev() {
+            let index = ((page >> (12 + level * 9)) & 0x1ff) as usize;
+            table = target.entries.get(&(table, index)).copied()? & physical_mask;
+        }
+        target
+            .entries
+            .get(&(table, ((page >> 12) & 0x1ff) as usize))
+            .copied()
     }
 
     /// The frame `page`'s leaf maps, if it is present.
@@ -316,5 +354,80 @@ fn no_frame_for_a_refill_undoes_the_published_batches() {
     assert!(Fixture::pages().all(|page| fixture.leaf(&target, page).is_none()));
     assert!(fixture.region.mappings().iter().all(Option::is_none));
     assert_eq!(fixture.objects.active_lease_count(), 0);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_failed_later_unmap_batch_restores_the_unmapped_pages() {
+    let mut fixture = Fixture::new(24);
+    let mut target = FakeTarget::default();
+    assert_eq!(fixture.map(&mut target).0, Ok(()));
+    target.fail_apply_at = Some(target.apply_count + 2);
+    let (result, undone) = fixture.change(&mut target, None);
+    assert_eq!(
+        result,
+        Err(X86AddressSpacePublishError::Journal(
+            OwnedPageTableJournalError::Target(())
+        ))
+    );
+    assert!(undone);
+    // The undo maps the first batch's pages back under their own tables,
+    // with no candidate.
+    for (index, page) in Fixture::pages().enumerate() {
+        assert_eq!(
+            fixture.leaf(&target, page),
+            Some(fixture.backing_start + index as u64 * BASE_PAGE_SIZE),
+            "page {page:#x}"
+        );
+    }
+    assert_eq!(fixture.region.mappings().iter().flatten().count(), 1);
+    assert_eq!(fixture.objects.active_lease_count(), 1);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_failed_later_protect_batch_restores_the_old_permissions() {
+    let mut fixture = Fixture::new(24);
+    let mut target = FakeTarget::default();
+    assert_eq!(fixture.map(&mut target).0, Ok(()));
+    let before: Vec<_> = Fixture::pages()
+        .map(|page| fixture.raw_leaf(&target, page))
+        .collect();
+    assert!(
+        before
+            .iter()
+            .all(|leaf| leaf.is_some_and(|leaf| leaf & super::super::super::WRITABLE != 0))
+    );
+    target.fail_apply_at = Some(target.apply_count + 2);
+    let (result, undone) = fixture.change(&mut target, Some(Protection::READ));
+    assert!(result.is_err());
+    assert!(undone);
+    let after: Vec<_> = Fixture::pages()
+        .map(|page| fixture.raw_leaf(&target, page))
+        .collect();
+    assert_eq!(after, before, "every leaf is writable again");
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_refill_whose_zeroing_fails_returns_its_frame_and_undoes() {
+    let mut fixture = Fixture::new(24);
+    let free = fixture.roles.available_frames();
+    let mut target = FakeTarget {
+        fail_zero: true,
+        ..FakeTarget::default()
+    };
+    let (result, undone) = fixture.map(&mut target);
+    assert_eq!(
+        result,
+        Err(X86AddressSpacePublishError::Journal(
+            OwnedPageTableJournalError::Target(())
+        ))
+    );
+    assert!(undone);
+    assert!(Fixture::pages().all(|page| fixture.leaf(&target, page).is_none()));
+    // Batch one turned its three candidates into tables; the failed
+    // refill's frame went back.
+    assert_eq!(fixture.roles.available_frames(), free);
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }

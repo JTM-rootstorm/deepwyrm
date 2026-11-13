@@ -20,6 +20,7 @@ struct FakeTarget {
     /// Fails only this apply, counting from one (DW2 M4).
     fail_apply_at: Option<usize>,
     apply_count: usize,
+    fail_zero: bool,
     read_count: usize,
     mutate_on_read: Option<(usize, (u64, usize), u64)>,
 }
@@ -44,6 +45,9 @@ unsafe impl AtomicPageTableTarget for FakeTarget {
     }
 
     fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error> {
+        if self.fail_zero {
+            return Err(());
+        }
         self.entries
             .retain(|(table, _), _| *table != frame.address());
         Ok(())
