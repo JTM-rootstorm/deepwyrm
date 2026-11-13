@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11).
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -347,7 +347,7 @@ Admission (doctrine §13): serving a page fault is a privileged VM state transit
 - A lookup or protection mismatch, including a mapping removed or protected before T was taken, gives today's terminal record.
 - A charge or frame failure gives `RESOURCE_POLICY`.
 - A leaf already present with the right protection was a spurious fault on another CPU: return.
-- Loop guard, as defence in depth: a thread that faults again with the same RIP, CR2 and error code, after a gate pass that committed nothing, published nothing and found the same mapping, is terminal.
+- Loop guard, as defence in depth: a thread that faults again with the same RIP, CR2 and error code, after a gate pass that committed nothing, published nothing and found the same mapping, is terminal. *(Replaced as built: §8.10.)*
 
 **Return validation stays read-only.** It accepts a missing entry at any page-table level when the model maps an on-demand page there with the needed protection. The return then raises the fault, and the gate serves it.
 
@@ -417,3 +417,28 @@ Decommit (giving pages back), a shared zero page for read-only touches, fault-ar
 **Open:**
 - Every first touch takes the global T. A group's usage scan is linear in objects, so touching 1 GiB takes about 262,000 holds of T.
 - Global frame exhaustion still kills whichever process touches next. That is overcommit, as §2's M6 row decided. The OOM killer (§6.7) comes later.
+
+### 8.10 M6 as built (2026-11-13)
+
+Deepwyrm `bc0b6cf` (index), `915b58a` (ABI, creation, commit, publisher), `829d7f1` (fault gate), `9939167` (fill-in), `1b689c9` (wrapper), review fixes `9dc2d21`; Wyrmroot `7a4f2a0` (pin of `915b58a` with the info-record consumer), `cbd55fa` and `dfb06aa` (probes). Every step passed `dev-boot --check --sdk`; the last run was Deepwyrm `9dc2d21` with Wyrmroot `dfb06aa`. Wyrmroot pins `1b689c9`, whose ABI `9dc2d21` leaves unchanged. Committed unsigned; re-sign before any push. `f05ef16` repaired the kernel's test binaries first (§9's pinned, no-fail-fast run) and deleted seven source-text tests.
+
+- **Index.** `frame_roles/index.rs`: a 512-way radix index of at most four levels (`IndexRoot`, `IndexNode`, `ObjectPage` roles). Frames for a commit are all taken and zeroed through the direct map before any is linked, so a commit is all or nothing. Eager objects keep their chains.
+- **ABI.** `DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND`; `memory_object_commit` (0x00020002, phase DW2-M, needs MAP, 16 MiB per step); the info record's `flags`.
+- **Publisher.** Each address space's leaves are its own: an absent leaf is skipped on unmap and protect, a map publishes none for an on-demand page, and `publish_touched_leaf` publishes one where the entry is zero.
+- **Fault gate.** The vector-14 stub sends CPL3 faults to `dw_x86_64_user_page_fault_gate` on the thread's stack. Only not-present user faults below the canonical hole are served. Page and tables are admitted together (§8.4), then committed and published in one hold of T and P. Any other fault ends with the record the terminal path built before. A quota or frame failure ends the process with `RESOURCE_POLICY`.
+- **Loop guard replaced** (review M6-3): a leaf already present counts as served only when it is exactly the leaf a publish would write (accessed and dirty ignored). Since only not-present faults are served, the retry then succeeds, and any other leaf ends the fault; so no per-CPU guard is needed.
+- **Fill-in.** Before a syscall's handler, the on-demand pages under its buffers (`NativeSyscallRequest::user_buffers`, each capped at what the syscall copies) are served as touches. A `dma_map` range is committed first, only when `dma_map`'s resource checks would pass, with MAP added to its rights. Nothing runs while no on-demand object is live.
+- **Guest proof.** `bin/hello on-demand` maps 64 MiB (four times the job's budget), touches it, reads untouched pages as zero, has a syscall write an untouched page and commits a page; `on-demand-exhaust` spends the quota and must end as `resource-policy`.
+
+### 8.11 Security review of M6
+
+**Reviewer:** Claude Opus 5.5 (low effort), 2026-11-13, at Deepwyrm `6382483..1b689c9` and Wyrmroot `7a4f2a0..dfb06aa`. Method: code reading; no tests run. No Critical or High defect. The entry assembly, the record's equality with the old path, index zeroing and release, the publisher's absent leaves, read-only return validation, the live-object counter and the weights were checked and found sound.
+
+- **M6-1 (Medium): fixed** (`9dc2d21`). `dma_map`'s fill-in committed the range before any of `dma_map`'s checks, with READ alone, so a READ holder with a bogus resource could spend the creator's quota.
+- **M6-2 (Medium): fixed** (`9dc2d21`). The fill-in walked a user-chosen length before the syscall checked it, up to 2^35 page lookups, without servicing BSP timers. Buffers are now capped (at most 17 pages each) and steps service the BSP's expiries.
+- **M6-3 (Low): fixed** (`9dc2d21`) as above. The per-CPU guard ignored the thread and the mapping and could end a correct program.
+- **M6-4 (Low): fixed** (`9dc2d21`). Page and tables were admitted separately, so a shared group could be overshot by up to three pages; a refusal other than quota is no longer reported as exhaustion.
+- **Behaviour changes, accepted:** a missing stack top is a kernel `ud2` and a missing runtime binding halts, as at the other gates; a thread or binding mismatch in the gate ends the process with its page-fault record.
+- **R1 (Low), open:** one commit step admits each page with a linear registry scan and zeroes up to 16 MiB in a hold of T (with §8.9's open note).
+- **Test gaps, open:** the gate, the fill-in and the commit step run only in the guest probe, which does not reach a spurious fault, a table refusal or a read-only buffer; §8.6's two-mapping and two-process teardown and undo cases; a weight-equals-frames check after mixed commits and faults; BSP expiries during a long fill-in.
+
