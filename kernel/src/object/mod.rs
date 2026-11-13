@@ -226,9 +226,11 @@ const EMPTY_SLOT: ObjectSlot = ObjectSlot {
     generation: 0,
     state: SlotState::Vacant,
 };
-/// CPUs that may each hold one create's page reservation; at least the
-/// kernel's CPU capacity (asserted in `lib.rs`).
-pub(crate) const RESERVATION_CPUS: usize = 4;
+/// Threads that may each hold one create's page reservation; at least the
+/// kernel's thread-stack capacity, which bounds live threads (asserted in
+/// `lib.rs`). Keyed by thread, not CPU, since a create can yield between
+/// reserving and creating and resume elsewhere (DW2 M5 §10.8 D1).
+pub(crate) const RESERVATION_THREADS: usize = 64;
 
 pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     domain: u64,
@@ -238,11 +240,12 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     /// Per slot, its weight under the page class: the pages of a RAM-backed
     /// MemoryObject, zero for everything else. Reset with the tag.
     pages: [u64; CAPACITY],
-    /// Per CPU, pages a MemoryObjectCreate admitted before allocating its
-    /// frames outside the global lock, charged to its tag until the hold
-    /// that creates the object (DW2 §7.3 R7). Concurrent creates see each
-    /// other's, so they cannot together allocate past a limit.
-    reserved: [Option<(charge::ChargeTag, u64)>; RESERVATION_CPUS],
+    /// Per creating thread, pages a MemoryObjectCreate admitted before
+    /// allocating its frames outside the global lock, charged to its tag
+    /// until the hold that creates the object (DW2 §7.3 R7). Concurrent
+    /// creates see each other's, so they cannot together allocate past a
+    /// limit.
+    reserved: [Option<(ObjectId, charge::ChargeTag, u64)>; RESERVATION_THREADS],
 }
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
@@ -252,22 +255,36 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             slots: [EMPTY_SLOT; CAPACITY],
             tags: [charge::ChargeTag::EMPTY; CAPACITY],
             pages: [0; CAPACITY],
-            reserved: [None; RESERVATION_CPUS],
+            reserved: [None; RESERVATION_THREADS],
         }
     }
 
-    /// Charges `pages` to `tag` for `cpu`'s create in flight, replacing any
-    /// reservation that CPU held.
-    pub(crate) fn reserve_pages(&mut self, cpu: usize, tag: charge::ChargeTag, pages: u64) {
-        if let Some(slot) = self.reserved.get_mut(cpu) {
-            *slot = Some((tag, pages));
+    /// Charges `pages` to `tag` for `thread`'s create in flight, replacing
+    /// any reservation that thread held. `false` when every slot is held by
+    /// another thread, which the thread capacity rules out.
+    #[must_use]
+    pub(crate) fn reserve_pages(
+        &mut self,
+        thread: ObjectId,
+        tag: charge::ChargeTag,
+        pages: u64,
+    ) -> bool {
+        self.release_reserved_pages(thread);
+        match self.reserved.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => {
+                *slot = Some((thread, tag, pages));
+                true
+            }
+            None => false,
         }
     }
 
-    /// Ends `cpu`'s reservation, if it holds one.
-    pub(crate) fn release_reserved_pages(&mut self, cpu: usize) {
-        if let Some(slot) = self.reserved.get_mut(cpu) {
-            *slot = None;
+    /// Ends `thread`'s reservation, if it holds one.
+    pub(crate) fn release_reserved_pages(&mut self, thread: ObjectId) {
+        for slot in &mut self.reserved {
+            if slot.is_some_and(|(owner, _, _)| owner == thread) {
+                *slot = None;
+            }
         }
     }
 
@@ -397,8 +414,8 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
                 self.reserved
                     .iter()
                     .flatten()
-                    .filter(|(tag, _)| tag.names(group))
-                    .fold(0usize, |total, &(_, pages)| {
+                    .filter(|(_, tag, _)| tag.names(group))
+                    .fold(0usize, |total, &(_, _, pages)| {
                         total.saturating_add(usize::try_from(pages).unwrap_or(usize::MAX))
                     }),
             )

@@ -980,7 +980,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &runtime.core.tasks,
                         process,
                         if on_demand { 1 } else { pages },
-                        cpu.index(),
+                        runtime.own.scheduled().thread,
                     )
                 });
                 (prepared, allows)
@@ -1077,7 +1077,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
             // The adapter admits again, against the others' reservations.
-            runtime.core.registry.release_reserved_pages(cpu.index());
+            let thread = runtime.own.scheduled().thread.object_id();
+            runtime.core.registry.release_reserved_pages(thread);
             let (status, released_pin) = match (request, atomic_pin) {
                 (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
                     let mut access = crate::syscall::DeferredMemoryObjectAccess::new(

@@ -8914,7 +8914,7 @@ pub(crate) fn memory_object_quota_allows<
 }
 
 /// Admits a MemoryObjectCreate of `pages` for `process` and, if admitted,
-/// reserves them for `cpu` until the hold that creates the object releases
+/// reserves them for `thread` until the hold that creates the object releases
 /// them (DW2 §7.3 R7): its frames are allocated outside the global lock,
 /// and without the reservation a concurrent create would not see them.
 pub(crate) fn reserve_memory_object_pages<
@@ -8928,14 +8928,12 @@ pub(crate) fn reserve_memory_object_pages<
     tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     process: ProcessKey,
     pages: u64,
-    cpu: usize,
+    thread: crate::task::ThreadKey,
 ) -> bool {
-    registry.release_reserved_pages(cpu);
+    let thread = thread.object_id();
+    registry.release_reserved_pages(thread);
     match admit_memory_object(registry, tasks, process, pages) {
-        Ok(tag) => {
-            registry.reserve_pages(cpu, tag, pages);
-            true
-        }
+        Ok(tag) => registry.reserve_pages(thread, tag, pages),
         Err(_) => false,
     }
 }

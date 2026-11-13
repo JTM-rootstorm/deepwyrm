@@ -14719,49 +14719,59 @@ fn a_quota_refused_early_backing_fails_closed() {
 
 mod dma;
 
-/// DW2 §7.3 R7: two CPUs' creates admitted before either allocates see each
-/// other's reservation, so together they cannot pass the group's limit.
+/// DW2 §7.3 R7: two threads' creates admitted before either allocates see
+/// each other's reservation, so together they cannot pass the group's limit.
+/// Reservations are per thread (M5 §10.8 D1): a create that yields and
+/// resumes elsewhere keeps its own, and another thread's create, on any CPU,
+/// neither replaces nor releases it.
 #[test]
 fn concurrent_create_reservations_share_the_limit() {
-    let (mut registry, mut tasks, _root, jobs, process, _) = limited_fixture();
+    let (mut registry, mut tasks, root, jobs, process, _) = limited_fixture();
     tasks
         .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 4)
         .unwrap();
+    // Distinct thread identities; the reservation keys on identity alone.
+    let first = crate::task::ThreadKey::from_object_id(root.object_id());
+    let second = crate::task::ThreadKey::from_object_id(jobs.object_id());
     assert!(reserve_memory_object_pages(
         &mut registry,
         &tasks,
         process,
         3,
-        0
+        first
     ));
-    // Alone each would fit; with CPU 0's three pages reserved, two do not.
+    // Alone each would fit; with the first thread's three pages reserved,
+    // two do not.
     assert!(!reserve_memory_object_pages(
         &mut registry,
         &tasks,
         process,
         2,
-        1
+        second
     ));
     assert!(reserve_memory_object_pages(
         &mut registry,
         &tasks,
         process,
         1,
-        1
+        second
     ));
     assert!(!memory_object_quota_allows(&registry, &tasks, process, 1));
-    // A CPU's new reservation replaces its old one rather than adding.
+    // Releasing the second thread's leaves the first thread's charged.
+    registry.release_reserved_pages(second.object_id());
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 1));
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 2));
+    // A thread's new reservation replaces its old one rather than adding.
     assert!(reserve_memory_object_pages(
         &mut registry,
         &tasks,
         process,
         2,
-        0
+        first
     ));
-    assert!(memory_object_quota_allows(&registry, &tasks, process, 1));
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 2));
     // The creating hold releases its own before the adapter admits again.
-    registry.release_reserved_pages(0);
-    registry.release_reserved_pages(1);
+    registry.release_reserved_pages(first.object_id());
     assert!(memory_object_quota_allows(&registry, &tasks, process, 4));
 }
 
@@ -14803,7 +14813,8 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
         .unwrap();
     // Thirty pages charged to the job (and so to jobs, which its tag names).
     let tag = tasks.charge_tag(process).unwrap();
-    registry.reserve_pages(0, tag, 30);
+    let reserving = process.object_id();
+    assert!(registry.reserve_pages(reserving, tag, 30));
 
     let query = |registry: &mut ObjectRegistry<32>, handle| {
         object_info_query(
@@ -14850,7 +14861,7 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
     );
 
     // Released usage shows at once.
-    registry.release_reserved_pages(0);
+    registry.release_reserved_pages(reserving);
     assert_eq!(read(&query(&mut registry, job_handle).unwrap()), (60, 0, 60, 0));
 
     // Any other object type is refused.
