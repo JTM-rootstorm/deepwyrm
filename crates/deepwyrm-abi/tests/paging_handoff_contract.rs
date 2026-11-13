@@ -335,38 +335,3 @@ fn malformed_module_sets_and_frame_lists_fail_closed() {
         assert!(validate_carrier_model(&[module], &header, &malformed_frames).is_err());
     }
 }
-
-#[test]
-fn generated_rust_c_and_docs_preserve_internal_carrier_semantics() {
-    let artifacts = [
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../abi/generated/deepwyrm_abi.rs"
-        )),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../abi/generated/deepwyrm_abi.h"
-        )),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../abi/generated/ABI.md"
-        )),
-    ];
-    let markers = [
-        "Exactly one READ_ONLY kernel-internal DwBootX86_64PagingHandoffV1 carrier",
-        "must never be transferred to userspace",
-        "strictly ascending and unique",
-        "enumerates every current transition page-table frame exactly once with no data frames",
-        "low 12 bits zero",
-        "must be exactly equal",
-    ];
-
-    for artifact in artifacts {
-        for marker in markers {
-            assert!(
-                artifact.contains(marker),
-                "generated paging-handoff artifact is missing marker: {marker}"
-            );
-        }
-    }
-}

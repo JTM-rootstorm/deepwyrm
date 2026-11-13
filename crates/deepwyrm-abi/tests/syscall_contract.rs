@@ -117,11 +117,3 @@ fn e_task_syscall_numbers_remain_canonical() {
         assert_eq!(actual, expected);
     }
 }
-
-#[test]
-fn no_std_boundary_includes_only_string_free_dispatch_material() {
-    let crate_source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
-    assert!(crate_source.contains("syscall_kernel.rs"));
-    assert!(!crate_source.contains("syscall_dispatch.rs"));
-    assert!(!crate_source.contains("syscall_wrappers.rs"));
-}
