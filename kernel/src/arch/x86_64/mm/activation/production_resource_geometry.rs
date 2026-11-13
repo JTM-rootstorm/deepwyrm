@@ -86,9 +86,16 @@ const INIT_RESIDENT_HANDLES: [usize; 6] = [4, 4, 3, 3, 4, 3];
 const STORAGE_DRIVERS: usize = 2;
 const STORAGE_SERVICES: usize = 5;
 const INIT_STORAGE_HANDLES: usize = STORAGE_DRIVERS * 3 + STORAGE_SERVICES * 4;
-/// A shell `run` of a file holds the file's Channel and the private memory
-/// init reads it into, beside the loader's own handles.
-const IMAGE_LAUNCH_HANDLES: usize = 2;
+/// A shell `run` of a file is read across ticks (Wyrmroot's parked image
+/// launch): init holds the request's five handles (three streams, the file's
+/// Channel and the job's namespace), the memory object the request bytes wait
+/// in, and the private memory it reads the image into.
+const IMAGE_LAUNCH_HANDLES: usize = 5 + 1 + 1;
+/// While an image read is parked init keeps serving other sessions, and one
+/// receive delivers up to a request's five handles before any is closed or
+/// placed. Init treats a handle table too full to receive as its own failure,
+/// so this headroom is what keeps a client from causing it.
+const REQUEST_RECEIVE_HANDLES: usize = 5;
 pub(super) const INIT_BASELINE_HANDLES: usize = sum(&INIT_RESIDENT_HANDLES) + INIT_STORAGE_HANDLES;
 
 /// The six interactive roles and the seven storage roles.
@@ -166,6 +173,7 @@ const REPLACEMENT_STAGING_HANDLES: usize = 3;
 pub(super) const HANDLE_PEAK: usize = INIT_BASELINE_HANDLES
     + STREAM_JOB_LOADER_HANDLES
     + IMAGE_LAUNCH_HANDLES
+    + REQUEST_RECEIVE_HANDLES
     + REPLACEMENT_STAGING_HANDLES
     + LIVE_SHELL_JOBS * JOB_HELD_HANDLES;
 pub(super) const MEMORY_PEAK: usize = BASELINE_MEMORY
@@ -373,7 +381,7 @@ mod tests {
         assert_eq!(INIT_STORAGE_HANDLES, 26);
         assert_eq!(INIT_BASELINE_HANDLES, 47);
         assert_eq!(STREAM_JOB_LOADER_HANDLES, 9);
-        assert_eq!(HANDLE_PEAK, 73);
+        assert_eq!(HANDLE_PEAK, 83);
         assert_eq!(RESIDENT_IMAGES, 13);
         assert_eq!(STORAGE_MEMORY, 9);
         assert_eq!(BASELINE_MEMORY, 49);
