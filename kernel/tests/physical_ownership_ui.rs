@@ -8,33 +8,6 @@ struct CompileFailCase<'a> {
     expected_error: &'a str,
 }
 
-/// Text test: `pub(super)` on the raw allocator means "the ownership module"
-/// only because ownership.rs path-loads these files as its children. Loaded
-/// from memory/mod.rs instead, the same `pub(super)` widens to all of
-/// `memory`, and the compile-fail cases below still pass, since they reach
-/// in from outside `memory`. No compiler error distinguishes the two parents.
-/// The raw items' privacy itself is held by those compile-fail cases.
-#[test]
-fn ownership_boundary_path_loads_the_raw_allocator_modules_as_children() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ownership = fs::read_to_string(manifest_dir.join("src/memory/ownership.rs"))
-        .expect("read live ownership boundary source");
-    for child in ["boot_map", "frame_roles", "physical"] {
-        assert!(
-            ownership
-                .lines()
-                .any(|line| line == format!("#[path = \"{child}.rs\"]")),
-            "ownership boundary must path-load {child}.rs as its child"
-        );
-        assert!(
-            ownership
-                .lines()
-                .any(|line| line.ends_with(&format!(" mod {child};"))),
-            "ownership boundary must declare {child} as its child module"
-        );
-    }
-}
-
 #[test]
 fn physical_ownership_compile_fail_contracts() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -7,8 +7,15 @@ mod sync;
 
 #[path = "../../src/boot/mod.rs"]
 mod boot;
-#[path = "../../src/arch/x86_64/mm/mod.rs"]
-mod mm;
+// Mounted where the kernel mounts it: the module names itself through
+// `crate::arch::x86_64::mm`.
+#[path = "../../src/arch"]
+mod arch {
+    pub(crate) mod x86_64 {
+        #[path = "mm/mod.rs"]
+        pub(crate) mod mm;
+    }
+}
 #[path = "../../src/object/mod.rs"]
 mod object;
 #[path = "../../src/handle/mod.rs"]
@@ -18,7 +25,9 @@ mod memory;
 
 use memory::address_region::{AddressSpaceKey, RegionKey};
 use memory::frame_roles::{FrameRoleManager, TableCandidateGrant, TableIdentity};
-use mm::{AtomicPageTableTarget, PageTableRoot, X86AddressSpacePublisher};
+use arch::x86_64::mm::{
+    AtomicPageTableTarget, JournalStorage, PageTableRoot, X86AddressSpacePublisher,
+};
 
 fn construct_safely<T: AtomicPageTableTarget>(
     address_space: AddressSpaceKey,
@@ -28,6 +37,7 @@ fn construct_safely<T: AtomicPageTableTarget>(
     roles: &mut FrameRoleManager<1, 1>,
     target: &mut T,
     candidates: &mut [Option<TableCandidateGrant>; 1],
+    storage: &mut JournalStorage<1, 1>,
 ) {
     let _ = X86AddressSpacePublisher::<T, 1, 1, 1, 1, 1>::new(
         address_space,
@@ -37,5 +47,6 @@ fn construct_safely<T: AtomicPageTableTarget>(
         roles,
         target,
         candidates,
+        storage,
     );
 }
