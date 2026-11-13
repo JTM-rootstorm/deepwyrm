@@ -486,3 +486,45 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 **Accepted by Mike (2026-11-13)**, as recommended; §5.3a R1 is instead superseded by M7, which carves the role table from buddy blocks:
 §5.2a R3 (AP trampoline's writable alias), R4 (1 GiB pages gated on the BSP's CPUID), R5 (a map needing over 2048 tables stops the boot), R6 (large leaves and MTRRs), R10 (guest-test usercopy uses user addresses); §5.3a R3 (a second proof on one root panics), R4 (O(slots) scans), R5 (`start_position` scans); §6.9a R2 (whole-table scans at boot); §7.1 R3 (a racing pin sees `Conflict` for the whole call), R4 (tables built by undone batches stay uncharged until teardown); §7.3 R1 (handles re-resolved per step), R4 (a protect in steps can refuse a W+X alias), R5 (pieces left by a stopped caller keep their leases).
 
+
+## 10. M5 design (2026-11-13)
+
+M5 lets a job use what M2–M6 made possible. Today a job gets 16 MiB, 4 MemoryObjects and 10 mapping slots, the SDK's `mmap` serves everything from at most four eager arenas of at most 16 MiB, and nothing tells userspace how much RAM exists. Facts below come from a read-only survey (Claude Sonnet 5.5, 2026-11-13) checked against the code; byte costs are field-layout estimates to be measured in step 1.
+
+### 10.1 Decisions
+
+- **Budget (Mike, 2026-11-13; §3 item 3):** each job's MEMORY_PAGES limit is half of the RAM free once init's resident services have started, capped by the platform config's size when one is set. Init computes it once per boot, before the first job, so every job of a boot gets the same budget.
+- **Overcommit:** four jobs at half each can promise twice the free RAM. An eager create that finds no frames fails with `NO_MEMORY` as now; an on-demand touch that finds none ends the toucher (§8.9, accepted). M9's OOM killer is the answer to both, not a smaller budget.
+
+### 10.2 Deepwyrm
+
+1. **How much RAM: a TaskGroup memory topic.** A new `object_get_info` topic, `DW_OBJECT_INFO_TOPIC_TASK_GROUP_MEMORY_V1`, on a TaskGroup handle with INSPECT, returns a 32-byte record: total allocator pages, free allocator pages, and the group's own MEMORY_PAGES limit and current usage. It is read under the locks that admission uses (P for the allocator count, T for usage), so it is the same truth admission sees. Free RAM is exposed only to holders of INSPECT on some TaskGroup, not to every caller of `abi_get_info`. A new implementation phase, as M6's commit call had.
+2. **Mapping slots: 10 → 64 per AddressRegion.** Every region has the same count, so all 32 regions pay: about 6.4 KB static per slot, about 410 KB at 64 (versus 64 KB now). The deepest map, unmap and protect path holds about 1–1.5 KB of stack per slot in `rebuild`, `commit_specs`, `prepare_replace` and `RegionSteps`, about 90 KB at 64, against the 512 KiB kernel thread stack; the stack oracles are re-measured. Moving those arrays to static storage is not needed at 64 and is not done.
+3. **Per-job MemoryObjects: 4 → 64,** with the production ledger following: `JOB_OWN_MEMORY_OBJECTS = 64`, `JOB_REGION_MAPPINGS = 64`. `MEMORY_PEAK` 81 → 321, `MAPPING_PEAK` 109 → 565, `REGISTRY_PEAK` 346 → 586; the pools become memory 384, leases 576, registry 640 (about 100–150 KB more static memory). The geometry tests that pin the old peaks change with them.
+
+### 10.3 Wyrmroot
+
+4. **Platform config:** a new bootfs entry, `system/bootstrap/platform-config-v1` (WRPC v1: magic, version, size, one `u64 job_memory_bytes_max`, zero for none, reserved fields zero; strict, bounded, fail-closed). The product builder writes it; the dev-boot product sets no cap.
+5. **Init:** after its resident roles are READY and before it accepts a job, init reads the memory topic on its own TaskGroup, computes `min(free / 2, cap)` in pages, saturated to the `u32` limit, and builds the job limit table at run time instead of the `JOB_TASK_GROUP_LIMITS` constant. `JOB_MEMORY_OBJECTS` becomes 64. The shell's `status` shows the budget.
+6. **Repin** Wyrmroot and the SDK to the new Deepwyrm together (memory `sdk-pin-follows-wyrmroot`).
+
+### 10.4 SDK
+
+7. **`mmap` by size.** An anonymous, non-fixed request of 1 MiB or more gets its own on-demand MemoryObject and mapping, so reserving costs one index page and `munmap` returns the memory. Smaller requests stay in arenas, which become on-demand too, so an arena costs only the pages touched. The 16 MiB ceiling on one allocation goes away; a request is limited by the job's budget and its free slots. `mprotect` on a dedicated mapping goes straight to the kernel; on arena pages it stays `ENOTSUP`.
+8. **Slots run out before RAM can:** the image takes 3 of 64 slots and arenas at most 4, so a program can hold about 57 large mappings at once; a partial `munmap` splits a mapping and costs a slot. Past that, `mmap` returns `ENOMEM`.
+
+### 10.5 Guest proof (`dev-boot --check --sdk`, 2 GiB guest)
+
+9. `bin/hello` reports its budget from the memory topic and checks it is half of free RAM, give or take what started in between.
+10. It maps an eager object larger than 16 MiB and touches every page, then protects and unmaps it in steps: M4's and M4b's first guest run with eager backing (§9 ledger).
+11. It times a large eager create and map and prints it, re-measuring L6's 44 ms fixed cost on the direct map (§9 ledger).
+12. A job stopped between steps of a large map leaves no lease or frame behind once it is reaped (§9 ledger: the stepped facade loop).
+13. An SDK program allocates past the old 16 MiB ceiling (one `malloc` of 256 MiB and a scattered set of small ones) and frees them, and SQLite runs as before.
+
+### 10.6 Steps
+
+1. Deepwyrm: the memory topic (ABI, phase, adapter, live read), slots and per-job objects with the geometry, re-measured stacks; host tests; development tier.
+2. Wyrmroot and SDK repinned; the platform config entry and builder; init's run-time budget and limit table; `status`.
+3. SDK: `mmap` by size over on-demand objects; its host tests replace the arena tests.
+4. Probes 9–13 in dev-boot.
+5. Independent security review of the stage; fixes; §9 ledger and an as-built record.
