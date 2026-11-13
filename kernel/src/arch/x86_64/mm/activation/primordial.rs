@@ -3025,7 +3025,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         registry: &mut ObjectRegistry<REGISTRY>,
         virtual_start: u64,
         byte_len: u64,
-    ) -> crate::memory::object::MappingFinalReleases<REGISTRY> {
+    ) -> crate::memory::object::MappingFinalReleases {
         let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
         let result = {
             let scratch = self

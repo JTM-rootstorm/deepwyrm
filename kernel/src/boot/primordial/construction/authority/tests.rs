@@ -280,10 +280,13 @@ fn finalize_known(
                 platform.allocations.swap_remove(slot);
             }
             DW_OBJECT_TYPE_CHANNEL => {
-                let finalization = channels.take_finalization(release, waits).unwrap();
-                let completion = complete_channel_finalization(registry, finalization);
-                let (_wakes, releases) = completion.into_parts();
-                pending.extend(releases.into_iter().flatten());
+                let mut wakes = crate::wait::WakeBatch::empty();
+                let finalization = channels
+                    .take_finalization(release, waits, &mut wakes)
+                    .unwrap();
+                complete_channel_finalization(registry, finalization, |release| {
+                    pending.push(release);
+                });
             }
             DW_OBJECT_TYPE_ADDRESS_REGION => {
                 let finalization = regions.take_finalization(spaces, release).unwrap();
@@ -359,15 +362,13 @@ fn concrete_authority_adapter_rolls_back_every_boundary_and_recovers_capacity() 
         let (_keys, references) = channels.create_pair(&mut registry).unwrap();
         for reference in references {
             let final_release = registry.release_handle(reference).unwrap().unwrap();
-            let finalization = channels.take_finalization(final_release, &waits).unwrap();
-            let completion = complete_channel_finalization(&mut registry, finalization);
-            assert!(
-                completion
-                    .into_parts()
-                    .1
-                    .into_iter()
-                    .all(|release| release.is_none())
-            );
+            let mut wakes = crate::wait::WakeBatch::empty();
+            let finalization = channels
+                .take_finalization(final_release, &waits, &mut wakes)
+                .unwrap();
+            complete_channel_finalization(&mut registry, finalization, |_| {
+                panic!("an unused Channel endpoint drained a transfer")
+            });
         }
     }
 }

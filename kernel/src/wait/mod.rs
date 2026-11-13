@@ -786,8 +786,21 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
     /// for deferred release. Among simultaneously ready duplicate views of the
     /// triggering object, the lowest ABI input index wins deterministically.
     pub(crate) fn take_ready(&self, object: ObjectId, observed: DwSignals) -> WakeBatch<CAPACITY> {
-        let mut slots = self.slots.lock();
         let mut batch = WakeBatch::empty();
+        self.take_ready_into(object, observed, &mut batch);
+        batch
+    }
+
+    /// [`Self::take_ready`], appending to the caller's batch: a finalizer
+    /// keeps one batch for a whole chain instead of copying one per object
+    /// (DW2 plan §10.2 item 2).
+    pub(crate) fn take_ready_into(
+        &self,
+        object: ObjectId,
+        observed: DwSignals,
+        batch: &mut WakeBatch<CAPACITY>,
+    ) {
+        let mut slots = self.slots.lock();
 
         for candidate_index in 0..CAPACITY {
             let Some(candidate) = slots[candidate_index].entry.as_ref() else {
@@ -829,7 +842,6 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
                 batch.push_pin(entry.pin);
             }
         }
-        batch
     }
 
     #[cfg(test)]

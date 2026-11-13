@@ -186,7 +186,7 @@ impl<
             let final_release = pending[pending_len]
                 .take()
                 .expect("pending finalization slot remains populated");
-            wakes.append(self.finalize_one(final_release, &mut pending, &mut pending_len));
+            self.finalize_one(final_release, &mut pending, &mut pending_len, &mut wakes);
         }
         wakes
     }
@@ -216,7 +216,8 @@ impl<
         final_release: FinalRelease,
         pending: &mut [Option<FinalRelease>; REGISTRY_OBJECTS],
         pending_len: &mut usize,
-    ) -> WakeBatch<WAITERS> {
+        wakes: &mut WakeBatch<WAITERS>,
+    ) {
         match final_release.object_type() {
             DW_OBJECT_TYPE_MEMORY_OBJECT => {
                 let finalization =
@@ -233,7 +234,6 @@ impl<
                     pending_len,
                     complete_memory_finalization(self.registry, self.roles, finalization),
                 );
-                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_ADDRESS_REGION => {
                 let finalization = self
@@ -247,7 +247,6 @@ impl<
                     pending_len,
                     complete_address_region_finalization(self.registry, finalization),
                 );
-                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_EVENT => {
                 let finalization =
@@ -257,7 +256,6 @@ impl<
                             panic!("Event final release bypassed its typed payload: {error:?}")
                         });
                 complete_event_finalization(self.registry, finalization);
-                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_TIMER => {
                 let finalization = self
@@ -267,21 +265,17 @@ impl<
                         panic!("Timer final release bypassed its typed payload: {error:?}")
                     });
                 complete_timer_finalization(self.registry, finalization);
-                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_CHANNEL => {
                 let finalization = self
                     .channels
-                    .take_finalization(final_release, self.waits)
+                    .take_finalization(final_release, self.waits, wakes)
                     .unwrap_or_else(|(error, _)| {
                         panic!("Channel final release bypassed its typed payload: {error:?}")
                     });
-                let completion = complete_channel_finalization(self.registry, finalization);
-                let (wakes, releases) = completion.into_parts();
-                for release in releases {
-                    push_pending(pending, pending_len, release);
-                }
-                wakes
+                complete_channel_finalization(self.registry, finalization, |release| {
+                    push_pending(pending, pending_len, Some(release));
+                });
             }
             DW_OBJECT_TYPE_DEVICE_RESOURCE => {
                 // The function's DMA domain goes first (storage K4): bus
@@ -325,7 +319,6 @@ impl<
                 } else {
                     complete_device_resource_finalization(self.registry, finalization);
                 }
-                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_INTERRUPT => {
                 let finalization = self
@@ -349,7 +342,6 @@ impl<
                     pending_len,
                     complete_interrupt_finalization(self.registry, finalization),
                 );
-                WakeBatch::empty()
             }
             DW_OBJECT_TYPE_TASK_GROUP | DW_OBJECT_TYPE_PROCESS | DW_OBJECT_TYPE_THREAD => {
                 let finalization =
@@ -366,7 +358,6 @@ impl<
                     pending_len,
                     complete_task_finalization(self.registry, finalization),
                 );
-                WakeBatch::empty()
             }
             object_type => panic!(
                 "DW0-E2 finalizer received unsupported payload object type {}",

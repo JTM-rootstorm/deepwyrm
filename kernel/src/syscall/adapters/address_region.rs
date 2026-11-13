@@ -82,7 +82,7 @@ impl<const OBJECTS: usize> Drop for HeldReleases<OBJECTS> {
 
 pub(super) fn queue_mapping_releases<const OBJECTS: usize>(
     cleanup: &mut CleanupQueue<OBJECTS>,
-    releases: crate::memory::object::MappingFinalReleases<OBJECTS>,
+    releases: crate::memory::object::MappingFinalReleases,
 ) {
     for release in releases.into_items().into_iter().flatten() {
         cleanup.push(release);

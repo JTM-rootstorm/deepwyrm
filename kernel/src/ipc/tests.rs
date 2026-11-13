@@ -52,18 +52,17 @@ fn pair() -> (
     (registry, channels, waits, keys, handles)
 }
 
-fn complete_no_transfer_finalization<
-    const OBJECTS: usize,
-    const DEPTH: usize,
-    const WAITERS: usize,
->(
+fn complete_no_transfer_finalization<const OBJECTS: usize, const DEPTH: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
-    finalization: ChannelFinalization<DEPTH, WAITERS>,
-) -> WakeBatch<WAITERS> {
-    let completion = complete_channel_finalization(registry, finalization);
-    let (wakes, releases) = completion.into_parts();
-    assert!(releases.into_iter().flatten().next().is_none());
-    wakes
+    finalization: ChannelFinalization<DEPTH>,
+) {
+    assert!(
+        collect_channel_releases(registry, finalization)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none()
+    );
 }
 
 fn finalize(
@@ -73,8 +72,12 @@ fn finalize(
     handle: HandleRef,
 ) -> WakeBatch<4> {
     let release = registry.release_handle(handle).unwrap().unwrap();
-    let finalization = channels.take_finalization(release, waits).unwrap();
-    complete_no_transfer_finalization(registry, finalization)
+    let mut wakes = WakeBatch::empty();
+    let finalization = channels
+        .take_finalization(release, waits, &mut wakes)
+        .unwrap();
+    complete_no_transfer_finalization(registry, finalization);
+    wakes
 }
 
 fn make_thread_key(registry: &mut Registry) -> ThreadKey {
@@ -344,19 +347,23 @@ fn readiness_waiters_wake_on_send_receive_and_peer_close() {
         ChannelWaitOutcome::Registered(_)
     ));
     let release0 = table.close(&mut registry, endpoint0).unwrap().unwrap();
-    let finalization = channels.take_finalization(release0, &waits).unwrap();
-    let close_wakes = complete_no_transfer_finalization(&mut registry, finalization);
+    let mut close_wakes = WakeBatch::empty();
+    let finalization = channels
+        .take_finalization(release0, &waits, &mut close_wakes)
+        .unwrap();
+    complete_no_transfer_finalization(&mut registry, finalization);
     let wakes = consume_wakes(&mut registry, &scheduler, close_wakes);
     let wake = wakes.into_iter().flatten().next().unwrap();
     assert_eq!(wake.item_index(), 5);
     assert_ne!(wake.observed().0 & DW_SIGNAL_PEER_CLOSED.0, 0);
 
     let release1 = table.close(&mut registry, endpoint1).unwrap().unwrap();
-    let finalization = channels.take_finalization(release1, &waits).unwrap();
-    assert_eq!(
-        complete_no_transfer_finalization(&mut registry, finalization).len(),
-        0
-    );
+    let mut wakes = WakeBatch::empty();
+    let finalization = channels
+        .take_finalization(release1, &waits, &mut wakes)
+        .unwrap();
+    complete_no_transfer_finalization(&mut registry, finalization);
+    assert_eq!(wakes.len(), 0);
 }
 
 #[test]
@@ -900,11 +907,14 @@ fn concurrent_send_receive_close_trace_preserves_fifo_and_committed_messages() {
                 .release_handle(handle0)
                 .unwrap()
                 .unwrap();
-            let finalization = channels.take_finalization(release, &waits).unwrap();
-            let wakes = {
+            let mut wakes = WakeBatch::empty();
+            let finalization = channels
+                .take_finalization(release, &waits, &mut wakes)
+                .unwrap();
+            {
                 let mut registry = registry.lock().unwrap();
-                complete_no_transfer_finalization(&mut registry, finalization)
-            };
+                complete_no_transfer_finalization(&mut registry, finalization);
+            }
             assert_eq!(wakes.len(), 0);
         })
     };
@@ -928,11 +938,14 @@ fn concurrent_send_receive_close_trace_preserves_fifo_and_committed_messages() {
         .release_handle(handle1)
         .unwrap()
         .unwrap();
-    let finalization = channels.take_finalization(release, &waits).unwrap();
-    let wakes = {
+    let mut wakes = WakeBatch::empty();
+    let finalization = channels
+        .take_finalization(release, &waits, &mut wakes)
+        .unwrap();
+    {
         let mut registry = registry.lock().unwrap();
-        complete_no_transfer_finalization(&mut registry, finalization)
-    };
+        complete_no_transfer_finalization(&mut registry, finalization);
+    }
     assert_eq!(wakes.len(), 0);
 }
 
@@ -962,9 +975,11 @@ fn peer_close_after_transfer_extraction_rolls_back_source_handle_exactly() {
     let send = channels.reserve_send(keys[0], b"race").unwrap();
     let (rollback, transfers) = prepared.extract();
     let peer_release = registry.release_handle(handle1).unwrap().unwrap();
-    let peer_finalization = channels.take_finalization(peer_release, &waits).unwrap();
-    let completion = complete_channel_finalization(&mut registry, peer_finalization);
-    let (wakes, releases) = completion.into_parts();
+    let mut wakes = WakeBatch::empty();
+    let peer_finalization = channels
+        .take_finalization(peer_release, &waits, &mut wakes)
+        .unwrap();
+    let releases = collect_channel_releases(&mut registry, peer_finalization);
     assert_eq!(wakes.len(), 0);
     assert!(releases.into_iter().flatten().next().is_none());
 
@@ -976,11 +991,11 @@ fn peer_close_after_transfer_extraction_rolls_back_source_handle_exactly() {
     let source_final = table.close(&mut registry, source).unwrap().unwrap();
     registry.complete_finalization(source_final).unwrap();
     let endpoint_release = registry.release_handle(handle0).unwrap().unwrap();
+    let mut wakes = WakeBatch::empty();
     let endpoint_finalization = channels
-        .take_finalization(endpoint_release, &waits)
+        .take_finalization(endpoint_release, &waits, &mut wakes)
         .unwrap();
-    let completion = complete_channel_finalization(&mut registry, endpoint_finalization);
-    let (wakes, releases) = completion.into_parts();
+    let releases = collect_channel_releases(&mut registry, endpoint_finalization);
     assert_eq!(wakes.len(), 0);
     assert!(releases.into_iter().flatten().next().is_none());
 }
@@ -1043,9 +1058,11 @@ fn reciprocal_transfer_reservations_are_serialized_at_commit() {
 
     for handle in [a0, a1, b1, received_b0] {
         let release = table.close(&mut registry, handle).unwrap().unwrap();
-        let finalization = channels.take_finalization(release, &waits).unwrap();
-        let completion = complete_channel_finalization(&mut registry, finalization);
-        let (wakes, releases) = completion.into_parts();
+        let mut wakes = WakeBatch::empty();
+        let finalization = channels
+            .take_finalization(release, &waits, &mut wakes)
+            .unwrap();
+        let releases = collect_channel_releases(&mut registry, finalization);
         assert_eq!(wakes.len(), 0);
         assert!(releases.into_iter().flatten().next().is_none());
     }
@@ -1061,9 +1078,11 @@ fn exhausted_vacant_pair_slot_does_not_mask_later_slots() {
     assert_eq!(channels.test_pair_key(keys[0]).unwrap().slot, 1);
     for handle in handles {
         let release = registry.release_handle(handle).unwrap().unwrap();
-        let finalization = channels.take_finalization(release, &waits).unwrap();
-        let completion = complete_channel_finalization(&mut registry, finalization);
-        let (wakes, releases) = completion.into_parts();
+        let mut wakes = WakeBatch::empty();
+        let finalization = channels
+            .take_finalization(release, &waits, &mut wakes)
+            .unwrap();
+        let releases = collect_channel_releases(&mut registry, finalization);
         assert_eq!(wakes.len(), 0);
         assert!(releases.into_iter().flatten().next().is_none());
     }
@@ -1172,8 +1191,11 @@ fn fill_every_queue_with_small_datagrams<
         for (_, handles) in pairs {
             for handle in handles {
                 let release = registry.release_handle(handle).unwrap().unwrap();
-                let finalization = channels.take_finalization(release, &waits).unwrap();
-                let _ = complete_no_transfer_finalization(&mut registry, finalization);
+                let mut wakes = WakeBatch::empty();
+                let finalization = channels
+                    .take_finalization(release, &waits, &mut wakes)
+                    .unwrap();
+                complete_no_transfer_finalization(&mut registry, finalization);
             }
         }
     }

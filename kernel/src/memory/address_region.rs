@@ -152,26 +152,21 @@ pub(crate) enum AddressSpaceTransactionError<E> {
 }
 
 #[derive(Debug)]
-pub(crate) struct AddressSpaceTransactionFailure<E, const FINALIZERS: usize> {
+pub(crate) struct AddressSpaceTransactionFailure<E> {
     error: AddressSpaceTransactionError<E>,
-    final_releases: MappingFinalReleases<FINALIZERS>,
+    final_releases: MappingFinalReleases,
 }
 
-impl<E, const FINALIZERS: usize> AddressSpaceTransactionFailure<E, FINALIZERS> {
+impl<E> AddressSpaceTransactionFailure<E> {
     pub(crate) const fn error(&self) -> &AddressSpaceTransactionError<E> {
         &self.error
     }
 
-    pub(crate) fn into_final_releases(self) -> MappingFinalReleases<FINALIZERS> {
+    pub(crate) fn into_final_releases(self) -> MappingFinalReleases {
         self.final_releases
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        AddressSpaceTransactionError<E>,
-        MappingFinalReleases<FINALIZERS>,
-    ) {
+    pub(crate) fn into_parts(self) -> (AddressSpaceTransactionError<E>, MappingFinalReleases) {
         (self.error, self.final_releases)
     }
 }
@@ -518,9 +513,7 @@ const fn intersects_specs(left: MappingSpec, right: MappingSpec) -> bool {
     left.virtual_start < right.end() && right.virtual_start < left.end()
 }
 
-fn model_failure<E, const FINALIZERS: usize>(
-    error: AddressRegionError,
-) -> AddressSpaceTransactionFailure<E, FINALIZERS> {
+fn model_failure<E>(error: AddressRegionError) -> AddressSpaceTransactionFailure<E> {
     AddressSpaceTransactionFailure {
         error: AddressSpaceTransactionError::Model(error),
         final_releases: MappingFinalReleases::empty(),
@@ -531,7 +524,7 @@ fn authorization_failure<E, const REGISTRY_OBJECTS: usize>(
     registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
     authorization: MapAuthorization,
     error: AddressRegionError,
-) -> AddressSpaceTransactionFailure<E, REGISTRY_OBJECTS> {
+) -> AddressSpaceTransactionFailure<E> {
     AddressSpaceTransactionFailure {
         error: AddressSpaceTransactionError::Model(error),
         final_releases: authorization.release(registry),

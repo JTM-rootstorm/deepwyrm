@@ -230,7 +230,7 @@ impl<'a> Elf<'a> {
         let strings = self.contents(self.sections[symtab].link as usize)?;
         let table = self.contents(symtab)?;
         let mut functions = Vec::new();
-        for entry in table.chunks_exact(24) {
+        for entry in table.as_chunks::<24>().0 {
             let info = entry[4];
             let size = u64_at(entry, 16)?;
             if info & 0xf == STT_FUNC && size > 0 {
@@ -271,7 +271,7 @@ impl<'a> Elf<'a> {
             if section.kind != SHT_RELA || section.info as usize != text {
                 continue;
             }
-            for entry in self.contents(index)?.chunks_exact(24) {
+            for entry in self.contents(index)?.as_chunks::<24>().0 {
                 let place = u64_at(entry, 0)?;
                 let kind = u64_at(entry, 8)? as u32;
                 if !matches!(

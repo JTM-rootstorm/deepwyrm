@@ -172,10 +172,9 @@ fn publish_execution(
 
 fn require_clean_mapping(
     result: Result<
-        crate::memory::object::MappingFinalReleases<REGISTRY_OBJECTS>,
+        crate::memory::object::MappingFinalReleases,
         crate::memory::address_region::AddressSpaceTransactionFailure<
             crate::arch::x86_64::mm::journal::X86AddressSpacePublishError<LiveActiveTargetError>,
-            REGISTRY_OBJECTS,
         >,
     >,
     detail: u32,

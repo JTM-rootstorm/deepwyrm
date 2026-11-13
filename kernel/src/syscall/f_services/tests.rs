@@ -586,12 +586,12 @@ fn close_channel_for_process(fixture: &mut Fixture, process: ProcessKey, handle:
         .close(&mut fixture.registry, handle)
         .unwrap()
         .unwrap();
+    let mut wakes = crate::wait::WakeBatch::empty();
     let finalization = fixture
         .channels
-        .take_finalization(release, &fixture.waits)
+        .take_finalization(release, &fixture.waits, &mut wakes)
         .unwrap();
-    let completion = crate::ipc::complete_channel_finalization(&mut fixture.registry, finalization);
-    let (wakes, releases) = completion.into_parts();
+    let releases = crate::ipc::collect_channel_releases(&mut fixture.registry, finalization);
     assert_eq!(wakes.len(), 0);
     assert!(releases.into_iter().flatten().next().is_none());
 }

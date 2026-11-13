@@ -568,9 +568,8 @@ impl ChannelPayloadCleanup {
     }
 }
 
-pub(crate) struct ChannelFinalization<const DEPTH: usize, const WAITERS: usize> {
+pub(crate) struct ChannelFinalization<const DEPTH: usize> {
     final_release: FinalRelease,
-    wakes: WakeBatch<WAITERS>,
     drained_transfers: [Option<HandleTransferBatch>; DEPTH],
 }
 
@@ -597,17 +596,6 @@ impl<const WAITERS: usize> ChannelReceivedMessage<WAITERS> {
 }
 
 #[must_use = "Channel finalization effects contain typed final releases that must be routed"]
-pub(crate) struct ChannelCompletion<const OBJECTS: usize, const WAITERS: usize> {
-    wakes: WakeBatch<WAITERS>,
-    final_releases: [Option<FinalRelease>; OBJECTS],
-}
-
-impl<const OBJECTS: usize, const WAITERS: usize> ChannelCompletion<OBJECTS, WAITERS> {
-    pub(crate) fn into_parts(self) -> (WakeBatch<WAITERS>, [Option<FinalRelease>; OBJECTS]) {
-        (self.wakes, self.final_releases)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChannelMessageInfo {
     pub(crate) required_bytes: u32,
@@ -1474,7 +1462,8 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         &self,
         final_release: FinalRelease,
         waits: &WaitRegistry<WAITERS>,
-    ) -> Result<ChannelFinalization<DEPTH, WAITERS>, (ChannelError, FinalRelease)> {
+        wakes: &mut WakeBatch<WAITERS>,
+    ) -> Result<ChannelFinalization<DEPTH>, (ChannelError, FinalRelease)> {
         if final_release.object_type() != DW_OBJECT_TYPE_CHANNEL {
             return Err((ChannelError::FinalizationMismatch, final_release));
         }
@@ -1501,12 +1490,11 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         }
         let drained_transfers = pair.inbound[side.index()].drain_transfers();
         self.small.reset_queue(slot_index, side);
-        let mut wakes = WakeBatch::empty();
         let peer = side.peer();
         if let Some(peer_endpoint) = pair.endpoints[peer.index()].as_ref() {
             let observed = Self::signals_for_pair(pair, peer)
                 .unwrap_or_else(|error| panic!("surviving Channel peer signal drifted: {error:?}"));
-            wakes.append(waits.take_ready(peer_endpoint.object, observed));
+            waits.take_ready_into(peer_endpoint.object, observed, wakes);
         }
         if pair.endpoints.iter().all(Option::is_none) {
             debug_assert!(pair.inbound.iter().all(ByteQueue::is_empty));
@@ -1514,7 +1502,6 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         }
         Ok(ChannelFinalization {
             final_release,
-            wakes,
             drained_transfers,
         })
     }
@@ -1564,17 +1551,17 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
     }
 }
 
-pub(crate) fn complete_channel_finalization<
-    const OBJECTS: usize,
-    const DEPTH: usize,
-    const WAITERS: usize,
->(
+/// Completes a Channel endpoint's generic finalization, then releases the
+/// handles still queued toward it, giving each final release they produce to
+/// `final_release_sink` (rather than collecting them in a registry-sized
+/// array, DW2 plan §10.2 item 2).
+pub(crate) fn complete_channel_finalization<const OBJECTS: usize, const DEPTH: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
-    finalization: ChannelFinalization<DEPTH, WAITERS>,
-) -> ChannelCompletion<OBJECTS, WAITERS> {
+    finalization: ChannelFinalization<DEPTH>,
+    mut final_release_sink: impl FnMut(FinalRelease),
+) {
     let ChannelFinalization {
         final_release,
-        wakes,
         drained_transfers,
     } = finalization;
     registry
@@ -1586,22 +1573,31 @@ pub(crate) fn complete_channel_finalization<
             )
         });
 
-    let mut final_releases = core::array::from_fn(|_| None);
-    let mut final_release_count = 0;
     for transfers in drained_transfers.into_iter().flatten() {
         for release in transfers.release(registry).into_iter().flatten() {
-            assert!(
-                final_release_count < OBJECTS,
-                "Channel teardown produced more final releases than registry capacity"
-            );
-            final_releases[final_release_count] = Some(release);
-            final_release_count += 1;
+            final_release_sink(release);
         }
     }
-    ChannelCompletion {
-        wakes,
-        final_releases,
-    }
+}
+
+#[cfg(test)]
+mod test_vec {
+    extern crate std;
+    pub(crate) use std::vec::Vec;
+}
+
+/// Test convenience: completes a Channel finalization and collects the final
+/// releases the drained transfers produce.
+#[cfg(test)]
+pub(crate) fn collect_channel_releases<const OBJECTS: usize, const DEPTH: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    finalization: ChannelFinalization<DEPTH>,
+) -> test_vec::Vec<Option<FinalRelease>> {
+    let mut releases = test_vec::Vec::new();
+    complete_channel_finalization(registry, finalization, |release| {
+        releases.push(Some(release));
+    });
+    releases
 }
 
 #[cfg(test)]

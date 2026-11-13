@@ -788,9 +788,11 @@ fn close_channel_for_test<
         .close(registry, handle)
         .unwrap()
         .unwrap();
-    let finalization = channels.take_finalization(release, waits).unwrap();
-    let completion = crate::ipc::complete_channel_finalization(registry, finalization);
-    let (wakes, releases) = completion.into_parts();
+    let mut wakes = crate::wait::WakeBatch::empty();
+    let finalization = channels
+        .take_finalization(release, waits, &mut wakes)
+        .unwrap();
+    let releases = crate::ipc::collect_channel_releases(registry, finalization);
     assert_eq!(wakes.len(), 0);
     assert!(releases.into_iter().flatten().next().is_none());
 }
@@ -839,9 +841,11 @@ fn complete_channel_cleanup_for_test<
     }
     while let Some(release) = pending.pop() {
         assert_eq!(release.object_type(), deepwyrm_abi::DW_OBJECT_TYPE_CHANNEL);
-        let finalization = channels.take_finalization(release, waits).unwrap();
-        let completion = crate::ipc::complete_channel_finalization(registry, finalization);
-        let (wakes, releases) = completion.into_parts();
+        let mut wakes = crate::wait::WakeBatch::empty();
+        let finalization = channels
+            .take_finalization(release, waits, &mut wakes)
+            .unwrap();
+        let releases = crate::ipc::collect_channel_releases(registry, finalization);
         assert_eq!(wakes.len(), 0);
         pending.extend(releases.into_iter().flatten());
     }
@@ -10385,12 +10389,13 @@ fn close_f10_channel(fixture: &mut F10Fixture, process: ProcessKey, handle: DwHa
         .close(&mut fixture.registry, handle)
         .unwrap()
         .unwrap();
+    let mut wakes = crate::wait::WakeBatch::empty();
     let finalization = fixture
         .channels
-        .take_finalization(release, &fixture.waits)
+        .take_finalization(release, &fixture.waits, &mut wakes)
         .unwrap();
-    let completion = crate::ipc::complete_channel_finalization(&mut fixture.registry, finalization);
-    assert_eq!(completion.into_parts().0.len(), 0);
+    let _ = crate::ipc::collect_channel_releases(&mut fixture.registry, finalization);
+    assert_eq!(wakes.len(), 0);
 }
 
 fn close_f10_fixture_with_open_channels(
@@ -14794,7 +14799,9 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
         .create_child_group(&mut registry, &root_owner)
         .unwrap();
     let jobs_owner = registry.retain_internal_from_handle(&jobs_ref).unwrap();
-    let (job, job_ref) = tasks.create_child_group(&mut registry, &jobs_owner).unwrap();
+    let (job, job_ref) = tasks
+        .create_child_group(&mut registry, &jobs_owner)
+        .unwrap();
     let job_owner = registry.retain_internal_from_handle(&job_ref).unwrap();
     let (process, process_ref) = tasks.create_process(&mut registry, &job_owner).unwrap();
     let root_ref = registry.internal_into_handle(root_owner).unwrap();
@@ -14831,8 +14838,10 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
     let read = |encoded: &super::super::abi_bytes::EncodedObjectInfo| {
         let bytes = encoded.bytes();
         assert_eq!(bytes.len(), 48);
-        let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        let u64_at = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let u32_at =
+            |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let u64_at =
+            |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         assert_eq!((u32_at(0), u32_at(4), u32_at(12)), (48, 1, 0));
         assert_eq!(u64_at(40), 0);
         (u32_at(8), u64_at(16), u64_at(24), u64_at(32))
@@ -14862,7 +14871,10 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
 
     // Released usage shows at once.
     registry.release_reserved_pages(reserving);
-    assert_eq!(read(&query(&mut registry, job_handle).unwrap()), (60, 0, 60, 0));
+    assert_eq!(
+        read(&query(&mut registry, job_handle).unwrap()),
+        (60, 0, 60, 0)
+    );
 
     // Any other object type is refused.
     assert_eq!(

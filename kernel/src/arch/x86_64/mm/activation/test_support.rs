@@ -525,11 +525,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         use crate::object::ObjectRegistry;
         use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 
-        fn require_clean_mapping<E, const FINALIZERS: usize>(
-            result: Result<
-                MappingFinalReleases<FINALIZERS>,
-                AddressSpaceTransactionFailure<E, FINALIZERS>,
-            >,
+        fn require_clean_mapping<E>(
+            result: Result<MappingFinalReleases, AddressSpaceTransactionFailure<E>>,
             detail: u32,
         ) -> Result<(), u32> {
             match result {

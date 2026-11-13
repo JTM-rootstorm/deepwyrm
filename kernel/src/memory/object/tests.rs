@@ -50,7 +50,7 @@ fn mapping<const OBJECTS: usize, const LEASES: usize>(
     (captured, authorization)
 }
 
-fn only_final<const CAPACITY: usize>(releases: MappingFinalReleases<CAPACITY>) -> FinalRelease {
+fn only_final(releases: MappingFinalReleases) -> FinalRelease {
     assert_eq!(releases.len(), 1);
     releases
         .into_items()

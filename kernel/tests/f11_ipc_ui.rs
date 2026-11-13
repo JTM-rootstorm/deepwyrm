@@ -109,7 +109,7 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
         },
         CompileFailCase {
             fixture: "f11_channel_finalization_clone.rs",
-            expected_error: "error[E0277]: the trait bound `ChannelFinalization<1, 1>: Clone` is not satisfied",
+            expected_error: "error[E0277]: the trait bound `ChannelFinalization<1>: Clone` is not satisfied",
         },
         CompileFailCase {
             fixture: "f11_channel_send_reservation_clone.rs",

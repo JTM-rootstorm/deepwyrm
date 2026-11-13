@@ -1,6 +1,10 @@
 use super::*;
 
 impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, LEASES> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error returns the final releases of the pins it let go; the kernel has no heap to box them into"
+    )]
     pub(in super::super) fn prepare_replace<
         'a,
         const BATCH: usize,
@@ -13,10 +17,14 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         released: &[MappingLease],
         requested: &[LeaseRequest],
         authorization: Option<MapAuthorization>,
-    ) -> Result<
-        PreparedReplace<'a, OBJECTS, LEASES, BATCH, REGISTRY_OBJECTS>,
-        PrepareReplaceError<REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<PreparedReplace<'a, OBJECTS, LEASES, BATCH, REGISTRY_OBJECTS>, PrepareReplaceError>
+    {
+        const {
+            assert!(
+                BATCH <= MAX_MAPPING_BATCH,
+                "a replace batch must fit one final-release batch"
+            );
+        }
         let plan = match self.plan_replace(
             address_space,
             region,
@@ -298,7 +306,7 @@ impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGIST
     /// Finalizes reference ownership only after page-table publication.
     /// Existing pins transfer where possible; surplus pins are released only
     /// after every replacement lease has acquired its exact lifetime owner.
-    pub(in super::super) fn commit(mut self) -> MappingFinalReleases<REGISTRY_OBJECTS> {
+    pub(in super::super) fn commit(mut self) -> MappingFinalReleases {
         let mut released_records: [Option<LeaseRecord>; BATCH] = core::array::from_fn(|_| None);
         for (position, record) in released_records
             .iter_mut()
@@ -356,7 +364,7 @@ impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGIST
     /// Aborts a prepared replacement before page-table publication.
     /// Committed old leases remain untouched; only speculative extra and
     /// authorization pins are released.
-    pub(in super::super) fn rollback(mut self) -> MappingFinalReleases<REGISTRY_OBJECTS> {
+    pub(in super::super) fn rollback(mut self) -> MappingFinalReleases {
         let mut final_releases = MappingFinalReleases::empty();
         for pin in self.extra_pins.iter_mut().filter_map(Option::take) {
             release_internal_pin(self.registry, pin, &mut final_releases);

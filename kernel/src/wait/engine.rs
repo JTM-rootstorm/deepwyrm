@@ -1189,9 +1189,11 @@ mod tests {
             .close(registry, handle)
             .unwrap()
             .unwrap();
-        let finalization = channels.take_finalization(release, waits).unwrap();
-        let completion = crate::ipc::complete_channel_finalization(registry, finalization);
-        let (wakes, releases) = completion.into_parts();
+        let mut wakes = crate::wait::WakeBatch::empty();
+        let finalization = channels
+            .take_finalization(release, waits, &mut wakes)
+            .unwrap();
+        let releases = crate::ipc::collect_channel_releases(registry, finalization);
         assert_eq!(wakes.len(), 0);
         assert!(releases.into_iter().flatten().next().is_none());
     }

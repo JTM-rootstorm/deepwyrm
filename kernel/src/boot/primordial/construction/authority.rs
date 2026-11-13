@@ -23,7 +23,7 @@ use crate::task::{
     ExecutionDomain, PreparedProcess, PreparedThread, PreparedThreadStart, ProcessKey,
     TaskAuthority, TaskCreateError, TaskError, ThreadKey, ThreadStartState,
 };
-use crate::wait::WaitRegistry;
+use crate::wait::{WaitRegistry, WakeBatch};
 
 use super::{
     BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, INIT_BYTES, INITIAL_CAPABILITIES,
@@ -420,20 +420,18 @@ where
             .release_handle(reference)
             .expect("primordial Channel reference release remains valid")
             .expect("unpublished Channel endpoint reaches final release");
+        let mut wakes = WakeBatch::empty();
         let finalization = self
             .channels
-            .take_finalization(final_release, self.waits)
+            .take_finalization(final_release, self.waits, &mut wakes)
             .unwrap_or_else(|(error, _)| panic!("primordial Channel rollback diverged: {error:?}"));
-        let completion = complete_channel_finalization(self.registry, finalization);
-        let (wakes, releases) = completion.into_parts();
+        complete_channel_finalization(self.registry, finalization, |_| {
+            panic!("uncommitted primordial Channel rollback drained transferred handles")
+        });
         assert_eq!(
             wakes.len(),
             0,
             "unpublished primordial Channel woke a waiter"
-        );
-        assert!(
-            releases.into_iter().all(|release| release.is_none()),
-            "uncommitted primordial Channel rollback drained transferred handles"
         );
     }
 }

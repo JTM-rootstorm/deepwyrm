@@ -115,6 +115,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         clippy::too_many_arguments,
         reason = "the mapping contract keeps virtual address, backing range, effective protection, and captured source ceiling explicit at the authority boundary"
     )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     pub(crate) fn map<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -130,10 +134,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         object_offset: u64,
         byte_len: u64,
         protection: Protection,
-    ) -> Result<
-        MappingFinalReleases<REGISTRY_OBJECTS>,
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<MappingFinalReleases, AddressSpaceTransactionFailure<P::Error>> {
         let mapping_authority = match authorization.capture(self.address_space, self.region) {
             Ok(authority) => authority,
             Err(error) => {
@@ -213,6 +214,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         clippy::too_many_arguments,
         reason = "the allocator-chosen variant intentionally mirrors the explicit fixed-map authority contract"
     )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     pub(crate) fn map_anywhere<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -227,10 +232,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         object_offset: u64,
         byte_len: u64,
         protection: Protection,
-    ) -> Result<
-        (u64, MappingFinalReleases<REGISTRY_OBJECTS>),
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<(u64, MappingFinalReleases), AddressSpaceTransactionFailure<P::Error>> {
         self.map_anywhere_with_room(
             authority,
             registry,
@@ -250,6 +252,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         clippy::too_many_arguments,
         reason = "the allocator-chosen variant mirrors the explicit fixed-map authority contract"
     )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     pub(crate) fn map_anywhere_with_room<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -265,10 +271,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         byte_len: u64,
         room: u64,
         protection: Protection,
-    ) -> Result<
-        (u64, MappingFinalReleases<REGISTRY_OBJECTS>),
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<(u64, MappingFinalReleases), AddressSpaceTransactionFailure<P::Error>> {
         if room < byte_len || !room.is_multiple_of(PAGE_SIZE) {
             return Err(authorization_failure(
                 registry,
@@ -355,6 +358,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     pub(crate) fn unmap<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -367,10 +374,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         publisher: &mut P,
         start: u64,
         byte_len: u64,
-    ) -> Result<
-        MappingFinalReleases<REGISTRY_OBJECTS>,
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<MappingFinalReleases, AddressSpaceTransactionFailure<P::Error>> {
         let end = self
             .checked_interval_end(start, byte_len)
             .map_err(model_failure)?;
@@ -378,6 +382,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         self.rebuild(authority, registry, publisher, start, end, None)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     pub(crate) fn protect<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -391,10 +399,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         start: u64,
         byte_len: u64,
         protection: Protection,
-    ) -> Result<
-        MappingFinalReleases<REGISTRY_OBJECTS>,
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<MappingFinalReleases, AddressSpaceTransactionFailure<P::Error>> {
         MemoryProtection::mapping(protection.bits())
             .map_err(|error| model_failure(protection_error(error)))?;
         let end = self
@@ -404,6 +409,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         self.rebuild(authority, registry, publisher, start, end, Some(protection))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     fn rebuild<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -417,10 +426,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         start: u64,
         end: u64,
         replacement_protection: Option<Protection>,
-    ) -> Result<
-        MappingFinalReleases<REGISTRY_OBJECTS>,
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<MappingFinalReleases, AddressSpaceTransactionFailure<P::Error>> {
         let mut staged = [None; SLOTS];
         let mut staged_len = 0;
         for mapping in self.mappings.iter().flatten().copied() {
@@ -457,6 +463,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         self.commit_specs(authority, registry, publisher, &staged, staged_len, None)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
     fn commit_specs<
         const OBJECTS: usize,
         const LEASES: usize,
@@ -470,10 +480,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         specs: &[Option<MappingSpec>; SLOTS],
         spec_len: usize,
         authorization: Option<MapAuthorization>,
-    ) -> Result<
-        MappingFinalReleases<REGISTRY_OBJECTS>,
-        AddressSpaceTransactionFailure<P::Error, REGISTRY_OBJECTS>,
-    > {
+    ) -> Result<MappingFinalReleases, AddressSpaceTransactionFailure<P::Error>> {
         let old_len = self.mapping_count();
         let mut released = [EMPTY_LEASE; SLOTS];
         let mut old = [EMPTY_MAPPING; SLOTS];

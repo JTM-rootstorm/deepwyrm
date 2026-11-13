@@ -117,7 +117,7 @@ impl MapAuthorizationCreateError {
     pub(crate) fn release<const REGISTRY_OBJECTS: usize>(
         self,
         registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
-    ) -> (MemoryObjectError, MappingFinalReleases<REGISTRY_OBJECTS>) {
+    ) -> (MemoryObjectError, MappingFinalReleases) {
         let error = self.error;
         let pin = self.resolved.into_internal();
         let mut final_releases = MappingFinalReleases::empty();
@@ -388,7 +388,7 @@ impl MapAuthorization {
     pub(super) fn release<const REGISTRY_OBJECTS: usize>(
         self,
         registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
-    ) -> MappingFinalReleases<REGISTRY_OBJECTS> {
+    ) -> MappingFinalReleases {
         let mut final_releases = MappingFinalReleases::empty();
         release_map_authorization(registry, self, &mut final_releases);
         final_releases
@@ -414,14 +414,25 @@ impl CapturedMappingAuthority {
     }
 }
 
+/// The most mappings one replace transaction may hold on either side: the
+/// largest per-region slot count any build may select.
+pub(crate) const MAX_MAPPING_BATCH: usize = 64;
+
+/// One replace transaction drops at most its released leases' pins, its
+/// surplus pins and its authorization: `2 * BATCH + 1`. Sizing the batch by
+/// the transaction rather than by the object registry keeps every frame that
+/// carries one small (it was 640 entries, several copies per frame; DW2 plan
+/// §10.2 item 2).
+pub(crate) const MAPPING_FINAL_RELEASE_CAPACITY: usize = 2 * MAX_MAPPING_BATCH + 1;
+
 #[must_use = "mapping reference releases may contain final MemoryObject cleanup authority"]
 #[derive(Debug)]
-pub(crate) struct MappingFinalReleases<const CAPACITY: usize> {
-    items: [Option<FinalRelease>; CAPACITY],
+pub(crate) struct MappingFinalReleases {
+    items: [Option<FinalRelease>; MAPPING_FINAL_RELEASE_CAPACITY],
     count: usize,
 }
 
-impl<const CAPACITY: usize> MappingFinalReleases<CAPACITY> {
+impl MappingFinalReleases {
     pub(crate) fn empty() -> Self {
         Self {
             items: core::array::from_fn(|_| None),
@@ -431,7 +442,7 @@ impl<const CAPACITY: usize> MappingFinalReleases<CAPACITY> {
 
     fn push(&mut self, release: FinalRelease) {
         assert!(
-            self.count < CAPACITY,
+            self.count < MAPPING_FINAL_RELEASE_CAPACITY,
             "mapping final-release batch overflow"
         );
         self.items[self.count] = Some(release);
@@ -446,23 +457,23 @@ impl<const CAPACITY: usize> MappingFinalReleases<CAPACITY> {
         self.count == 0
     }
 
-    pub(crate) fn into_items(self) -> [Option<FinalRelease>; CAPACITY] {
+    pub(crate) fn into_items(self) -> [Option<FinalRelease>; MAPPING_FINAL_RELEASE_CAPACITY] {
         self.items
     }
 }
 
 #[derive(Debug)]
-pub(super) struct PrepareReplaceError<const CAPACITY: usize> {
+pub(super) struct PrepareReplaceError {
     error: MemoryObjectError,
-    final_releases: MappingFinalReleases<CAPACITY>,
+    final_releases: MappingFinalReleases,
 }
 
-impl<const CAPACITY: usize> PrepareReplaceError<CAPACITY> {
+impl PrepareReplaceError {
     pub(super) const fn error(&self) -> MemoryObjectError {
         self.error
     }
 
-    pub(super) fn into_final_releases(self) -> MappingFinalReleases<CAPACITY> {
+    pub(super) fn into_final_releases(self) -> MappingFinalReleases {
         self.final_releases
     }
 }
@@ -1201,7 +1212,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
 fn release_internal_pin<const REGISTRY_OBJECTS: usize>(
     registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
     pin: InternalRef,
-    final_releases: &mut MappingFinalReleases<REGISTRY_OBJECTS>,
+    final_releases: &mut MappingFinalReleases,
 ) {
     match registry.release_internal(pin) {
         Ok(Some(final_release)) => final_releases.push(final_release),
@@ -1213,7 +1224,7 @@ fn release_internal_pin<const REGISTRY_OBJECTS: usize>(
 fn release_map_authorization<const REGISTRY_OBJECTS: usize>(
     registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
     authorization: MapAuthorization,
-    final_releases: &mut MappingFinalReleases<REGISTRY_OBJECTS>,
+    final_releases: &mut MappingFinalReleases,
 ) {
     release_internal_pin(registry, authorization.pin, final_releases);
 }
