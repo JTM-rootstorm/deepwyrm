@@ -472,6 +472,16 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         self.free.adopt(larger, EMPTY_RANGE)
     }
 
+    /// Pages in the largest free range: the largest run one allocation can
+    /// take now.
+    pub(super) fn largest_free_pages(&self) -> u64 {
+        self.free.as_slice()[..self.free_len]
+            .iter()
+            .map(|range| range.page_count())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Number of currently available frames.
     pub(super) fn available_frames(&self) -> u64 {
         self.free.as_slice()[..self.free_len]

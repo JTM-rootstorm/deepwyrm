@@ -913,7 +913,7 @@ fn a_freed_slot_is_reused_with_the_next_generation_and_a_spent_one_retires() {
 
 #[test]
 fn growth_keeps_identities_adds_slots_and_indexes_tables() {
-    // 2 MiB of allocator RAM: one slot more than the 16 boot slots.
+    // 2 MiB of allocator RAM: one slot per page beyond the 16 boot slots.
     let mut roles = manager(BASE_PAGE_SIZE, 512);
     let owner = roles.create_table_owner().unwrap();
     let root = allocate_zeroed(&mut roles, 1);
@@ -922,8 +922,8 @@ fn growth_keeps_identities_adds_slots_and_indexes_tables() {
     let kept = roles.allocate(1).unwrap();
 
     let layout = grow(&mut roles);
-    assert_eq!(layout.slot_count(), 17);
-    assert_eq!(roles.roles.len(), 17);
+    assert_eq!(layout.slot_count(), 16 + 512);
+    assert_eq!(roles.roles.len(), 16 + 512);
     assert_eq!(roles.validate_allocation(&kept), Ok(()));
     assert_eq!(roles.validate_table_identity(root), Ok(()));
     assert_eq!(
@@ -932,17 +932,20 @@ fn growth_keeps_identities_adds_slots_and_indexes_tables() {
     );
     assert_eq!(roles.check_invariants(), Ok(()));
 
-    // Every slot is usable: fill the grown table, then one more is refused.
+    // Slots cannot run out before pages do (DW2 M3 §6.7): one-page runs
+    // fill memory, and the refusal is for memory, not slots.
     let mut held = Vec::new();
-    while let Ok(grant) = roles.allocate(1) {
-        held.push(grant);
-    }
+    let refusal = loop {
+        match roles.allocate(1) {
+            Ok(grant) => held.push(grant),
+            Err(error) => break error,
+        }
+    };
     assert_eq!(
-        held.len() + 3,
-        17,
-        "root, kept and the run hold three slots"
+        refusal,
+        FrameRoleError::Physical(PhysicalMemoryError::NoFramesAvailable)
     );
-    assert_eq!(roles.allocate(1), Err(FrameRoleError::Capacity));
+    assert_eq!(roles.available_frames(), 0);
 
     // A table committed after growth is found through the start index.
     let freed = held.pop().unwrap();

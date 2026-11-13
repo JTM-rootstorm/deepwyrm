@@ -252,19 +252,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         grant: ZeroedGrant,
     ) -> Result<ObjectBackingGrant, GrantTransitionError<ZeroedGrant>> {
-        let kind = ObjectBackingKind::AllocatorOwned;
+        let link = ChainLink {
+            head: grant.identity.raw,
+            object_page: 0,
+            next: 0,
+        };
         if let Err(error) = self.transition(
             grant.identity,
             grant.range,
             FrameRole::Zeroed,
-            FrameRole::ObjectBacking(kind),
+            FrameRole::ObjectBacking(link),
         ) {
             return Err(GrantTransitionError::new(error, grant));
         }
         Ok(ObjectBackingGrant {
             identity: BackingIdentity(grant.identity),
             range: grant.range,
-            kind,
+            kind: ObjectBackingKind::AllocatorOwned,
+            pages: grant.range.page_count(),
+            runs: 1,
         })
     }
 
@@ -1006,6 +1012,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             identity: BackingIdentity(identity),
             range: pages,
             kind: ObjectBackingKind::ImmutableModule { module_index },
+            pages: pages.page_count(),
+            runs: 1,
         })
     }
 
@@ -1039,6 +1047,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             identity: BackingIdentity(identity),
             range: pages,
             kind: ObjectBackingKind::DeviceMmio,
+            pages: pages.page_count(),
+            runs: 1,
         })
     }
 
@@ -1071,10 +1081,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         grant: ObjectBackingGrant,
     ) -> Result<(), GrantTransitionError<ObjectBackingGrant>> {
         let result = match grant.kind {
-            ObjectBackingKind::AllocatorOwned => self.cancel(
+            ObjectBackingKind::AllocatorOwned => self.release_chain(
                 grant.identity.0,
-                grant.range,
-                FrameRole::ObjectBacking(grant.kind),
+                ChainState::Backing,
+                grant.pages,
+                grant.runs,
             ),
             ObjectBackingKind::ImmutableModule { .. } | ObjectBackingKind::DeviceMmio => {
                 Err(FrameRoleError::WrongRole)
@@ -1123,7 +1134,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(FrameRoleError::WrongRole);
         }
         match record.role {
-            FrameRole::ObjectBacking(ObjectBackingKind::AllocatorOwned) => Ok(()),
+            FrameRole::ObjectBacking(_) => Ok(()),
             FrameRole::ExternalImmutableModule { .. } if writable => {
                 Err(FrameRoleError::ReadOnlyBacking)
             }
@@ -1371,7 +1382,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(FrameRoleError::InvariantViolation);
         }
-        Ok(())
+        self.check_chains()
     }
 
     fn transition(
@@ -1484,7 +1495,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(identity)
     }
 
-    fn next_slot(&self) -> Result<(usize, u32), FrameRoleError> {
+    pub(super) fn next_slot(&self) -> Result<(usize, u32), FrameRoleError> {
         self.free_slot(0)
     }
 
@@ -1510,7 +1521,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Publishes `record` in the slot on top of the free-slot stack, which
     /// must be `slot`.
-    fn occupy(&mut self, slot: usize, generation: u32, record: RoleRecord) {
+    pub(super) fn occupy(&mut self, slot: usize, generation: u32, record: RoleRecord) {
         let top = self
             .free_slot_count
             .checked_sub(1)
@@ -1532,14 +1543,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Replaces the record of a live slot with the same range.
-    fn replace_record(&mut self, slot: usize, record: RoleRecord) {
+    pub(super) fn replace_record(&mut self, slot: usize, record: RoleRecord) {
         self.roles.as_mut_slice()[slot].record = Some(record);
         self.version = self.version.wrapping_add(1);
     }
 
     /// Empties a live slot and returns it to the free-slot stack unless its
     /// generation is spent.
-    fn vacate(&mut self, slot: usize) {
+    pub(super) fn vacate(&mut self, slot: usize) {
         let entry = &mut self.roles.as_mut_slice()[slot];
         let record = entry.record.take().expect("a vacated slot was live");
         entry.mark = 0;
@@ -1607,7 +1618,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn identity(&self, slot: usize, generation: u32) -> Result<FrameRoleIdentity, FrameRoleError> {
+    pub(super) fn identity(
+        &self,
+        slot: usize,
+        generation: u32,
+    ) -> Result<FrameRoleIdentity, FrameRoleError> {
         let slot = u32::try_from(slot)
             .ok()
             .and_then(|slot| slot.checked_add(1))
@@ -1618,7 +1633,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
-    fn slot(&self, identity: FrameRoleIdentity) -> Result<usize, FrameRoleError> {
+    pub(super) fn slot(&self, identity: FrameRoleIdentity) -> Result<usize, FrameRoleError> {
         if identity.domain != self.domain {
             return Err(FrameRoleError::ForeignManager);
         }
@@ -1640,7 +1655,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(slot)
     }
 
-    fn record(&self, identity: FrameRoleIdentity) -> Result<RoleRecord, FrameRoleError> {
+    pub(super) fn record(&self, identity: FrameRoleIdentity) -> Result<RoleRecord, FrameRoleError> {
         let slot = self.slot(identity)?;
         self.roles.as_slice()[slot]
             .record

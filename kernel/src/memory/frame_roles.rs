@@ -22,8 +22,13 @@ use super::physical::{
     BASE_PAGE_SIZE, PageRange, PhysicalFrameAllocator, PhysicalMemoryError, PhysicalRange,
 };
 
+#[path = "frame_roles/chain.rs"]
+mod chain;
 #[path = "frame_roles/manager.rs"]
 mod manager;
+use chain::ChainState;
+#[allow(unused_imports, reason = "DW2 M3 step 3 maps through object segments")]
+pub(crate) use chain::ObjectSegments;
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]
 mod test_support;
@@ -261,11 +266,25 @@ pub(crate) enum FrameRoleKind {
     RoleTableStorage,
 }
 
+/// Where one run sits in an allocator-owned object backing (DW2 M3 §6.2).
+/// Identities are raw values in this manager's domain; `next` is zero on
+/// the last run. The head run has `head` equal to its own identity and
+/// `object_page` zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChainLink {
+    head: u64,
+    object_page: u64,
+    next: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameRole {
     AllocatedUninitialized,
     Zeroed,
-    ObjectBacking(ObjectBackingKind),
+    /// One run of a backing allocated but not yet zeroed.
+    BackingAllocated(ChainLink),
+    /// One run of an allocator-owned object backing.
+    ObjectBacking(ChainLink),
     ArchitectureBootstrap(ArchitectureBootstrapKind),
     TableCandidate {
         owner: TableOwnerKey,
@@ -296,7 +315,10 @@ impl FrameRole {
         match self {
             Self::AllocatedUninitialized => FrameRoleKind::AllocatedUninitialized,
             Self::Zeroed => FrameRoleKind::Zeroed,
-            Self::ObjectBacking(kind) => FrameRoleKind::ObjectBacking(kind),
+            Self::BackingAllocated(_) => FrameRoleKind::AllocatedUninitialized,
+            Self::ObjectBacking(_) => {
+                FrameRoleKind::ObjectBacking(ObjectBackingKind::AllocatorOwned)
+            }
             Self::ArchitectureBootstrap(kind) => FrameRoleKind::ArchitectureBootstrap(kind),
             Self::TableCandidate { owner, level } => FrameRoleKind::TableCandidate { owner, level },
             Self::PageTable {
@@ -337,9 +359,10 @@ const EMPTY_ROLE_SLOT: RoleSlot = RoleSlot {
     tables: 0,
 };
 
-/// Role slots the grown table has beyond the boot table, per page of
-/// allocator RAM: one per 2 MiB (DW2 M2 §5.3).
-const GROWN_SLOT_PAGES: u64 = 512;
+/// Allocator pages per role slot the grown table adds beyond the boot table:
+/// one per page, so slots cannot run out before pages do, since every run
+/// takes one slot and at least one page (DW2 M3 §6.7).
+const GROWN_SLOT_PAGES: u64 = 1;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AllocationGrant {
@@ -462,11 +485,16 @@ impl ArchitectureBootstrapGrant {
     }
 }
 
+/// Move-only ownership of one object backing: for allocator-owned memory,
+/// a chain of runs named by its head run (DW2 M3 §6.2).
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ObjectBackingGrant {
     identity: BackingIdentity,
+    /// The head run.
     range: PageRange,
     kind: ObjectBackingKind,
+    pages: u64,
+    runs: u64,
 }
 
 impl ObjectBackingGrant {
@@ -474,17 +502,53 @@ impl ObjectBackingGrant {
         self.identity
     }
 
+    /// The head run's start; the whole backing only when it is one run.
     pub(crate) const fn physical_start(&self) -> u64 {
         self.range.start
     }
 
+    /// The whole backing's length.
     pub(crate) const fn byte_len(&self) -> u64 {
-        self.range.end - self.range.start
+        self.pages * BASE_PAGE_SIZE
+    }
+
+    pub(crate) const fn run_count(&self) -> u64 {
+        self.runs
     }
 
     pub(crate) const fn kind(&self) -> ObjectBackingKind {
         self.kind
     }
+}
+
+/// Move-only ownership of a backing's runs before they are zeroed: the
+/// chain [`FrameRoleManager::allocate_backing`] made (DW2 M3 §6.3).
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "a backing allocation must be zeroed into a backing or cancelled"]
+pub(crate) struct BackingAllocation {
+    head: FrameRoleIdentity,
+    pages: u64,
+    runs: u64,
+}
+
+impl BackingAllocation {
+    pub(crate) const fn byte_len(&self) -> u64 {
+        self.pages * BASE_PAGE_SIZE
+    }
+
+    pub(crate) const fn run_count(&self) -> u64 {
+        self.runs
+    }
+}
+
+/// One physically contiguous piece of an object range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectSegment {
+    /// The run holding the piece.
+    pub(crate) run: FrameRoleIdentity,
+    pub(crate) object_offset: u64,
+    pub(crate) physical_start: u64,
+    pub(crate) byte_len: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
