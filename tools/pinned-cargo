@@ -289,6 +289,16 @@ fi
 
 export CARGO_TARGET_DIR="$normalized_target"
 export CARGO_INCREMENTAL=0
+# Guest artifacts carry no host paths, so a product is reproducible from any
+# checkout location (DW1 closure item 21). The accepted toolchain's prebuilt
+# `core` still names the path it was built at; that needs a toolchain built
+# with its own remapping (TOOLCHAIN_PLAN.md step 4). Host builds keep their real paths
+# for diagnostics.
+if [ "$lane" = target ]; then
+    export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$workspace=/source/deepwyrm--remap-path-prefix=$cargo_home=/cargo-home--remap-path-prefix=$normalized_target=/cargo-target"
+    CARGO_ENCODED_RUSTFLAGS=$(printf '%b' "$CARGO_ENCODED_RUSTFLAGS")
+    export CARGO_ENCODED_RUSTFLAGS
+fi
 export CARGO_NET_OFFLINE=true
 export RUSTC="$rustc"
 
