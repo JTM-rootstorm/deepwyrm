@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is designed (§6).
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -119,3 +119,51 @@ Teardown (item 2) changes object and address-space finalization, so it needs the
 - **Validation:** kernel host tests (1156, five new for growth, refusals, slot retirement, the grown free list and proof invalidation, one for D1), fmt and clippy. dev-boot `--check --sdk` with Wyrmroot `d5ac3af`: 11 of 12 runs passed at 35–37 s, against 63 s before; the scans this removes ran on every user page walk, which is the likely cause of the 41 s/63 s spread seen before. One run (on `e6a07c3`) hung after the shell exited: QEMU did not exit in the check's 180 s, and COM1 shows no retirement or panic record after the boot lines. Its cause is not found; it has not recurred in 11 runs.
 - **Independent review:** Claude Opus 5.5, default effort, 2026-11-12, Deepwyrm `e6a07c3` against `31d352d`. No Critical or High. D1 (Medium: below about 780 MiB of allocator RAM growth was refused and boot panicked, since the free-list bound is shorter than the 4503-entry boot list) fixed in `aae63fc` with a production-shaped test that fails without it. R2 (freed tables keep stale entries) taken as documentation. Accepted, Low: R1 (the run is one contiguous first-fit allocation, 64 MiB of index at 64 GiB; a map too fragmented for it panics at boot), R3 (a second proof on the same root between finish and reclaim panics; the only caller holds the manager exclusively throughout), R4 (the remaining O(slots) scans above), R5 (`start_position` scans the initial ranges per lookup, at most about 400). Open question from the review, not new in this change: the proof does not check that no other owner's tables point into this owner's hierarchy.
 
+
+## 6. M3 design (2026-11-12)
+
+Read for this design: Deepwyrm `ebfc46b` (`memory/object.rs`, `memory/object/lease.rs`, `memory/address_region*.rs`, `memory/frame_roles*.rs`, `arch/x86_64/mm/journal{.rs,/publisher.rs}`, `arch/x86_64/mm/activation/{user_access.rs,primordial.rs}`, `boot/primordial/construction/authority.rs`, `device/dma{.rs,/live.rs}`, `device/pci.rs`, `syscall/adapters{.rs,/address_region.rs}`, `object/finalizer.rs`) and `DW0_D0_OBJECT_HANDLE_CONTRACT.md` §5.
+
+### 6.1 What assumes one run today
+
+- `object_range()` (object.rs) computes `physical_start = record.physical_start + offset` for every map, protect and unmap rebuild, and for `dma_physical_range`. `ObjectRecord.physical_start` duplicates the grant's start.
+- The publisher: `validate_mapping_batch` checks a whole mapping against one role record, and `page_descriptor` computes `physical_start + offset`. `publish_pages` compares only the first page of a run between the old and new mappings and skips the run when they match, which is sound only if both are linear.
+- `allocate_zeroed_backing` (user_access.rs) and its boot twin `LivePlatform::allocate` (primordial.rs) take one run; `write_backing` (boot ELF segments, stack, bootfs up to 32 MiB) writes linearly from the start.
+- `dma_map` resolves one physical start; `DmaDomains::map` already maps page by page onto a contiguous IOVA range.
+- Not affected: usercopy translates through the page tables and the direct map, never through object backing; futex keys use object offsets; the journal's per-leaf `authorize_leaf` and publish recheck already work per page. DeviceMmio (one BAR) and ImmutableBootModule (no production caller) stay single-run.
+
+### 6.2 Where the run list lives: the frame-role manager
+
+The publisher holds only `&mut FrameRoleManager` while the object authority is held by the prepared replace for the whole call, and `Mapping` is copied into each of a job's 10 region slots. So a mapping cannot carry a list of runs, and the publisher cannot ask the object authority. The role manager can: every run is already its own role slot.
+
+- An allocator-owned object backing is a **chain of runs**. Each run is one role slot with record `ObjectBacking { head, object_offset, next }`: the head run's identity names the backing, `object_offset` is where the run starts in the object, `next` is the following run's slot and generation (or none). The head is the run at offset 0.
+- `ObjectBackingGrant` stays the one move-only typed token D0 §5 requires: the head identity, the total length and the run count. Cancelling it walks the chain and frees every run whole, so M1's invariant (each run holds one slot for life and is freed whole) and the free-list bound still hold.
+- A chain holds at most `MAX_BACKING_RUNS` = 64 runs. That bounds a page lookup and makes a request that would need more runs fail with no memory rather than degrade.
+- `MemoryObjectRange` keeps the head identity and the object offset and drops `physical_start`; `ObjectRecord.physical_start` goes. Resolution is the role manager's: `resolve_object_page(head, offset) → (run identity, physical)`, walking the chain (at most 64 steps). A sequential walk over a mapping keeps its place in the chain, so a whole mapping costs one chain walk.
+
+### 6.3 Allocation: largest first
+
+`allocate_scattered(pages)` takes runs of `min(remaining, largest free run)` until the request is met, failing (and freeing what it took) past 64 runs or when memory runs out. The physical allocator gains a largest-free-run query. When memory is not fragmented this is one run, exactly as today. Zeroing goes through the direct map run by run. The user path and the boot path share one function instead of today's two copies.
+
+### 6.4 Consumers
+
+- **Publisher:** `validate_mapping_batch` validates a mapping as the runs that cover `[offset, offset + len)`, each against its own record. `page_descriptor` resolves through the chain. The skip-a-run check compares the backing head and object offset instead of the first page's physical address: two mappings of the same object at the same offset map the same frames page by page, linear or not.
+- **Boot writes:** `write_backing` writes page by page through `resolve_object_page`.
+- **DMA:** `dma_physical_range` returns the validated range; the carrier resolves it page by page through the role manager and `DmaDomains::map` takes the page list (or a resolver) instead of one start, keeping the contiguous IOVA. A DMA range may cross runs.
+- **Finalization:** `complete_memory_finalization` and the two boot rollback paths cancel the whole chain through the grant.
+
+### 6.5 Steps
+
+1. Role manager: chain records, `allocate_scattered`, `resolve_object_page`, range validation over a chain, whole-chain cancel; host tests including fragmentation (a request larger than the largest hole succeeds), the 64-run limit, and rollback.
+2. Object authority and ranges: drop `physical_start` from records and ranges.
+3. Publisher: per-page resolution, chain validation, the skip check.
+4. Allocation users: `allocate_zeroed_backing`, the boot allocator and `write_backing`.
+5. DMA.
+6. Independent security review (CLAUDE.md §1: object finalization and the physical-access boundary change), then `dev-boot --check --sdk`.
+
+Each step keeps the tree building and its tests passing; until step 4 every backing is one run, so behavior does not change before it.
+
+### 6.6 Open choices (defaults taken unless Mike says otherwise)
+
+- `MAX_BACKING_RUNS` = 64. Larger costs only lookup time; smaller fails earlier under fragmentation.
+- No minimum run size: a fragmented request may use 4 KiB runs. 2 MiB user pages (later stage) will want 2 MiB-aligned runs and can add a preference then.
