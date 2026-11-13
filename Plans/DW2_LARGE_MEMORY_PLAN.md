@@ -555,6 +555,24 @@ Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `988540f`, read-only. 
 
 Risks it raised: re-zeroing never-touched arena pages (fixed, item 10); pages a failed syscall's fill-in committed stay charged until unmapped, as on Linux (Mike to accept); the registry scan per admission grows to 640 slots (already M8's, §9); 64 slots in every region's static storage (kept: per-region sizing is not worth a separate pool now); whether init needs another MemoryObject to read the config (step 2 measures it and adjusts the baseline ledger if so).
 
+### 10.8 Yielding between steps: design (2026-11-13)
+
+From a read-only survey (Claude Opus 5.5, 2026-11-13, at Deepwyrm `b29a611`), checked against the code; paths are under `kernel/src/`, P is `arch/x86_64/mm/activation/primordial.rs`.
+
+**What exists.** A thread switch is a real kernel-context switch (`arch/x86_64/kernel_context.S`; `syscall/live.rs` `switch_kernel_context`): the outgoing thread is suspended inside the kernel on its own stack and resumes there, possibly on another CPU. It happens today only at four shallow gates in `live.rs`: the syscall return loop, `SuspendCurrent` in the trampoline (how a blocking wait parks), the timer pre-IRET gate and the page-fault gate. Interrupts are off for a whole syscall (`syscall/msr.rs` FMASK includes IF), so a quantum that expires mid-call is seen only at the return boundary. The safe points between steps check for a Stop and nothing else.
+
+**Why not switch inside the step loop.** The step loops are methods on the per-CPU facade (`&mut self`, `self.cpu` cached), and the switch code's rule is that the CPU's carrier is never borrowed across a switch (`live.rs` ~1989): after a switch the thread may run on another CPU whose facade another thread holds. The phase reservation (`syscall/stationary_runtime.rs`) and the cached `UserCopyRoot` (`address_space.rs` ~1308) are also tied to one CPU and one hold. A user-visible restart (rewinding RIP with rewritten registers) cannot carry the map's pins, allocator placement, undo-on-failure or create's unzeroed allocation, and would change the ABI.
+
+**Design: yield the way a wait parks.**
+
+1. **The yield point.** A variant of the safe-point helper (P `with_synchronized_runtime_at_safe_point`) also services the quantum deadline and reads the reschedule request, returning Stop, Yield or Continue. Every step loop uses it: map, unmap and protect; the fill-in; the commit; and `MemoryObjectCreate`'s zeroing, which gains safe points between its steps (so a Stop can land there too).
+2. **Parking.** On Yield a loop commits its phase, moves its step state (the `RegionSteps` chain, snapshot, progress, create's backing) into a per-thread parked-call record, and returns a new `SyscallControl::Yield`. Nothing is held then: each step's holds and shootdown finish before the loop advances.
+3. **Switching.** The trampoline's Yield arm reuses the return loop's preemption switch (`service_syscall_return_preemption`), re-reads the carrier after it, and calls a facade method that continues the parked call: a fresh phase and `UserCopyRoot`, then the next step. The page-fault gate's order is followed (§8.5): poll Stop, authorize, check the reschedule, switch; a fresh quantum only for the thread that resumes; poll Stop again after.
+4. **Termination while parked.** A thread terminated while parked is retired without running again, so whatever must be settled lives in the parked-call record, not on its stack: the map's owned output pin and authorization pin, create's output pins and its `BackingAllocation`. The terminal path (`task/execution.rs` `retire_exit_pins_inner`) settles them under P (discard the outputs, release the pins, cancel the backing), as it does for a blocked operation's resource bundle. The pin model is unchanged.
+5. **Tests.** Host tests drive each loop with a reschedule request raised at every step, a Stop at every step, and termination of a parked thread, checking that no pin, lease, frame or charge is left. The stack-size check (item 2 of §10.2) covers the trampoline's new frame. In the guest, probe 15 stops a job parked mid-call, and a two-thread probe on one CPU shows a large map no longer delays the other thread by more than about one step.
+
+Before it is built this design gets an independent review (root `CLAUDE.md` §1: it changes scheduling and termination).
+
 ## 11. M9 direction (Mike, 2026-11-13)
 
 Mike: overcommit is handled the way Linux handles it, tailored to this architecture, OOM killer included. The design comes after M5, M7 and M8; this records the mapping it starts from.
