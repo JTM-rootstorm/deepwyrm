@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a).
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is in progress: batched publication is built and reviewed (§7); releasing the global locks between batches is M4b, next (Mike, 2026-11-13).
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -207,3 +207,26 @@ Deepwyrm `502ad10` (step 1), `18b1622` (steps 2, 3 and 5 together: the publisher
 - **R2 (Low), accepted:** whole-table scans (`owns_any`, external imports, `check_invariants`) are now linear in pages; every caller is at boot or in tests.
 - **R3 (Low): fixed** (`7f1b688`). A run being allocated reports `FrameRoleKind::BackingAllocated`, not `AllocatedUninitialized`.
 - **R4 (Low), deferred to §6.8:** allocation costs runs × free ranges (the allocator's linear scans).
+
+## 7. M4 as built (2026-11-13)
+
+Deepwyrm `321571d`, with review fixes in `35daf2e`; both pass `dev-boot --check --sdk`. Committed unsigned (Mike, 2026-11-13); re-sign before any push.
+
+- **Batches.** `X86AddressSpacePublisher::publish_pages` publishes a change in address order, one journal at a time. A batch ends before a page that might not fit (`has_room_for_page`: every page stages exactly four entries and one invalidation) or that needs a table the pool has run out of. A batch may start mid-stretch: two linear mappings that agree at one page agree on the whole stretch.
+- **Tables.** Between batches the pool is refilled to what the caller gave it, through `AtomicPageTableTarget::zero_table_frame`. The map syscall sizes its pool for one 16 MiB batch.
+- **Pins.** Once a change needs a second batch, the whole changed span is closed to new user pins (`begin_mutation_span`, held by `TrackedActiveTarget`) until the call ends.
+- **Failure.** If a later batch or a refill fails, the published batches are undone by publishing the reverse change, which only rewrites leaves under tables left in place, so it needs no candidates. The call returns the error with the mappings unchanged; the tables built stay with the root until teardown. `failed_after_publishing` makes the coherency publisher shoot the span down anyway.
+- **Not yet:** the global locks T and P are still held for the whole call (M4b).
+- **Not exercised in a guest:** no guest program maps more than 16 MiB while a job's budget is 16 MiB (L1, M5). The host tests (`journal/batch_tests.rs`) cover batching, refills and undoing a map, an unmap and a protect.
+
+### 7.1 Security review of M4
+
+**Reviewer:** Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `321571d` (base `e2bbd41`). Method: code reading plus host unit tests. No Critical or High defect. Batch cuts, mid-stretch starts, the room bound, the undo's independence from candidates, the pin span and candidate accounting were checked and found sound, and a failed call's shootdown still precedes the release of its leases.
+
+- **D1 (Medium, confirmed): open, to be fixed by M4b (Mike, 2026-11-13).** One call now holds T and P for time that grows with the size userspace asks for (tens of milliseconds per 16 MiB, twice on failure), contrary to §2's M4 row. Object creation already zeroes its backing under P alone, so M4b bounds both: the locks are released between batches, and creation zeroes in chunks.
+- **R1 (Low): fixed** (`35daf2e`). A call refused on identity could report a stale undone-batches flag; `publish_replace` now clears it first.
+- **R2 (Low), open:** teardown of a mapping over 16 MiB holds the pin span over the whole mapping; a pin overlapping it panics, as a pin overlapping one batch did before.
+- **R3 (Low), accepted:** a racing usercopy pin in the same address space now sees `Conflict` for the whole call, not one batch.
+- **R4 (Low), accepted:** tables built by undone batches stay until teardown, uncharged, as after a map and unmap.
+- **Test gaps:** G2 and G3 (undoing an unmap and a protect, a failed refill) are closed in `35daf2e`. Open: G1, `TrackedActiveTarget`'s span on the host (it wraps the live scratch target); G4, a batch starting mid-run of a multi-run backing; G5, a bound on lock-hold cost, which M4b addresses.
+
