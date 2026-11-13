@@ -166,10 +166,11 @@ const TIMERS: usize = 2;
 // pages after init0 termination-race reconciliation. The ordinary Wave 4
 // bootfs is exactly 17 pages with its selector-specific init0 artifact.
 //
-// D7: a user map may now span 16 MiB (`PRIMORDIAL_MAX_USER_MAPPING_PAGES`),
+// D7: one journal batch spans up to 16 MiB (`PRIMORDIAL_MAX_USER_MAPPING_PAGES`),
 // which crosses up to nine PT, two PD and two PDPT boundaries. The pool holds
-// sixteen; a map prepares only the candidates its length can need, so small
-// maps still prepare six.
+// sixteen; a map prepares only the candidates one batch of its length can
+// need, so small maps still prepare six, and the publisher refills the pool
+// between batches (DW2 M4).
 pub(super) const PRIMORDIAL_TABLE_CANDIDATES: usize = 16;
 // F3A.6y. This was a literal 17 -- "the ordinary Wave 4 bootfs is exactly 17
 // pages", per the comment above, and true of the archive that was current when
@@ -192,11 +193,11 @@ const PRIMORDIAL_BOOTFS_MAX_PAGES: usize = parse_production_bootfs_pages();
 const PRIMORDIAL_STACK_MAPPING_PAGES: usize =
     crate::boot::primordial::construction::STACK_BYTES as usize / 4096;
 const _: () = assert!(crate::boot::primordial::construction::STACK_BYTES % 4096 == 0);
-/// The most pages one user map, unmap or protect may change (Deepwyrm D7):
-/// 16 MiB, a userspace job's whole RAM budget (Wyrmroot's `JOB_MEMORY_PAGES`).
-/// Larger requests are refused with `NO_RESOURCES`. The journal that stages a
-/// mapping lives in static storage beneath P (`LiveJournalStorage`), not on a
-/// kernel stack, so this bound costs static memory only.
+/// The most pages one journal batch of a user map, unmap or protect changes
+/// (Deepwyrm D7): 16 MiB. A larger change is published in batches of this
+/// size (DW2 M4), so this bounds static memory, not the size of a map. The
+/// journal lives in static storage beneath P (`LiveJournalStorage`), not on
+/// a kernel stack.
 const PRIMORDIAL_MAX_USER_MAPPING_PAGES: usize = 4096;
 // Mapping machinery must fit the selector-local bootfs ceiling, the
 // independently owned primordial stack and the largest user mapping, without
@@ -2681,6 +2682,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 scratch,
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
+                span: None,
             };
             // SAFETY: [P-PUBLISHER] `region` is the primordial root region, whose address space is
             // `active.root`; `target.roles` and `tracked` serialize that root, and no other
@@ -2819,6 +2821,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 scratch,
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
+                span: None,
             };
             // SAFETY: [P-PUBLISHER] `region` is the primordial root region, whose address space is
             // `active.root`; `target.roles` and `tracked` serialize that root, and no other
@@ -8501,8 +8504,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     let result = (|| {
                         // As many tables as the mapping's length can need
                         // at each level (D7), never more than the pool.
+                        // A larger map is published in batches, and the
+                        // publisher refills this pool between them (DW2 M4).
                         let levels = crate::arch::x86_64::mm::table_candidates_for(
-                            args.byte_len.0,
+                            args.byte_len
+                                .0
+                                .min(PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * 4096),
                             PRIMORDIAL_TABLE_CANDIDATES,
                         )
                         .ok_or(DW_STATUS_NO_RESOURCES)?;

@@ -1875,6 +1875,12 @@ unsafe impl crate::arch::x86_64::mm::journal::AtomicPageTableTarget for FlatRoot
         Ok(*self.entries.get(&(table.address(), index)).unwrap_or(&0))
     }
 
+    fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error> {
+        self.entries
+            .retain(|(table, _), _| *table != frame.address());
+        Ok(())
+    }
+
     fn apply(
         &mut self,
         writes: &[crate::arch::x86_64::mm::journal::JournalWrite],

@@ -438,6 +438,14 @@ mod pin_tracker {
     }
 }
 
+#[cfg_attr(
+    not(all(target_os = "none", target_arch = "x86_64")),
+    allow(
+        unused_imports,
+        reason = "only the live tracked target holds a permit across batches"
+    )
+)]
+pub(crate) use pin_tracker::UserMutationPermit;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) use pin_tracker::{AddressSpaceTeardownReservation, UserPinError, UserPinTracker};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]

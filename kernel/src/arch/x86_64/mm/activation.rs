@@ -974,7 +974,6 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         Ok(result)
     }
 
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     fn zero_allocator_frame(&mut self, frame: FrameAddress) -> Result<(), LiveActiveTargetError> {
         assert!(!self.poisoned, "active Deep scratch mapper is poisoned");
         self.require_owning_cpu()?;
@@ -1202,6 +1201,10 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
 )]
 unsafe impl<I: ActiveScratchIo> AtomicPageTableTarget for ActiveScratchTarget<I> {
     type Error = LiveActiveTargetError;
+
+    fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error> {
+        self.zero_allocator_frame(frame)
+    }
 
     fn read_entry(&mut self, table: FrameAddress, index: usize) -> Result<u64, Self::Error> {
         self.read_location(table, index)
@@ -2439,6 +2442,7 @@ mod live_sessions {
                     scratch,
                     pins: &self.user_pins,
                     address_space,
+                    span: None,
                 },
                 journal: &mut *self.journal,
                 _root: core::marker::PhantomData,

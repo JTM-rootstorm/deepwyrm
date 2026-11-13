@@ -13,6 +13,8 @@ struct FakePublisher {
     address_space: AddressSpaceKey,
     calls: usize,
     fail: bool,
+    /// A failure reports that batches were published and undone (DW2 M4).
+    undone: bool,
     last_before: usize,
     last_after: usize,
 }
@@ -23,6 +25,7 @@ impl FakePublisher {
             address_space: region.address_space,
             calls: 0,
             fail: false,
+            undone: false,
             last_before: 0,
             last_after: 0,
         }
@@ -56,6 +59,10 @@ unsafe impl AddressSpacePublisher for FakePublisher {
         self.last_before = before.len();
         self.last_after = after.len();
         if self.fail { Err(()) } else { Ok(()) }
+    }
+
+    fn failed_after_publishing(&mut self) -> bool {
+        self.fail && core::mem::take(&mut self.undone)
     }
 }
 
@@ -503,6 +510,51 @@ fn a_coherent_publisher_finishes_with_its_settlement() {
     )
     .unwrap();
     assert!(matches!(publisher.finish(), ShootdownOutcome::Completed(_)));
+    assert_eq!(authority.active_lease_count(), 0);
+}
+
+/// DW2 M4: an inner publication that fails after publishing batches and
+/// undoing them still shoots the span down, since other CPUs may cache the
+/// undone entries, and still returns the error.
+#[test]
+fn a_failure_after_undone_batches_still_shoots_down() {
+    let mut authority = TestObjects::<2, 8>::new();
+    let object = object(&mut authority, Protection::READ_WRITE);
+    let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 4);
+    let coherency = AddressSpaceCoherency::<4>::new(region.address_space_key());
+    let cpu0 = CpuIndex::new(0).unwrap();
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let _resident0 = coherency.enter(cpu0).unwrap();
+    let _resident1 = coherency.enter(cpu1).unwrap();
+    let mut base = FakePublisher::for_region(&region);
+    let mut driver = DeterministicShootdownDriver::new(cpu0);
+
+    base.fail = true;
+    base.undone = true;
+    let authorization = authorization(&mut authority, object, &region, Protection::READ_WRITE);
+    let mut publisher =
+        CoherentAddressSpacePublisher::<_, _, 4, 8>::new(&mut base, &coherency, &mut driver);
+    assert!(
+        test_map(
+            &mut region,
+            &mut authority,
+            &mut publisher,
+            PAGE_SIZE,
+            authorization,
+            0,
+            PAGE_SIZE,
+            Protection::READ_WRITE,
+        )
+        .is_err()
+    );
+    let ShootdownOutcome::Completed(permit) = publisher.finish() else {
+        panic!("undone batches finished without a shootdown")
+    };
+    assert_eq!(permit.request().generation(), 1);
+    assert_eq!(permit.target_count(), 2);
+    assert_eq!(coherency.published_generation(), 1);
+    assert!(driver.delivered.iter().any(|(cpu, _)| *cpu == cpu1));
+    assert!(region.mappings().iter().all(Option::is_none));
     assert_eq!(authority.active_lease_count(), 0);
 }
 
@@ -1135,6 +1187,7 @@ fn space_region_and_lease_identities_reject_swaps_overlaps_and_stale_releases() 
         address_space: second_space,
         calls: 0,
         fail: false,
+        undone: false,
         last_before: 0,
         last_after: 0,
     };

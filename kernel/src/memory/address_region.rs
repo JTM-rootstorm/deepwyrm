@@ -397,6 +397,15 @@ pub(crate) unsafe trait AddressSpacePublisher: publisher_seal::Sealed {
         before: &[Mapping],
         after: &[Mapping],
     ) -> Result<(), Self::Error>;
+
+    /// Whether the last `publish_replace`, though it failed and left the
+    /// mappings as they were, made part of the change visible for a while
+    /// (DW2 M4: a change published in batches and undone). Other CPUs may
+    /// then cache entries that no longer exist, so the coherency layer still
+    /// shoots the span down. Reading it clears it.
+    fn failed_after_publishing(&mut self) -> bool {
+        false
+    }
 }
 
 /// Identity-bound in-memory publisher used by the G2 concrete host gate.

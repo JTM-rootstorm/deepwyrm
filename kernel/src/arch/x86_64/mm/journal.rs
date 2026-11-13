@@ -52,6 +52,9 @@ pub(super) mod target_seal {
 /// The unsafe boundary which pairs a target with a publisher must additionally
 /// attest that this serialization domain is the exact supplied root and
 /// address-space authority domain. This trait cannot introspect that identity.
+///
+/// `zero_table_frame` must, on success, leave all 512 entries of `frame`
+/// zero: the publisher then hands the frame to the role manager as zeroed.
 #[allow(
     unsafe_code,
     reason = "atomic page-table writes and TLB invalidation are architecture facts"
@@ -66,6 +69,21 @@ pub(crate) unsafe trait AtomicPageTableTarget: target_seal::Sealed {
         writes: &[JournalWrite],
         invalidations: &[VirtualPage],
     ) -> Result<(), Self::Error>;
+
+    /// Zeroes a freshly allocated frame that the publisher turns into a
+    /// table candidate between batches (DW2 M4).
+    fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error>;
+
+    /// Keeps `[start, start + byte_len)` closed to new user pins across
+    /// every `apply` until `end_mutation_span`, so a mapping published in
+    /// batches can always be undone (DW2 M4). Each `apply` meanwhile must
+    /// lie inside the span. A target without pins has nothing to hold.
+    fn begin_mutation_span(&mut self, _start: u64, _byte_len: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Ends the span `begin_mutation_span` opened.
+    fn end_mutation_span(&mut self) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,6 +253,9 @@ pub(crate) fn table_candidates_for(
 /// mutation touches at most one.
 const UNDO_CAPACITY: usize = MAX_PATH_ASSERTIONS + MAX_MUTATIONS;
 
+/// The entries one page's plan observes or writes, one per level.
+const PAGE_PLAN_ENTRIES: usize = 4;
+
 /// One unpublished journal over an exclusively borrowed atomic target.
 pub(crate) struct PageTableJournal<
     'a,
@@ -394,6 +415,18 @@ where
         self.roles
     }
 
+    /// The target this journal publishes to.
+    pub(super) fn target_mut(&mut self) -> &mut T {
+        self.journal.target
+    }
+
+    /// Whether one more page surely fits: every page's plan stages exactly
+    /// `PAGE_PLAN_ENTRIES` entries and one invalidation (DW2 M4).
+    pub(super) fn has_room_for_page(&self) -> bool {
+        self.journal.entry_count + PAGE_PLAN_ENTRIES <= ENTRY_CAPACITY
+            && self.journal.invalidation_count < INVALIDATION_CAPACITY
+    }
+
     fn check_leaf(
         &self,
         cursor: &mut BackingCursor,
@@ -538,7 +571,7 @@ where
     ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
         if plan.root().address() != self.root.physical_start()
             || plan.mutations().is_empty()
-            || plan.assertions().len() + plan.mutations().len() != 4
+            || plan.assertions().len() + plan.mutations().len() != PAGE_PLAN_ENTRIES
             || plan.new_tables().len() >= plan.mutations().len()
         {
             return Err(OwnedPageTableJournalError::InvalidPlan);

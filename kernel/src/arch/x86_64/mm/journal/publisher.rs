@@ -85,6 +85,10 @@ pub(crate) struct X86AddressSpacePublisher<
     pub(super) target: &'a mut T,
     candidates: &'a mut [Option<TableCandidateGrant>; CANDIDATE_CAPACITY],
     storage: &'a mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
+    /// The target holds the call's changed span against user pins.
+    span_held: bool,
+    /// The last publish failed after publishing and undoing batches.
+    reverted: bool,
 }
 
 impl<
@@ -167,17 +171,104 @@ where
             target,
             candidates,
             storage,
+            span_held: false,
+            reverted: false,
         })
     }
 
+    /// Publishes the change from `before` to `after`. A change too large
+    /// for one journal is published in batches, each a complete journal, in
+    /// address order (DW2 M4). Between batches the table-candidate pool is
+    /// refilled to what it held at the start, and the whole changed span is
+    /// held against new user pins. If a later batch or a refill fails, the
+    /// batches already published are undone, newest state first, so the call
+    /// changes nothing it returns an error for; `failed_after_publishing`
+    /// then tells the coherency layer that other CPUs may still cache the
+    /// undone entries.
     fn publish_pages(
         &mut self,
         before: &[Mapping],
         after: &[Mapping],
     ) -> Result<(), X86AddressSpacePublishError<T::Error>> {
+        self.reverted = false;
         validate_mapping_batch(self.roles, self.address_space, self.region, before)?;
         validate_mapping_batch(self.roles, self.address_space, self.region, after)?;
+        let span = changed_span(self.roles, before, after)?;
+        let pool = self.candidate_counts();
+        let first = first_mapping_start(before, after);
+        let result = self.publish_batches(before, after, first, span, pool);
+        if self.span_held {
+            self.target.end_mutation_span();
+            self.span_held = false;
+        }
+        result
+    }
 
+    fn publish_batches(
+        &mut self,
+        before: &[Mapping],
+        after: &[Mapping],
+        first: Option<u64>,
+        span: Option<(u64, u64)>,
+        pool: [(TableLevel, usize); 3],
+    ) -> Result<(), X86AddressSpacePublishError<T::Error>> {
+        let mut from = first;
+        let mut published_to = None;
+        loop {
+            let next = match self.publish_batch(before, after, from, u64::MAX, span) {
+                Ok(None) => return Ok(()),
+                Ok(Some(next)) => next,
+                Err(error) => {
+                    if let Some(published_to) = published_to {
+                        self.undo(before, after, first, published_to);
+                    }
+                    return Err(error);
+                }
+            };
+            published_to = Some(next);
+            if let Err(error) = self.refill_candidates(pool) {
+                self.undo(before, after, first, next);
+                return Err(error);
+            }
+            from = Some(next);
+        }
+    }
+
+    /// Restores `before` below `published_to` after a later batch failed.
+    /// The reverse change only rewrites leaves under tables the forward
+    /// batches left in place, inside the span still held against pins, so
+    /// it needs no candidates and nothing userspace does can refuse it.
+    fn undo(
+        &mut self,
+        before: &[Mapping],
+        after: &[Mapping],
+        first: Option<u64>,
+        published_to: u64,
+    ) {
+        self.reverted = true;
+        let mut from = first;
+        loop {
+            match self.publish_batch(after, before, from, published_to, None) {
+                Ok(None) => return,
+                Ok(Some(next)) => from = Some(next),
+                Err(_) => panic!("a mapping published in batches could not be undone"),
+            }
+        }
+    }
+
+    /// Publishes, in one journal, the changed pages from `from` up to `end`
+    /// that fit. `Some(address)`: the batch stopped before `address`, the
+    /// first page it did not publish; every changed page below it is
+    /// published. Before publishing a batch that stops early, the whole
+    /// `span` is closed to user pins.
+    fn publish_batch(
+        &mut self,
+        before: &[Mapping],
+        after: &[Mapping],
+        from: Option<u64>,
+        end: u64,
+        span: Option<(u64, u64)>,
+    ) -> Result<Option<u64>, X86AddressSpacePublishError<T::Error>> {
         let mut journal = OwnedPageTableJournal::<
             _,
             RANGE_CAPACITY,
@@ -195,20 +286,26 @@ where
         )
         .map_err(X86AddressSpacePublishError::FrameRole)?;
 
-        let mut cursor = first_mapping_start(before, after);
-        let mut changed_pages = 0;
+        let mut cursor = from;
+        let mut staged = 0_usize;
+        let mut stopped = None;
         // Places in the old and new backings' chains: addresses only grow,
         // so each mapping costs one chain walk (DW2 M3 review D1).
         let mut old_run = None;
         let mut new_run = None;
-        while let Some(address) = cursor {
+        'pages: while let Some(address) = cursor {
+            if address >= end {
+                break;
+            }
             let old = mapping_at(before, address)?;
             let new = mapping_at(after, address)?;
             if old.is_none() && new.is_none() {
                 cursor = next_mapping_start(before, after, address);
                 continue;
             }
-            let boundary = next_boundary(before, after, address, old, new)?;
+            let boundary = next_boundary(before, after, address, old, new)?.min(end);
+            // Two linear mappings that agree at one page agree on the whole
+            // stretch, so a batch may start mid-stretch.
             let old_page = match old {
                 Some(mapping) => Some(page_descriptor(
                     journal.roles(),
@@ -234,8 +331,9 @@ where
 
             let mut page_address = address;
             while page_address < boundary {
-                if changed_pages == INVALIDATION_CAPACITY {
-                    return Err(X86AddressSpacePublishError::Capacity);
+                if !journal.has_room_for_page() {
+                    stopped = Some(page_address);
+                    break 'pages;
                 }
                 let old_page = match old {
                     Some(mapping) => Some(page_descriptor(
@@ -255,17 +353,119 @@ where
                     )?),
                     None => None,
                 };
-                publish_page(self.root, &mut journal, page_address, old_page, new_page)?;
-                changed_pages += 1;
+                match publish_page(self.root, &mut journal, page_address, old_page, new_page) {
+                    // The table pool ran out. A page stages all or nothing,
+                    // so publish what is staged and continue from this page
+                    // with the pool refilled. A page that an empty journal
+                    // and a full pool cannot take is a real failure.
+                    Err(X86AddressSpacePublishError::Map(MapError::InsufficientTableFrames))
+                        if staged != 0 =>
+                    {
+                        stopped = Some(page_address);
+                        break 'pages;
+                    }
+                    result => result?,
+                }
+                staged += 1;
                 page_address = page_address
                     .checked_add(BASE_PAGE_SIZE)
                     .ok_or(X86AddressSpacePublishError::InvalidMapping)?;
             }
             cursor = (boundary != u64::MAX).then_some(boundary);
         }
+        if stopped.is_some()
+            && !self.span_held
+            && let Some((start, byte_len)) = span
+        {
+            journal
+                .target_mut()
+                .begin_mutation_span(start, byte_len)
+                .map_err(|error| {
+                    X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
+                })?;
+            self.span_held = true;
+        }
         journal
             .publish()
-            .map_err(X86AddressSpacePublishError::Journal)
+            .map_err(X86AddressSpacePublishError::Journal)?;
+        Ok(stopped)
+    }
+
+    /// How many of this root's candidates the pool holds at each level.
+    fn candidate_counts(&self) -> [(TableLevel, usize); 3] {
+        let owner = self.root_identity.owner();
+        [TableLevel::Pdpt, TableLevel::Pd, TableLevel::Pt].map(|level| {
+            let count = self
+                .candidates
+                .iter()
+                .flatten()
+                .filter(|candidate| candidate.owner() == owner && candidate.level() == level)
+                .count();
+            (level, count)
+        })
+    }
+
+    /// Tops the pool back up to `wanted` at each level.
+    fn refill_candidates(
+        &mut self,
+        wanted: [(TableLevel, usize); 3],
+    ) -> Result<(), X86AddressSpacePublishError<T::Error>> {
+        let have = self.candidate_counts();
+        for ((level, want), (_, mut count)) in wanted.into_iter().zip(have) {
+            while count < want {
+                let slot = self
+                    .candidates
+                    .iter()
+                    .position(Option::is_none)
+                    .ok_or(X86AddressSpacePublishError::Capacity)?;
+                self.candidates[slot] = Some(self.prepare_candidate(level)?);
+                count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// One zeroed table candidate for this root, as the live session
+    /// prepares them. No frame left is `InsufficientTableFrames`, as when
+    /// the caller's pool is too small.
+    #[allow(
+        unsafe_code,
+        reason = "the target's zero_table_frame contract makes the frame zero before the role manager is told so"
+    )]
+    fn prepare_candidate(
+        &mut self,
+        level: TableLevel,
+    ) -> Result<TableCandidateGrant, X86AddressSpacePublishError<T::Error>> {
+        let allocation = self
+            .roles
+            .allocate(1)
+            .map_err(|_| X86AddressSpacePublishError::Map(MapError::InsufficientTableFrames))?;
+        let zeroed = FrameAddress::new(allocation.physical_start(), self.root.physical_limit())
+            .map_err(|_| X86AddressSpacePublishError::InvalidMapping)
+            .and_then(|frame| {
+                self.target.zero_table_frame(frame).map_err(|error| {
+                    X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
+                })
+            });
+        if let Err(error) = zeroed {
+            self.roles
+                .cancel_allocation(allocation)
+                .unwrap_or_else(|_| panic!("table-candidate rollback lost allocation authority"));
+            return Err(error);
+        }
+        // SAFETY: `zero_table_frame` succeeded, so every entry of the frame
+        // is zero (`AtomicPageTableTarget`'s contract).
+        let zeroed = unsafe { self.roles.assume_zeroed(allocation) }
+            .unwrap_or_else(|_| panic!("zeroed table-candidate transition drifted"));
+        self.roles
+            .prepare_table(zeroed, self.root_identity.owner(), level)
+            .map_err(|failure| {
+                let error = failure.error();
+                self.roles
+                    .cancel_zeroed(failure.into_grant())
+                    .unwrap_or_else(|_| panic!("zeroed table-candidate rollback drifted"));
+                X86AddressSpacePublishError::FrameRole(error)
+            })
     }
 }
 
@@ -330,6 +530,10 @@ where
             return Err(X86AddressSpacePublishError::Identity);
         }
         self.publish_pages(before, after)
+    }
+
+    fn failed_after_publishing(&mut self) -> bool {
+        core::mem::take(&mut self.reverted)
     }
 }
 
@@ -567,6 +771,47 @@ pub(super) fn next_boundary<E>(
         return Err(X86AddressSpacePublishError::InvalidMapping);
     }
     Ok(boundary)
+}
+
+/// The span from the first changed page to the end of the last changed
+/// stretch, as `(start, byte_len)`; `None` when nothing changes.
+fn changed_span<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    before: &[Mapping],
+    after: &[Mapping],
+) -> Result<Option<(u64, u64)>, X86AddressSpacePublishError<E>> {
+    let mut span: Option<(u64, u64)> = None;
+    let mut cursor = first_mapping_start(before, after);
+    let mut old_run = None;
+    let mut new_run = None;
+    while let Some(address) = cursor {
+        let old = mapping_at(before, address)?;
+        let new = mapping_at(after, address)?;
+        if old.is_none() && new.is_none() {
+            cursor = next_mapping_start(before, after, address);
+            continue;
+        }
+        let boundary = next_boundary(before, after, address, old, new)?;
+        let old_page = match old {
+            Some(mapping) => Some(page_descriptor(roles, mapping, address, &mut old_run)?),
+            None => None,
+        };
+        let new_page = match new {
+            Some(mapping) => Some(page_descriptor(roles, mapping, address, &mut new_run)?),
+            None => None,
+        };
+        if old_page != new_page {
+            let start = span.map_or(address, |(start, _)| start);
+            span = Some((start, boundary));
+        }
+        cursor = (boundary != u64::MAX).then_some(boundary);
+    }
+    span.map(|(start, end)| {
+        end.checked_sub(start)
+            .map(|byte_len| (start, byte_len))
+            .ok_or(X86AddressSpacePublishError::InvalidMapping)
+    })
+    .transpose()
 }
 
 fn page_descriptor<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(

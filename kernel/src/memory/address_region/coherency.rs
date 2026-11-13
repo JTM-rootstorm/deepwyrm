@@ -949,10 +949,35 @@ where
             .coherency
             .prepare_mutation(mutation, scope)
             .map_err(CoherentPublishError::Coherency)?;
-        self.publisher
+        if let Err(error) = self
+            .publisher
             .publish_replace(address_space, region, before, after)
-            .map_err(CoherentPublishError::Publish)?;
+        {
+            if self.publisher.failed_after_publishing() {
+                // Undone batches were visible: shoot the span down anyway.
+                self.complete_shootdown(transaction, initiating_cpu);
+            }
+            return Err(CoherentPublishError::Publish(error));
+        }
+        self.complete_shootdown(transaction, initiating_cpu);
+        Ok(())
+    }
+}
 
+impl<P, D, const CPUS: usize, const WAIT_STEPS: usize>
+    CoherentAddressSpacePublisher<'_, P, D, CPUS, WAIT_STEPS>
+where
+    P: AddressSpacePublisher,
+    D: ShootdownDriver<CPUS>,
+{
+    /// Publishes the prepared shootdown after the page-table writes, notifies
+    /// the other targets, and records its completion, or, deferred, the
+    /// pending request.
+    fn complete_shootdown(
+        &mut self,
+        transaction: MutationTransaction<'_, CPUS>,
+        initiating_cpu: CpuIndex,
+    ) {
         let mut barrier = transaction.publish();
         let request = barrier.request();
         if barrier.targets().contains(initiating_cpu) {
@@ -969,11 +994,11 @@ where
         match barrier.try_complete() {
             Ok(permit) => {
                 self.record_completion(permit);
-                return Ok(());
+                return;
             }
             Err(pending) if self.deferred => {
                 self.record_pending(pending);
-                return Ok(());
+                return;
             }
             Err(pending) => barrier = pending,
         }
@@ -982,7 +1007,7 @@ where
             match barrier.try_complete() {
                 Ok(permit) => {
                     self.record_completion(permit);
-                    return Ok(());
+                    return;
                 }
                 Err(pending) => barrier = pending,
             }

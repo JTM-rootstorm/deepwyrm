@@ -17,6 +17,9 @@ struct FakeTarget {
     applied: Vec<(u64, usize)>,
     invalidated: Vec<u64>,
     fail_apply: bool,
+    /// Fails only this apply, counting from one (DW2 M4).
+    fail_apply_at: Option<usize>,
+    apply_count: usize,
     read_count: usize,
     mutate_on_read: Option<(usize, (u64, usize), u64)>,
 }
@@ -40,12 +43,19 @@ unsafe impl AtomicPageTableTarget for FakeTarget {
         Ok(*self.entries.get(&(table.address(), index)).unwrap_or(&0))
     }
 
+    fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error> {
+        self.entries
+            .retain(|(table, _), _| *table != frame.address());
+        Ok(())
+    }
+
     fn apply(
         &mut self,
         writes: &[JournalWrite],
         invalidations: &[VirtualPage],
     ) -> Result<(), Self::Error> {
-        if self.fail_apply {
+        self.apply_count += 1;
+        if self.fail_apply || self.fail_apply_at == Some(self.apply_count) {
             return Err(());
         }
         let mut entries = self.entries.clone();
@@ -773,48 +783,6 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
         .create_region::<4>(address_space, 0x4000, BASE_PAGE_SIZE * 4)
         .unwrap();
     let mut target = FakeTarget::default();
-    {
-        let mut limited = unsafe {
-            X86AddressSpacePublisher::<_, 1, 32, 3, 32, 1>::new(
-                region.address_space_key(),
-                region.region_key(),
-                &page_tables,
-                root,
-                &mut roles,
-                &mut target,
-                &mut candidates,
-                storage(),
-            )
-        }
-        .unwrap();
-        let resolved = crate::handle::resolve_test_internal_owner(
-            &mut registry,
-            &object_owner,
-            deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
-        );
-        let authorization = region
-            .authorize_map(&objects, resolved, Protection::READ_WRITE_EXECUTE)
-            .unwrap();
-        let failure = region
-            .map(
-                &mut objects,
-                &mut registry,
-                &mut limited,
-                0x4000,
-                authorization,
-                0,
-                BASE_PAGE_SIZE * 2,
-                Protection::READ_WRITE,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            failure.error(),
-            crate::memory::address_region::AddressSpaceTransactionError::Publish(
-                X86AddressSpacePublishError::Capacity
-            )
-        ));
-        assert!(failure.into_final_releases().is_empty());
-    }
     assert!(region.mappings().iter().all(Option::is_none));
     assert_eq!(objects.active_lease_count(), 0);
     assert!(target.entries.is_empty());
@@ -977,9 +945,9 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
 
 /// Stage 7's question, answered on the live publisher type: does a
 /// create/map/write/unmap/close round leave anything behind that the next
-/// round's publish consumes? The publisher's only bound is per publish
-/// (`changed_pages` against `INVALIDATION_CAPACITY` in `publish_pages`), so
-/// with room for exactly one page every round must still fit.
+/// round's publish consumes? The publisher's only bound is per journal
+/// batch (`has_room_for_page`), so with room for exactly one page every
+/// round must still fit in one batch.
 #[test]
 #[allow(
     unsafe_code,
@@ -1096,7 +1064,8 @@ fn one_page_map_unmap_rounds_never_accumulate_publisher_capacity() {
     unsafe_code,
     reason = "the host integration model supplies two independently typed inactive roots and zeroed frame grants"
 )]
-fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_back() {
+fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_one_page_more_takes_a_second_batch()
+{
     const STACK_PAGES: u64 = 16;
     const STACK_START: u64 = 0x0000_007f_ffff_f000;
     let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
@@ -1158,7 +1127,7 @@ fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_b
         .unwrap();
     let mut target = FakeTarget::default();
     let mut publisher = unsafe {
-        X86AddressSpacePublisher::<_, 1, 64, 6, 22, 16>::new(
+        X86AddressSpacePublisher::<_, 1, 64, 6, 25, 16>::new(
             region.address_space_key(),
             region.region_key(),
             &page_tables,
@@ -1199,8 +1168,8 @@ fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_b
     assert_eq!(candidates.iter().flatten().count(), 0, "{candidates:?}");
     assert_eq!(roles.check_invariants(), Ok(()));
 
-    // The 17th changed page must fail at the publisher's fixed invalidation
-    // bound before it can publish any table writes or consume model leases.
+    // The 17th changed page no longer fits the journal: it is published in a
+    // second batch (DW2 M4).
     let mut roles = synthetic_frame_role_manager::<1, 64>(0x20000, 32);
     let owner = roles.create_table_owner().unwrap();
     let root_allocation = roles.allocate(1).unwrap();
@@ -1251,7 +1220,7 @@ fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_b
         .unwrap();
     let mut target = FakeTarget::default();
     let mut publisher = unsafe {
-        X86AddressSpacePublisher::<_, 1, 64, 6, 22, 16>::new(
+        X86AddressSpacePublisher::<_, 1, 64, 6, 25, 16>::new(
             region.address_space_key(),
             region.region_key(),
             &page_tables,
@@ -1271,30 +1240,25 @@ fn bounded_stack_mapping_crosses_every_lower_table_boundary_and_overflow_rolls_b
     let authorization = region
         .authorize_map(&objects, resolved, Protection::READ_WRITE)
         .unwrap();
-    let failure = region
-        .map(
-            &mut objects,
-            &mut registry,
-            &mut publisher,
-            0x400000,
-            authorization,
-            0,
-            (STACK_PAGES + 1) * BASE_PAGE_SIZE,
-            Protection::READ_WRITE,
-        )
-        .unwrap_err();
-    assert!(matches!(
-        failure.error(),
-        crate::memory::address_region::AddressSpaceTransactionError::Publish(
-            X86AddressSpacePublishError::Capacity
-        )
-    ));
-    assert!(failure.into_final_releases().is_empty());
-    assert!(region.mappings().iter().all(Option::is_none));
-    assert_eq!(objects.active_lease_count(), 0);
-    assert!(target.entries.is_empty());
-    assert!(target.invalidated.is_empty());
-    assert!(candidates.iter().all(Option::is_some));
+    assert!(
+        region
+            .map(
+                &mut objects,
+                &mut registry,
+                &mut publisher,
+                0x400000,
+                authorization,
+                0,
+                (STACK_PAGES + 1) * BASE_PAGE_SIZE,
+                Protection::READ_WRITE,
+            )
+            .unwrap_or_else(|failure| panic!("map failed: {:?}", failure.error()))
+            .is_empty()
+    );
+    assert_eq!(region.mappings().iter().flatten().count(), 1);
+    assert_eq!(objects.active_lease_count(), 1);
+    assert_eq!(target.apply_count, 2);
+    assert_eq!(target.invalidated.len(), STACK_PAGES as usize + 1);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
 
@@ -1707,3 +1671,6 @@ fn a_backing_split_across_runs_maps_each_page_to_its_run() {
     assert_eq!(objects.active_lease_count(), 0);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+#[path = "batch_tests.rs"]
+mod batch;

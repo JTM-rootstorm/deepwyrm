@@ -479,6 +479,13 @@ pub(crate) struct TrackedActiveTarget<'a> {
     pub(super) scratch: ActiveScratchTarget<LiveActiveScratchIo>,
     pub(super) pins: &'a UserPinTracker<E5_USER_PIN_CAPACITY>,
     pub(super) address_space: crate::memory::address_region::AddressSpaceKey,
+    /// The span a batched publication holds against pins (DW2 M4), as
+    /// `[start, end)` with its permit.
+    pub(super) span: Option<(
+        u64,
+        u64,
+        crate::memory::usercopy::UserMutationPermit<'a, E5_USER_PIN_CAPACITY>,
+    )>,
 }
 
 impl super::journal_target_seal::Sealed for TrackedActiveTarget<'_> {}
@@ -503,6 +510,17 @@ unsafe impl AtomicPageTableTarget for TrackedActiveTarget<'_> {
     ) -> Result<(), Self::Error> {
         let permit = if invalidations.is_empty() {
             None
+        } else if let Some((span_start, span_end, _)) = &self.span {
+            // The held span already excludes pins; the batch must lie in it.
+            if invalidations
+                .iter()
+                .any(|page| page.address() < *span_start || page.address() >= *span_end)
+            {
+                return Err(LiveTrackedTargetError::Pin(
+                    UserPinError::InvalidMutationRange,
+                ));
+            }
+            None
         } else {
             let mut start = u64::MAX;
             let mut end = 0_u64;
@@ -524,6 +542,33 @@ unsafe impl AtomicPageTableTarget for TrackedActiveTarget<'_> {
             .map_err(LiveTrackedTargetError::Target);
         drop(permit);
         result
+    }
+
+    fn zero_table_frame(&mut self, frame: FrameAddress) -> Result<(), Self::Error> {
+        self.scratch
+            .zero_table_frame(frame)
+            .map_err(LiveTrackedTargetError::Target)
+    }
+
+    fn begin_mutation_span(&mut self, start: u64, byte_len: u64) -> Result<(), Self::Error> {
+        if self.span.is_some() {
+            return Err(LiveTrackedTargetError::Pin(UserPinError::Conflict));
+        }
+        let end = start
+            .checked_add(byte_len)
+            .ok_or(LiveTrackedTargetError::Pin(
+                UserPinError::InvalidMutationRange,
+            ))?;
+        let permit = self
+            .pins
+            .begin_mutation(self.address_space, start, byte_len)
+            .map_err(LiveTrackedTargetError::Pin)?;
+        self.span = Some((start, end, permit));
+        Ok(())
+    }
+
+    fn end_mutation_span(&mut self) {
+        self.span = None;
     }
 }
 
