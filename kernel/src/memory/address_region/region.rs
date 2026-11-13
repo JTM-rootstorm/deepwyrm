@@ -499,8 +499,10 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 spec.protection,
             );
         }
+        let mut plan = ReplacePlan::<SLOTS>::new();
         let prepared = match authority.prepare_replace::<SLOTS, REGISTRY_OBJECTS>(
             registry,
+            &mut plan,
             self.address_space,
             self.region,
             &released[..old_len],
@@ -519,7 +521,6 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             }
         };
         let mut next_dense = [EMPTY_MAPPING; SLOTS];
-        let mut next = [None; SLOTS];
         for (index, (spec, ticket)) in specs[..spec_len]
             .iter()
             .flatten()
@@ -539,7 +540,6 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 lease: ticket.lease(),
             };
             next_dense[index] = mapping;
-            next[index] = Some(mapping);
         }
         if publisher.address_space_key() != self.address_space {
             let final_releases = prepared.rollback();
@@ -563,7 +563,9 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
 
         // Publication succeeded. From this point the reference transaction is
         // infallible except for fail-stop invariant corruption.
-        self.mappings = next;
+        for (index, slot) in self.mappings.iter_mut().enumerate() {
+            *slot = (index < spec_len).then(|| next_dense[index]);
+        }
         Ok(prepared.commit())
     }
 

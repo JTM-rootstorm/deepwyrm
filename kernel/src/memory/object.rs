@@ -692,7 +692,11 @@ struct PendingLease {
     pin_source: PendingPinSource,
 }
 
-struct ReplacePlan<const BATCH: usize> {
+/// One replace transaction's plan. The caller owns it and lends it to
+/// [`MemoryObjectAuthority::prepare_replace`] for the transaction's life, so
+/// the plan is built in place and never copied between frames: at 64 slots it
+/// is about 19.5 KB (DW2 plan §10.2 item 2).
+pub(crate) struct ReplacePlan<const BATCH: usize> {
     released: [usize; BATCH],
     released_len: usize,
     pending: [Option<PendingLease>; BATCH],
@@ -700,6 +704,20 @@ struct ReplacePlan<const BATCH: usize> {
     tickets: [Option<LeaseTicket>; BATCH],
     extra_sources: [Option<ExistingPinSource>; BATCH],
     extra_len: usize,
+}
+
+impl<const BATCH: usize> ReplacePlan<BATCH> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            released: [usize::MAX; BATCH],
+            released_len: 0,
+            pending: [None; BATCH],
+            pending_len: 0,
+            tickets: [None; BATCH],
+            extra_sources: [None; BATCH],
+            extra_len: 0,
+        }
+    }
 }
 
 /// Fixed-capacity authority over objects and their active mapping leases.
@@ -1239,7 +1257,7 @@ pub(super) struct PreparedReplace<
 > {
     authority: &'a mut MemoryObjectAuthority<OBJECTS, LEASES>,
     registry: &'a mut ObjectRegistry<REGISTRY_OBJECTS>,
-    plan: ReplacePlan<BATCH>,
+    plan: &'a mut ReplacePlan<BATCH>,
     extra_pins: [Option<InternalRef>; BATCH],
     authorization: Option<MapAuthorization>,
     finished: bool,

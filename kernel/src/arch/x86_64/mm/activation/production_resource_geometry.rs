@@ -137,7 +137,7 @@ const JOB_OWN_CHANNEL_PAIRS: usize = 5;
 /// it may map an object it holds into every slot. The lease pool is sized for
 /// that, not for its image alone, so jobs cannot drain it. `primordial.rs`
 /// asserts the two are equal.
-pub(super) const JOB_REGION_MAPPINGS: usize = 10;
+pub(super) const JOB_REGION_MAPPINGS: usize = 64;
 /// Init holds each live job's Process, TaskGroup and launch Channel.
 const JOB_HELD_HANDLES: usize = 3;
 
@@ -309,7 +309,7 @@ pub(super) struct Capacity {
 pub(super) const SELECTED: Capacity = Capacity {
     handles: 96,
     memory: 384,
-    mappings: 128,
+    mappings: 320,
     identities: 32,
     registry: 640,
     channel_pairs: 96,
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(STORAGE_MEMORY, 9);
         assert_eq!(BASELINE_MEMORY, 49);
         assert_eq!(MEMORY_PEAK, 321);
-        assert_eq!(MAPPING_PEAK, 93);
+        assert_eq!(MAPPING_PEAK, 309);
         assert_eq!(LIVE_PROCESSES, 18);
         assert_eq!(LIVE_TASK_GROUPS, 21);
         assert_eq!(LIVE_IDENTITY_PEAK, 21);

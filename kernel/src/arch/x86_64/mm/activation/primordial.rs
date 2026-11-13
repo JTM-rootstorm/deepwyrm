@@ -107,10 +107,12 @@ const HANDLES: usize = super::production_resource_geometry::SELECTED.handles;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
-/// DW2 M5 raises this to 64 only once the map, unmap and protect frames no
-/// longer grow with it: at 64 the stepped map's direct call chain needs about
-/// 487 KB of the 512 KiB thread stack (plan §10.2 item 2).
-const REGION_SLOTS: usize = 10;
+/// DW2 M5's 64 mappings per region. The map, unmap and protect paths borrow
+/// one replace plan instead of copying it between frames, and size their
+/// final-release batches by the transaction, so `xtask kernel-check` bounds
+/// every kernel stack with a quarter spare at this count (plan §10.2 item 2;
+/// before those changes the stepped map needed about 487 KB here).
+const REGION_SLOTS: usize = 64;
 const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // WYR1-F production is selected explicitly for the same reason selectors 33
 // and 34 are: the freestanding product must not inherit the bootstrap-era DW0

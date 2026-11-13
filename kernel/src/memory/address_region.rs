@@ -14,7 +14,7 @@
 use super::object::{
     CapturedMappingAuthority, LeaseRequest, MapAuthorization, MapAuthorizationCreateError,
     MappingFinalReleases, MappingLease, MemoryObjectAuthority, MemoryObjectError, MemoryObjectKey,
-    MemoryObjectRange, MemoryProtection, PAGE_SIZE,
+    MemoryObjectRange, MemoryProtection, PAGE_SIZE, ReplacePlan,
 };
 use crate::handle::ResolvedHandle;
 use crate::object::{ObjectId, ObjectRegistry};

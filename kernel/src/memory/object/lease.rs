@@ -5,6 +5,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         clippy::result_large_err,
         reason = "the error returns the final releases of the pins it let go; the kernel has no heap to box them into"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the transaction borrows the registry and the caller's plan beside its own description"
+    )]
     pub(in super::super) fn prepare_replace<
         'a,
         const BATCH: usize,
@@ -12,6 +16,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     >(
         &'a mut self,
         registry: &'a mut ObjectRegistry<REGISTRY_OBJECTS>,
+        plan: &'a mut ReplacePlan<BATCH>,
         address_space: AddressSpaceKey,
         region: RegionKey,
         released: &[MappingLease],
@@ -25,14 +30,15 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 "a replace batch must fit one final-release batch"
             );
         }
-        let plan = match self.plan_replace(
+        match self.plan_replace(
+            plan,
             address_space,
             region,
             released,
             requested,
             authorization.as_ref(),
         ) {
-            Ok(plan) => plan,
+            Ok(()) => {}
             Err(error) => {
                 let mut final_releases = MappingFinalReleases::empty();
                 if let Some(authorization) = authorization {
@@ -92,14 +98,16 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
+    /// Validates a replacement and fills `plan` in place.
     fn plan_replace<const BATCH: usize>(
         &self,
+        plan: &mut ReplacePlan<BATCH>,
         address_space: AddressSpaceKey,
         region: RegionKey,
         released: &[MappingLease],
         requested: &[LeaseRequest],
         authorization: Option<&MapAuthorization>,
-    ) -> Result<ReplacePlan<BATCH>, MemoryObjectError> {
+    ) -> Result<(), MemoryObjectError> {
         if !address_space.same_domain(region) {
             return Err(MemoryObjectError::ForeignLease);
         }
@@ -110,7 +118,22 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             return Err(MemoryObjectError::LeaseCapacity);
         }
 
-        let mut release_slots = [usize::MAX; BATCH];
+        let ReplacePlan {
+            released: release_slots,
+            released_len: plan_released_len,
+            pending,
+            pending_len: plan_pending_len,
+            tickets,
+            extra_sources,
+            extra_len: plan_extra_len,
+        } = plan;
+        release_slots.fill(usize::MAX);
+        pending.fill(None);
+        tickets.fill(None);
+        extra_sources.fill(None);
+        *plan_released_len = 0;
+        *plan_pending_len = 0;
+        *plan_extra_len = 0;
         for (position, lease) in released.iter().copied().enumerate() {
             let slot = self.lease_slot(lease)?;
             let record = self.leases[slot]
@@ -152,9 +175,6 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             return Err(MemoryObjectError::LeaseCapacity);
         }
 
-        let mut pending: [Option<PendingLease>; BATCH] = core::array::from_fn(|_| None);
-        let mut tickets = [None; BATCH];
-        let mut extra_sources: [Option<ExistingPinSource>; BATCH] = core::array::from_fn(|_| None);
         let mut extra_len = 0;
         let mut released_used = [false; BATCH];
         let mut authorization_used = false;
@@ -284,15 +304,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             return Err(MemoryObjectError::ObjectReference);
         }
 
-        Ok(ReplacePlan {
-            released: release_slots,
-            released_len: released.len(),
-            pending,
-            pending_len: requested.len(),
-            tickets,
-            extra_sources,
-            extra_len,
-        })
+        *plan_released_len = released.len();
+        *plan_pending_len = requested.len();
+        *plan_extra_len = extra_len;
+        Ok(())
     }
 }
 

@@ -1224,9 +1224,11 @@ fn space_region_and_lease_identities_reject_swaps_overlaps_and_stale_releases() 
     let stale_lease = first.mappings()[0].unwrap().lease();
     let error = {
         let (authority, registry) = objects.split_mut();
+        let mut plan = ReplacePlan::<2>::new();
         authority
             .prepare_replace::<2, 1>(
                 registry,
+                &mut plan,
                 first_space,
                 second.region,
                 &[stale_lease],
@@ -1249,9 +1251,11 @@ fn space_region_and_lease_identities_reject_swaps_overlaps_and_stale_releases() 
     .unwrap();
     let error = {
         let (authority, registry) = objects.split_mut();
+        let mut plan = ReplacePlan::<2>::new();
         authority
             .prepare_replace::<2, 1>(
                 registry,
+                &mut plan,
                 first_space,
                 first.region,
                 &[stale_lease],
