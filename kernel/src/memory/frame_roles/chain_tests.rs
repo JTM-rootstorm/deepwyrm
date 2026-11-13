@@ -345,3 +345,61 @@ fn the_shared_allocator_zeroes_every_page_once_and_rolls_back_a_failure() {
     assert_eq!(roles.available_frames(), before);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+#[test]
+fn a_cursor_follows_pages_forward_restarts_backward_and_names_its_run() {
+    let mut roles = manager(64);
+    let _held = fragment(&mut roles, &[1, 1, 1, 1, 1]);
+    let grant = backing(&mut roles, 5);
+    let expected = [PAGE, 3 * PAGE, 5 * PAGE, 7 * PAGE, 9 * PAGE];
+    let mut cursor = BackingCursor::new(grant.identity());
+    for (page, physical) in expected.iter().enumerate() {
+        let resolved = roles
+            .resolve_at(&mut cursor, page as u64 * PAGE, true)
+            .unwrap();
+        assert_eq!(resolved.physical_start, *physical);
+        assert_eq!(
+            cursor.run, resolved.run,
+            "the cursor stays at the page's run"
+        );
+    }
+    // Backward restarts from the head; past the end fails.
+    assert_eq!(
+        roles
+            .resolve_at(&mut cursor, PAGE, false)
+            .unwrap()
+            .physical_start,
+        3 * PAGE
+    );
+    assert_eq!(
+        roles.resolve_at(&mut cursor, 5 * PAGE, false).err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.resolve_at(&mut cursor, PAGE + 1, false).err(),
+        Some(FrameRoleError::WrongRole)
+    );
+}
+
+#[test]
+fn a_cursor_grants_nothing_once_its_backing_is_gone() {
+    let mut roles = manager(64);
+    let _held = fragment(&mut roles, &[1, 1, 1]);
+    let grant = backing(&mut roles, 3);
+    let identity = grant.identity();
+    let mut cursor = BackingCursor::new(identity);
+    roles.resolve_at(&mut cursor, 2 * PAGE, false).unwrap();
+    roles.cancel_object_backing(grant).unwrap();
+    // The same slots and frames come back as another backing.
+    let other = backing(&mut roles, 3);
+    assert_ne!(other.identity(), identity);
+    assert_eq!(
+        roles.resolve_at(&mut cursor, 2 * PAGE, false).err(),
+        Some(FrameRoleError::InvalidGrant)
+    );
+    // A cursor for one backing does not resolve another's pages.
+    let mut wrong = BackingCursor::new(identity);
+    wrong.run = segments(&roles, &other)[1].run;
+    wrong.run_page = 1;
+    assert!(roles.resolve_at(&mut wrong, PAGE, false).is_err());
+}

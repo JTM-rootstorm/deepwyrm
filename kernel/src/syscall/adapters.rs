@@ -2620,11 +2620,13 @@ pub(crate) fn dma_map<
     let pages = byte_len / crate::memory::object::PAGE_SIZE;
     // The held lookup pin keeps the object, and so its backing, alive until
     // the mapping owns it; each page is resolved through the backing's runs.
+    // The cursor keeps its place, so the whole range costs one chain walk.
+    let mut cursor = crate::memory::frame_roles::BackingCursor::new(range.backing_identity());
     let mut page_at = |page: u64| {
         let offset = page
             .checked_mul(crate::memory::object::PAGE_SIZE)
             .and_then(|bytes| bytes.checked_add(range.object_offset()))?;
-        object_pages.object_page(range.backing_identity(), offset, device.write)
+        object_pages.object_page(&mut cursor, offset, device.write)
     };
     match dma.map(
         resource_id,

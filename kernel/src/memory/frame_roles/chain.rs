@@ -282,16 +282,70 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(self.segments(backing.0, ChainState::Backing, first, end))
     }
 
-    /// The run and physical address of the backing page at `offset`.
+    /// The run and physical address of the backing page at `offset`,
+    /// walking from the head.
     pub(crate) fn resolve_object_page(
         &self,
         backing: BackingIdentity,
         offset: u64,
         writable: bool,
     ) -> Result<ObjectSegment, FrameRoleError> {
-        self.object_segments(backing, offset, BASE_PAGE_SIZE, writable)?
-            .next()
-            .ok_or(FrameRoleError::InvariantViolation)
+        self.resolve_at(&mut BackingCursor::new(backing), offset, writable)
+    }
+
+    /// The run and physical address of the page at `offset` of the backing
+    /// `cursor` walks, moving `cursor` to that page's run. Resolving pages
+    /// in increasing order costs one step per run crossed; an earlier page
+    /// or a stale cursor restarts from the head. Every step checks its run
+    /// against the head and the object page it starts at, so the cursor
+    /// grants nothing by itself.
+    pub(crate) fn resolve_at(
+        &self,
+        cursor: &mut BackingCursor,
+        offset: u64,
+        writable: bool,
+    ) -> Result<ObjectSegment, FrameRoleError> {
+        if !offset.is_multiple_of(BASE_PAGE_SIZE) {
+            return Err(FrameRoleError::WrongRole);
+        }
+        let page = offset / BASE_PAGE_SIZE;
+        let head = cursor.head;
+        match self.record(head)?.role {
+            FrameRole::ObjectBacking(_) | FrameRole::ExternalDeviceMmio => {}
+            FrameRole::ExternalImmutableModule { .. } if writable => {
+                return Err(FrameRoleError::ReadOnlyBacking);
+            }
+            FrameRole::ExternalImmutableModule { .. } => {}
+            _ => return Err(FrameRoleError::WrongRole),
+        }
+        if page < cursor.run_page {
+            *cursor = BackingCursor::new(BackingIdentity(head));
+        }
+        let mut restarted = cursor.run == head;
+        loop {
+            let run = match self.chain_run(head, cursor.run, cursor.run_page, ChainState::Backing) {
+                Ok(run) => run,
+                Err(_) if !restarted => {
+                    *cursor = BackingCursor::new(BackingIdentity(head));
+                    restarted = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let end = cursor.run_page + run.range.page_count();
+            if page < end {
+                return Ok(ObjectSegment {
+                    run: cursor.run,
+                    object_offset: offset,
+                    physical_start: run.range.start + (page - cursor.run_page) * BASE_PAGE_SIZE,
+                    byte_len: BASE_PAGE_SIZE,
+                });
+            }
+            cursor.run = self
+                .link_identity(run.link.next)
+                .ok_or(FrameRoleError::WrongRole)?;
+            cursor.run_page = end;
+        }
     }
 
     /// Frees a whole chain after checking it is `pages` pages in `runs`

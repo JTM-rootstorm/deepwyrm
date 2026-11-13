@@ -197,6 +197,10 @@ where
 
         let mut cursor = first_mapping_start(before, after);
         let mut changed_pages = 0;
+        // Places in the old and new backings' chains: addresses only grow,
+        // so each mapping costs one chain walk (DW2 M3 review D1).
+        let mut old_run = None;
+        let mut new_run = None;
         while let Some(address) = cursor {
             let old = mapping_at(before, address)?;
             let new = mapping_at(after, address)?;
@@ -206,11 +210,21 @@ where
             }
             let boundary = next_boundary(before, after, address, old, new)?;
             let old_page = match old {
-                Some(mapping) => Some(page_descriptor(journal.roles(), mapping, address)?),
+                Some(mapping) => Some(page_descriptor(
+                    journal.roles(),
+                    mapping,
+                    address,
+                    &mut old_run,
+                )?),
                 None => None,
             };
             let new_page = match new {
-                Some(mapping) => Some(page_descriptor(journal.roles(), mapping, address)?),
+                Some(mapping) => Some(page_descriptor(
+                    journal.roles(),
+                    mapping,
+                    address,
+                    &mut new_run,
+                )?),
                 None => None,
             };
             if old_page == new_page {
@@ -224,11 +238,21 @@ where
                     return Err(X86AddressSpacePublishError::Capacity);
                 }
                 let old_page = match old {
-                    Some(mapping) => Some(page_descriptor(journal.roles(), mapping, page_address)?),
+                    Some(mapping) => Some(page_descriptor(
+                        journal.roles(),
+                        mapping,
+                        page_address,
+                        &mut old_run,
+                    )?),
                     None => None,
                 };
                 let new_page = match new {
-                    Some(mapping) => Some(page_descriptor(journal.roles(), mapping, page_address)?),
+                    Some(mapping) => Some(page_descriptor(
+                        journal.roles(),
+                        mapping,
+                        page_address,
+                        &mut new_run,
+                    )?),
                     None => None,
                 };
                 publish_page(self.root, &mut journal, page_address, old_page, new_page)?;
@@ -549,20 +573,19 @@ fn page_descriptor<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     mapping: &Mapping,
     address: u64,
+    run: &mut Option<BackingCursor>,
 ) -> Result<PageDescriptor, X86AddressSpacePublishError<E>> {
     let backing = mapping.backing();
     let object_offset = address
         .checked_sub(mapping.virtual_start())
         .and_then(|offset| offset.checked_add(backing.object_offset()))
         .ok_or(X86AddressSpacePublishError::InvalidMapping)?;
+    let mut cursor = BackingCursor::for_backing(*run, backing.backing_identity());
     let physical_start = roles
-        .resolve_object_page(
-            backing.backing_identity(),
-            object_offset,
-            mapping.protection().writable(),
-        )
+        .resolve_at(&mut cursor, object_offset, mapping.protection().writable())
         .map_err(X86AddressSpacePublishError::FrameRole)?
         .physical_start;
+    *run = Some(cursor);
     Ok(PageDescriptor {
         backing: backing.backing_identity(),
         object_offset,

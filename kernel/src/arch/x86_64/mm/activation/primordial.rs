@@ -2753,6 +2753,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
         // through its chain.
         let mut object_offset = offset;
         let mut copied = 0_usize;
+        let mut cursor = crate::memory::frame_roles::BackingCursor::new(backing.identity());
         let mut scratch = self
             .active
             .target
@@ -2765,7 +2766,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 .active
                 .target
                 .roles
-                .resolve_object_page(backing.identity(), object_offset & !(PAGE_SIZE - 1), true)
+                .resolve_at(&mut cursor, object_offset & !(PAGE_SIZE - 1), true)
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
             let frame = FrameAddress::new(page.physical_start, self.active.root.physical_limit())
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;

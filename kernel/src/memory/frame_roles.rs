@@ -247,6 +247,8 @@ pub(crate) enum FrameRoleKind {
     /// or fully writes it before use.
     AllocatedUninitialized,
     Zeroed,
+    /// One run of a backing allocated but not yet zeroed (DW2 M3).
+    BackingAllocated,
     ObjectBacking(ObjectBackingKind),
     ArchitectureBootstrap(ArchitectureBootstrapKind),
     TableCandidate {
@@ -315,7 +317,7 @@ impl FrameRole {
         match self {
             Self::AllocatedUninitialized => FrameRoleKind::AllocatedUninitialized,
             Self::Zeroed => FrameRoleKind::Zeroed,
-            Self::BackingAllocated(_) => FrameRoleKind::AllocatedUninitialized,
+            Self::BackingAllocated(_) => FrameRoleKind::BackingAllocated,
             Self::ObjectBacking(_) => {
                 FrameRoleKind::ObjectBacking(ObjectBackingKind::AllocatorOwned)
             }
@@ -541,6 +543,39 @@ impl BackingAllocation {
     }
 }
 
+/// A place in one backing's chain, kept by a caller that resolves pages in
+/// order so each page costs one step instead of a walk from the head (DW2
+/// M3 §6.2). It holds no borrow and grants nothing: every step revalidates
+/// the run it names, and a stale place restarts from the head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackingCursor {
+    head: FrameRoleIdentity,
+    run: FrameRoleIdentity,
+    run_page: u64,
+}
+
+impl BackingCursor {
+    pub(crate) const fn new(backing: BackingIdentity) -> Self {
+        Self {
+            head: backing.0,
+            run: backing.0,
+            run_page: 0,
+        }
+    }
+
+    /// The backing this cursor walks.
+    pub(crate) const fn backing(&self) -> BackingIdentity {
+        BackingIdentity(self.head)
+    }
+
+    /// This cursor if it walks `backing`, else a new one at its head.
+    pub(crate) fn for_backing(cursor: Option<Self>, backing: BackingIdentity) -> Self {
+        cursor
+            .filter(|cursor| cursor.head == backing.0)
+            .unwrap_or(Self::new(backing))
+    }
+}
+
 /// One physically contiguous piece of an object range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObjectSegment {
@@ -646,11 +681,12 @@ impl RoleTableLayout {
 /// Resolves one page of an object backing to its physical address, for a
 /// caller that maps pages one at a time onto another address space (DMA).
 pub(crate) trait ObjectPages {
-    /// The physical page of `backing` at `object_offset`, or `None` when the
-    /// backing does not hold that page or refuses a writable use.
+    /// The physical page at `object_offset` of the backing `cursor` walks,
+    /// or `None` when the backing does not hold that page or refuses a
+    /// writable use.
     fn object_page(
         &self,
-        backing: BackingIdentity,
+        cursor: &mut BackingCursor,
         object_offset: u64,
         writable: bool,
     ) -> Option<u64>;
@@ -661,11 +697,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> ObjectPages
 {
     fn object_page(
         &self,
-        backing: BackingIdentity,
+        cursor: &mut BackingCursor,
         object_offset: u64,
         writable: bool,
     ) -> Option<u64> {
-        self.resolve_object_page(backing, object_offset, writable)
+        self.resolve_at(cursor, object_offset, writable)
             .ok()
             .map(|page| page.physical_start)
     }

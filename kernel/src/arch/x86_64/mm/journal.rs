@@ -18,8 +18,8 @@ use crate::memory::address_region::{
     AddressSpaceKey, AddressSpacePublisher, Mapping, RegionKey, publisher_seal,
 };
 use crate::memory::frame_roles::{
-    BackingIdentity, FrameRoleError, FrameRoleManager, StagedTableCommit, TableCandidateGrant,
-    TableCommitParent, TableIdentity, TableLevel,
+    BackingCursor, BackingIdentity, FrameRoleError, FrameRoleManager, StagedTableCommit,
+    TableCandidateGrant, TableCommitParent, TableIdentity, TableLevel,
 };
 
 #[path = "journal/publisher.rs"]
@@ -286,7 +286,8 @@ const EMPTY_CANDIDATE_USE: CandidateUse = CandidateUse {
 
 #[derive(Clone, Copy)]
 struct LeafAuthorization {
-    backing: BackingIdentity,
+    /// At the authorized page's run, so the recheck is one step.
+    cursor: BackingCursor,
     object_offset: u64,
     physical_start: u64,
 }
@@ -314,6 +315,10 @@ pub(crate) struct OwnedPageTableJournal<
     uses: [CandidateUse; CANDIDATE_CAPACITY],
     use_count: usize,
     leaf_authorization: Option<LeafAuthorization>,
+    /// Where the last authorized leaf's backing page was: leaves are
+    /// authorized in address order, so successive pages of one mapping cost
+    /// one step each (DW2 M3 review D1).
+    leaf_cursor: Option<BackingCursor>,
 }
 
 impl<
@@ -360,6 +365,7 @@ where
             uses: [EMPTY_CANDIDATE_USE; CANDIDATE_CAPACITY],
             use_count: 0,
             leaf_authorization: None,
+            leaf_cursor: None,
         })
     }
 
@@ -372,9 +378,11 @@ where
         object_offset: u64,
         physical_start: u64,
     ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
-        self.check_leaf(backing, object_offset, physical_start, false)?;
+        let mut cursor = BackingCursor::for_backing(self.leaf_cursor, backing);
+        self.check_leaf(&mut cursor, object_offset, physical_start, false)?;
+        self.leaf_cursor = Some(cursor);
         self.leaf_authorization = Some(LeafAuthorization {
-            backing,
+            cursor,
             object_offset,
             physical_start,
         });
@@ -388,14 +396,14 @@ where
 
     fn check_leaf(
         &self,
-        backing: BackingIdentity,
+        cursor: &mut BackingCursor,
         object_offset: u64,
         physical_start: u64,
         writable: bool,
     ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
         let page = self
             .roles
-            .resolve_object_page(backing, object_offset, writable)
+            .resolve_at(cursor, object_offset, writable)
             .map_err(OwnedPageTableJournalError::FrameRole)?;
         if page.physical_start != physical_start {
             return Err(OwnedPageTableJournalError::FrameRole(
@@ -553,8 +561,9 @@ where
             .last()
             .ok_or(OwnedPageTableJournalError::InvalidPlan)?;
         let required_writable = leaf_mutation.replacement() & super::WRITABLE != 0;
+        let mut cursor = authorization.cursor;
         self.check_leaf(
-            authorization.backing,
+            &mut cursor,
             authorization.object_offset,
             authorization.physical_start,
             required_writable,
