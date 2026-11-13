@@ -226,6 +226,10 @@ const EMPTY_SLOT: ObjectSlot = ObjectSlot {
     generation: 0,
     state: SlotState::Vacant,
 };
+/// CPUs that may each hold one create's page reservation; at least the
+/// kernel's CPU capacity (asserted in `lib.rs`).
+pub(crate) const RESERVATION_CPUS: usize = 4;
+
 pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     domain: u64,
     slots: [ObjectSlot; CAPACITY],
@@ -234,6 +238,11 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     /// Per slot, its weight under the page class: the pages of a RAM-backed
     /// MemoryObject, zero for everything else. Reset with the tag.
     pages: [u64; CAPACITY],
+    /// Per CPU, pages a MemoryObjectCreate admitted before allocating its
+    /// frames outside the global lock, charged to its tag until the hold
+    /// that creates the object (DW2 §7.3 R7). Concurrent creates see each
+    /// other's, so they cannot together allocate past a limit.
+    reserved: [Option<(charge::ChargeTag, u64)>; RESERVATION_CPUS],
 }
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
@@ -243,6 +252,22 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             slots: [EMPTY_SLOT; CAPACITY],
             tags: [charge::ChargeTag::EMPTY; CAPACITY],
             pages: [0; CAPACITY],
+            reserved: [None; RESERVATION_CPUS],
+        }
+    }
+
+    /// Charges `pages` to `tag` for `cpu`'s create in flight, replacing any
+    /// reservation that CPU held.
+    pub(crate) fn reserve_pages(&mut self, cpu: usize, tag: charge::ChargeTag, pages: u64) {
+        if let Some(slot) = self.reserved.get_mut(cpu) {
+            *slot = Some((tag, pages));
+        }
+    }
+
+    /// Ends `cpu`'s reservation, if it holds one.
+    pub(crate) fn release_reserved_pages(&mut self, cpu: usize) {
+        if let Some(slot) = self.reserved.get_mut(cpu) {
+            *slot = None;
         }
     }
 
@@ -368,6 +393,15 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             .fold(0usize, |total, (_, &pages)| {
                 total.saturating_add(usize::try_from(pages).unwrap_or(usize::MAX))
             })
+            .saturating_add(
+                self.reserved
+                    .iter()
+                    .flatten()
+                    .filter(|(tag, _)| tag.names(group))
+                    .fold(0usize, |total, &(_, pages)| {
+                        total.saturating_add(usize::try_from(pages).unwrap_or(usize::MAX))
+                    }),
+            )
     }
 
     /// Live and finalizing objects of `class` charged to `group`.

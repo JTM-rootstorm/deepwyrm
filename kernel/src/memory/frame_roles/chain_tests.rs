@@ -468,3 +468,28 @@ fn a_backing_zeroed_in_parts_zeroes_every_page_once() {
     assert_eq!(grant.run_count(), 2);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+/// DW2 §7.3 test gap: a zeroing step that fails after earlier steps zeroed
+/// part of a multi-run allocation leaves it cancelable, and cancelling it
+/// gives back every frame of every run.
+#[test]
+fn a_backing_whose_later_zeroing_step_fails_is_cancelled_whole() {
+    let mut roles = manager(16);
+    let _held = fragment(&mut roles, &[3, 2]);
+    let free = roles.available_frames();
+    let allocation = roles.allocate_backing(5).unwrap();
+    assert_eq!(roles.available_frames(), free - 5);
+    let whole: Vec<u64> = roles
+        .backing_allocation_segments(&allocation)
+        .unwrap()
+        .flat_map(|segment| {
+            (0..segment.byte_len / PAGE).map(move |page| segment.physical_start + page * PAGE)
+        })
+        .collect();
+    assert!(roles.zero_backing_pages(&allocation, 0, 2, &mut |_| true));
+    // The second step crosses into the second run and fails there.
+    assert!(!roles.zero_backing_pages(&allocation, 2, 2, &mut |page| page != whole[3]));
+    roles.cancel_backing_allocation(allocation).unwrap();
+    assert_eq!(roles.available_frames(), free);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}

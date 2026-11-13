@@ -1658,6 +1658,51 @@ fn pieces_that_continue_each_other_merge_into_one_mapping() {
     assert_eq!(objects.active_lease_count(), 1);
 }
 
+/// DW2 §7.3 test gap: a mapping merged from four steps holds one lease, and
+/// once the object's owner is gone, unmapping it hands back exactly one
+/// final release, which finalizes the object once.
+#[test]
+fn an_object_finalizes_once_after_its_merged_mapping_is_unmapped() {
+    let mut objects = TestObjects::<2, 8>::new();
+    let object = object(&mut objects, Protection::READ_WRITE);
+    let mut region = region::<2>(PAGE_SIZE, PAGE_SIZE * 8);
+    let mut publisher = FakePublisher::for_region(&region);
+    for step in 0..4 {
+        let authorization = authorization(&mut objects, object, &region, Protection::READ_WRITE);
+        test_map(
+            &mut region,
+            &mut objects,
+            &mut publisher,
+            PAGE_SIZE * (1 + 2 * step),
+            authorization,
+            PAGE_SIZE * 2 * step,
+            PAGE_SIZE * 2,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    }
+    assert_eq!(region.mappings().iter().flatten().count(), 1);
+    assert_eq!(objects.active_lease_count(), 1);
+    // The owner goes; the merged mapping's lease keeps the object alive.
+    let owner = objects.owners[0].take().unwrap();
+    assert!(objects.registry.release_internal(owner).unwrap().is_none());
+    let (authority, registry) = objects.split_mut();
+    let releases = region
+        .unmap(
+            authority,
+            registry,
+            &mut publisher,
+            PAGE_SIZE,
+            PAGE_SIZE * 8,
+        )
+        .unwrap();
+    assert_eq!(releases.len(), 1);
+    assert_eq!(objects.active_lease_count(), 0);
+    let release = releases.into_items().into_iter().flatten().next().unwrap();
+    assert!(objects.authority.take_finalization(release).is_ok());
+    assert!(region.mappings().iter().flatten().next().is_none());
+}
+
 /// DW2 M4b review D1 and D3: the whole-range check refuses a gap or a
 /// range past the region's end; a full region reports `Capacity` before
 /// `Overlap` unless the piece merges; a different ceiling never merges.

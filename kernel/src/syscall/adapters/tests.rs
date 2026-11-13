@@ -14610,6 +14610,12 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
     // A committed page costs nothing more.
     assert_eq!(commit(&mut registry, &mut roles, 1), Ok(0));
     assert_eq!(roles.on_demand_frames(backing), Ok(4));
+    // The slot's weight is exactly the backing's frames, root included
+    // (§8.11): what quota counts is what the object holds.
+    assert_eq!(
+        registry.charge(object).map(|(_, pages)| pages),
+        Ok(roles.on_demand_frames(backing).unwrap())
+    );
 
     // Finalizing gives back every frame and every page of quota.
     assert_eq!(
@@ -14712,3 +14718,49 @@ fn a_quota_refused_early_backing_fails_closed() {
 }
 
 mod dma;
+
+/// DW2 §7.3 R7: two CPUs' creates admitted before either allocates see each
+/// other's reservation, so together they cannot pass the group's limit.
+#[test]
+fn concurrent_create_reservations_share_the_limit() {
+    let (mut registry, mut tasks, _root, jobs, process, _) = limited_fixture();
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 4)
+        .unwrap();
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        3,
+        0
+    ));
+    // Alone each would fit; with CPU 0's three pages reserved, two do not.
+    assert!(!reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        2,
+        1
+    ));
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        1,
+        1
+    ));
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 1));
+    // A CPU's new reservation replaces its old one rather than adding.
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        2,
+        0
+    ));
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 1));
+    // The creating hold releases its own before the adapter admits again.
+    registry.release_reserved_pages(0);
+    registry.release_reserved_pages(1);
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 4));
+}

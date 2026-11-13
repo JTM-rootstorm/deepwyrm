@@ -22,6 +22,8 @@ struct Fixture {
     page_tables: PageTableRoot,
     candidates: [Option<TableCandidateGrant>; 3],
     backing_start: u64,
+    /// Each object page's frame, in object order.
+    frames: std::vec::Vec<u64>,
     registry: ObjectRegistry<1>,
     objects: MemoryObjectAuthority<1, 2>,
     owner: InternalRef,
@@ -37,6 +39,16 @@ impl Fixture {
         reason = "the host model attests synthetic frame zeroing and root ownership"
     )]
     fn new(frames: u64) -> Self {
+        Self::with_runs(frames, &[])
+    }
+
+    /// As [`Fixture::new`], with the object's backing taken from free runs
+    /// of these sizes (summing to `PAGES`) when `runs` is not empty.
+    #[allow(
+        unsafe_code,
+        reason = "the host model attests synthetic frame zeroing and root ownership"
+    )]
+    fn with_runs(frames: u64, runs: &[u64]) -> Self {
         let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
         let mut roles = synthetic_frame_role_manager::<4, 64>(0x1000, frames);
         let owner = roles.create_table_owner().unwrap();
@@ -65,11 +77,37 @@ impl Fixture {
             let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
             candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
         }
-        let allocation = roles.allocate(PAGES).unwrap();
-        // SAFETY: as for the root.
-        let backing = unsafe { roles.assume_zeroed(allocation) }.unwrap();
-        let backing = roles.assign_object_backing(backing).unwrap();
+        let backing = if runs.is_empty() {
+            let allocation = roles.allocate(PAGES).unwrap();
+            // SAFETY: as for the root.
+            let backing = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+            roles.assign_object_backing(backing).unwrap()
+        } else {
+            // Holes of the run sizes between held pages, and the rest held,
+            // so the backing must take exactly those runs.
+            let mut holes = std::vec::Vec::new();
+            for &run in runs {
+                holes.push(roles.allocate(run).unwrap());
+                core::mem::forget(roles.allocate(1).unwrap());
+            }
+            let rest = roles.allocate(roles.available_frames()).unwrap();
+            for hole in holes {
+                roles.cancel_allocation(hole).unwrap();
+            }
+            let allocation = roles.allocate_backing(PAGES).unwrap();
+            roles.cancel_allocation(rest).unwrap();
+            // SAFETY: the host model never dereferences synthetic frames.
+            unsafe { roles.assume_backing_zeroed(allocation) }.unwrap()
+        };
         let backing_start = backing.physical_start();
+        let frames: std::vec::Vec<u64> = roles
+            .object_segments(backing.identity(), 0, PAGES * BASE_PAGE_SIZE, true)
+            .unwrap()
+            .flat_map(|segment| {
+                (0..segment.byte_len / BASE_PAGE_SIZE)
+                    .map(move |page| segment.physical_start + page * BASE_PAGE_SIZE)
+            })
+            .collect();
         let mut registry = ObjectRegistry::<1>::new();
         let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
         let mut objects = MemoryObjectAuthority::<1, 2>::new();
@@ -95,6 +133,7 @@ impl Fixture {
             page_tables,
             candidates,
             backing_start,
+            frames,
             registry,
             objects,
             owner,
@@ -429,5 +468,36 @@ fn a_refill_whose_zeroing_fails_returns_its_frame_and_undoes() {
     // Batch one turned its three candidates into tables; the failed
     // refill's frame went back.
     assert_eq!(fixture.roles.available_frames(), free);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// DW2 §7.1 G4: a batch may start partway into a run. With runs of three
+/// and one page and two pages per journal, one batch starts inside the
+/// three-page run; every page still maps its own frame, there and in the
+/// unmap.
+#[test]
+fn a_batch_starting_inside_a_run_of_a_scattered_backing_maps_its_own_frames() {
+    let mut fixture = Fixture::with_runs(40, &[3, 1]);
+    let runs = fixture
+        .frames
+        .windows(2)
+        .filter(|pair| pair[1] != pair[0] + BASE_PAGE_SIZE)
+        .count()
+        + 1;
+    assert_eq!(runs, 2, "the backing is two runs");
+    let mut target = FakeTarget::default();
+    let (result, undone) = fixture.map(&mut target);
+    assert_eq!(result, Ok(()));
+    assert!(!undone);
+    assert_eq!(target.apply_count, 2);
+    for (index, page) in Fixture::pages().enumerate() {
+        assert_eq!(
+            fixture.leaf(&target, page),
+            Some(fixture.frames[index]),
+            "page {page:#x}"
+        );
+    }
+    fixture.unmap(&mut target);
+    assert!(Fixture::pages().all(|page| fixture.leaf(&target, page).is_none()));
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }

@@ -38,6 +38,9 @@ pub mod memory;
     reason = "DW0-D5 consumes generic lifetime primitives ahead of DW0-E process/syscall ownership"
 )]
 pub(crate) mod object;
+
+// Every CPU needs a MemoryObjectCreate page reservation slot (DW2 §7.3 R7).
+const _: () = assert!(object::RESERVATION_CPUS >= cpu::CPU_CAPACITY);
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) mod one_shot;
 #[path = "handle/service.rs"]

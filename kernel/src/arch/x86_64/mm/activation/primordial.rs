@@ -969,8 +969,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 let prepared = runtime.prepare_guard_free_usercopy();
                 // Frames are allocated only for a request its quota admits
                 // now; the adapter's admission under the next hold decides.
+                // Admitted pages stay reserved until the final hold, so a
+                // concurrent create cannot allocate past the limit (§7.3 R7).
                 let allows = backing_pages.is_none_or(|pages| {
-                    runtime.memory_object_quota_allows(if on_demand { 1 } else { pages })
+                    let process = runtime.own.scheduled().process;
+                    crate::syscall::reserve_memory_object_pages(
+                        &mut runtime.core.registry,
+                        &runtime.core.tasks,
+                        process,
+                        if on_demand { 1 } else { pages },
+                        cpu.index(),
+                    )
                 });
                 (prepared, allows)
             })
@@ -1065,6 +1074,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (ready, released_pin) = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            // The adapter admits again, against the others' reservations.
+            runtime.core.registry.release_reserved_pages(cpu.index());
             let (status, released_pin) = match (request, atomic_pin) {
                 (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
                     let mut access = crate::syscall::DeferredMemoryObjectAccess::new(
@@ -8179,18 +8190,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             ),
             _ => unreachable!("deferred-output classification drifted"),
         }
-    }
-
-    /// Whether the scheduled process may create one more MemoryObject of
-    /// `pages` pages now; asked before frames are allocated (F4 residual,
-    /// D6), so a request over its page limit never takes or zeroes frames.
-    fn memory_object_quota_allows(&self, pages: u64) -> bool {
-        crate::syscall::memory_object_quota_allows(
-            &self.core.registry,
-            &self.core.tasks,
-            self.own.scheduled().process,
-            pages,
-        )
     }
 
     /// The guarded half of a deferred `MemoryObjectCreate` (D1 commit 6c):

@@ -8910,6 +8910,33 @@ pub(crate) fn memory_object_quota_allows<
     admit_memory_object(registry, tasks, process, pages).is_ok()
 }
 
+/// Admits a MemoryObjectCreate of `pages` for `process` and, if admitted,
+/// reserves them for `cpu` until the hold that creates the object releases
+/// them (DW2 §7.3 R7): its frames are allocated outside the global lock,
+/// and without the reservation a concurrent create would not see them.
+pub(crate) fn reserve_memory_object_pages<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+    pages: u64,
+    cpu: usize,
+) -> bool {
+    registry.release_reserved_pages(cpu);
+    match admit_memory_object(registry, tasks, process, pages) {
+        Ok(tag) => {
+            registry.reserve_pages(cpu, tag, pages);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// MemoryObjectCreate. One combined access provides the detached output pin
 /// and the physical backing, so the two cannot alias. This is the only
 /// MemoryObjectCreate transaction; host tests drive it through a shim.
