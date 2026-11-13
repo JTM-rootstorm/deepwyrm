@@ -21,6 +21,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             next_table_owner: 1,
             next_epoch: 1,
             version: 0,
+            index_memory: None,
         };
         manager.fill_boot_free_slots()?;
         Ok(manager)
@@ -1087,6 +1088,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 grant.pages,
                 grant.runs,
             ),
+            ObjectBackingKind::OnDemand => self.release_index(grant.identity.0),
             ObjectBackingKind::ImmutableModule { .. } | ObjectBackingKind::DeviceMmio => {
                 Err(FrameRoleError::WrongRole)
             }
@@ -1353,7 +1355,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(FrameRoleError::InvariantViolation);
         }
-        self.check_chains()
+        self.check_chains()?;
+        self.check_indexes()
     }
 
     fn transition(

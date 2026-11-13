@@ -340,6 +340,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let page = offset / BASE_PAGE_SIZE;
         let head = cursor.head;
         match self.record(head)?.role {
+            FrameRole::IndexRoot(_) => {
+                let (run, physical_start) = self.index_resolve(head, page)?;
+                return Ok(ObjectSegment {
+                    run,
+                    object_offset: offset,
+                    physical_start,
+                    byte_len: BASE_PAGE_SIZE,
+                });
+            }
             FrameRole::ObjectBacking(_) | FrameRole::ExternalDeviceMmio => {}
             FrameRole::ExternalImmutableModule { .. } if writable => {
                 return Err(FrameRoleError::ReadOnlyBacking);
@@ -426,7 +435,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
-    fn take_run(
+    pub(super) fn take_run(
         &mut self,
         wanted: u64,
     ) -> Result<(usize, u32, FrameRoleIdentity, PageRange), FrameRoleError> {

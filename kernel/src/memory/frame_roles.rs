@@ -24,9 +24,13 @@ use super::physical::{
 
 #[path = "frame_roles/chain.rs"]
 mod chain;
+#[path = "frame_roles/index.rs"]
+mod index;
 #[path = "frame_roles/manager.rs"]
 mod manager;
 use chain::ChainState;
+use index::{IndexEntryLink, IndexRootLink};
+pub(crate) use index::IndexMemory;
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]
 mod test_support;
@@ -57,6 +61,9 @@ pub(crate) enum FrameRoleError {
     ReadOnlyBacking,
     /// The caller could not initialize a page of a new backing.
     InitializationFailed,
+    /// The page lies in an on-demand backing but has no frame yet (DW2 M6
+    /// §8.3).
+    Absent,
     InvariantViolation,
 }
 
@@ -211,6 +218,9 @@ pub(crate) enum ObjectBackingKind {
     /// One admitted PCI memory BAR: device registers outside the allocator,
     /// never RAM, mapped uncached and never executable.
     DeviceMmio,
+    /// Allocator pages given on first touch through a per-object index
+    /// (DW2 M6 §8.3).
+    OnDemand,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,6 +276,10 @@ pub(crate) enum FrameRoleKind {
     ExternalDeviceMmio,
     /// The run holding the grown role table itself (DW2 M2 §5.3).
     RoleTableStorage,
+    /// A node of an on-demand backing's index below its root (DW2 M6).
+    BackingIndexNode,
+    /// A committed page of an on-demand backing (DW2 M6).
+    OnDemandPage,
 }
 
 /// Where one run sits in an allocator-owned object backing (DW2 M3 §6.2).
@@ -303,6 +317,12 @@ enum FrameRole {
     },
     ExternalDeviceMmio,
     RoleTableStorage,
+    /// The root node of an on-demand backing: the backing's identity.
+    IndexRoot(IndexRootLink),
+    /// A node of an on-demand backing's index below its root.
+    IndexNode(IndexEntryLink),
+    /// A committed page of an on-demand backing.
+    ObjectPage(IndexEntryLink),
 }
 
 impl FrameRole {
@@ -334,6 +354,9 @@ impl FrameRole {
             }
             Self::ExternalDeviceMmio => FrameRoleKind::ExternalDeviceMmio,
             Self::RoleTableStorage => FrameRoleKind::RoleTableStorage,
+            Self::IndexRoot(_) => FrameRoleKind::ObjectBacking(ObjectBackingKind::OnDemand),
+            Self::IndexNode(_) => FrameRoleKind::BackingIndexNode,
+            Self::ObjectPage(_) => FrameRoleKind::OnDemandPage,
         }
     }
 }
@@ -657,6 +680,8 @@ pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPAC
     next_epoch: u64,
     /// Changes whenever any role record changes; binds hierarchy proofs.
     version: u64,
+    /// Access to on-demand index pages (DW2 M6 §8.3); none until set.
+    index_memory: Option<&'static dyn IndexMemory>,
 }
 
 /// Where each part of the grown role table lies in its run, in bytes.
