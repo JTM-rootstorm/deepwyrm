@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is designed (§6).
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a).
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -154,7 +154,7 @@ The publisher holds only `&mut FrameRoleManager` while the object authority is h
 
 ### 6.5 Steps
 
-1. Role manager: chain records, `allocate_scattered`, `resolve_object_page`, range validation over a chain, whole-chain cancel; host tests including fragmentation (a request larger than the largest hole succeeds), the 64-run limit, and rollback.
+1. Role manager: chain records, `allocate_scattered`, `resolve_object_page`, range validation over a chain, whole-chain cancel; host tests including fragmentation (a request larger than the largest hole succeeds) and rollback. (The 64-run limit test went with the limit, §6.7.)
 2. Object authority and ranges: drop `physical_start` from records and ranges.
 3. Publisher: per-page resolution, chain validation, the skip check.
 4. Allocation users: `allocate_zeroed_backing`, the boot allocator and `write_backing`.
@@ -185,3 +185,23 @@ Mike: fragmented memory must not make the kernel slow; this and the OOM killer c
 3. **Fragmentation itself.** Buddy merging keeps fragmentation low. Where it does not, **compaction** moves object pages to make room: copy, republish the mappings through the journal, and shoot down stale TLB entries. Pages pinned for DMA or by an in-flight operation are not moved. It runs when a large request fails, before the OOM path.
 
 Order: the buddy allocator first, since it also speeds up today's single-run allocation, then the object index, then compaction. The OOM killer (§6.7) comes after compaction, so it only runs when memory is really full, not merely fragmented.
+
+### 6.9 M3 as built (2026-11-12)
+
+Deepwyrm `502ad10` (step 1), `18b1622` (steps 2, 3 and 5 together: the publisher and DMA were the users of the removed physical start), `c4ba18e` (step 4), review fixes `7f1b688` and the commit recording this section.
+
+- **Chains** (`memory/frame_roles/chain.rs`): role variants `BackingAllocated(ChainLink)` and `ObjectBacking(ChainLink)`, a link being head, object page and next run. Every walk checks each run's role, head and starting page, so stale, foreign and cyclic links fail. `allocate_backing` takes the largest free run first; `allocate_zeroed_backing` is the one path for the boot and user allocators and frees every run if a page fails to zero. Boot modules and BARs are one-run chains.
+- **Lookup:** `object_segments` validates a range once; `BackingCursor` with `resolve_at` keeps a place in the chain, so the publisher (one cursor per side), journal leaf authorization, DMA and boot writes cost pages plus runs. A cursor grants nothing: each step revalidates against the head, and a stale place restarts there.
+- **Consumers:** object records and ranges carry no physical start. The publisher's protect-in-place and skip checks compare backing and object offset. DMA resolves each page under P, taken before the DMA lock, onto one contiguous IOVA range.
+- **Slots:** one per allocator page (`GROWN_SLOT_PAGES` = 1), so slots run out only with pages. `RoleSlot` is 80 bytes; with the start index, free-slot stack and free list the grown table costs about 104 bytes per 4 KiB page, about 2.5% of RAM, in one contiguous run carved right after activation (review R1).
+- **Validation (development tier):** 1172 kernel host tests and clippy pass; the production kernel and the `memory-mapping` selector compile for `x86_64-unknown-none`; one `dev-boot --check --sdk` passed at `c4ba18e` and again at `7f1b688`.
+
+### 6.9a Security review of M3
+
+**Reviewer:** Claude Opus 5.5 (low effort), 2026-11-12, at Deepwyrm `c4ba18e` (base `37c37ae`), then the fix at `7f1b688` (base `c4ba18e`). Method: code reading plus host unit tests; no guest runs. No Critical or High defect; no way found for a mapping, DMA mapping or boot write to reach a frame the object does not own, no double or partial free, and no panic userspace can reach. The P → `LIVE_DMA` order was checked: no `LIVE_DMA` section takes P.
+
+- **D1 (Medium, confirmed): fixed** (`7f1b688`). Every page was resolved from the chain head, twice, so a publish, DMA map or boot write cost pages × runs, contrary to §6.2 and §6.7. The cursor makes in-order walks linear; the re-review found no defect in it and confirmed the cost. Its one Low test gap (a cursor aimed at another live backing's run) is closed by a test in the commit recording this section.
+- **R1 (Low/Medium), open for Mike:** the grown table is about 2.5% of RAM in one contiguous run, and boot stops if no such run exists. Shrinking `RoleSlot` (fields only page tables use) would roughly halve it.
+- **R2 (Low), accepted:** whole-table scans (`owns_any`, external imports, `check_invariants`) are now linear in pages; every caller is at boot or in tests.
+- **R3 (Low): fixed** (`7f1b688`). A run being allocated reports `FrameRoleKind::BackingAllocated`, not `AllocatedUninitialized`.
+- **R4 (Low), deferred to §6.8:** allocation costs runs × free ranges (the allocator's linear scans).

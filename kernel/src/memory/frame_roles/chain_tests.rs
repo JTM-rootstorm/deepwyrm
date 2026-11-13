@@ -397,9 +397,35 @@ fn a_cursor_grants_nothing_once_its_backing_is_gone() {
         roles.resolve_at(&mut cursor, 2 * PAGE, false).err(),
         Some(FrameRoleError::InvalidGrant)
     );
-    // A cursor for one backing does not resolve another's pages.
-    let mut wrong = BackingCursor::new(identity);
-    wrong.run = segments(&roles, &other)[1].run;
-    wrong.run_page = 1;
-    assert!(roles.resolve_at(&mut wrong, PAGE, false).is_err());
+}
+
+#[test]
+fn a_cursor_never_borrows_another_live_backings_run() {
+    let mut roles = manager(64);
+    let _held = fragment(&mut roles, &[1, 1, 1, 1]);
+    let first = backing(&mut roles, 2);
+    let second = backing(&mut roles, 2);
+    let second_run = segments(&roles, &second)[1].run;
+    // The first backing's cursor aimed at the second's run at the same
+    // object page: the run's link names another head, so the walk restarts
+    // from the first head and resolves the first backing's own page.
+    let mut aimed = BackingCursor::new(first.identity());
+    aimed.run = second_run;
+    aimed.run_page = 1;
+    let own = segments(&roles, &first)[1];
+    let resolved = roles.resolve_at(&mut aimed, PAGE, true).unwrap();
+    assert_eq!(resolved.physical_start, own.physical_start);
+    assert_eq!(resolved.run, own.run);
+    assert_ne!(
+        resolved.physical_start,
+        segments(&roles, &second)[1].physical_start
+    );
+    // Aimed past a run end, it still finds only the first backing's pages.
+    let mut past = BackingCursor::new(first.identity());
+    past.run = second_run;
+    past.run_page = 1;
+    assert_eq!(
+        roles.resolve_at(&mut past, 2 * PAGE, false).err(),
+        Some(FrameRoleError::WrongRole)
+    );
 }
