@@ -290,6 +290,20 @@ mod pin_tracker {
             Ok(())
         }
 
+        /// Whether any user pin, or a mutation, holds part of
+        /// `address_space`. An exited Process's teardown requires none.
+        pub(crate) fn holds_any(&self, address_space: AddressSpaceKey) -> bool {
+            let state = self.state.lock();
+            state
+                .mutation
+                .is_some_and(|mutation| mutation.address_space == address_space)
+                || state
+                    .pins
+                    .iter()
+                    .filter_map(|slot| slot.range)
+                    .any(|pin| pin.address_space == address_space)
+        }
+
         pub(crate) fn begin_mutation(
             &self,
             address_space: AddressSpaceKey,
@@ -1143,6 +1157,28 @@ mod tests {
 
     fn scope(raw: u64) -> AddressSpaceKey {
         AddressSpaceKey::for_test(1, raw)
+    }
+
+    /// DW2 §7.1 R2: teardown's precondition sees a pin or a mutation in its
+    /// own address space, and only there.
+    #[test]
+    fn holds_any_sees_pins_and_mutations_of_one_address_space() {
+        let tracker = UserPinTracker::<2>::new();
+        assert!(!tracker.holds_any(scope(1)));
+        let pin = tracker
+            .pin_owned(scope(1), range_at(PAGE_SIZE * 4, 8, UserAccess::READ))
+            .unwrap();
+        assert!(tracker.holds_any(scope(1)));
+        assert!(!tracker.holds_any(scope(2)));
+        tracker.release_owned(scope(1), pin).unwrap();
+        assert!(!tracker.holds_any(scope(1)));
+        let mutation = tracker
+            .begin_mutation(scope(2), PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        assert!(tracker.holds_any(scope(2)));
+        assert!(!tracker.holds_any(scope(1)));
+        drop(mutation);
+        assert!(!tracker.holds_any(scope(2)));
     }
 
     #[test]

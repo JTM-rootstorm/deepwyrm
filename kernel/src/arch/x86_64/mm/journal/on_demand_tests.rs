@@ -653,3 +653,50 @@ fn an_undone_protect_of_two_mappings_restores_present_leaves() {
     assert_eq!(fixture.change(START, 2 * SPAN, None), Ok(()));
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }
+
+/// DW2 §5.3a's question (reviewed 2026-11-13: safe by construction): a
+/// root never links a table another root's owner holds. A touch in one
+/// Process offered only the other's table candidates is refused, and
+/// nothing is published.
+#[test]
+fn a_root_refuses_another_owners_table_candidates() {
+    let mut fixture = Fixture::new();
+    fixture.add_process();
+    fixture.commit(0);
+    let other = fixture.other.as_mut().unwrap();
+    core::mem::swap(&mut fixture.candidates, &mut other.2);
+    assert!(fixture.touch(START).is_err());
+    assert_eq!(fixture.leaf(START), None);
+    let other = fixture.other.as_mut().unwrap();
+    core::mem::swap(&mut fixture.candidates, &mut other.2);
+    assert_eq!(fixture.touch(START), Ok(true));
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// The same question, for an entry already in place: a PML4 entry planted
+/// to name the other Process's PDPT is refused, not followed, even by the
+/// read-only walk that finds an already-present leaf (it found the other
+/// Process's leaf and called the touch served before this was checked).
+#[test]
+fn a_root_refuses_an_entry_naming_another_owners_table() {
+    let mut fixture = Fixture::new();
+    fixture.add_process();
+    let frame = fixture.commit(0);
+    fixture.swap_process();
+    fixture.touch(START).unwrap();
+    let index = ((START >> 39) & 0x1ff) as usize;
+    let foreign = fixture.target.entries[&(fixture.root.physical_start(), index)];
+    fixture.swap_process();
+    fixture
+        .target
+        .entries
+        .insert((fixture.root.physical_start(), index), foreign);
+    assert!(matches!(
+        fixture.touch(START),
+        Err(X86AddressSpacePublishError::Journal(_))
+    ));
+    // The other Process's leaf is untouched.
+    fixture.swap_process();
+    assert_eq!(fixture.leaf(START), Some((frame, true)));
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}

@@ -5323,6 +5323,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .page_table_mutation_session(self.own.active_root.as_ref().ok_or(())?, current_process);
         user.select_process_for_return_validation(process)
             .map_err(|_| ())?;
+        // Reviewed safe (DW2 §7.1 R2, 2026-11-13): every owned pin is drained
+        // with its blocked operation or held by a CPU still resident on this
+        // root, which the caller has ruled out. Checked here, before any
+        // change, rather than failing partway through the unmaps below.
+        let address_space = self
+            .core
+            .regions
+            .region(root_key)
+            .map_err(|_| ())?
+            .address_space_key();
+        assert!(
+            !user.pins_hold_any(address_space),
+            "an exited Process's address space still holds a user pin at teardown"
+        );
         loop {
             let mapping = self
                 .core

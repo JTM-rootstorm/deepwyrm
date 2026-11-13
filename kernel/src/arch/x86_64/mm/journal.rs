@@ -794,6 +794,34 @@ where
         }
     }
 
+    /// Checks that every table on `page`'s present path is this root's own,
+    /// at its level and under its parent, as a plan's walked entries are
+    /// checked. A read-only walk that finds a present leaf trusts nothing
+    /// until this passes (DW2 §5.3a: a root never links another owner's
+    /// table).
+    pub(super) fn validate_present_path(
+        &mut self,
+        page: VirtualPage,
+    ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
+        let mut current = TableReference::Committed(self.root);
+        let mut current_address = self.root.physical_start();
+        for level_index in (1..=3).rev() {
+            let table = FrameAddress::new(current_address, self.physical_limit)
+                .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+            let entry = self
+                .journal
+                .read_entry(table, page.index(level_index))
+                .map_err(journal_error)?;
+            let frame = decode_intermediate(entry, page.is_user_half(), self.physical_limit)
+                .map_err(|_| OwnedPageTableJournalError::InvalidPlan)?;
+            let child = self.table_reference(frame.address(), level_for_index(level_index - 1))?;
+            self.validate_parent(current, child)?;
+            current = child;
+            current_address = frame.address();
+        }
+        Ok(())
+    }
+
     fn table_level(
         &self,
         table: TableReference,

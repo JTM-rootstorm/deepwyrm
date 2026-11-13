@@ -314,7 +314,14 @@ where
             .present_leaf_matches(&mut journal, page, frame, descriptor.permissions)
             .map_err(X86AddressSpacePublishError::Map)?
         {
-            Some(true) => return Ok(false),
+            // Only through this root's own tables (§5.3a): a leaf reached
+            // through another owner's is no leaf of this mapping.
+            Some(true) => {
+                journal
+                    .validate_present_path(page)
+                    .map_err(X86AddressSpacePublishError::Journal)?;
+                return Ok(false);
+            }
             Some(false) => return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch)),
             None => {}
         }

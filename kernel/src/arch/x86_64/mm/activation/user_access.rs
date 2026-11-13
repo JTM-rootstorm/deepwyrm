@@ -65,6 +65,14 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.session.prepare_table_candidate(level)
     }
 
+    /// Whether any user pin or mutation holds part of `address_space`.
+    pub(crate) fn pins_hold_any(
+        &self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> bool {
+        self.session.target.pins.holds_any(address_space)
+    }
+
     /// Frames committing object page `page` of the on-demand `backing`
     /// would take (DW2 M6 §8.4).
     pub(crate) fn on_demand_commit_cost(
