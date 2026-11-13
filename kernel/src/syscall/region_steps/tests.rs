@@ -171,12 +171,15 @@ fn a_failed_protect_step_restores_the_old_protections() {
     );
     // Read-write up to 20 MiB in, then read-only; a mapping outside the
     // range is ignored.
-    steps.set_snapshot([
-        Some((base, 20 * MIB, READ_WRITE)),
-        Some((base + 20 * MIB, 3 * STEP - 20 * MIB, READ)),
-        Some((base + 3 * STEP, STEP, READ_WRITE)),
-        None,
-    ]);
+    assert_eq!(
+        steps.set_snapshot(Ok([
+            Some((base, 20 * MIB, READ_WRITE)),
+            Some((base + 20 * MIB, 3 * STEP - 20 * MIB, READ)),
+            Some((base + 3 * STEP, STEP, READ_WRITE)),
+            None,
+        ])),
+        Ok(())
+    );
     assert_eq!(steps.snapshot_range(), None);
     assert_eq!(range_step(&steps.step()), (base, STEP, Some(READ)));
     assert_eq!(steps.advance(DW_STATUS_SUCCESS, None), None);
@@ -210,6 +213,17 @@ fn a_failed_unmap_step_is_retried_then_left_partial() {
         byte_len: 2 * STEP,
     };
     let mut steps = Steps::new(request, STEP);
+    // The whole range is checked first; a gap refuses the call before any
+    // step (review D1).
+    assert_eq!(
+        steps.snapshot_range(),
+        Some((REGION, base, base + 2 * STEP))
+    );
+    assert_eq!(
+        Steps::new(request, STEP).set_snapshot(Err(DW_STATUS_BAD_STATE)),
+        Err(DW_STATUS_BAD_STATE)
+    );
+    assert_eq!(steps.set_snapshot(Ok([None; 4])), Ok(()));
     assert_eq!(steps.snapshot_range(), None);
     assert_eq!(range_step(&steps.step()), (base, STEP, None));
     assert_eq!(steps.advance(DW_STATUS_SUCCESS, None), None);

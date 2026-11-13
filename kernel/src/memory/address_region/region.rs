@@ -155,6 +155,19 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             protection,
             mapping_authority,
         };
+        // A full region refuses a piece that merges with nothing before
+        // looking for overlap, as it did before pieces merged.
+        if length == SLOTS
+            && !staged[..length].iter().flatten().any(|current| {
+                super::continues(*current, candidate) || super::continues(candidate, *current)
+            })
+        {
+            return Err(authorization_failure(
+                registry,
+                authorization,
+                AddressRegionError::Capacity,
+            ));
+        }
         if staged[..length]
             .iter()
             .flatten()
@@ -546,6 +559,19 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             specs[index] = Some(mapping.spec());
         }
         specs
+    }
+
+    /// The checks an unmap or protect of `[start, start + byte_len)` makes
+    /// before changing anything: the range is in the region and wholly
+    /// mapped. A call in steps makes them once for the whole range (DW2
+    /// M4b review D1), so a gap refuses it before its first step.
+    pub(crate) fn check_covered(
+        &self,
+        start: u64,
+        byte_len: u64,
+    ) -> Result<(), AddressRegionError> {
+        let end = self.checked_interval_end(start, byte_len)?;
+        self.require_covered(start, end)
     }
 
     fn checked_interval_end(&self, start: u64, byte_len: u64) -> Result<u64, AddressRegionError> {

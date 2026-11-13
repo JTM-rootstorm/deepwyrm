@@ -443,6 +443,65 @@ pub(crate) fn address_region_mutation_target<
     target
 }
 
+/// Before the first step of an unmap or protect in steps (DW2 M4b): the
+/// checks the whole call makes before changing anything (the region's
+/// rights, the range in the region and wholly mapped), and the protections
+/// over the range, which a protect restores if a later step fails. `Err`
+/// is the status one call would have returned.
+#[allow(
+    clippy::type_complexity,
+    reason = "the snapshot is a fixed array of (start, length, protection) pieces"
+)]
+pub(crate) fn address_region_range_snapshot<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+    const REGION_OBJECTS: usize,
+    const REGION_SLOTS: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    regions: &AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>,
+    current_process: ProcessKey,
+    address_region: DwHandle,
+    required_rights: DwRights,
+    start: u64,
+    byte_len: u64,
+    cleanup: &mut CleanupQueue<OBJECTS>,
+) -> Result<[Option<(u64, u64, u32)>; REGION_SLOTS], DwStatus> {
+    let target = address_region_mutation_target(
+        registry,
+        tasks,
+        regions,
+        current_process,
+        address_region,
+        required_rights,
+        cleanup,
+    )?;
+    let region = regions
+        .region(target.region)
+        .map_err(address_region_object_status)?;
+    region
+        .check_covered(start, byte_len)
+        .map_err(address_region_status)?;
+    let end = start + byte_len;
+    let mut pieces = [None; REGION_SLOTS];
+    for (slot, mapping) in region.mappings().iter().flatten().enumerate() {
+        let piece_start = mapping.virtual_start().max(start);
+        let piece_end = (mapping.virtual_start() + mapping.byte_len()).min(end);
+        if piece_start < piece_end {
+            pieces[slot] = Some((
+                piece_start,
+                piece_end - piece_start,
+                u32::from(mapping.protection().bits()),
+            ));
+        }
+    }
+    Ok(pieces)
+}
+
 /// Short authority phase for delegated mapping or unmapping.
 pub(crate) fn prepare_address_region_mutation<
     const OBJECTS: usize,

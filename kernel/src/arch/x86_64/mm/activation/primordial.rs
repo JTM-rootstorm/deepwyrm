@@ -1820,7 +1820,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         runtime.service_pending_timer_expiries_on_bootstrap();
                     }
                     let snapshot = snapshot_range
-                        .map(|(region, start, end)| runtime.region_protections(region, start, end));
+                        .map(|(region, start, end)| runtime.region_snapshot(region, start, end));
                     let (phase, root, process) = runtime.prepare_guard_free_usercopy();
                     (phase, root, process, snapshot)
                 })
@@ -1832,7 +1832,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             let (root, process) = *user.get_or_insert((root, process));
             if let Some(snapshot) = snapshot {
-                steps.set_snapshot(snapshot);
+                if let Err(status) = steps.set_snapshot(snapshot) {
+                    // Refused as one call would be, before any step.
+                    let ready = {
+                        let mut guard = self.runtime.lock();
+                        let mut runtime = guard.on(&mut self.owned);
+                        runtime.return_from_steps(phase, status)
+                    };
+                    return Some(Ok(ready));
+                }
             }
             // Map's arguments and output pin, with P alone (D1 commit 9).
             if steps.needs_map_input() {
@@ -8572,42 +8580,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.ready_to_return(NativeSyscallResult::returning(status))
     }
 
-    /// The protections over `[start, end)` of `address_region`'s mappings,
-    /// which a protect in steps restores if a later step fails (DW2 M4b).
-    /// Empty if the handle does not resolve; the first step then fails.
-    fn region_protections(
+    /// The whole-range checks and protection snapshot of an unmap or
+    /// protect in steps, before its first step (DW2 M4b).
+    fn region_snapshot(
         &mut self,
         address_region: deepwyrm_abi::DwHandle,
         start: u64,
         end: u64,
-    ) -> [Option<(u64, u64, u32)>; REGION_SLOTS] {
-        let mut pieces = [None; REGION_SLOTS];
-        let Ok(prepared) = crate::syscall::prepare_address_region_mutation(
+    ) -> Result<[Option<(u64, u64, u32)>; REGION_SLOTS], deepwyrm_abi::DwStatus> {
+        crate::syscall::address_region_range_snapshot(
             &mut self.core.registry,
             &self.core.tasks,
             &self.core.regions,
             self.own.scheduled().process,
             address_region,
             deepwyrm_abi::DW_RIGHT_MODIFY,
+            start,
+            end - start,
             &mut self.core.cleanup,
-        ) else {
-            return pieces;
-        };
-        if let Ok(region) = self.core.regions.region(prepared.target().region) {
-            for (slot, mapping) in region.mappings().iter().flatten().enumerate() {
-                let piece_start = mapping.virtual_start().max(start);
-                let piece_end = (mapping.virtual_start() + mapping.byte_len()).min(end);
-                if piece_start < piece_end {
-                    pieces[slot] = Some((
-                        piece_start,
-                        piece_end - piece_start,
-                        u32::from(mapping.protection().bits()),
-                    ));
-                }
-            }
-        }
-        prepared.abort();
-        pieces
+        )
     }
 
     /// The last hold of a published family-G syscall (D1 option B3): its

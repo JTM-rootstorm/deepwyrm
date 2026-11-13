@@ -9,9 +9,12 @@
 //!
 //! - A failed map unmaps the steps it made; a failed protect restores the
 //!   protections it changed, from a snapshot taken before its first step.
+//! - An unmap or protect checks the whole range (in the region, wholly
+//!   mapped) before its first step, so a gap refuses it before any change.
 //! - A failed unmap step is retried, each attempt after a safe point; when
 //!   the retries run out the call returns the error with the steps already
-//!   made left unmapped.
+//!   made left unmapped. After the whole-range check only a transient pin
+//!   or a concurrent change can fail a step.
 //! - A step that fails before anything changed returns its status at once.
 //! - The undo is best effort: an undo step that fails is skipped.
 
@@ -22,6 +25,9 @@ use deepwyrm_abi::{
 };
 
 const PAGE_SIZE: u64 = 4096;
+
+/// The protections over a range, as (start, length, protection) pieces.
+pub(crate) type RangeSnapshot<const SLOTS: usize> = [Option<(u64, u64, u32)>; SLOTS];
 
 /// Failed unmap steps retried in one call.
 pub(crate) const UNMAP_STEP_RETRIES: usize = 4;
@@ -80,7 +86,7 @@ pub(crate) struct RegionSteps<P, const SLOTS: usize> {
     /// A map's address, once known.
     placed: Option<u64>,
     /// A protect's old protections over its range.
-    snapshot: Option<[Option<(u64, u64, u32)>; SLOTS]>,
+    snapshot: Option<RangeSnapshot<SLOTS>>,
     retries: usize,
     progress: Progress<SLOTS>,
 }
@@ -157,23 +163,29 @@ impl<P: Copy, const SLOTS: usize> RegionSteps<P, SLOTS> {
             && self.start.checked_add(self.total).is_some()
     }
 
-    /// The range whose protections a protect in steps must snapshot before
-    /// its first step, as (region handle, start, end).
+    /// The range an unmap or protect in steps checks whole, and snapshots,
+    /// before its first step, as (region handle, start, end).
     pub(crate) fn snapshot_range(&self) -> Option<(deepwyrm_abi::DwHandle, u64, u64)> {
-        match (self.kind, self.request) {
-            (
-                Kind::Protect(_),
-                NativeSyscallRequest::AddressRegionProtect { address_region, .. },
-            ) if self.snapshot.is_none() && self.done == 0 && self.in_steps() => {
+        match self.request {
+            NativeSyscallRequest::AddressRegionUnmap { address_region, .. }
+            | NativeSyscallRequest::AddressRegionProtect { address_region, .. }
+                if self.snapshot.is_none() && self.done == 0 && self.in_steps() =>
+            {
                 Some((address_region, self.start, self.start + self.total))
             }
             _ => None,
         }
     }
 
-    /// The old protections over the protect's range.
-    pub(crate) fn set_snapshot(&mut self, snapshot: [Option<(u64, u64, u32)>; SLOTS]) {
-        self.snapshot = Some(snapshot);
+    /// The whole-range check and the protections over the range. `Err`:
+    /// the call is refused with that status before any step, as one call
+    /// would be (review D1: a gap must not leave a partial unmap).
+    pub(crate) fn set_snapshot(
+        &mut self,
+        snapshot: Result<RangeSnapshot<SLOTS>, DwStatus>,
+    ) -> Result<(), DwStatus> {
+        self.snapshot = Some(snapshot?);
+        Ok(())
     }
 
     /// A map's address: where its first step placed it.

@@ -105,8 +105,9 @@ pub(crate) use address_region::{
     AddressRegionMutationTarget, AddressSpacePublishStatus, HeldReleases,
     PreparedAddressRegionMutation, address_region_map, address_region_map_model,
     address_region_map_prepared_model, address_region_mutation_target, address_region_protect,
-    address_region_protect_prepared, address_region_unmap, address_region_unmap_prepared,
-    decode_map_args, prepare_address_region_mutation, process_handle_target,
+    address_region_protect_prepared, address_region_range_snapshot, address_region_unmap,
+    address_region_unmap_prepared, decode_map_args, prepare_address_region_mutation,
+    process_handle_target,
 };
 
 /// Runs one bounded HandleTable mutation while retaining the exact process

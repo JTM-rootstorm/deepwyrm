@@ -1657,3 +1657,89 @@ fn pieces_that_continue_each_other_merge_into_one_mapping() {
     assert_eq!(only(&region), (PAGE_SIZE, PAGE_SIZE * 8));
     assert_eq!(objects.active_lease_count(), 1);
 }
+
+/// DW2 M4b review D1 and D3: the whole-range check refuses a gap or a
+/// range past the region's end; a full region reports `Capacity` before
+/// `Overlap` unless the piece merges; a different ceiling never merges.
+#[test]
+fn whole_range_checks_capacity_order_and_ceilings() {
+    let mut objects = TestObjects::<2, 8>::new();
+    let object = object(&mut objects, Protection::READ_WRITE);
+    let mut region = region::<2>(PAGE_SIZE, PAGE_SIZE * 8);
+    let mut publisher = FakePublisher::for_region(&region);
+    let mut map = |region: &mut AddressRegion<2>,
+                   objects: &mut TestObjects<2, 8>,
+                   at: u64,
+                   offset: u64,
+                   pages: u64,
+                   ceiling: Protection| {
+        let authorization = authorization(objects, object, region, ceiling);
+        test_map(
+            region,
+            objects,
+            &mut publisher,
+            at,
+            authorization,
+            offset,
+            PAGE_SIZE * pages,
+            Protection::READ,
+        )
+    };
+    map(
+        &mut region,
+        &mut objects,
+        PAGE_SIZE,
+        0,
+        2,
+        Protection::READ_WRITE,
+    )
+    .unwrap();
+    // The same object and protection under another ceiling stays apart.
+    map(
+        &mut region,
+        &mut objects,
+        PAGE_SIZE * 3,
+        PAGE_SIZE * 2,
+        2,
+        Protection::READ,
+    )
+    .unwrap();
+    assert_eq!(region.mappings().iter().flatten().count(), 2);
+
+    // Mapped: [1, 5) pages. A gap or a range past the end is refused whole.
+    assert_eq!(region.check_covered(PAGE_SIZE, PAGE_SIZE * 4), Ok(()));
+    assert_eq!(
+        region.check_covered(PAGE_SIZE, PAGE_SIZE * 5),
+        Err(AddressRegionError::Unmapped)
+    );
+    assert_eq!(
+        region.check_covered(PAGE_SIZE * 7, PAGE_SIZE * 4),
+        Err(AddressRegionError::OutsideRegion)
+    );
+
+    // Full: an overlapping piece that merges with nothing is `Capacity`,
+    // as before pieces merged; one that continues a mapping still fits.
+    assert_eq!(
+        map(
+            &mut region,
+            &mut objects,
+            PAGE_SIZE,
+            4 * PAGE_SIZE,
+            1,
+            Protection::READ_WRITE
+        ),
+        Err(AddressSpaceTransactionError::Model(
+            AddressRegionError::Capacity
+        ))
+    );
+    map(
+        &mut region,
+        &mut objects,
+        PAGE_SIZE * 5,
+        PAGE_SIZE * 4,
+        2,
+        Protection::READ,
+    )
+    .unwrap();
+    assert_eq!(region.mappings().iter().flatten().count(), 2);
+}
