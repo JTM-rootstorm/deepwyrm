@@ -184,7 +184,9 @@ Mike: fragmented memory must not make the kernel slow; this and the OOM killer c
 2. **The physical allocator** (first-fit over a sorted free list, and the largest-run query, both linear in free ranges). Replace it with a **buddy allocator**: power-of-two blocks in per-order free lists with a bitmap, so allocation, freeing, merging and the largest-free-block query are each O(log memory). The M1 free-list bound goes away with it. Scattered allocation then takes the largest available blocks.
 3. **Fragmentation itself.** Buddy merging keeps fragmentation low. Where it does not, **compaction** moves object pages to make room: copy, republish the mappings through the journal, and shoot down stale TLB entries. Pages pinned for DMA or by an in-flight operation are not moved. It runs when a large request fails, before the OOM path.
 
-Order: the buddy allocator first, since it also speeds up today's single-run allocation, then the object index, then compaction. The OOM killer (§6.7) comes after compaction, so it only runs when memory is really full, not merely fragmented.
+4. **The role table's size** (M3 review R1). M3 gives every allocator page a role slot, about 104 bytes per 4 KiB page (2.5% of RAM) in one contiguous run carved at boot. With the buddy allocator, shrink `RoleSlot` (move the fields only page tables use out of it) to roughly halve that, and carve the table from the largest buddy blocks rather than one run, so a fragmented boot map cannot stop the boot.
+
+Order: the buddy allocator first, since it also speeds up today's single-run allocation, then the object index, then compaction; the role-table work goes with the buddy allocator. The OOM killer (§6.7) comes after compaction, so it only runs when memory is really full, not merely fragmented.
 
 ### 6.9 M3 as built (2026-11-12)
 
@@ -201,7 +203,7 @@ Deepwyrm `502ad10` (step 1), `18b1622` (steps 2, 3 and 5 together: the publisher
 **Reviewer:** Claude Opus 5.5 (low effort), 2026-11-12, at Deepwyrm `c4ba18e` (base `37c37ae`), then the fix at `7f1b688` (base `c4ba18e`). Method: code reading plus host unit tests; no guest runs. No Critical or High defect; no way found for a mapping, DMA mapping or boot write to reach a frame the object does not own, no double or partial free, and no panic userspace can reach. The P → `LIVE_DMA` order was checked: no `LIVE_DMA` section takes P.
 
 - **D1 (Medium, confirmed): fixed** (`7f1b688`). Every page was resolved from the chain head, twice, so a publish, DMA map or boot write cost pages × runs, contrary to §6.2 and §6.7. The cursor makes in-order walks linear; the re-review found no defect in it and confirmed the cost. Its one Low test gap (a cursor aimed at another live backing's run) is closed by a test in the commit recording this section.
-- **R1 (Low/Medium), open for Mike:** the grown table is about 2.5% of RAM in one contiguous run, and boot stops if no such run exists. Shrinking `RoleSlot` (fields only page tables use) would roughly halve it.
+- **R1 (Low/Medium), deferred to §6.8 (Mike, 2026-11-13):** the grown table is about 2.5% of RAM in one contiguous run, and boot stops if no such run exists. Shrinking `RoleSlot` (fields only page tables use) would roughly halve it; that is §6.8 item 4.
 - **R2 (Low), accepted:** whole-table scans (`owns_any`, external imports, `check_invariants`) are now linear in pages; every caller is at boot or in tests.
 - **R3 (Low): fixed** (`7f1b688`). A run being allocated reports `FrameRoleKind::BackingAllocated`, not `AllocatedUninitialized`.
 - **R4 (Low), deferred to §6.8:** allocation costs runs × free ranges (the allocator's linear scans).
