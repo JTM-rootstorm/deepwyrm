@@ -632,6 +632,29 @@ pub fn address_region_map(
     }
 }
 
+/// Give every page of `[offset, offset + byte_len)` of an on-demand
+/// MemoryObject a zeroed frame now (DW2 M6). `NO_RESOURCES` when the
+/// creator's page quota is spent, `NO_MEMORY` when frames run out.
+#[inline]
+pub fn memory_object_commit(
+    memory_object: DwHandle,
+    offset: DwOffset,
+    byte_len: DwSize,
+) -> DwStatus {
+    // SAFETY: every argument is a generated scalar ABI value.
+    unsafe {
+        syscall6(
+            DW_SYSCALL_MEMORY_OBJECT_COMMIT,
+            memory_object.0,
+            offset.0,
+            byte_len.0,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
 /// Remove one fully mapped native AddressRegion range.
 #[inline]
 pub fn address_region_unmap(
