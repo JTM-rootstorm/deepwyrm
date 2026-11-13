@@ -231,6 +231,158 @@ pub(crate) enum NativeSyscallRequest {
     },
 }
 
+/// One user buffer a syscall copies in or out (DW2 M6 §8.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserBuffer {
+    pub(crate) address: u64,
+    pub(crate) byte_len: u64,
+    /// The syscall writes it.
+    pub(crate) write: bool,
+}
+
+impl NativeSyscallRequest {
+    /// The user buffers this request copies, as its arguments declare them,
+    /// so on-demand pages under them can be filled in before any copy (DW2
+    /// M6 §8.6). Every request is listed, so a new syscall must say.
+    pub(crate) fn user_buffers(&self) -> [Option<UserBuffer>; 3] {
+        use deepwyrm_abi::{
+            DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE,
+            DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE,
+        };
+        let out = |address: DwUserAddress, byte_len: u64| {
+            Some(UserBuffer {
+                address: address.0,
+                byte_len,
+                write: true,
+            })
+        };
+        let input = |address: DwUserAddress, byte_len: u64| {
+            Some(UserBuffer {
+                address: address.0,
+                byte_len,
+                write: false,
+            })
+        };
+        let records = |count: u32, size: u32| u64::from(count) * u64::from(size);
+        match *self {
+            Self::AbiGetInfo {
+                out_info,
+                out_size,
+                out_required_size,
+            }
+            | Self::ObjectGetInfoV1 {
+                out_info,
+                out_size,
+                out_required_size,
+                ..
+            } => [out(out_info, out_size), out(out_required_size, 8), None],
+            Self::HandleDuplicate { out_handle, .. }
+            | Self::TaskGroupCreate { out_handle, .. }
+            | Self::MemoryObjectCreate { out_handle, .. } => [out(out_handle, 8), None, None],
+            Self::ThreadCreate { out_thread, .. } => [out(out_thread, 8), None, None],
+            Self::EventCreate { out_event, .. } => [out(out_event, 8), None, None],
+            Self::TimerCreate { out_timer, .. } => [out(out_timer, 8), None, None],
+            Self::ClockGet {
+                out_nanoseconds, ..
+            } => [out(out_nanoseconds, 8), None, None],
+            Self::DeviceResourceClaim { out_resource, .. } => [out(out_resource, 8), None, None],
+            Self::DeviceMmioObjectCreate {
+                out_memory_object, ..
+            } => [out(out_memory_object, 8), None, None],
+            Self::DmaMap { out_iova, .. } => [out(out_iova, 8), None, None],
+            Self::InterruptCreate { out_interrupt, .. } => [out(out_interrupt, 8), None, None],
+            Self::DevicePioRead { out_value, .. } | Self::DevicePciConfigRead { out_value, .. } => {
+                [out(out_value, 4), None, None]
+            }
+            Self::ProcessCreate {
+                args,
+                args_size,
+                out_result,
+                result_size,
+            } => [input(args, args_size), out(out_result, result_size), None],
+            Self::ThreadStart { args, args_size } => [input(args, args_size), None, None],
+            Self::AddressRegionMap {
+                args,
+                args_size,
+                out_address,
+                ..
+            } => [input(args, args_size), out(out_address, 8), None],
+            Self::ChannelCreate {
+                out_endpoint0,
+                out_endpoint1,
+                ..
+            } => [out(out_endpoint0, 8), out(out_endpoint1, 8), None],
+            Self::ChannelSend {
+                bytes,
+                byte_len,
+                transfers,
+                transfer_count,
+                ..
+            } => [
+                input(bytes, u64::from(byte_len)),
+                input(
+                    transfers,
+                    records(transfer_count, DW_HANDLE_TRANSFER_V1_SIZE),
+                ),
+                None,
+            ],
+            Self::ChannelReceive {
+                out_bytes,
+                byte_capacity,
+                out_handles,
+                handle_capacity,
+                out_result,
+                ..
+            } => [
+                out(out_bytes, u64::from(byte_capacity)),
+                out(
+                    out_handles,
+                    records(handle_capacity, DW_RECEIVED_HANDLE_INFO_V1_SIZE),
+                ),
+                out(out_result, u64::from(DW_CHANNEL_RECEIVE_RESULT_V1_SIZE)),
+            ],
+            Self::WaitOne { out_result, .. } => [
+                out(out_result, u64::from(DW_WAIT_RESULT_V1_SIZE)),
+                None,
+                None,
+            ],
+            Self::WaitMany {
+                items,
+                item_count,
+                out_result,
+                ..
+            } => [
+                input(items, records(item_count, DW_WAIT_ITEM_V1_SIZE)),
+                out(out_result, u64::from(DW_WAIT_RESULT_V1_SIZE)),
+                None,
+            ],
+            Self::AtomicWait32 { address, .. } => [input(address, 4), None, None],
+            Self::AtomicWake {
+                address, out_woken, ..
+            } => [input(address, 4), out(out_woken, 4), None],
+            // Unmap and protect name a target range, not a buffer they copy.
+            Self::HandleClose { .. }
+            | Self::TaskGroupTerminate { .. }
+            | Self::TaskGroupLimit { .. }
+            | Self::ProcessExit { .. }
+            | Self::ProcessTerminate { .. }
+            | Self::ThreadSetFsBase { .. }
+            | Self::ThreadExit { .. }
+            | Self::ThreadTerminate { .. }
+            | Self::MemoryObjectCommit { .. }
+            | Self::AddressRegionUnmap { .. }
+            | Self::AddressRegionProtect { .. }
+            | Self::EventSignal { .. }
+            | Self::TimerSet { .. }
+            | Self::TimerCancel { .. }
+            | Self::DevicePioWrite { .. }
+            | Self::DevicePciCommand { .. }
+            | Self::DmaUnmap { .. }
+            | Self::InterruptAck { .. } => [None, None, None],
+        }
+    }
+}
+
 fn u32_arg(value: u64) -> Result<u32, DwStatus> {
     u32::try_from(value).map_err(|_| DW_STATUS_INVALID_ARGUMENT)
 }
@@ -1252,8 +1404,9 @@ pub(crate) enum UserPageFaultOutcome {
     /// Not an on-demand page this access may touch: today's terminal fault.
     Unserved,
     /// An on-demand page that could not be given a frame: the process ends
-    /// with `DW_TERMINATION_RESOURCE_POLICY`.
-    Exhausted,
+    /// with `DW_TERMINATION_RESOURCE_POLICY`, and a syscall's fill-in fails
+    /// with this status (`NO_RESOURCES` for quota, `NO_MEMORY` for frames).
+    Exhausted(DwStatus),
     /// The runtime could not reach a safe point: poll for a stop and retry.
     Retry,
 }

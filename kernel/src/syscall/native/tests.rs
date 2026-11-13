@@ -414,3 +414,68 @@ fn suspended_dispatch_returns_control_without_authorizing_the_user_frame() {
     assert_eq!(frame.test_status_bits(), 0);
     assert_eq!(frame.test_return_authorized(), 0);
 }
+
+/// DW2 M6 §8.6: the fill-in phase covers exactly the buffers a syscall
+/// copies, with the lengths its arguments give and the direction it copies.
+#[test]
+fn user_buffers_are_the_copied_ranges() {
+    use deepwyrm_abi::{
+        DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE,
+        DW_RECEIVED_HANDLE_INFO_V1_SIZE,
+    };
+    let buffer = |address, byte_len, write| {
+        Some(UserBuffer {
+            address,
+            byte_len,
+            write,
+        })
+    };
+    let receive = NativeSyscallRequest::ChannelReceive {
+        channel: DwHandle(1),
+        out_bytes: DwUserAddress(0x1000),
+        byte_capacity: 300,
+        out_handles: DwUserAddress(0x2000),
+        handle_capacity: 3,
+        out_result: DwUserAddress(0x3000),
+    };
+    assert_eq!(
+        receive.user_buffers(),
+        [
+            buffer(0x1000, 300, true),
+            buffer(0x2000, 3 * u64::from(DW_RECEIVED_HANDLE_INFO_V1_SIZE), true),
+            buffer(0x3000, u64::from(DW_CHANNEL_RECEIVE_RESULT_V1_SIZE), true),
+        ]
+    );
+    let send = NativeSyscallRequest::ChannelSend {
+        channel: DwHandle(1),
+        bytes: DwUserAddress(0x4000),
+        byte_len: 12,
+        transfers: DwUserAddress(0x5000),
+        transfer_count: 2,
+        flags: 0,
+    };
+    assert_eq!(
+        send.user_buffers(),
+        [
+            buffer(0x4000, 12, false),
+            buffer(0x5000, 2 * u64::from(DW_HANDLE_TRANSFER_V1_SIZE), false),
+            None,
+        ]
+    );
+    // Unmap names a target range it does not copy.
+    let unmap = NativeSyscallRequest::AddressRegionUnmap {
+        address_region: DwHandle(2),
+        address: DwUserAddress(0x10_0000),
+        byte_len: 0x1000,
+    };
+    assert_eq!(unmap.user_buffers(), [None, None, None]);
+    let wake = NativeSyscallRequest::AtomicWake {
+        address: DwUserAddress(0x6000),
+        count: 1,
+        out_woken: DwUserAddress(0x7000),
+    };
+    assert_eq!(
+        wake.user_buffers(),
+        [buffer(0x6000, 4, false), buffer(0x7000, 4, true), None]
+    );
+}

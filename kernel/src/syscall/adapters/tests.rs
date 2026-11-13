@@ -14518,6 +14518,7 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
                 handle,
                 offset,
                 byte_len,
+                deepwyrm_abi::DW_RIGHT_MAP,
             ),
             Err(DW_STATUS_INVALID_ARGUMENT),
             "offset {offset:#x} length {byte_len:#x}"
@@ -14531,6 +14532,7 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
         handle,
         0,
         pages * 4096,
+        deepwyrm_abi::DW_RIGHT_MAP,
     )
     .unwrap()
     .expect("an on-demand target");
@@ -14597,6 +14599,7 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
             unmappable,
             0,
             4096,
+            deepwyrm_abi::DW_RIGHT_MAP,
         ),
         Err(deepwyrm_abi::DW_STATUS_ACCESS_DENIED)
     );

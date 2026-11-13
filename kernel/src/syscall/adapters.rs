@@ -2476,7 +2476,8 @@ fn revoke_foreign_dma<D: crate::device::dma::DmaService, const OBJECTS: usize>(
 /// never the last reference.
 /// What `memory_object_commit` fills in: an on-demand object's backing and
 /// its identity, or `None` for an object that is not on demand, whose pages
-/// all have frames (DW2 M6 §8.2). Needs `MAP` on the handle. The lookup pin
+/// all have frames (DW2 M6 §8.2). Needs `required` on the handle: `MAP` for
+/// `memory_object_commit`, `READ` before a `dma_map`. The lookup pin
 /// is let go before returning; the caller holds T, so the object cannot be
 /// finalized before it is done with the backing.
 pub(crate) fn memory_object_commit_target<
@@ -2495,6 +2496,7 @@ pub(crate) fn memory_object_commit_target<
     memory_object: DwHandle,
     offset: u64,
     byte_len: u64,
+    required: DwRights,
 ) -> Result<
     Option<(
         crate::memory::frame_roles::BackingIdentity,
@@ -2509,7 +2511,7 @@ pub(crate) fn memory_object_commit_target<
                 registry,
                 memory_object,
                 crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
-                deepwyrm_abi::DW_RIGHT_MAP,
+                required,
             )
             .map_err(handle_status)?,
         Err(error) => return Err(task_status(error)),

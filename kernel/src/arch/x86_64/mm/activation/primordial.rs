@@ -1961,6 +1961,88 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// A syscall's fill-in phase (DW2 M6 §8.6): before any copy, gives every
+    /// on-demand page under the request's user buffers a frame and a leaf,
+    /// and commits a `dma_map` range, a step per hold. `None` to go on to
+    /// the syscall; `Some` when it ends here, with the fill-in's status or a
+    /// stop. Nothing runs while no on-demand object exists.
+    fn fill_in_user_buffers(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        if crate::memory::object::LIVE_ON_DEMAND_OBJECTS.load(core::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            return None;
+        }
+        for buffer in request.user_buffers().into_iter().flatten() {
+            if buffer.byte_len == 0 {
+                continue;
+            }
+            // A buffer the copy cannot use is the copy's to refuse.
+            let Some(end) = buffer
+                .address
+                .checked_add(buffer.byte_len)
+                .and_then(|end| end.checked_add(PAGE_SIZE - 1))
+                .map(|end| end & !(PAGE_SIZE - 1))
+            else {
+                continue;
+            };
+            let mut next = buffer.address & !(PAGE_SIZE - 1);
+            while next < end {
+                match self.with_synchronized_runtime_at_safe_point(|runtime| {
+                    runtime.fill_in_user_range(&mut next, end, buffer.write)
+                }) {
+                    Err(()) => return Some(Err(())),
+                    Ok(Err(status)) => return Some(self.return_status(status)),
+                    Ok(Ok(())) => {}
+                }
+            }
+        }
+        // `dma_map` maps frames, not leaves: commit its range first (§8.6).
+        if let NativeSyscallRequest::DmaMap {
+            memory_object,
+            offset,
+            byte_len,
+            ..
+        } = request
+        {
+            let mut next = offset;
+            loop {
+                match self.with_synchronized_runtime_at_safe_point(|runtime| {
+                    runtime.commit_on_demand_step(
+                        memory_object,
+                        offset,
+                        byte_len,
+                        deepwyrm_abi::DW_RIGHT_READ,
+                        &mut next,
+                    )
+                }) {
+                    Err(()) => return Some(Err(())),
+                    Ok(Ok(true)) => break,
+                    Ok(Ok(false)) => {}
+                    Ok(Err(
+                        status @ (deepwyrm_abi::DW_STATUS_NO_RESOURCES
+                        | deepwyrm_abi::DW_STATUS_NO_MEMORY),
+                    )) => return Some(self.return_status(status)),
+                    // The syscall reports a bad range or handle itself.
+                    Ok(Err(_)) => break,
+                }
+            }
+        }
+        None
+    }
+
+    /// Ends a syscall with `status`.
+    fn return_status(
+        &mut self,
+        status: deepwyrm_abi::DwStatus,
+    ) -> Result<crate::syscall::native::ReturnReady, ()> {
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.ready_to_return(NativeSyscallResult::returning(status))
+        })
+    }
+
     /// `memory_object_commit` (DW2 M6 §8.2): commits the range a step of at
     /// most 16 MiB per hold of T and P, with a safe point between steps.
     /// Each step resolves the handle again. A failure returns at once; the
@@ -1984,8 +2066,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                     runtime.service_pending_timer_expiries_on_bootstrap();
                 }
-                let result =
-                    runtime.commit_on_demand_step(memory_object, offset, byte_len, &mut next);
+                let result = runtime.commit_on_demand_step(
+                    memory_object,
+                    offset,
+                    byte_len,
+                    deepwyrm_abi::DW_RIGHT_MAP,
+                    &mut next,
+                );
                 match result {
                     Ok(false) => None,
                     Ok(true) => Some(
@@ -6391,7 +6478,8 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 }
             }
             let handled = match self
-                .handle_guard_free_usercopy(request)
+                .fill_in_user_buffers(request)
+                .or_else(|| self.handle_guard_free_usercopy(request))
                 .or_else(|| self.handle_deferred_output(request))
                 .or_else(|| self.handle_object_info(request))
                 .or_else(|| self.handle_channel_send(request))
@@ -8873,7 +8961,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 )
                 .is_err())
         {
-            return Outcome::Exhausted;
+            return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
         }
         if cost != 0 {
             match session.commit_on_demand_page(backing, page) {
@@ -8886,7 +8974,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     FrameRoleError::Physical(_)
                     | FrameRoleError::Capacity
                     | FrameRoleError::InitializationFailed,
-                ) => return Outcome::Exhausted,
+                ) => return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY),
                 Err(_) => return Outcome::Unserved,
             }
         }
@@ -8905,7 +8993,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     for candidate in candidates.iter_mut().filter_map(Option::take) {
                         session.recycle_table_candidate(candidate);
                     }
-                    return Outcome::Exhausted;
+                    return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY);
                 }
             }
         }
@@ -8940,6 +9028,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// One hold of a syscall's fill-in phase (DW2 M6 §8.6): serves, as a
+    /// user touch of the access the syscall will make, every on-demand page
+    /// under `[*next, end)` up to one step's end, publishing its leaf here so
+    /// the copy's page walk finds it. Pages outside on-demand mappings are
+    /// left to the copy, which fails them as before.
+    fn fill_in_user_range(
+        &mut self,
+        next: &mut u64,
+        end: u64,
+        write: bool,
+    ) -> Result<(), deepwyrm_abi::DwStatus> {
+        const USER: u64 = 1 << 2;
+        const WRITE: u64 = 1 << 1;
+        let process = self.own.scheduled().process;
+        let step_end = end.min(next.saturating_add(FAMILY_G_STEP_BYTES));
+        while *next < step_end {
+            let page = *next;
+            *next = page.saturating_add(PAGE_SIZE);
+            let on_demand = match self
+                .core
+                .regions
+                .root_mapping_at(&self.core.tasks, process, page)
+            {
+                Ok(Some(mapping)) => mapping
+                    .object_id()
+                    .is_some_and(|object| self.core.memory.object_is_on_demand(object)),
+                _ => false,
+            };
+            if !on_demand {
+                continue;
+            }
+            let error = USER | if write { WRITE } else { 0 };
+            if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
+                self.serve_user_page_fault(page, error)
+            {
+                return Err(status);
+            }
+        }
+        Ok(())
+    }
+
     /// One hold of `memory_object_commit`: commits pages from `*next` up to
     /// one step's end, each admitted against the object's creator in this
     /// hold and charged to its weight once committed (DW2 M6 §8.4).
@@ -8949,6 +9078,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         memory_object: deepwyrm_abi::DwHandle,
         offset: u64,
         byte_len: u64,
+        required: deepwyrm_abi::DwRights,
         next: &mut u64,
     ) -> Result<bool, deepwyrm_abi::DwStatus> {
         let process = self.own.scheduled().process;
@@ -8960,6 +9090,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             memory_object,
             offset,
             byte_len,
+            required,
         )?
         else {
             return Ok(true);

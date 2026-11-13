@@ -626,6 +626,12 @@ struct ObjectSlot {
 
 const EMPTY_OBJECT_SLOT: ObjectSlot = ObjectSlot { record: None };
 
+/// On-demand MemoryObjects with a live payload record, across every
+/// authority. While it is zero no user buffer can lie on an on-demand page,
+/// so a syscall skips its fill-in phase without taking a lock (DW2 M6 §8.6).
+pub(crate) static LIVE_ON_DEMAND_OBJECTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Clone, Copy)]
 struct LeaseMetadata {
     address_space: AddressSpaceKey,
@@ -854,6 +860,9 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             }),
         };
         self.backings[slot] = Some(backing);
+        if kind == MemoryObjectKind::OnDemand {
+            LIVE_ON_DEMAND_OBJECTS.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
         MemoryObjectKey {
             object: Some(object),
         }
@@ -1062,6 +1071,9 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let backing = self.backings[slot]
             .take()
             .expect("memory payload lost its typed backing authority");
+        if record.kind == MemoryObjectKind::OnDemand {
+            LIVE_ON_DEMAND_OBJECTS.fetch_sub(1, core::sync::atomic::Ordering::Release);
+        }
         Ok(MemoryObjectFinalization {
             final_release,
             backing,

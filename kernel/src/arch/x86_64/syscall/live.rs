@@ -1739,7 +1739,7 @@ unsafe fn native_runtime_user_page_fault<
         UserPageFaultOutcome::Unserved => {
             end_user_page_fault::<R>(context, TerminalAction::UserException(record));
         }
-        UserPageFaultOutcome::Exhausted => {
+        UserPageFaultOutcome::Exhausted(_) => {
             end_user_page_fault::<R>(context, TerminalAction::UserResourceFault(record));
         }
         UserPageFaultOutcome::Retry => unreachable!("the serve loop retries"),
