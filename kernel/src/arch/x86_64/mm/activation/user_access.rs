@@ -1211,37 +1211,16 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         page_count: u64,
     ) -> Result<ObjectBackingGrant, LiveUserAccessError> {
-        let allocation = self
-            .roles
-            .allocate(page_count)
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
-        let physical_start = allocation.physical_start();
-        let byte_len = allocation.byte_len();
-        let mut offset = 0;
-        while offset < byte_len {
-            let frame = FrameAddress::new(
-                physical_start + offset,
-                self.selected_root().physical_limit(),
-            )
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
-            if self.target.scratch.zero_allocator_frame(frame).is_err() {
-                self.roles
-                    .cancel_allocation(allocation)
-                    .unwrap_or_else(|_| panic!("E5 backing rollback lost allocation authority"));
-                return Err(LiveUserAccessError::MissingOrInvalid);
-            }
-            offset += PAGE_SIZE;
-        }
-        // SAFETY: every page in the exact exclusive allocation was zeroed
-        // through the authenticated scratch mapping immediately above.
-        let zeroed = unsafe { self.roles.assume_zeroed(allocation) }
-            .unwrap_or_else(|_| panic!("E5 zeroed allocation role transition drifted"));
-        self.roles.assign_object_backing(zeroed).map_err(|failure| {
-            self.roles
-                .cancel_zeroed(failure.into_grant())
-                .unwrap_or_else(|_| panic!("E5 zeroed backing rollback drifted"));
-            LiveUserAccessError::MissingOrInvalid
-        })
+        let limit = self.selected_root().physical_limit();
+        let scratch = &mut self.target.scratch;
+        let mut zero = |page: u64| {
+            FrameAddress::new(page, limit)
+                .is_ok_and(|frame| scratch.zero_allocator_frame(frame).is_ok())
+        };
+        // SAFETY: `zero` clears each exclusively owned page of the new
+        // backing through the authenticated scratch mapping, or fails.
+        unsafe { self.roles.allocate_zeroed_backing(page_count, &mut zero) }
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
     }
 
     #[allow(

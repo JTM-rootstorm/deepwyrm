@@ -129,6 +129,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
+    /// Allocates `page_count` pages as a chain, has `zero` clear every page,
+    /// and makes the chain one object backing: the one path for the boot
+    /// and user allocators (DW2 M3 §6.3). If any page fails, every run is
+    /// freed.
+    ///
+    /// # Safety
+    ///
+    /// `zero(page)` must exclusively zero the whole base page at physical
+    /// `page`, with any cache maintenance it needs, or return `false`.
+    #[allow(
+        unsafe_code,
+        reason = "the caller's zeroing is an architecture access fact attested by a typed state transition"
+    )]
+    pub(crate) unsafe fn allocate_zeroed_backing(
+        &mut self,
+        page_count: u64,
+        zero: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<ObjectBackingGrant, FrameRoleError> {
+        let allocation = self.allocate_backing(page_count)?;
+        let zeroed = self
+            .backing_allocation_segments(&allocation)
+            .expect("a fresh allocation is a whole chain")
+            .all(|segment| {
+                (0..segment.byte_len / BASE_PAGE_SIZE)
+                    .all(|page| zero(segment.physical_start + page * BASE_PAGE_SIZE))
+            });
+        if !zeroed {
+            self.cancel_backing_allocation(allocation)
+                .unwrap_or_else(|_| panic!("a fresh backing allocation frees"));
+            return Err(FrameRoleError::InitializationFailed);
+        }
+        // SAFETY: `zero` cleared every page of every run, per this
+        // function's contract.
+        Ok(unsafe { self.assume_backing_zeroed(allocation) }
+            .unwrap_or_else(|_| panic!("a zeroed backing allocation becomes a backing")))
+    }
+
     /// The physical pieces of an allocation, for zeroing.
     pub(crate) fn backing_allocation_segments(
         &self,

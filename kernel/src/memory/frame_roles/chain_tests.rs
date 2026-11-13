@@ -309,3 +309,39 @@ fn external_backings_are_one_run_and_a_module_is_read_only() {
     );
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model's zero callback touches no memory"
+)]
+fn the_shared_allocator_zeroes_every_page_once_and_rolls_back_a_failure() {
+    let mut roles = manager(64);
+    let _held = fragment(&mut roles, &[2, 3]);
+    let mut zeroed = Vec::new();
+    // SAFETY: the host model never dereferences the synthetic pages.
+    let grant = unsafe {
+        roles.allocate_zeroed_backing(4, &mut |page| {
+            zeroed.push(page);
+            true
+        })
+    }
+    .unwrap();
+    assert_eq!(grant.run_count(), 2);
+    zeroed.sort_unstable();
+    assert_eq!(zeroed, [PAGE, 4 * PAGE, 5 * PAGE, 6 * PAGE]);
+    roles.cancel_object_backing(grant).unwrap();
+
+    let before = roles.available_frames();
+    let mut calls = 0;
+    // SAFETY: as above.
+    let failed = unsafe {
+        roles.allocate_zeroed_backing(4, &mut |_| {
+            calls += 1;
+            calls < 3
+        })
+    };
+    assert_eq!(failed, Err(FrameRoleError::InitializationFailed));
+    assert_eq!(roles.available_frames(), before);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}

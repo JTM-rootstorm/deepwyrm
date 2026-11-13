@@ -55,6 +55,8 @@ pub(crate) enum FrameRoleError {
     InvalidTableParent,
     DuplicateTableRoot,
     ReadOnlyBacking,
+    /// The caller could not initialize a page of a new backing.
+    InitializationFailed,
     InvariantViolation,
 }
 

@@ -2581,50 +2581,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         page_count: u64,
     ) -> Result<ObjectBackingGrant, user_access::LiveUserAccessError> {
-        let allocation = self
-            .active
-            .target
-            .roles
-            .allocate(page_count)
-            .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-        let physical_start = allocation.physical_start();
-        let byte_len = allocation.byte_len();
+        let limit = self.active.root.physical_limit();
         let mut scratch = self
             .active
             .target
             .current_scratch_target()
             .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-        let mut offset = 0;
-        while offset < byte_len {
-            let frame =
-                FrameAddress::new(physical_start + offset, self.active.root.physical_limit())
-                    .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-            if scratch.zero_allocator_frame(frame).is_err() {
-                self.active
-                    .target
-                    .roles
-                    .cancel_allocation(allocation)
-                    .unwrap_or_else(|_| panic!("primordial backing rollback lost allocation"));
-                return Err(user_access::LiveUserAccessError::MissingOrInvalid);
-            }
-            offset += PAGE_SIZE;
+        let mut zero = |page: u64| {
+            FrameAddress::new(page, limit)
+                .is_ok_and(|frame| scratch.zero_allocator_frame(frame).is_ok())
+        };
+        // SAFETY: `zero` clears each page of the freshly granted, exclusively owned backing
+        // through the scratch window (`zero_allocator_frame`), or fails; x86 caches are
+        // coherent, so no maintenance is needed.
+        unsafe {
+            self.active
+                .target
+                .roles
+                .allocate_zeroed_backing(page_count, &mut zero)
         }
-        // SAFETY: the loop above zeroed every page of this freshly granted, exclusively owned run
-        // through the scratch window (`zero_allocator_frame`); x86 caches are coherent, so no
-        // maintenance is needed.
-        let zeroed = unsafe { self.active.target.roles.assume_zeroed(allocation) }
-            .unwrap_or_else(|_| panic!("primordial zeroed-backing transition drifted"));
-        match self.active.target.roles.assign_object_backing(zeroed) {
-            Ok(backing) => Ok(backing),
-            Err(failure) => {
-                self.active
-                    .target
-                    .roles
-                    .cancel_zeroed(failure.into_grant())
-                    .unwrap_or_else(|_| panic!("primordial zeroed-backing rollback drifted"));
-                Err(user_access::LiveUserAccessError::MissingOrInvalid)
-            }
-        }
+        .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)
     }
 
     fn prepare_candidate(
@@ -2773,7 +2749,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
         {
             return Err(user_access::LiveUserAccessError::MissingOrInvalid);
         }
-        let mut physical = backing.physical_start() + offset;
+        // The backing may be several runs (DW2 M3): each page is resolved
+        // through its chain.
+        let mut object_offset = offset;
         let mut copied = 0_usize;
         let mut scratch = self
             .active
@@ -2781,15 +2759,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
             .current_scratch_target()
             .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
         while copied < bytes.len() {
-            let page = physical & !(PAGE_SIZE - 1);
-            let page_offset = (physical & (PAGE_SIZE - 1)) as usize;
+            let page_offset = (object_offset & (PAGE_SIZE - 1)) as usize;
             let take = (PAGE_SIZE as usize - page_offset).min(bytes.len() - copied);
-            let frame = FrameAddress::new(page, self.active.root.physical_limit())
+            let page = self
+                .active
+                .target
+                .roles
+                .resolve_object_page(backing.identity(), object_offset & !(PAGE_SIZE - 1), true)
+                .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
+            let frame = FrameAddress::new(page.physical_start, self.active.root.physical_limit())
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
             scratch
                 .write_physical_bytes(frame, page_offset, &bytes[copied..copied + take])
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
-            physical += take as u64;
+            object_offset += take as u64;
             copied += take;
         }
         Ok(())
