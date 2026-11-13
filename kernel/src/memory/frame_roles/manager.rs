@@ -1114,35 +1114,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(())
     }
 
-    pub(crate) fn validate_object_backing(
-        &self,
-        backing: BackingIdentity,
-        physical_start: u64,
-        byte_len: u64,
-        writable: bool,
-    ) -> Result<(), FrameRoleError> {
-        let range = PageRange::from_page_count(
-            physical_start,
-            byte_len
-                .checked_div(BASE_PAGE_SIZE)
-                .filter(|_| byte_len.is_multiple_of(BASE_PAGE_SIZE))
-                .ok_or(FrameRoleError::WrongRole)?,
-            self.allocator.physical_limit(),
-        )?;
-        let record = self.record(backing.0)?;
-        if !record.range.contains(range) {
-            return Err(FrameRoleError::WrongRole);
-        }
-        match record.role {
-            FrameRole::ObjectBacking(_) => Ok(()),
-            FrameRole::ExternalImmutableModule { .. } if writable => {
-                Err(FrameRoleError::ReadOnlyBacking)
-            }
-            FrameRole::ExternalImmutableModule { .. } | FrameRole::ExternalDeviceMmio => Ok(()),
-            _ => Err(FrameRoleError::WrongRole),
-        }
-    }
-
     /// Confirms that one exact base page belongs to the boot-authenticated
     /// kernel image segment whose permissions C2 is about to retain.
     pub(crate) fn validate_kernel_image_page(

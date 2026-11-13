@@ -2553,6 +2553,7 @@ pub(crate) fn dma_map<
     tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     resources: &DeviceResourceAuthority<RESOURCES>,
     dma: &mut D,
+    object_pages: &dyn crate::memory::frame_roles::ObjectPages,
     current_process: ProcessKey,
     resource: DwHandle,
     memory_object: DwHandle,
@@ -2605,8 +2606,8 @@ pub(crate) fn dma_map<
         },
         Err(error) => return task_status(error),
     };
-    let physical = match memory.dma_physical_range(&resolved, offset, byte_len, device.write) {
-        Ok(physical) => physical,
+    let range = match memory.dma_physical_range(&resolved, offset, byte_len, device.write) {
+        Ok(range) => range,
         Err(error) => {
             release_held_lookup_pin(registry, resolved.into_internal());
             return match error {
@@ -2617,11 +2618,19 @@ pub(crate) fn dma_map<
         }
     };
     let pages = byte_len / crate::memory::object::PAGE_SIZE;
+    // The held lookup pin keeps the object, and so its backing, alive until
+    // the mapping owns it; each page is resolved through the backing's runs.
+    let mut page_at = |page: u64| {
+        let offset = page
+            .checked_mul(crate::memory::object::PAGE_SIZE)
+            .and_then(|bytes| bytes.checked_add(range.object_offset()))?;
+        object_pages.object_page(range.backing_identity(), offset, device.write)
+    };
     match dma.map(
         resource_id,
         current_process.object_id(),
         devfn,
-        physical,
+        &mut page_at,
         pages,
         device,
         resolved.into_internal(),

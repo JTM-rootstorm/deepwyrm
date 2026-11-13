@@ -55,13 +55,22 @@ impl DmaService for FakeDma {
         resource: ObjectId,
         owner: ObjectId,
         devfn: u8,
-        physical: u64,
+        page_at: &mut dyn FnMut(u64) -> Option<u64>,
         pages: u64,
         access: DeviceAccess,
         pin: InternalRef,
     ) -> Result<u64, (DmaError, InternalRef)> {
         if let Some(error) = self.fail_with {
             return Err((error, pin));
+        }
+        // Records the first page; every page must resolve, one after another.
+        let Some(physical) = page_at(0) else {
+            return Err((DmaError::InvalidRange, pin));
+        };
+        for page in 1..pages {
+            if page_at(page) != Some(physical + page * 4096) {
+                return Err((DmaError::InvalidRange, pin));
+            }
         }
         let iova = IOVA + (self.mappings.len() as u64) * 0x10_0000;
         self.owners.push(owner);
@@ -203,6 +212,7 @@ impl Fixture {
             &mut self.tasks,
             &self.devices,
             &mut self.dma,
+            &self.backing.roles,
             self.process,
             resource,
             object,

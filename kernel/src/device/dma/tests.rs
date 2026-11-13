@@ -772,3 +772,56 @@ fn another_process_cannot_use_a_domain_and_revoking_it_releases_everything() {
     assert_eq!(translate(&model, root, iova + PAGE), None);
     assert_eq!(domains.owner(resource), Some(successor));
 }
+
+#[test]
+fn pages_may_lie_anywhere_and_a_bad_later_page_rolls_back() {
+    let mut fixture = Fixture::new();
+    let mut model = Model::new(16);
+    let mut domains = Domains::new();
+    let resource = fixture.resource();
+    // Three pages from two runs of a backing (DW2 M3): the IOVA range is
+    // contiguous, the physical pages are not.
+    let physical = [0x4000_0000, 0x4000_1000, 0x7000_0000];
+    let mut page_at = |page: u64| physical.get(page as usize).copied();
+    let iova = domains
+        .map_pages(
+            &mut model,
+            resource,
+            resource,
+            0x08,
+            &mut page_at,
+            3,
+            RW,
+            fixture.pin(),
+        )
+        .unwrap();
+    let root = model.root_of(0x08);
+    for (page, expected) in physical.iter().enumerate() {
+        assert_eq!(
+            translate(&model, root, iova + page as u64 * PAGE),
+            Some((*expected, RW))
+        );
+    }
+
+    // A page that does not resolve undoes the pages before it.
+    let other = fixture.resource();
+    let mut broken = |page: u64| (page < 2).then_some(0x5000_0000 + page * PAGE);
+    assert_eq!(
+        domains
+            .map_pages(
+                &mut model,
+                other,
+                other,
+                0x10,
+                &mut broken,
+                3,
+                RW,
+                fixture.pin()
+            )
+            .unwrap_err()
+            .0,
+        DmaError::InvalidRange
+    );
+    assert!(!model.context_present(0x10));
+    assert_eq!(domains.live_domains(), 1);
+}

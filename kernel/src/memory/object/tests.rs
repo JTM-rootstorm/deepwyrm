@@ -1167,6 +1167,7 @@ fn device_mmio_objects_are_whole_bar_uncached_and_never_executable() {
     let mut registry = ObjectRegistry::<2>::new();
     let parent = device_resource_pin(&mut registry);
     let backing = crate::memory::frame_roles::synthetic_device_mmio_backing(0xe1_0000_0000, 2);
+    let binding_backing = backing.identity();
     let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
     let mut authority = MemoryObjectAuthority::<2, 1>::new();
     let binding = authority
@@ -1180,7 +1181,8 @@ fn device_mmio_objects_are_whole_bar_uncached_and_never_executable() {
     let record = authority.object_record(key).unwrap();
     let range = object_range(record, PAGE_SIZE, PAGE_SIZE).unwrap();
     assert!(range.uncached());
-    assert_eq!(range.physical_start(), 0xe1_0000_1000);
+    assert_eq!(range.object_offset(), PAGE_SIZE);
+    assert_eq!(range.backing_identity(), binding_backing);
     let _ = registry.finish_payload_binding(binding).unwrap();
 
     // The generic bind path refuses an executable ceiling or a partial BAR.

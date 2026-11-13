@@ -268,7 +268,7 @@ fn owned_journal_claims_candidate_chain_only_after_target_publication() {
     )
     .unwrap();
     journal
-        .authorize_leaf(backing.identity(), backing.physical_start())
+        .authorize_leaf(backing.identity(), 0, backing.physical_start())
         .unwrap();
     page_tables
         .map_page(
@@ -366,7 +366,7 @@ fn owned_journal_upgrades_shared_supervisor_ancestors_without_exposing_the_leaf(
     )
     .unwrap();
     journal
-        .authorize_leaf(user_backing.identity(), user_backing.physical_start())
+        .authorize_leaf(user_backing.identity(), 0, user_backing.physical_start())
         .unwrap();
     page_tables
         .map_page(
@@ -456,7 +456,7 @@ fn owned_journal_restores_candidate_grants_when_atomic_target_rejects() {
     )
     .unwrap();
     journal
-        .authorize_leaf(backing.identity(), backing.physical_start())
+        .authorize_leaf(backing.identity(), 0, backing.physical_start())
         .unwrap();
     page_tables
         .map_page(
@@ -536,7 +536,7 @@ fn owned_journal_derives_writability_from_the_leaf_replacement() {
         )
         .unwrap();
         journal
-            .authorize_leaf(backing.identity(), backing.physical_start())
+            .authorize_leaf(backing.identity(), 0, backing.physical_start())
             .unwrap();
         assert_eq!(
             page_tables.map_page(
@@ -563,7 +563,7 @@ fn owned_journal_derives_writability_from_the_leaf_replacement() {
         )
         .unwrap();
         journal
-            .authorize_leaf(backing.identity(), backing.physical_start())
+            .authorize_leaf(backing.identity(), 0, backing.physical_start())
             .unwrap();
         page_tables
             .map_page(
@@ -590,7 +590,7 @@ fn owned_journal_derives_writability_from_the_leaf_replacement() {
         )
         .unwrap();
         journal
-            .authorize_leaf(backing.identity(), backing.physical_start())
+            .authorize_leaf(backing.identity(), 0, backing.physical_start())
             .unwrap();
         assert_eq!(
             page_tables.protect_page(&mut journal, page, MappingPermissions::USER_READ_WRITE,),
@@ -1571,4 +1571,139 @@ fn the_publisher_capacity_walls_each_name_a_distinct_resource() {
 fn storage<const ENTRY_CAPACITY: usize, const INVALIDATION_CAPACITY: usize>()
 -> &'static mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY> {
     std::boxed::Box::leak(std::boxed::Box::new(JournalStorage::new()))
+}
+
+/// DW2 M3: a backing split across runs maps each page to its own run's
+/// frame, and unmapping checks each frame against its run.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host integration model attests synthetic frame zeroing, root ownership, and handle authority"
+)]
+fn a_backing_split_across_runs_maps_each_page_to_its_run() {
+    let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
+    let capabilities = PagingCapabilities {
+        physical_limit: limit,
+    };
+    let mut roles = synthetic_frame_role_manager::<4, 32>(0x1000, 16);
+    let owner = roles.create_table_owner().unwrap();
+    let allocation = roles.allocate(1).unwrap();
+    // SAFETY: an unused synthetic allocation is zero by construction.
+    let root = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+    let root = roles.prepare_table(root, owner, TableLevel::Pml4).unwrap();
+    let root = roles.commit_table(root, None).unwrap();
+    // SAFETY: `root` is the committed PML4 this model owns exclusively.
+    let page_tables =
+        unsafe { PageTableRoot::from_owned_root(root.physical_start(), capabilities) }.unwrap();
+    let mut candidates: [Option<TableCandidateGrant>; 3] = [const { None }; 3];
+    for (slot, level) in [TableLevel::Pt, TableLevel::Pdpt, TableLevel::Pd]
+        .into_iter()
+        .enumerate()
+    {
+        let allocation = roles.allocate(1).unwrap();
+        // SAFETY: as for the root.
+        let zeroed = unsafe { roles.assume_zeroed(allocation) }.unwrap();
+        candidates[slot] = Some(roles.prepare_table(zeroed, owner, level).unwrap());
+    }
+    // Free holes: one page at 0x5000 and two at 0x7000.
+    let small = roles.allocate(1).unwrap();
+    let _between = roles.allocate(1).unwrap();
+    let large = roles.allocate(2).unwrap();
+    let _rest = roles.allocate(roles.available_frames()).unwrap();
+    roles.cancel_allocation(small).unwrap();
+    roles.cancel_allocation(large).unwrap();
+    let allocation = roles.allocate_backing(3).unwrap();
+    // SAFETY: as for the root.
+    let backing = unsafe { roles.assume_backing_zeroed(allocation) }.unwrap();
+    assert_eq!(backing.run_count(), 2);
+
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let mut objects = MemoryObjectAuthority::<1, 2>::new();
+    objects
+        .grant_backing(
+            &creation,
+            backing,
+            3 * BASE_PAGE_SIZE,
+            MemoryObjectKind::PageBacked,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    let object_owner = registry.creation_into_internal(creation).unwrap();
+    // SAFETY: this model creates the only address-space authority it uses.
+    let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
+    let address_space = spaces.create_address_space().unwrap();
+    let mut region = spaces
+        .create_region::<1>(address_space, 0x4000, 3 * BASE_PAGE_SIZE)
+        .unwrap();
+    let mut target = FakeTarget::default();
+    // SAFETY: the keys were issued for the root and region this binds.
+    let mut publisher = unsafe {
+        X86AddressSpacePublisher::<_, 4, 32, 3, 32, 4>::new(
+            region.address_space_key(),
+            region.region_key(),
+            &page_tables,
+            root,
+            &mut roles,
+            &mut target,
+            &mut candidates,
+            storage(),
+        )
+    }
+    .unwrap();
+    let resolved = crate::handle::resolve_test_internal_owner(
+        &mut registry,
+        &object_owner,
+        deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
+    );
+    let authorization = region
+        .authorize_map(&objects, resolved, Protection::READ_WRITE)
+        .unwrap();
+    assert!(
+        region
+            .map(
+                &mut objects,
+                &mut registry,
+                &mut publisher,
+                0x4000,
+                authorization,
+                0,
+                3 * BASE_PAGE_SIZE,
+                Protection::READ_WRITE,
+            )
+            .unwrap_or_else(|failure| panic!("map failed: {:?}", failure.error()))
+            .is_empty()
+    );
+    let physical_mask = ((1_u64 << 40) - 1) & !(BASE_PAGE_SIZE - 1);
+    let leaf = |entries: &BTreeMap<(u64, usize), u64>, page: u64| {
+        let mut table = root.physical_start();
+        for level in (1..=3).rev() {
+            table =
+                entries[&(table, ((page >> (12 + level * 9)) & 0x1ff) as usize)] & physical_mask;
+        }
+        entries[&(table, ((page >> 12) & 0x1ff) as usize)] & physical_mask
+    };
+    // Largest run first: object pages 0-1 in the two-page hole, page 2 in
+    // the one-page hole.
+    for (page, frame) in [(0x4000, 0x7000), (0x5000, 0x8000), (0x6000, 0x5000)] {
+        assert_eq!(
+            leaf(&publisher.target.entries, page),
+            frame,
+            "page {page:#x}"
+        );
+    }
+    assert!(
+        region
+            .unmap(
+                &mut objects,
+                &mut registry,
+                &mut publisher,
+                0x4000,
+                3 * BASE_PAGE_SIZE,
+            )
+            .unwrap_or_else(|failure| panic!("unmap failed: {:?}", failure.error()))
+            .is_empty()
+    );
+    assert_eq!(objects.active_lease_count(), 0);
+    assert_eq!(roles.check_invariants(), Ok(()));
 }

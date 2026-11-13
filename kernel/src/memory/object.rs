@@ -499,7 +499,6 @@ impl MemoryObjectInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryObjectRange {
     backing: BackingIdentity,
-    physical_start: u64,
     object_offset: u64,
     byte_len: u64,
     /// Device registers: mapped strong-uncacheable (PCD|PWT).
@@ -509,19 +508,10 @@ pub(crate) struct MemoryObjectRange {
 impl MemoryObjectRange {
     pub(super) const EMPTY: Self = Self {
         backing: BackingIdentity::EMPTY,
-        physical_start: 0,
         object_offset: 0,
         byte_len: 0,
         uncached: false,
     };
-
-    #[allow(
-        dead_code,
-        reason = "the page-table publisher needs physical backing metadata without exposing allocator authority"
-    )]
-    pub(crate) const fn physical_start(self) -> u64 {
-        self.physical_start
-    }
 
     pub(crate) const fn backing_identity(self) -> BackingIdentity {
         self.backing
@@ -620,7 +610,6 @@ impl LeaseTicket {
 struct ObjectRecord {
     object: ObjectId,
     backing: BackingIdentity,
-    physical_start: u64,
     logical_byte_len: u64,
     rounded_byte_len: u64,
     kind: MemoryObjectKind,
@@ -851,12 +840,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         kind: MemoryObjectKind,
         protection_ceiling: MemoryProtection,
     ) -> MemoryObjectKey {
-        let physical_start = backing.physical_start();
         self.objects[slot] = ObjectSlot {
             record: Some(ObjectRecord {
                 object,
                 backing: backing.identity(),
-                physical_start,
                 logical_byte_len,
                 rounded_byte_len,
                 kind,
@@ -889,16 +876,11 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         {
             return Err(MemoryObjectError::ObjectIdentity);
         }
-        let physical_start = backing.physical_start();
+        // The role manager made the grant: its runs are page-aligned and in
+        // range, and its length is whole pages.
         let backing_len = backing.byte_len();
         if backing_len == 0 || logical_byte_len == 0 {
             return Err(MemoryObjectError::Empty);
-        }
-        if !physical_start.is_multiple_of(PAGE_SIZE) || !backing_len.is_multiple_of(PAGE_SIZE) {
-            return Err(MemoryObjectError::Unaligned);
-        }
-        if physical_start.checked_add(backing_len).is_none() {
-            return Err(MemoryObjectError::Overflow);
         }
         MemoryProtection::ceiling(protection_ceiling.0)?;
         let rounded_byte_len = round_up_to_page(logical_byte_len)?;
@@ -990,8 +972,9 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
-    /// The physical start of `[offset, offset + byte_len)` of a page-backed
-    /// object a DMA mapping may name (storage K4). Device-MMIO and boot-module
+    /// The validated range `[offset, offset + byte_len)` of a page-backed
+    /// object a DMA mapping may name (storage K4). The caller resolves its
+    /// pages through the role manager; they may lie in several runs (DW2 M3). Device-MMIO and boot-module
     /// objects are refused with `BackingKind`; a device-writable mapping needs
     /// a writable object.
     pub(crate) fn dma_physical_range(
@@ -1000,7 +983,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         offset: u64,
         byte_len: u64,
         device_writes: bool,
-    ) -> Result<u64, MemoryObjectError> {
+    ) -> Result<MemoryObjectRange, MemoryObjectError> {
         if resolved.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
             return Err(MemoryObjectError::ObjectReference);
         }
@@ -1013,7 +996,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         if device_writes && !record.protection_ceiling.writable() {
             return Err(MemoryObjectError::ProtectionCeiling);
         }
-        Ok(object_range(record, offset, byte_len)?.physical_start())
+        object_range(record, offset, byte_len)
     }
 
     pub(crate) fn take_finalization(
@@ -1228,13 +1211,8 @@ fn object_range(
     if end > object.rounded_byte_len {
         return Err(MemoryObjectError::BackingTooSmall);
     }
-    let physical_start = object
-        .physical_start
-        .checked_add(object_offset)
-        .ok_or(MemoryObjectError::Overflow)?;
     Ok(MemoryObjectRange {
         backing: object.backing,
-        physical_start,
         object_offset,
         byte_len,
         uncached: matches!(object.kind, MemoryObjectKind::DeviceMmio),

@@ -287,6 +287,7 @@ const EMPTY_CANDIDATE_USE: CandidateUse = CandidateUse {
 #[derive(Clone, Copy)]
 struct LeafAuthorization {
     backing: BackingIdentity,
+    object_offset: u64,
     physical_start: u64,
 }
 
@@ -362,18 +363,45 @@ where
         })
     }
 
+    /// Authorizes the next leaf to name `physical_start`, which must be the
+    /// page of `backing` at `object_offset` (DW2 M3: a backing may be
+    /// several runs, so the page is resolved through its chain).
     pub(crate) fn authorize_leaf(
         &mut self,
         backing: BackingIdentity,
+        object_offset: u64,
         physical_start: u64,
     ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
-        self.roles
-            .validate_object_backing(backing, physical_start, BASE_PAGE_SIZE, false)
-            .map_err(OwnedPageTableJournalError::FrameRole)?;
+        self.check_leaf(backing, object_offset, physical_start, false)?;
         self.leaf_authorization = Some(LeafAuthorization {
             backing,
+            object_offset,
             physical_start,
         });
+        Ok(())
+    }
+
+    /// The role manager this journal holds, for resolving object pages.
+    pub(crate) fn roles(&self) -> &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY> {
+        self.roles
+    }
+
+    fn check_leaf(
+        &self,
+        backing: BackingIdentity,
+        object_offset: u64,
+        physical_start: u64,
+        writable: bool,
+    ) -> Result<(), OwnedPageTableJournalError<T::Error>> {
+        let page = self
+            .roles
+            .resolve_object_page(backing, object_offset, writable)
+            .map_err(OwnedPageTableJournalError::FrameRole)?;
+        if page.physical_start != physical_start {
+            return Err(OwnedPageTableJournalError::FrameRole(
+                FrameRoleError::WrongRole,
+            ));
+        }
         Ok(())
     }
 
@@ -525,14 +553,12 @@ where
             .last()
             .ok_or(OwnedPageTableJournalError::InvalidPlan)?;
         let required_writable = leaf_mutation.replacement() & super::WRITABLE != 0;
-        self.roles
-            .validate_object_backing(
-                authorization.backing,
-                authorization.physical_start,
-                BASE_PAGE_SIZE,
-                required_writable,
-            )
-            .map_err(OwnedPageTableJournalError::FrameRole)?;
+        self.check_leaf(
+            authorization.backing,
+            authorization.object_offset,
+            authorization.physical_start,
+            required_writable,
+        )?;
 
         let ancestor_mutations = &plan.mutations()[..plan.mutations().len() - 1];
         let mut assertion_index = 0;

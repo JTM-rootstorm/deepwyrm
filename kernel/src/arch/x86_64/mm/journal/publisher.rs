@@ -60,6 +60,9 @@ impl<E> X86AddressSpacePublishError<E> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PageDescriptor {
     backing: BackingIdentity,
+    /// Two descriptors with the same backing and object offset name the
+    /// same page, however many runs the backing has (DW2 M3 §6.4).
+    object_offset: u64,
     physical_start: u64,
     permissions: MappingPermissions,
 }
@@ -203,11 +206,11 @@ where
             }
             let boundary = next_boundary(before, after, address, old, new)?;
             let old_page = match old {
-                Some(mapping) => Some(page_descriptor(mapping, address)?),
+                Some(mapping) => Some(page_descriptor(journal.roles(), mapping, address)?),
                 None => None,
             };
             let new_page = match new {
-                Some(mapping) => Some(page_descriptor(mapping, address)?),
+                Some(mapping) => Some(page_descriptor(journal.roles(), mapping, address)?),
                 None => None,
             };
             if old_page == new_page {
@@ -221,11 +224,11 @@ where
                     return Err(X86AddressSpacePublishError::Capacity);
                 }
                 let old_page = match old {
-                    Some(mapping) => Some(page_descriptor(mapping, page_address)?),
+                    Some(mapping) => Some(page_descriptor(journal.roles(), mapping, page_address)?),
                     None => None,
                 };
                 let new_page = match new {
-                    Some(mapping) => Some(page_descriptor(mapping, page_address)?),
+                    Some(mapping) => Some(page_descriptor(journal.roles(), mapping, page_address)?),
                     None => None,
                 };
                 publish_page(self.root, &mut journal, page_address, old_page, new_page)?;
@@ -329,9 +332,9 @@ fn validate_mapping_batch<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: u
             return Err(X86AddressSpacePublishError::InvalidMapping);
         }
         roles
-            .validate_object_backing(
+            .object_segments(
                 backing.backing_identity(),
-                backing.physical_start(),
+                backing.object_offset(),
                 backing.byte_len(),
                 mapping.protection().writable(),
             )
@@ -381,7 +384,7 @@ where
     let result = match (before, after) {
         (None, Some(after)) => {
             journal
-                .authorize_leaf(after.backing, after.physical_start)
+                .authorize_leaf(after.backing, after.object_offset, after.physical_start)
                 .map_err(X86AddressSpacePublishError::Journal)?;
             let (candidates, count) = journal
                 .candidate_addresses_for_page(root, page)
@@ -396,7 +399,7 @@ where
         }
         (Some(before), None) => {
             journal
-                .authorize_leaf(before.backing, before.physical_start)
+                .authorize_leaf(before.backing, before.object_offset, before.physical_start)
                 .map_err(X86AddressSpacePublishError::Journal)?;
             root.unmap_page(journal, page).and_then(|removed| {
                 if removed.address() == before.physical_start {
@@ -406,15 +409,17 @@ where
                 }
             })
         }
-        (Some(before), Some(after)) if before.physical_start == after.physical_start => {
+        (Some(before), Some(after))
+            if before.backing == after.backing && before.object_offset == after.object_offset =>
+        {
             journal
-                .authorize_leaf(after.backing, after.physical_start)
+                .authorize_leaf(after.backing, after.object_offset, after.physical_start)
                 .map_err(X86AddressSpacePublishError::Journal)?;
             root.protect_page(journal, page, after.permissions)
         }
         (Some(before), Some(after)) => {
             journal
-                .authorize_leaf(after.backing, after.physical_start)
+                .authorize_leaf(after.backing, after.object_offset, after.physical_start)
                 .map_err(X86AddressSpacePublishError::Journal)?;
             root.replace_page(
                 journal,
@@ -540,20 +545,27 @@ pub(super) fn next_boundary<E>(
     Ok(boundary)
 }
 
-fn page_descriptor<E>(
+fn page_descriptor<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
     mapping: &Mapping,
     address: u64,
 ) -> Result<PageDescriptor, X86AddressSpacePublishError<E>> {
-    let offset = address
-        .checked_sub(mapping.virtual_start())
-        .ok_or(X86AddressSpacePublishError::InvalidMapping)?;
     let backing = mapping.backing();
-    let physical_start = backing
-        .physical_start()
-        .checked_add(offset)
+    let object_offset = address
+        .checked_sub(mapping.virtual_start())
+        .and_then(|offset| offset.checked_add(backing.object_offset()))
         .ok_or(X86AddressSpacePublishError::InvalidMapping)?;
+    let physical_start = roles
+        .resolve_object_page(
+            backing.backing_identity(),
+            object_offset,
+            mapping.protection().writable(),
+        )
+        .map_err(X86AddressSpacePublishError::FrameRole)?
+        .physical_start;
     Ok(PageDescriptor {
         backing: backing.backing_identity(),
+        object_offset,
         physical_start,
         permissions: MappingPermissions {
             user: true,

@@ -7708,22 +7708,28 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 byte_len,
                 access,
                 out_iova,
-            } => crate::syscall::dma_map(
-                user,
-                &mut self.core.registry,
-                &self.core.memory,
-                &mut self.core.tasks,
-                &self.core.shared.device_resources,
-                &mut crate::device::dma::live::LiveDmaService,
-                process,
-                resource,
-                memory_object,
-                offset,
-                byte_len,
-                access,
-                out_iova,
-                &mut self.core.cleanup,
-            ),
+            } => {
+                // P is taken beneath T and before the DMA lock, which never
+                // takes P; the role manager resolves each page of the range.
+                let paging = self.paging.lock();
+                crate::syscall::dma_map(
+                    user,
+                    &mut self.core.registry,
+                    &self.core.memory,
+                    &mut self.core.tasks,
+                    &self.core.shared.device_resources,
+                    &mut crate::device::dma::live::LiveDmaService,
+                    &*paging.target.roles,
+                    process,
+                    resource,
+                    memory_object,
+                    offset,
+                    byte_len,
+                    access,
+                    out_iova,
+                    &mut self.core.cleanup,
+                )
+            }
             NativeSyscallRequest::DevicePciConfigRead {
                 resource,
                 offset,

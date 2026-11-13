@@ -490,21 +490,15 @@ fn external_roles_are_disjoint_and_immutable_backing_is_read_only() {
     let module = unsafe { roles.import_immutable_module(module_range, 7) }.unwrap();
     assert_eq!(module.byte_len(), BASE_PAGE_SIZE * 2);
     assert_eq!(
-        roles.validate_object_backing(
-            module.identity(),
-            module.physical_start(),
-            module.byte_len(),
-            false,
-        ),
+        roles
+            .object_segments(module.identity(), 0, module.byte_len(), false)
+            .map(|_| ()),
         Ok(())
     );
     assert_eq!(
-        roles.validate_object_backing(
-            module.identity(),
-            module.physical_start(),
-            module.byte_len(),
-            true,
-        ),
+        roles
+            .object_segments(module.identity(), 0, module.byte_len(), true)
+            .map(|_| ()),
         Err(FrameRoleError::ReadOnlyBacking)
     );
     let error = roles.cancel_object_backing(module).unwrap_err();
@@ -703,7 +697,9 @@ fn object_backing_identity_cannot_validate_a_table_role() {
     let confused = BackingIdentity(table.role);
 
     assert_eq!(
-        roles.validate_object_backing(confused, table.physical_start(), BASE_PAGE_SIZE, false,),
+        roles
+            .object_segments(confused, 0, BASE_PAGE_SIZE, false)
+            .map(|_| ()),
         Err(FrameRoleError::WrongRole)
     );
     assert_eq!(roles.check_invariants(), Ok(()));
@@ -754,12 +750,9 @@ fn device_mmio_imports_are_writable_permanent_and_exclusive() {
     assert_eq!(grant.kind(), ObjectBackingKind::DeviceMmio);
     for writable in [false, true] {
         assert_eq!(
-            roles.validate_object_backing(
-                grant.identity(),
-                grant.physical_start(),
-                grant.byte_len(),
-                writable,
-            ),
+            roles
+                .object_segments(grant.identity(), 0, grant.byte_len(), writable)
+                .map(|_| ()),
             Ok(())
         );
     }

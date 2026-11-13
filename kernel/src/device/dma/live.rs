@@ -294,7 +294,7 @@ impl DmaService for LiveDmaService {
         resource: ObjectId,
         owner: ObjectId,
         devfn: u8,
-        physical: u64,
+        page_at: &mut dyn FnMut(u64) -> Option<u64>,
         pages: u64,
         access: DeviceAccess,
         pin: InternalRef,
@@ -308,12 +308,12 @@ impl DmaService for LiveDmaService {
         let Some(live) = live.as_mut() else {
             return Err((DmaError::NotSupported, pin));
         };
-        live.domains.map(
+        live.domains.map_pages(
             &mut live.iommu,
             resource,
             owner,
             devfn,
-            physical,
+            page_at,
             pages,
             access,
             pin,

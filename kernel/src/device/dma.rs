@@ -126,10 +126,8 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
             .position(|domain| domain.as_ref().is_some_and(|d| d.resource == resource))
     }
 
-    /// Maps `pages` pages starting at `physical` for `resource`'s function
-    /// on behalf of process `owner`, and returns the IOVA. On success `pin`
-    /// stays with the mapping; on failure it comes back unchanged. A domain
-    /// another process owns is `FunctionBusy`: the caller revokes it first.
+    /// Maps `pages` physically contiguous pages starting at `physical`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map<H: DmaHardware>(
         &mut self,
@@ -142,7 +140,43 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
         access: DeviceAccess,
         pin: InternalRef,
     ) -> Result<u64, (DmaError, InternalRef)> {
-        if pages == 0 || !physical.is_multiple_of(PAGE_BYTES) || !(access.read || access.write) {
+        let mut page_at = |page: u64| physical.checked_add(page.checked_mul(PAGE_BYTES)?);
+        self.map_pages(
+            hardware,
+            resource,
+            owner,
+            devfn,
+            &mut page_at,
+            pages,
+            access,
+            pin,
+        )
+    }
+
+    /// Maps `pages` pages for `resource`'s function on behalf of process
+    /// `owner` onto one contiguous IOVA range, and returns its start.
+    /// `page_at(i)` is the physical address of page `i`; the pages need not
+    /// be contiguous (DW2 M3 §6.4). On success `pin` stays with the mapping;
+    /// on failure it comes back unchanged. A domain another process owns is
+    /// `FunctionBusy`: the caller revokes it first.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_pages<H: DmaHardware>(
+        &mut self,
+        hardware: &mut H,
+        resource: ObjectId,
+        owner: ObjectId,
+        devfn: u8,
+        page_at: &mut dyn FnMut(u64) -> Option<u64>,
+        pages: u64,
+        access: DeviceAccess,
+        pin: InternalRef,
+    ) -> Result<u64, (DmaError, InternalRef)> {
+        // The first page is checked before any domain work, so a malformed
+        // request changes nothing; a later bad page rolls the call back.
+        if pages == 0
+            || !(access.read || access.write)
+            || !page_at(0).is_some_and(|physical| physical.is_multiple_of(PAGE_BYTES))
+        {
             return Err((DmaError::InvalidRange, pin));
         }
         let Some(byte_len) = pages.checked_mul(PAGE_BYTES) else {
@@ -205,13 +239,13 @@ impl<const DOMAINS: usize, const MAPPINGS: usize> DmaDomains<DOMAINS, MAPPINGS> 
                 .ok_or(DmaError::NoAddressSpace)?;
             for page in 0..pages {
                 let offset = page * PAGE_BYTES;
-                if let Err(error) = tables::map_page(
-                    hardware,
-                    domain.root,
-                    iova + offset,
-                    physical + offset,
-                    access,
-                ) {
+                let mapped = match page_at(page) {
+                    Some(physical) if physical.is_multiple_of(PAGE_BYTES) => {
+                        tables::map_page(hardware, domain.root, iova + offset, physical, access)
+                    }
+                    _ => Err(TableError::InvalidAddress),
+                };
+                if let Err(error) = mapped {
                     for undo in 0..page {
                         tables::unmap_page(hardware, domain.root, iova + undo * PAGE_BYTES)
                             .expect("a leaf this call installed is still mapped");
@@ -355,13 +389,15 @@ pub(crate) trait DmaService {
         may_revoke: bool,
         release: &mut dyn FnMut(InternalRef),
     ) -> Result<(), DmaError>;
+    /// Maps `pages` pages, page `i` at physical `page_at(i)`, onto one
+    /// contiguous IOVA range (see [`DmaDomains::map_pages`]).
     #[allow(clippy::too_many_arguments)]
     fn map(
         &mut self,
         resource: ObjectId,
         owner: ObjectId,
         devfn: u8,
-        physical: u64,
+        page_at: &mut dyn FnMut(u64) -> Option<u64>,
         pages: u64,
         access: DeviceAccess,
         pin: InternalRef,
@@ -415,17 +451,17 @@ impl<H: DmaHardware, const DOMAINS: usize, const MAPPINGS: usize> DmaService
         resource: ObjectId,
         owner: ObjectId,
         devfn: u8,
-        physical: u64,
+        page_at: &mut dyn FnMut(u64) -> Option<u64>,
         pages: u64,
         access: DeviceAccess,
         pin: InternalRef,
     ) -> Result<u64, (DmaError, InternalRef)> {
-        self.domains.map(
+        self.domains.map_pages(
             self.hardware,
             resource,
             owner,
             devfn,
-            physical,
+            page_at,
             pages,
             access,
             pin,

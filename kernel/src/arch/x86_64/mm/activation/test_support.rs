@@ -472,14 +472,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         region: &crate::memory::address_region::AddressRegion<2>,
         objects: &crate::memory::object::MemoryObjectAuthority<1, 2>,
         virtual_start: u64,
-        physical_start: u64,
         protection: crate::memory::object::MemoryProtection,
     ) -> bool {
         let mut mappings = region.mappings().iter().flatten();
         mappings.next().is_some_and(|mapping| {
             mapping.virtual_start() == virtual_start
                 && mapping.byte_len() == PAGE_SIZE
-                && mapping.backing().physical_start() == physical_start
+                && mapping.backing().object_offset() == 0
                 && mapping.protection() == protection
         }) && mappings.next().is_none()
             && objects.active_lease_count() == 1
@@ -490,7 +489,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         objects: &crate::memory::object::MemoryObjectAuthority<1, 2>,
         first: (u64, crate::memory::object::MemoryProtection),
         second: (u64, crate::memory::object::MemoryProtection),
-        physical_start: u64,
     ) -> bool {
         let mappings = region.mappings();
         let Some(first_mapping) = mappings[0] else {
@@ -503,8 +501,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             && second_mapping.virtual_start() == second.0
             && first_mapping.byte_len() == PAGE_SIZE
             && second_mapping.byte_len() == PAGE_SIZE
-            && first_mapping.backing().physical_start() == physical_start
-            && second_mapping.backing().physical_start() == physical_start
+            && first_mapping.backing().object_offset() == 0
+            && second_mapping.backing().object_offset() == 0
+            && first_mapping.backing().backing_identity()
+                == second_mapping.backing().backing_identity()
             && first_mapping.protection() == first.1
             && second_mapping.protection() == second.1
             && mappings[2..].iter().all(Option::is_none)
@@ -643,7 +643,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             &region,
                             &objects,
                             first,
-                            backing_physical,
                             MemoryProtection::READ_WRITE,
                         )
                     {
@@ -690,7 +689,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &region,
                                 &objects,
                                 first,
-                                backing_physical,
                                 MemoryProtection::READ_WRITE,
                             )
                         {
@@ -724,7 +722,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &region,
                                 &objects,
                                 first,
-                                backing_physical,
                                 MemoryProtection::READ,
                             )
                         {
@@ -757,7 +754,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &region,
                                 &objects,
                                 first,
-                                backing_physical,
                                 MemoryProtection::READ_EXECUTE,
                             )
                         {
@@ -794,7 +790,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &region,
                                 &objects,
                                 first,
-                                backing_physical,
                                 MemoryProtection::READ_EXECUTE,
                             )
                         {
@@ -827,7 +822,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &region,
                                 &objects,
                                 first,
-                                backing_physical,
                                 MemoryProtection::READ,
                             )
                         {
@@ -1134,7 +1128,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &objects,
                                 (first, MemoryProtection::READ_WRITE),
                                 (second, MemoryProtection::READ),
-                                backing_physical,
                             )
                         {
                             return Err(0x047c);
@@ -1161,7 +1154,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &objects,
                                 (first, MemoryProtection::READ_WRITE),
                                 (second, MemoryProtection::READ),
-                                backing_physical,
                             )
                         {
                             return Err(0x047d);
@@ -1295,7 +1287,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &objects,
                                 (first, MemoryProtection::READ_WRITE),
                                 (second, MemoryProtection::READ_WRITE),
-                                backing_physical,
                             )
                         {
                             return Err(0x0452);
@@ -1329,7 +1320,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 &region,
                                 &objects,
                                 second,
-                                backing_physical,
                                 MemoryProtection::READ_WRITE,
                             )
                         {

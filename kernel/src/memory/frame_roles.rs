@@ -27,8 +27,6 @@ mod chain;
 #[path = "frame_roles/manager.rs"]
 mod manager;
 use chain::ChainState;
-#[allow(unused_imports, reason = "DW2 M3 step 3 maps through object segments")]
-pub(crate) use chain::ObjectSegments;
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]
 mod test_support;
@@ -640,6 +638,34 @@ impl RoleTableLayout {
     /// Role slots the grown table holds.
     pub(crate) const fn slot_count(&self) -> usize {
         self.slots
+    }
+}
+
+/// Resolves one page of an object backing to its physical address, for a
+/// caller that maps pages one at a time onto another address space (DMA).
+pub(crate) trait ObjectPages {
+    /// The physical page of `backing` at `object_offset`, or `None` when the
+    /// backing does not hold that page or refuses a writable use.
+    fn object_page(
+        &self,
+        backing: BackingIdentity,
+        object_offset: u64,
+        writable: bool,
+    ) -> Option<u64>;
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> ObjectPages
+    for FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn object_page(
+        &self,
+        backing: BackingIdentity,
+        object_offset: u64,
+        writable: bool,
+    ) -> Option<u64> {
+        self.resolve_object_page(backing, object_offset, writable)
+            .ok()
+            .map(|page| page.physical_start)
     }
 }
 
