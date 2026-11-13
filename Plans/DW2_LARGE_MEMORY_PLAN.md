@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is in progress: batched publication is built and reviewed (§7); releasing the global locks between batches is M4b, next (Mike, 2026-11-13).
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -223,10 +223,41 @@ Deepwyrm `321571d`, with review fixes in `35daf2e`; both pass `dev-boot --check 
 
 **Reviewer:** Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `321571d` (base `e2bbd41`). Method: code reading plus host unit tests. No Critical or High defect. Batch cuts, mid-stretch starts, the room bound, the undo's independence from candidates, the pin span and candidate accounting were checked and found sound, and a failed call's shootdown still precedes the release of its leases.
 
-- **D1 (Medium, confirmed): open, to be fixed by M4b (Mike, 2026-11-13).** One call now holds T and P for time that grows with the size userspace asks for (tens of milliseconds per 16 MiB, twice on failure), contrary to §2's M4 row. Object creation already zeroes its backing under P alone, so M4b bounds both: the locks are released between batches, and creation zeroes in chunks.
+- **D1 (Medium, confirmed): fixed by M4b (§7.2; Mike's choice of design, 2026-11-13).** One call now holds T and P for time that grows with the size userspace asks for (tens of milliseconds per 16 MiB, twice on failure), contrary to §2's M4 row. Object creation already zeroes its backing under P alone, so M4b bounds both: the locks are released between batches, and creation zeroes in chunks.
 - **R1 (Low): fixed** (`35daf2e`). A call refused on identity could report a stale undone-batches flag; `publish_replace` now clears it first.
 - **R2 (Low), open:** teardown of a mapping over 16 MiB holds the pin span over the whole mapping; a pin overlapping it panics, as a pin overlapping one batch did before.
 - **R3 (Low), accepted:** a racing usercopy pin in the same address space now sees `Conflict` for the whole call, not one batch.
 - **R4 (Low), accepted:** tables built by undone batches stay until teardown, uncharged, as after a map and unmap.
 - **Test gaps:** G2 and G3 (undoing an unmap and a protect, a failed refill) are closed in `35daf2e`. Open: G1, `TrackedActiveTarget`'s span on the host (it wraps the live scratch target); G4, a batch starting mid-run of a multi-run backing; G5, a bound on lock-hold cost, which M4b addresses.
+
+### 7.2 M4b as built (2026-11-13)
+
+Deepwyrm `0e02d55` (calls in steps), `3017325` (creation zeroed in steps), review fixes `72bbcfb`; each passes `dev-boot --check --sdk`. Committed unsigned.
+
+Mike chose (2026-11-13) to run a large call as a chain of ordinary calls rather than reserve an in-flight range: S cannot be held across a release of T and P (lock order T, P, S), and a lease held across holds would turn ProcessExit into `BAD_STATE`.
+
+- **Steps.** An `AddressRegionMap`, `Unmap` or `Protect` larger than 16 MiB (one journal batch) is a chain of complete family-G transactions of at most 16 MiB, each through its own holds and shootdown, with a safe point between them (`syscall/region_steps.rs` plans the chain; `handle_address_region_mutation` runs it). A call of 16 MiB or less, or a misaligned one, runs exactly as before.
+- **Placement.** The first step of an allocator-placed map finds room for the whole map (`map_anywhere_with_room`); later steps are FIXED after it.
+- **Merging.** Pieces of one object that continue each other in address, object offset, captured authority (object and ceiling) and protection merge in the model (`push_spec`), so a chain leaves the slots and leases one call would. A merging map gives its authorization pin to the merged lease; the displaced pin is released as surplus. This applies to every map, unmap and protect.
+- **Before the first step** an unmap or protect checks its whole range (rights, inside the region, wholly mapped) and snapshots the protections over it; a failure is refused with one call's status before any change.
+- **Failure.** A failed map step unmaps the steps made; a failed protect step restores the snapshot. The undo is best effort: an undo step that fails is skipped. A failed unmap step is retried four times, each after a safe point, then the call returns the error with the steps made left unmapped; after the whole-range check only a transient pin or a concurrent change can fail one.
+- **Creation.** `MemoryObjectCreate` allocates its backing under P, zeroes it 16 MiB at a time with P taken per step, and makes it the object's backing under P (`zero_backing_in_steps`). The frames are reachable only through the `BackingAllocation` in the facade frame.
+- **Semantics that changed (§2's M4 row said all-or-nothing):** other threads can see a call's intermediate state; a caller stopped between steps leaves the steps it made, and an allocator-placed map's address is then never returned; an unmap can end partial as above. Mike accepted these with the design.
+- **Not exercised in a guest** until M5 raises the job budget past 16 MiB; the host tests cover the plan, merging, the whole-range check and zeroing in parts.
+
+### 7.3 Security review of M4b
+
+**Reviewer:** Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `0e02d55` and `3017325` (base `aa0b569`). Method: code reading plus host unit tests. No Critical or High defect. Phase revalidation across steps, a caller stopped between steps, pin and lease accounting with merging, what may merge, protect's undo (rechecked for ceiling and W^X), FIXED placement after the first step, and creation's frames between zeroing steps were checked and found sound.
+
+- **D1 (Medium): fixed** (`72bbcfb`). An unmap in steps over a gap, or past the region's end, unmapped the steps before it; the whole range is now checked first.
+- **D2 (Low): fixed** by this section (the code cited it before it existed).
+- **D3 (Low): fixed** (`72bbcfb`). A full region again reports `Capacity` before `Overlap` for a piece that merges with nothing.
+- **R1 (Low), accepted:** each step resolves its handles again, so a handle closed and reused between steps retargets later steps or the undo. It needs MODIFY on the region, so nothing gains authority.
+- **R2 (Low), open:** one step's hold still grows with the backing's run count (`chain_totals` per mapping, zeroing from the chain's head); §6.8's object index addresses it.
+- **R3 (Low), open:** a call in steps passes safe points but never yields the CPU; creation's zeroing has no safe point, its time bounded by the quota.
+- **R4 (Low), accepted:** a protect in steps can refuse a W+X alias that one call would have avoided, by creating it mid-chain. Stricter, not a bypass.
+- **R5 (Low), accepted:** pieces left by a stopped caller or a failed undo keep their leases until region teardown.
+- **R6 (Low), open:** §7.1 R2's window widens, since a map's output pin lives for the whole chain.
+- **R7 (Low), open:** concurrent creates can still allocate past the quota before admission, as before.
+- **Test gaps, open:** the facade loop (stop between steps, a published inner step, the output) and the snapshot capture are live-only; no test finalizes an object after a merge; no test of a zeroing step failing mid-allocation.
 
