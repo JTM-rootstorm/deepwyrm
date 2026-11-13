@@ -390,6 +390,7 @@ fn userspace_exception_is_process_fatal_and_siblings_do_not_claim_fault() {
             DW_EXCEPTION_PAGE_FAULT,
             0x17,
             0x0000_0000_4141_5000,
+            deepwyrm_abi::DW_TERMINATION_RESOURCE_POLICY,
         )
         .unwrap();
     let (_, drained) = tasks
@@ -408,7 +409,9 @@ fn userspace_exception_is_process_fatal_and_siblings_do_not_claim_fault() {
         tasks.process_info(process).unwrap(),
         tasks.thread_info(faulting).unwrap(),
     ] {
-        assert_eq!(info.reason, DW_TERMINATION_UNHANDLED_EXCEPTION);
+        // The reason the fault carries (DW2 M6: an on-demand page out of
+        // quota), with the fault's own record.
+        assert_eq!(info.reason, deepwyrm_abi::DW_TERMINATION_RESOURCE_POLICY);
         assert_eq!(info.exception_type, DW_EXCEPTION_PAGE_FAULT);
         assert_eq!(info.detail, 0x17);
         assert_eq!(info.fault_address, 0x0000_0000_4141_5000);
@@ -1340,7 +1343,14 @@ fn assert_process_wide_snapshot_agrees(entry: ProcessWideEntry, sibling_state: S
     let pins = match entry {
         ProcessWideEntry::ProcessExit => tasks.exit_process(process, lead, 0x10).unwrap(),
         ProcessWideEntry::Exception => tasks
-            .terminate_process_exception(process, lead, DW_EXCEPTION_PAGE_FAULT, 1, 0x4000)
+            .terminate_process_exception(
+                process,
+                lead,
+                DW_EXCEPTION_PAGE_FAULT,
+                1,
+                0x4000,
+                DW_TERMINATION_UNHANDLED_EXCEPTION,
+            )
             .unwrap(),
         ProcessWideEntry::ProcessTerminate => {
             tasks.terminate_process_authorized(process, 0x22).unwrap()

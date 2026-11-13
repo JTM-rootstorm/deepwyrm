@@ -14460,12 +14460,12 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
 
     // 1 GiB, far over the four-page limit: a two-level index, one page now.
     let pages = 1_u64 << 18;
-    let mut create = |registry: &mut ObjectRegistry<32>,
-                      tasks: &mut Tasks,
-                      roles: &mut crate::memory::frame_roles::FrameRoleManager<16, 16>,
-                      memory: &mut MemoryObjectAuthority<4, 4>,
-                      cleanup: &mut CleanupQueue<32>,
-                      rights: DwRights| {
+    let create = |registry: &mut ObjectRegistry<32>,
+                  tasks: &mut Tasks,
+                  roles: &mut crate::memory::frame_roles::FrameRoleManager<16, 16>,
+                  memory: &mut MemoryObjectAuthority<4, 4>,
+                  cleanup: &mut CleanupQueue<32>,
+                  rights: DwRights| {
         let early = roles.allocate_on_demand_backing(pages);
         let mut access = DeferredMemoryObjectAccess::new(
             crate::memory::usercopy::DeferredUserOutput::new(Some(range)),
@@ -14534,14 +14534,14 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
     )
     .unwrap()
     .expect("an on-demand target");
-    let mut commit = |registry: &mut ObjectRegistry<32>,
-                      roles: &mut crate::memory::frame_roles::FrameRoleManager<16, 16>,
-                      page: u64| {
+    let commit = |registry: &mut ObjectRegistry<32>,
+                  roles: &mut crate::memory::frame_roles::FrameRoleManager<16, 16>,
+                  page: u64| {
         let cost = roles.on_demand_commit_cost(backing, page).unwrap();
-        admit_on_demand_frames(registry, &tasks, object, cost)?;
+        admit_charged_pages(registry, &tasks, object, cost)?;
         let frames = roles.commit_on_demand_page(backing, page).unwrap().frames;
         assert_eq!(frames, cost);
-        record_on_demand_frames(registry, object, frames);
+        record_charged_pages(registry, object, frames);
         Ok::<u64, DwStatus>(frames)
     };
     // A leaf node and the page, then a neighbour in the same leaf.

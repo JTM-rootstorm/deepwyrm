@@ -169,6 +169,10 @@ pub(crate) struct TaskExceptionRecord {
     pub(crate) exception_type: DwExceptionType,
     pub(crate) detail: u32,
     pub(crate) fault_address: u64,
+    /// `DW_TERMINATION_UNHANDLED_EXCEPTION`, or `DW_TERMINATION_RESOURCE_POLICY`
+    /// for a fault on an on-demand page that could not be given a frame
+    /// (DW2 M6 §8.2).
+    pub(crate) reason: deepwyrm_abi::DwTerminationReason,
 }
 
 impl TaskExceptionRecord {
@@ -181,6 +185,15 @@ impl TaskExceptionRecord {
             exception_type,
             detail,
             fault_address,
+            reason: deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION,
+        }
+    }
+
+    /// The same fault, ending the process for a resource it could not get.
+    pub(crate) const fn resource_policy(self) -> Self {
+        Self {
+            reason: deepwyrm_abi::DW_TERMINATION_RESOURCE_POLICY,
+            ..self
         }
     }
 }

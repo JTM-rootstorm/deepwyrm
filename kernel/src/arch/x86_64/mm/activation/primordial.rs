@@ -3999,11 +3999,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .stack_bounds(self.own.scheduled().stack_id)
             .unwrap_or_else(|error| panic!("could not load fresh Thread stack: {error:?}"));
         let state = {
+            let regions = &self.core.regions;
+            let memory = &self.core.memory;
+            let demand = |process, address, execute| {
+                regions.on_demand_return_allowed(process, address, execute, |object| {
+                    memory.object_is_on_demand(object)
+                })
+            };
             let mut paging = self.paging.lock();
             let mut mappings = paging.return_validation_session(
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
+            let mut mappings = OnDemandReturn {
+                inner: &mut mappings,
+                demand: &demand,
+            };
             crate::arch::x86_64::syscall::ValidatedUserReturn::initial(context, &mut mappings)
                 .unwrap_or_else(|error| panic!("invalid fresh Thread return: {error:?}"))
         };
@@ -6049,12 +6060,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
+        let regions = &self.core.regions;
+        let memory = &self.core.memory;
+        let demand = |process, address, execute| {
+            regions.on_demand_return_allowed(process, address, execute, |object| {
+                memory.object_is_on_demand(object)
+            })
+        };
         let mut paging = self.paging.lock();
         let mut mappings = paging.return_validation_session(
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
-        frame.validate_and_sanitize(&mut mappings)
+        frame.validate_and_sanitize(&mut OnDemandReturn {
+            inner: &mut mappings,
+            demand: &demand,
+        })
     }
 
     fn authorize_return(
@@ -6073,12 +6094,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
         }
+        let regions = &self.core.regions;
+        let memory = &self.core.memory;
+        let demand = |process, address, execute| {
+            regions.on_demand_return_allowed(process, address, execute, |object| {
+                memory.object_is_on_demand(object)
+            })
+        };
         let mut paging = self.paging.lock();
         let mut mappings = paging.return_validation_session(
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
-        frame.authorize_return(current_binding_generation, &mut mappings)?;
+        frame.authorize_return(
+            current_binding_generation,
+            &mut OnDemandReturn {
+                inner: &mut mappings,
+                demand: &demand,
+            },
+        )?;
         drop(mappings);
         drop(paging);
         Ok(())
@@ -6698,6 +6732,24 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
         self.terminate_exception_with_remote_stops(record.task_exception());
+    }
+
+    fn user_resource_fault(
+        &mut self,
+        record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) {
+        self.terminate_exception_with_remote_stops(record.task_exception().resource_policy());
+    }
+
+    fn serve_user_page_fault(
+        &mut self,
+        cr2: u64,
+        error: u64,
+    ) -> crate::syscall::native::UserPageFaultOutcome {
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            runtime.serve_user_page_fault(cr2, error)
+        })
+        .unwrap_or(crate::syscall::native::UserPageFaultOutcome::Retry)
     }
 
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> ! {
@@ -8230,9 +8282,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 self.own.active_root.as_ref().expect("active root"),
                 self.own.scheduled().process,
             );
+            let regions = &self.core.regions;
+            let memory = &self.core.memory;
+            let demand = |process, address, execute| {
+                regions.on_demand_return_allowed(process, address, execute, |object| {
+                    memory.object_is_on_demand(object)
+                })
+            };
             crate::syscall::thread_start_prepared(
                 args,
-                &mut validation,
+                &mut OnDemandReturn {
+                    inner: &mut validation,
+                    demand: &demand,
+                },
                 &mut self.core.registry,
                 &mut self.core.tasks,
                 &self.core.shared.execution,
@@ -8723,6 +8785,161 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     // Out of line (D1 option B2): its held releases stay out of the
     // ordinary handler's measured frame.
     #[inline(never)]
+    /// Serves a CPL3 page fault at `cr2` on an on-demand page, under T and
+    /// then P (DW2 M6 §8.5). In this one hold it finds the mapping, checks
+    /// the access against its protection, admits the page and any index
+    /// nodes against the object's creator and any page tables against this
+    /// Process, commits the page, and publishes its one leaf here.
+    fn serve_user_page_fault(
+        &mut self,
+        cr2: u64,
+        error: u64,
+    ) -> crate::syscall::native::UserPageFaultOutcome {
+        use crate::memory::frame_roles::FrameRoleError;
+        use crate::syscall::native::UserPageFaultOutcome as Outcome;
+        const WRITE: u64 = 1 << 1;
+        const FETCH: u64 = 1 << 4;
+        let process = self.own.scheduled().process;
+        let thread = self.own.scheduled().thread;
+        if self.core.tasks.thread_process(thread) != Ok(process)
+            || self.core.shared.execution.current_thread_on(self.cpu()) != Some(thread)
+        {
+            return Outcome::Unserved;
+        }
+        let address = cr2 & !(PAGE_SIZE - 1);
+        let Ok(Some(mapping)) =
+            self.core
+                .regions
+                .root_mapping_at(&self.core.tasks, process, address)
+        else {
+            return Outcome::Unserved;
+        };
+        let protection = mapping.protection();
+        if (error & WRITE != 0 && !protection.writable())
+            || (error & FETCH != 0 && !protection.executable())
+        {
+            return Outcome::Unserved;
+        }
+        let Some(object) = mapping.object_id() else {
+            return Outcome::Unserved;
+        };
+        let backing = mapping.backing().backing_identity();
+        let page =
+            (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE;
+        let mut paging = self.paging.lock();
+        let mut session = paging.page_table_mutation_session(
+            self.own.active_root.as_ref().expect("active root"),
+            process,
+        );
+        if session
+            .select_process_for_return_validation(process)
+            .is_err()
+        {
+            return Outcome::Unserved;
+        }
+        // An eager backing has no commit cost to ask: its page faulting is
+        // not one this serves.
+        let Ok(cost) = session.on_demand_commit_cost(backing, page) else {
+            return Outcome::Unserved;
+        };
+        let tables = {
+            let mut empty: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
+                [const { None }; 3];
+            let Ok(mut publisher) =
+                session.publisher::<3>(mapping.address_space(), mapping.region(), &mut empty)
+            else {
+                return Outcome::Unserved;
+            };
+            match publisher.touch_table_cost(address) {
+                Ok(tables) => tables as u64,
+                Err(_) => return Outcome::Unserved,
+            }
+        };
+        // Admit both before taking a frame (§8.4).
+        if (cost != 0
+            && crate::syscall::admit_charged_pages(
+                &self.core.registry,
+                &self.core.tasks,
+                object,
+                cost,
+            )
+            .is_err())
+            || (tables != 0
+                && crate::syscall::admit_charged_pages(
+                    &self.core.registry,
+                    &self.core.tasks,
+                    process.object_id(),
+                    tables,
+                )
+                .is_err())
+        {
+            return Outcome::Exhausted;
+        }
+        if cost != 0 {
+            match session.commit_on_demand_page(backing, page) {
+                Ok(commit) => crate::syscall::record_charged_pages(
+                    &mut self.core.registry,
+                    object,
+                    commit.frames,
+                ),
+                Err(
+                    FrameRoleError::Physical(_)
+                    | FrameRoleError::Capacity
+                    | FrameRoleError::InitializationFailed,
+                ) => return Outcome::Exhausted,
+                Err(_) => return Outcome::Unserved,
+            }
+        }
+        // The levels missing are the lowest `tables` of PDPT, PD, PT.
+        let mut candidates: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
+            [const { None }; 3];
+        let levels = [
+            crate::memory::frame_roles::TableLevel::Pdpt,
+            crate::memory::frame_roles::TableLevel::Pd,
+            crate::memory::frame_roles::TableLevel::Pt,
+        ];
+        for (slot, level) in levels[3 - tables as usize..].iter().enumerate() {
+            match session.prepare_table_candidate(*level) {
+                Ok(candidate) => candidates[slot] = Some(candidate),
+                Err(_) => {
+                    for candidate in candidates.iter_mut().filter_map(Option::take) {
+                        session.recycle_table_candidate(candidate);
+                    }
+                    return Outcome::Exhausted;
+                }
+            }
+        }
+        let published = {
+            let Ok(mut publisher) =
+                session.publisher::<3>(mapping.address_space(), mapping.region(), &mut candidates)
+            else {
+                panic!("an on-demand fault's publisher was refused after its lookup");
+            };
+            publisher
+                .publish_touched_leaf(&mapping, address)
+                .unwrap_or_else(|error| {
+                    panic!("an on-demand fault could not publish its leaf: {error:?}")
+                })
+        };
+        let unused = candidates.iter().flatten().count() as u64;
+        for candidate in candidates.iter_mut().filter_map(Option::take) {
+            session.recycle_table_candidate(candidate);
+        }
+        let built = tables - unused;
+        if built != 0 {
+            crate::syscall::record_charged_pages(
+                &mut self.core.registry,
+                process.object_id(),
+                built,
+            );
+        }
+        if published || cost != 0 {
+            Outcome::Served
+        } else {
+            Outcome::AlreadyPresent
+        }
+    }
+
     /// One hold of `memory_object_commit`: commits pages from `*next` up to
     /// one step's end, each admitted against the object's creator in this
     /// hold and charged to its weight once committed (DW2 M6 §8.4).
@@ -8761,7 +8978,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .on_demand_commit_cost(backing, page)
                 .map_err(|_| DW_STATUS_BAD_STATE)?;
             if cost != 0 {
-                crate::syscall::admit_on_demand_frames(
+                crate::syscall::admit_charged_pages(
                     &self.core.registry,
                     &self.core.tasks,
                     object,
@@ -8777,7 +8994,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         }
                         _ => DW_STATUS_BAD_STATE,
                     })?;
-                crate::syscall::record_on_demand_frames(
+                crate::syscall::record_charged_pages(
                     &mut self.core.registry,
                     object,
                     commit.frames,
@@ -10054,4 +10271,49 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 enum EarlyBacking {
     Unzeroed(crate::memory::frame_roles::BackingAllocation),
     Ready(crate::memory::frame_roles::ObjectBackingGrant),
+}
+
+/// A return validator that also admits an absent leaf where the Process maps
+/// an on-demand page with the protection the return needs (DW2 M6 §8.5,
+/// review D6). The return then faults, and the fault gate serves it or ends
+/// the Process with the fault's own cause. It reads only: nothing is
+/// committed here.
+struct OnDemandReturn<'v, M> {
+    inner: &'v mut M,
+    /// Whether `(process, address, execute)` is such a page.
+    demand: &'v dyn Fn(ProcessKey, u64, bool) -> bool,
+}
+
+impl<M: crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation>
+    crate::arch::x86_64::syscall::UserReturnMappingValidation for OnDemandReturn<'_, M>
+{
+    fn executable_at(&mut self, address: u64) -> bool {
+        self.inner.executable_at(address) || (self.demand)(self.inner.process_key(), address, true)
+    }
+
+    fn writable_byte_below(&mut self, stack_pointer: u64) -> bool {
+        self.inner.writable_byte_below(stack_pointer)
+            || stack_pointer
+                .checked_sub(1)
+                .is_some_and(|address| (self.demand)(self.inner.process_key(), address, false))
+    }
+}
+
+impl<M: crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation>
+    crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation for OnDemandReturn<'_, M>
+{
+    fn process_key(&self) -> ProcessKey {
+        self.inner.process_key()
+    }
+}
+
+impl<M: crate::syscall::ThreadStartRetarget> crate::syscall::ThreadStartRetarget
+    for OnDemandReturn<'_, M>
+{
+    fn retarget_for_thread_start(
+        &mut self,
+        process: ProcessKey,
+    ) -> Result<(), deepwyrm_abi::DwStatus> {
+        self.inner.retarget_for_thread_start(process)
+    }
 }

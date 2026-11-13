@@ -52,6 +52,17 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
 
     /// Resolves one four-byte, readable mapped word to its stable object key.
     ///
+    /// The mapping containing `virtual_address`, if any (DW2 M6 §8.5).
+    pub(crate) fn mapping_containing(&self, virtual_address: u64) -> Option<Mapping> {
+        self.mappings
+            .iter()
+            .flatten()
+            .find(|mapping| {
+                mapping.virtual_start <= virtual_address && virtual_address < mapping.end()
+            })
+            .copied()
+    }
+
     /// Callers must first validate and hold a live user-range pin for this
     /// exact word.  That pin excludes overlapping publication, so the mapping
     /// and its lease-backed `MemoryObject` remain stable through use of the

@@ -262,6 +262,11 @@ impl Mapping {
         self.protection
     }
 
+    /// The mapped object's identity.
+    pub(crate) const fn object_id(&self) -> Option<ObjectId> {
+        self.object.object_id()
+    }
+
     #[allow(
         dead_code,
         reason = "the architecture publisher uses the opaque lease for publication and invalidation provenance"

@@ -203,6 +203,76 @@ fn user_page_fault_becomes_structured_process_fatal_record() {
     assert_eq!(task.fault_address, 0xdead_beef);
 }
 
+/// DW2 M6 §8.5: a page fault the returning gate does not serve ends with
+/// the very record the terminal path builds, and an exhausted on-demand page
+/// changes only the termination reason.
+#[test]
+fn an_unserved_page_fault_ends_with_the_terminal_record() {
+    for (error, cr2) in [
+        (0x806f, 0xdead_beef),
+        (0x4, 0x7fff_ffff_f000),
+        (0x16, 0x1000),
+    ] {
+        let mut raw = raw_user(14);
+        raw.raw_error_code = error;
+        raw.cr2 = cr2;
+        let ExceptionDisposition::UserFatal(terminal) = classify_raw_exception(raw).unwrap() else {
+            panic!("CPL3 page fault was not classified as user-fatal");
+        };
+        let gate = UserExceptionRecord::user_page_fault(
+            error,
+            cr2,
+            raw.instruction_pointer,
+            raw.stack_pointer,
+        );
+        assert_eq!(gate, terminal);
+        let task = gate.task_exception();
+        assert_eq!(
+            task.reason,
+            deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION
+        );
+        let exhausted = task.resource_policy();
+        assert_eq!(
+            exhausted.reason,
+            deepwyrm_abi::DW_TERMINATION_RESOURCE_POLICY
+        );
+        assert_eq!(
+            (
+                exhausted.exception_type,
+                exhausted.detail,
+                exhausted.fault_address
+            ),
+            (task.exception_type, task.detail, task.fault_address)
+        );
+    }
+}
+
+/// Only a user access to a page not present, at a lower-half address past
+/// page zero, with no reserved-bit, key, shadow-stack or SGX cause, may be
+/// served from an on-demand object.
+#[test]
+fn only_a_plain_user_not_present_fault_may_be_served() {
+    const USER: u64 = 1 << 2;
+    let address = 0x4000_0000;
+    for error in [USER, USER | 1 << 1, USER | 1 << 4] {
+        assert!(page_fault_may_be_served(error, address), "{error:#x}");
+    }
+    for error in [
+        0,
+        1 | USER,
+        USER | 1 << 3,
+        USER | 1 << 5,
+        USER | 1 << 6,
+        USER | 1 << 15,
+    ] {
+        assert!(!page_fault_may_be_served(error, address), "{error:#x}");
+    }
+    for cr2 in [0, 0xfff, 0x0000_8000_0000_0000, 0xffff_8000_0000_0000] {
+        assert!(!page_fault_may_be_served(USER, cr2), "{cr2:#x}");
+    }
+    assert!(page_fault_may_be_served(USER, 0x0000_7fff_ffff_ffff));
+}
+
 #[test]
 fn unnumbered_user_exception_uses_none_plus_raw_vector_detail() {
     let raw = raw_user(7);

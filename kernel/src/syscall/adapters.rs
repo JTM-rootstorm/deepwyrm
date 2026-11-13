@@ -2529,10 +2529,11 @@ pub(crate) fn memory_object_commit_target<
     }
 }
 
-/// Admits `frames` more pages for the on-demand object `object`, against
-/// the tag it was created with: the creator pays for every touch (DW2 M6
-/// §8.4). Runs in the same hold as the commit it admits.
-pub(crate) fn admit_on_demand_frames<
+/// Admits `frames` more pages of weight for the live object `object`,
+/// against the tag it was created with (DW2 M6 §8.4): an on-demand object's
+/// creator pays for every touch, and a Process for the page tables touches
+/// build in its root. Runs in the same hold as the allocation it admits.
+pub(crate) fn admit_charged_pages<
     const OBJECTS: usize,
     const GROUPS: usize,
     const PROCESSES: usize,
@@ -2556,18 +2557,18 @@ pub(crate) fn admit_on_demand_frames<
         .map_err(quota_status)
 }
 
-/// Adds `frames` committed frames to the on-demand object's page weight.
-pub(crate) fn record_on_demand_frames<const OBJECTS: usize>(
+/// Adds `frames` admitted frames to the object's page weight.
+pub(crate) fn record_charged_pages<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     object: crate::object::ObjectId,
     frames: u64,
 ) {
     let (_, pages) = registry
         .charge(object)
-        .unwrap_or_else(|error| panic!("an admitted on-demand object lost its slot: {error:?}"));
+        .unwrap_or_else(|error| panic!("an admitted object lost its slot: {error:?}"));
     registry
         .set_charge_pages(object, pages + frames)
-        .unwrap_or_else(|error| panic!("an on-demand object rejected its weight: {error:?}"));
+        .unwrap_or_else(|error| panic!("an admitted object rejected its weight: {error:?}"));
 }
 
 fn release_held_lookup_pin<const OBJECTS: usize>(
@@ -7609,6 +7610,7 @@ pub(crate) fn prepare_process_unhandled_exception<
         exception.exception_type,
         exception.detail,
         exception.fault_address,
+        exception.reason,
     ) {
         Ok(pins) => pins,
         Err(TaskError::OperationsInFlight) => {
@@ -7626,6 +7628,7 @@ pub(crate) fn prepare_process_unhandled_exception<
                 exception.exception_type,
                 exception.detail,
                 exception.fault_address,
+                exception.reason,
             ) {
                 Ok(pins) => pins,
                 Err(error) => return Err(task_status(error)),

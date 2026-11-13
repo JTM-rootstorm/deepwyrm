@@ -1605,6 +1605,7 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
             exception.exception_type,
             exception.detail,
             exception.fault_address,
+            exception.reason,
         )?;
         let drained = tasks.drain_exited_process_handles(registry, process)?;
         let (pins, deferred_current) =

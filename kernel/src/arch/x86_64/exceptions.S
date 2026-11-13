@@ -43,7 +43,23 @@ ERROR 10
 ERROR 11
 ERROR 12
 ERROR 13
-ERROR 14
+
+/*
+ * #PF (DW2 M6 §8.5): a CPL3 fault takes the returning tail below, which may
+ * serve it from an on-demand MemoryObject and resume the faulting
+ * instruction. A kernel-origin fault keeps the terminal common entry.
+ */
+    .p2align 4
+    .globl dw_x86_64_exception_vector_14
+    .type dw_x86_64_exception_vector_14,@function
+dw_x86_64_exception_vector_14:
+    pushq $14
+    /* vector, error, RIP, then saved CS */
+    testb $3, 24(%rsp)
+    jz .Lexception_common
+    jmp .Luser_page_fault
+    .size dw_x86_64_exception_vector_14, .-dw_x86_64_exception_vector_14
+
 NO_ERROR 15
 NO_ERROR 16
 ERROR 17
@@ -200,6 +216,66 @@ dw_x86_64_apic_timer_entry:
 .Lapic_timer_entry_fail:
     ud2
 .size dw_x86_64_apic_timer_entry, .-dw_x86_64_apic_timer_entry
+
+/*
+ * CPL3 #PF tail (DW2 M6 §8.5). The stub left the vector and error code above
+ * the hardware frame on the CPU-private RSP0 stack. Like the timer entry,
+ * this copies the interrupted context onto the Thread's bound kernel stack
+ * in the 160-byte timer frame layout, without the vector and error words,
+ * and calls the gate with CR2 and the error code captured here. The gate
+ * returns only for a served fault; the exit is the timer entry's.
+ */
+.p2align 4
+.Luser_page_fault:
+    cld
+    /* Clear the user-settable AC so SMAP holds in the handler (DW2 M2). */
+    pushfq
+    btrq $18, (%rsp)
+    popfq
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    /* The 15 register words, then the vector and the error code. */
+    movq %cr2, %r13
+    movq 128(%rsp), %r14
+    swapgs
+    movq %rsp, %rsi
+    movq %gs:DW_GS_CURRENT_STACK_TOP, %rdx
+    testq %rdx, %rdx
+    jz .Luser_page_fault_fail
+    subq $DW_TIMER_FRAME_SIZE, %rdx
+    movq %rdx, %rdi
+    movl $15, %ecx
+    cld
+    rep movsq
+    /* Skip the vector and error words; copy RIP, CS, RFLAGS, RSP and SS. */
+    addq $16, %rsi
+    movl $5, %ecx
+    rep movsq
+    movq %rdx, %rsp
+    movq %rsp, %r12
+    movq %rsp, %rdi
+    movq %r13, %rsi
+    movq %r14, %rdx
+    andq $-16, %rsp
+    callq dw_x86_64_user_page_fault_gate
+    movq %r12, %rsp
+    swapgs
+    jmp .Lapic_timer_restore
+.Luser_page_fault_fail:
+    ud2
 
 .p2align 4
 .globl dw_x86_64_apic_error_entry

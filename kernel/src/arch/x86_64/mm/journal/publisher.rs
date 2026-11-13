@@ -215,9 +215,48 @@ where
     /// empty to present needs no shootdown and changes no pinned
     /// translation. `Ok(false)` when the leaf already maps that frame, as
     /// after another CPU's touch.
-    #[allow(
-        dead_code,
-        reason = "the fault gate and fill-in (DW2 M6 steps 3 and 4) are its live callers"
+    /// How many page tables publishing a leaf at `address` would build
+    /// (DW2 M6 §8.4), so a caller can admit them before taking candidates.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "the live fault gate is its only caller outside tests"
+        )
+    )]
+    pub(crate) fn touch_table_cost(
+        &mut self,
+        address: u64,
+    ) -> Result<usize, X86AddressSpacePublishError<T::Error>> {
+        let page =
+            VirtualPage::new(address).map_err(|_| X86AddressSpacePublishError::InvalidMapping)?;
+        let mut journal = OwnedPageTableJournal::<
+            _,
+            RANGE_CAPACITY,
+            ROLE_CAPACITY,
+            CANDIDATE_CAPACITY,
+            ENTRY_CAPACITY,
+            INVALIDATION_CAPACITY,
+        >::new(
+            self.target,
+            self.storage,
+            self.roles,
+            self.root_identity,
+            self.root.physical_limit(),
+            self.candidates,
+        )
+        .map_err(X86AddressSpacePublishError::FrameRole)?;
+        self.root
+            .missing_tables(&mut journal, page)
+            .map_err(X86AddressSpacePublishError::Map)
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "the live fault gate is its only caller outside tests"
+        )
     )]
     pub(crate) fn publish_touched_leaf(
         &mut self,

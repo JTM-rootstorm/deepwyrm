@@ -921,6 +921,14 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         Ok((slot, rounded_byte_len))
     }
 
+    /// Whether the live object `object` is on demand (DW2 M6).
+    pub(crate) fn object_is_on_demand(&self, object: ObjectId) -> bool {
+        self.object_record(MemoryObjectKey {
+            object: Some(object),
+        })
+        .is_ok_and(|record| record.kind == MemoryObjectKind::OnDemand)
+    }
+
     pub(crate) fn object_info(
         &self,
         object: MemoryObjectKey,

@@ -188,6 +188,8 @@ type RendezvousReaperHandler = unsafe fn(*mut ()) -> !;
 type QuantumExpiryHandler = unsafe fn(*mut (), crate::task::SchedulerQuantumTicket) -> bool;
 type PrepareQuantumHandler = unsafe fn(*mut ()) -> Option<crate::task::SchedulerQuantumTicket>;
 type TimerPreIretHandler = unsafe fn(*mut (), &mut super::frame::RawCpl3TimerReturnFrame);
+type UserPageFaultHandler =
+    unsafe fn(*mut (), &mut super::frame::RawCpl3TimerReturnFrame, u64, u64);
 
 #[derive(Clone, Copy)]
 struct RuntimeBindingState {
@@ -204,6 +206,7 @@ struct RuntimeBindingState {
     quantum_expiry_handler: QuantumExpiryHandler,
     prepare_quantum_handler: PrepareQuantumHandler,
     timer_pre_iret_handler: TimerPreIretHandler,
+    user_page_fault_handler: UserPageFaultHandler,
 }
 
 struct RuntimeStorage(UnsafeCell<MaybeUninit<RuntimeBindingState>>);
@@ -241,6 +244,9 @@ enum TerminalAction {
     CompleteCurrent,
     InvalidReturn(super::frame::UserReturnError),
     UserException(crate::arch::x86_64::exceptions::UserExceptionRecord),
+    /// A fault on an on-demand page that could not be given a frame (DW2 M6
+    /// §8.2): the process ends with `DW_TERMINATION_RESOURCE_POLICY`.
+    UserResourceFault(crate::arch::x86_64::exceptions::UserExceptionRecord),
 }
 
 const RENDEZVOUS_ACTION_EMPTY: u8 = 0;
@@ -1118,6 +1124,7 @@ pub(crate) unsafe fn bind_native_runtime_carrier_for_slot<
             native_runtime_quantum_expiry::<R::QuantumExpiry>,
             native_runtime_prepare_quantum::<R>,
             native_runtime_timer_pre_iret::<R>,
+            native_runtime_user_page_fault::<R>,
         )
     }?;
     RUNTIME_CARRIER_LIFECYCLES
@@ -1212,6 +1219,7 @@ unsafe fn publish_syscall_runtime(
     quantum_expiry_handler: QuantumExpiryHandler,
     prepare_quantum_handler: PrepareQuantumHandler,
     timer_pre_iret_handler: TimerPreIretHandler,
+    user_page_fault_handler: UserPageFaultHandler,
 ) -> Result<(), SyscallRuntimeBindError> {
     if quantum_expiry_context.is_null() {
         return Err(SyscallRuntimeBindError::NullContext);
@@ -1260,6 +1268,7 @@ unsafe fn publish_syscall_runtime(
             quantum_expiry_handler,
             prepare_quantum_handler,
             timer_pre_iret_handler,
+            user_page_fault_handler,
         });
     }
     state.store(RUNTIME_BOUND, Ordering::Release);
@@ -1637,6 +1646,173 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_timer_pre_iret_gate(
     unsafe { (binding.timer_pre_iret_handler)(binding.context, &mut *frame) }
 }
 
+/// The record a CPL3 page fault ends with when it is not served: exactly
+/// the one the terminal exception path builds (DW2 M6 §8.5).
+fn user_page_fault_record(
+    frame: &super::frame::RawCpl3TimerReturnFrame,
+    cr2: u64,
+    error: u64,
+) -> crate::arch::x86_64::exceptions::UserExceptionRecord {
+    crate::arch::x86_64::exceptions::UserExceptionRecord::user_page_fault(
+        error, cr2, frame.rip, frame.rsp,
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the terminal action is staged in CPU-local storage and the faulting Thread's stack is abandoned before runtime mutation"
+)]
+fn end_user_page_fault<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    context: *mut (),
+    action: TerminalAction,
+) -> ! {
+    stage_terminal_action(action).unwrap_or_else(|_| halt_forever());
+    handoff_to_terminal_reaper::<R>(context)
+}
+
+/// The last unproductive page fault each CPU served: thread-agnostic
+/// `(rip, cr2, error)`, zero when the last one made progress (DW2 M6 §8.5's
+/// loop guard).
+static LAST_IDLE_FAULT: [[core::sync::atomic::AtomicU64; 3];
+    crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 3] };
+        crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT];
+
+/// Serves a CPL3 page fault on an on-demand page and returns to the faulting
+/// instruction, or ends the process (DW2 M6 §8.5). Every fault the runtime
+/// does not serve ends with the record the terminal path would have built.
+#[allow(
+    unsafe_code,
+    reason = "the fault frame stays on the current Thread's bound stack; carrier reborrows are scoped"
+)]
+unsafe fn native_runtime_user_page_fault<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    mut context: *mut (),
+    frame: &mut super::frame::RawCpl3TimerReturnFrame,
+    cr2: u64,
+    error: u64,
+) {
+    use crate::syscall::native::UserPageFaultOutcome;
+    let record = user_page_fault_record(frame, cr2, error);
+    if !crate::arch::x86_64::exceptions::page_fault_may_be_served(error, cr2) {
+        end_user_page_fault::<R>(context, TerminalAction::UserException(record));
+    }
+    let outcome = loop {
+        poll_timer_return_stop(context);
+        validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
+        // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the fault gate has no other
+        // Rust frame on this CPU that holds one.
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        match runtime.serve_user_page_fault(cr2, error) {
+            UserPageFaultOutcome::Retry => continue,
+            outcome => break outcome,
+        }
+    };
+    let cpu = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
+    let last = LAST_IDLE_FAULT.get(cpu).unwrap_or_else(|| halt_forever());
+    match outcome {
+        UserPageFaultOutcome::Served => {
+            for word in last {
+                word.store(0, Ordering::Relaxed);
+            }
+        }
+        UserPageFaultOutcome::AlreadyPresent => {
+            // Spurious once (another CPU's touch); twice at the same place
+            // with nothing done in between is a loop.
+            let key = [frame.rip, cr2, error];
+            if last
+                .iter()
+                .zip(key)
+                .all(|(word, value)| word.load(Ordering::Relaxed) == value)
+            {
+                end_user_page_fault::<R>(context, TerminalAction::UserException(record));
+            }
+            for (word, value) in last.iter().zip(key) {
+                word.store(value, Ordering::Relaxed);
+            }
+        }
+        UserPageFaultOutcome::Unserved => {
+            end_user_page_fault::<R>(context, TerminalAction::UserException(record));
+        }
+        UserPageFaultOutcome::Exhausted => {
+            end_user_page_fault::<R>(context, TerminalAction::UserResourceFault(record));
+        }
+        UserPageFaultOutcome::Retry => unreachable!("the serve loop retries"),
+    }
+    // Return as the timer gate does, but without a fresh quantum: a thread
+    // that faults often must still expire. Only a switch arms one, for the
+    // Thread that resumes.
+    poll_timer_return_stop(context);
+    {
+        // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        if let Err(error) = runtime.authorize_timer_return(frame) {
+            invalid_bound_return::<R>(context, error);
+        }
+    }
+    let has_request = {
+        // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        runtime.has_reschedule_request()
+    };
+    if has_request {
+        let plan = {
+            // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
+            let runtime = unsafe { &mut *context.cast::<R>() };
+            // SAFETY: this is a safe-boundary gate on the current Thread's bound kernel stack, the
+            // trait method's `# Safety`; the plan is consumed immediately below.
+            unsafe { runtime.prepare_preemption() }
+        };
+        match plan {
+            crate::syscall::native::NativePreemptionPlan::Return => {}
+            crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
+                switch_kernel_context(plan);
+                context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+                // SAFETY: [CARRIER] `context` was re-read from this CPU's binding after the switch.
+                let runtime = unsafe { &mut *context.cast::<R>() };
+                if let Err(error) = runtime.resume_timer_preemption(frame) {
+                    invalid_bound_return::<R>(context, error);
+                }
+                // The resumed Thread gets its quantum through the timer
+                // gate's own loop, as after a timer switch.
+                // SAFETY: the frame is still on this Thread's bound stack.
+                unsafe { native_runtime_timer_pre_iret::<R>(context, frame) };
+                return;
+            }
+        }
+    }
+    poll_timer_return_stop(context);
+}
+
+/// Fixed assembly seam for a CPL3 page fault (DW2 M6 §8.5). `frame` is the
+/// interrupted context, copied onto the Thread's bound stack in the timer
+/// frame's layout; `cr2` and `error` were captured at entry. Returning means
+/// the fault was served and the frame revalidated for the scheduler-current
+/// Thread; otherwise this never returns.
+#[allow(
+    unsafe_code,
+    reason = "the audited assembly supplies the complete in-place 160-byte frame"
+)]
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "sysv64" fn dw_x86_64_user_page_fault_gate(
+    frame: *mut super::frame::RawCpl3TimerReturnFrame,
+    cr2: u64,
+    error: u64,
+) {
+    if frame.is_null() || (frame as usize) & 7 != 0 {
+        halt_forever();
+    }
+    let binding = runtime_binding().unwrap_or_else(|| halt_forever());
+    // SAFETY: [CARRIER] this CPU's immutable binding and its matching handler. [FRAME] the frame
+    // was checked non-null and aligned above.
+    unsafe { (binding.user_page_fault_handler)(binding.context, &mut *frame, cr2, error) }
+}
+
 #[allow(
     unsafe_code,
     reason = "the current CPU exclusively stages one Copy terminal action before Release publication to its GS-selected reaper"
@@ -1792,6 +1968,9 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
         }
         TerminalAction::UserException(record) => {
             carrier.get().user_exception(record);
+        }
+        TerminalAction::UserResourceFault(record) => {
+            carrier.get().user_resource_fault(record);
         }
     }
     R::terminate_current(carrier)
@@ -2457,6 +2636,7 @@ impl<
                     native_runtime_quantum_expiry::<R::QuantumExpiry>,
                     native_runtime_prepare_quantum::<R>,
                     native_runtime_timer_pre_iret::<R>,
+                    native_runtime_user_page_fault::<R>,
                 )
             }
             .unwrap_or_else(|_| halt_forever());

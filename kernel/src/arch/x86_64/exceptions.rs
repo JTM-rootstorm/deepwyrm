@@ -266,6 +266,46 @@ impl UserExceptionRecord {
     pub(crate) const fn task_exception(self) -> crate::task::TaskExceptionRecord {
         crate::task::TaskExceptionRecord::new(self.exception_type, self.detail, self.fault_address)
     }
+
+    /// The record of a CPL3 page fault, as the terminal path builds it: the
+    /// returning page-fault gate ends with exactly this one when it does not
+    /// serve the fault (DW2 M6 §8.5).
+    pub(crate) fn user_page_fault(error: u64, cr2: u64, rip: u64, rsp: u64) -> Self {
+        let vector = ExceptionVector::PageFault;
+        Self {
+            exception_type: vector.native_exception_type().unwrap_or(DW_EXCEPTION_NONE),
+            vector: 14,
+            detail: error as u32,
+            reserved: 0,
+            fault_address: cr2,
+            instruction_pointer: rip,
+            stack_pointer: rsp,
+        }
+    }
+}
+
+/// Whether a CPL3 page fault may be one an on-demand page serves (DW2 M6
+/// §8.5): a user access to a page not present, with no reserved-bit,
+/// protection-key, shadow-stack or SGX cause, at a canonical lower-half
+/// address. Every other fault is terminal before any lock is taken.
+#[cfg_attr(
+    not(all(target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "the live fault gate is its only caller outside tests"
+    )
+)]
+pub(crate) const fn page_fault_may_be_served(error: u64, cr2: u64) -> bool {
+    const PRESENT: u64 = 1 << 0;
+    const USER: u64 = 1 << 2;
+    const RESERVED: u64 = 1 << 3;
+    const PROTECTION_KEY: u64 = 1 << 5;
+    const SHADOW_STACK: u64 = 1 << 6;
+    const SGX: u64 = 1 << 15;
+    error & (PRESENT | RESERVED | PROTECTION_KEY | SHADOW_STACK | SGX) == 0
+        && error & USER != 0
+        && cr2 >= 0x1000
+        && cr2 < 0x0000_8000_0000_0000
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +357,16 @@ pub(crate) fn classify_raw_exception(
         } else {
             u32::from(vector_number)
         };
+        if matches!(vector, ExceptionVector::PageFault) {
+            return Ok(ExceptionDisposition::UserFatal(
+                UserExceptionRecord::user_page_fault(
+                    raw.raw_error_code,
+                    raw.cr2,
+                    raw.instruction_pointer,
+                    raw.stack_pointer,
+                ),
+            ));
+        }
         return Ok(ExceptionDisposition::UserFatal(UserExceptionRecord {
             exception_type: vector.native_exception_type().unwrap_or(DW_EXCEPTION_NONE),
             vector: u32::from(vector_number),

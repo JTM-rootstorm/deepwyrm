@@ -796,6 +796,29 @@ impl PageTableRoot {
         commit(access, &plan)
     }
 
+    /// How many page tables mapping `page` would build: the levels below the
+    /// first empty entry on its path, 0 to 3 (DW2 M6 §8.4).
+    pub fn missing_tables<A: PageTableTransaction>(
+        &self,
+        access: &mut A,
+        page: VirtualPage,
+    ) -> Result<usize, MapError<A::Error>> {
+        validate_page_half(page)?;
+        let user = page.is_user_half();
+        let mut current = self.frame;
+        for (depth, level) in (1..=3).rev().enumerate() {
+            let entry = access
+                .read_entry(current, page.index(level))
+                .map_err(MapError::Access)?;
+            if entry == 0 {
+                return Ok(3 - depth);
+            }
+            current = decode_intermediate(entry, user, self.physical_limit())
+                .map_err(|_| MapError::InvalidPath)?;
+        }
+        Ok(0)
+    }
+
     /// The frame of the present leaf at `page`, or `None` when the leaf or
     /// any table above it is empty. A page of an on-demand object may be
     /// present in one address space and absent in another (DW2 M6 §8.6).

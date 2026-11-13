@@ -261,6 +261,19 @@ impl Fixture {
             .physical_start
     }
 
+    /// How many tables a touch at `address` would build.
+    fn table_cost(&mut self, address: u64) -> usize {
+        let mut publisher = Self::publisher(
+            &mut self.roles,
+            self.root,
+            &self.page_tables,
+            &mut self.candidates,
+            &self.region,
+            &mut self.target,
+        );
+        publisher.touch_table_cost(address).unwrap()
+    }
+
     /// Publishes the leaf a touch at `address` needs.
     fn touch(&mut self, address: u64) -> Result<bool, X86AddressSpacePublishError<()>> {
         let mapping: Mapping = self
@@ -333,8 +346,12 @@ fn a_touch_publishes_one_leaf_and_a_second_touch_finds_it() {
         ))
     );
     let frame = fixture.commit(0);
+    // No table exists yet: the touch builds a PDPT, a PD and a PT, and
+    // after it the rest of the object needs none.
+    assert_eq!(fixture.table_cost(START), 3);
     assert_eq!(fixture.touch(START), Ok(true));
     assert_eq!(fixture.leaf(START), Some((frame, true)));
+    assert_eq!(fixture.table_cost(ALIAS), 0);
     // The alias shares the frame but not the leaf.
     assert_eq!(fixture.leaf(ALIAS), None);
     assert_eq!(fixture.touch(START), Ok(false), "a spurious second touch");

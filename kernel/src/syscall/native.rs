@@ -1242,6 +1242,22 @@ impl NativeQuantumExpiry for NoQuantumExpiry {
     }
 }
 
+/// What the runtime did with a CPL3 page fault (DW2 M6 §8.5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserPageFaultOutcome {
+    /// A frame was committed or a leaf published: return and retry.
+    Served,
+    /// The leaf was already present with that frame (a spurious fault).
+    AlreadyPresent,
+    /// Not an on-demand page this access may touch: today's terminal fault.
+    Unserved,
+    /// An on-demand page that could not be given a frame: the process ends
+    /// with `DW_TERMINATION_RESOURCE_POLICY`.
+    Exhausted,
+    /// The runtime could not reach a safe point: poll for a stop and retry.
+    Retry,
+}
+
 #[allow(
     unsafe_code,
     reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
@@ -1312,6 +1328,23 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// current Process. The exception trampoline performs the divergent
     /// reaper-stack handoff after this method returns.
     fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord);
+
+    /// Ends the current Process for a fault on an on-demand page that could
+    /// not be given a frame, with `DW_TERMINATION_RESOURCE_POLICY` (DW2 M6
+    /// §8.2). A runtime without on-demand objects never stages one.
+    fn user_resource_fault(
+        &mut self,
+        record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) {
+        self.user_exception(record);
+    }
+
+    /// Serves a CPL3 page fault at `cr2` with error code `error` if it lies
+    /// on an on-demand page the faulting access may touch (DW2 M6 §8.5). A
+    /// runtime without on-demand objects serves none.
+    fn serve_user_page_fault(&mut self, _cr2: u64, _error: u64) -> UserPageFaultOutcome {
+        UserPageFaultOutcome::Unserved
+    }
 
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> !
     where

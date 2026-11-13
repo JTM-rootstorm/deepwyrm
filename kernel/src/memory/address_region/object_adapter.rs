@@ -222,6 +222,56 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(&mut self.record_mut(key)?.region)
     }
 
+    /// Whether `process`'s own address space maps an on-demand page at
+    /// `address` with write (or, with `execute`, execute) protection: a
+    /// return there may find the leaf absent and fault it in (DW2 M6 §8.5).
+    /// `on_demand` says whether a mapped object is on demand.
+    pub(crate) fn on_demand_return_allowed(
+        &self,
+        process: ProcessKey,
+        address: u64,
+        execute: bool,
+        on_demand: impl Fn(ObjectId) -> bool,
+    ) -> bool {
+        self.records
+            .iter()
+            .flatten()
+            .filter(|record| record.process == process.object_id() && record.owns_address_space)
+            .filter_map(|record| record.region.mapping_containing(address))
+            .any(|mapping| {
+                let protection = mapping.protection();
+                (if execute {
+                    protection.executable()
+                } else {
+                    protection.writable()
+                }) && mapping.object_id().is_some_and(&on_demand)
+            })
+    }
+
+    /// The mapping containing `address` in `process`'s own root region: the
+    /// one a page fault at `address` touches (DW2 M6 §8.5).
+    pub(crate) fn root_mapping_at<
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &self,
+        tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        process: ProcessKey,
+        address: u64,
+    ) -> Result<Option<Mapping>, AddressRegionObjectError> {
+        let root = tasks
+            .root_region(process)
+            .map_err(AddressRegionObjectError::Task)?
+            .ok_or(AddressRegionObjectError::WrongProcess)?;
+        let record = self.record(AddressRegionObjectKey::from_object_id(root))?;
+        if record.process != process.object_id() || !record.owns_address_space {
+            return Err(AddressRegionObjectError::WrongProcess);
+        }
+        Ok(record.region.mapping_containing(address))
+    }
+
     /// Resolves a pinned current-process virtual word without exposing the
     /// root-region payload or permitting a handle-selected foreign region.
     #[cfg(test)]

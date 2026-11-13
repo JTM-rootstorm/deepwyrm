@@ -354,6 +354,10 @@ extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {{}}
 #[unsafe(no_mangle)]
 extern "sysv64" fn dw_x86_64_timer_pre_iret_gate(_frame: *mut u64) {{}}
 
+#[allow(unsafe_code, reason = "fixed symbol required by the audited DW2 M6 CPL3 page-fault boundary")]
+#[unsafe(no_mangle)]
+extern "sysv64" fn dw_x86_64_user_page_fault_gate(_frame: *mut u64, _cr2: u64, _error: u64) {{}}
+
 #[allow(unsafe_code, reason = "fixed symbol required by the audited terminal APIC assembly boundary")]
 #[unsafe(no_mangle)]
 extern "sysv64" fn dw_x86_64_terminal_interrupt_dispatch(_vector: u64) -> ! {{

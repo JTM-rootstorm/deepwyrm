@@ -1257,9 +1257,10 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         exception_type: DwExceptionType,
         detail: u32,
         fault_address: u64,
+        reason: deepwyrm_abi::DwTerminationReason,
     ) -> Result<ExitPins<THREADS>, TaskError> {
         let fault = TerminationRecord {
-            reason: deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION,
+            reason,
             application_code: 0,
             exception_type,
             detail,

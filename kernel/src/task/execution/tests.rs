@@ -855,6 +855,7 @@ fn ap_exception_retires_exact_cpu_generation_before_reclaim() {
             DW_EXCEPTION_PAGE_FAULT,
             0x84,
             0x0000_0000_4141_5000,
+            deepwyrm_abi::DW_TERMINATION_UNHANDLED_EXCEPTION,
         )
         .unwrap();
     assert_eq!(
