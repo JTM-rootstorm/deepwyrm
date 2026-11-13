@@ -138,12 +138,12 @@ The publisher holds only `&mut FrameRoleManager` while the object authority is h
 
 - An allocator-owned object backing is a **chain of runs**. Each run is one role slot with record `ObjectBacking { head, object_offset, next }`: the head run's identity names the backing, `object_offset` is where the run starts in the object, `next` is the following run's slot and generation (or none). The head is the run at offset 0.
 - `ObjectBackingGrant` stays the one move-only typed token D0 §5 requires: the head identity, the total length and the run count. Cancelling it walks the chain and frees every run whole, so M1's invariant (each run holds one slot for life and is freed whole) and the free-list bound still hold.
-- A chain holds at most `MAX_BACKING_RUNS` = 64 runs. That bounds a page lookup and makes a request that would need more runs fail with no memory rather than degrade.
-- `MemoryObjectRange` keeps the head identity and the object offset and drops `physical_start`; `ObjectRecord.physical_start` goes. Resolution is the role manager's: `resolve_object_page(head, offset) → (run identity, physical)`, walking the chain (at most 64 steps). A sequential walk over a mapping keeps its place in the chain, so a whole mapping costs one chain walk.
+- A chain has no run limit (Mike, 2026-11-12: a request fails only when RAM is actually exhausted, §6.7). A lookup is bounded by the object's page count, since every run is at least one page.
+- `MemoryObjectRange` keeps the head identity and the object offset and drops `physical_start`; `ObjectRecord.physical_start` goes. Resolution is the role manager's: `resolve_object_page(head, offset) → (run identity, physical)`, walking the chain. A sequential walk over a mapping keeps its place in the chain, so a whole mapping costs one chain walk.
 
 ### 6.3 Allocation: largest first
 
-`allocate_scattered(pages)` takes runs of `min(remaining, largest free run)` until the request is met, failing (and freeing what it took) past 64 runs or when memory runs out. The physical allocator gains a largest-free-run query. When memory is not fragmented this is one run, exactly as today. Zeroing goes through the direct map run by run. The user path and the boot path share one function instead of today's two copies.
+`allocate_scattered(pages)` takes runs of `min(remaining, largest free run)` until the request is met, failing (and freeing what it took) only when memory runs out. The physical allocator gains a largest-free-run query. When memory is not fragmented this is one run, exactly as today. Zeroing goes through the direct map run by run. The user path and the boot path share one function instead of today's two copies.
 
 ### 6.4 Consumers
 
@@ -165,5 +165,23 @@ Each step keeps the tree building and its tests passing; until step 4 every back
 
 ### 6.6 Open choices (defaults taken unless Mike says otherwise)
 
-- `MAX_BACKING_RUNS` = 64. Larger costs only lookup time; smaller fails earlier under fragmentation.
+- ~~`MAX_BACKING_RUNS` = 64~~: dropped, see §6.7.
 - No minimum run size: a fragmented request may use 4 KiB runs. 2 MiB user pages (later stage) will want 2 MiB-aligned runs and can add a preference then.
+
+### 6.7 Allocation fails only at real exhaustion (Mike, 2026-11-12)
+
+Mike: any number of programs should run as long as together they do not ask for more RAM than exists; an OOM killer may come later. Two parts of the design above broke that, and change:
+
+- **No run limit per object.** A 64-run cap would fail a fragmented request with RAM still free. Lookup cost grows with the run count instead; sequential walks (publisher, zeroing, boot writes, DMA) keep their place in the chain, so they stay linear in pages.
+- **One role slot per allocator page** instead of one per 2 MiB. Every run takes one slot and holds at least one page, so slots cannot run out before pages do; the free-list bound (M1) follows the slot count. This costs one `RoleSlot` per 4 KiB of RAM, so `RoleSlot` is kept small. The grown-table change lands with M3 step 1.
+- **Not in M3:** other fixed per-kernel limits that could stop a new program while RAM is free (object, handle, task tables) need their own survey, and an OOM killer is policy: the kernel would supply mechanism (per-job memory accounting, a low-memory signal, job termination already exists) and Wyrmroot would choose the victim (CLAUDE.md §6).
+
+### 6.8 Later: fragmentation that stays fast (Mike, 2026-11-12; not M3)
+
+Mike: fragmented memory must not make the kernel slow; this and the OOM killer come after M3. Three places get slow as fragmentation grows, and each has a fix that keeps M3's interfaces (`resolve_object_page` and the in-order segment walk), so M3 does not need redoing:
+
+1. **Page lookup in an object** (a chain walk, linear in runs). Once a backing exceeds a small run count (about 16), it gets a **per-object index**: a 512-way radix tree keyed by object page, shaped like a page table, whose leaves name the run and physical page. Lookup is at most 4 steps however fragmented the object is. Index nodes are allocator pages under their own role, owned by the backing and freed with it, about one node per 2 MiB of object. Short chains keep the plain walk.
+2. **The physical allocator** (first-fit over a sorted free list, and the largest-run query, both linear in free ranges). Replace it with a **buddy allocator**: power-of-two blocks in per-order free lists with a bitmap, so allocation, freeing, merging and the largest-free-block query are each O(log memory). The M1 free-list bound goes away with it. Scattered allocation then takes the largest available blocks.
+3. **Fragmentation itself.** Buddy merging keeps fragmentation low. Where it does not, **compaction** moves object pages to make room: copy, republish the mappings through the journal, and shoot down stale TLB entries. Pages pinned for DMA or by an in-flight operation are not moved. It runs when a large request fails, before the OOM path.
+
+Order: the buddy allocator first, since it also speeds up today's single-run allocation, then the object index, then compaction. The OOM killer (§6.7) comes after compaction, so it only runs when memory is really full, not merely fragmented.
