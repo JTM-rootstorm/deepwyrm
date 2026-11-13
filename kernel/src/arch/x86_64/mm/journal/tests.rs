@@ -1678,3 +1678,6 @@ fn a_backing_split_across_runs_maps_each_page_to_its_run() {
 
 #[path = "batch_tests.rs"]
 mod batch;
+
+#[path = "on_demand_tests.rs"]
+mod on_demand_tests;

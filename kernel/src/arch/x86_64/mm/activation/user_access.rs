@@ -65,6 +65,28 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.session.prepare_table_candidate(level)
     }
 
+    /// Frames committing object page `page` of the on-demand `backing`
+    /// would take (DW2 M6 §8.4).
+    pub(crate) fn on_demand_commit_cost(
+        &self,
+        backing: crate::memory::frame_roles::BackingIdentity,
+        page: u64,
+    ) -> Result<u64, crate::memory::frame_roles::FrameRoleError> {
+        self.session.roles.on_demand_commit_cost(backing, page)
+    }
+
+    /// Gives object page `page` of the on-demand `backing` a zeroed frame.
+    pub(crate) fn commit_on_demand_page(
+        &mut self,
+        backing: crate::memory::frame_roles::BackingIdentity,
+        page: u64,
+    ) -> Result<
+        crate::memory::frame_roles::OnDemandCommit,
+        crate::memory::frame_roles::FrameRoleError,
+    > {
+        self.session.roles.commit_on_demand_page(backing, page)
+    }
+
     pub(crate) fn recycle_table_candidate(&mut self, candidate: TableCandidateGrant) {
         self.session.recycle_table_candidate(candidate);
     }
@@ -1276,6 +1298,17 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<crate::memory::frame_roles::BackingAllocation, LiveUserAccessError> {
         self.roles
             .allocate_backing(page_count)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+    }
+
+    /// A new on-demand MemoryObject's backing: its index root, zeroed, and
+    /// no pages (DW2 M6 §8.3).
+    pub(crate) fn allocate_on_demand_backing(
+        &mut self,
+        page_count: u64,
+    ) -> Result<crate::memory::frame_roles::ObjectBackingGrant, LiveUserAccessError> {
+        self.roles
+            .allocate_on_demand_backing(page_count)
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)
     }
 

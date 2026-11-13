@@ -29,8 +29,10 @@ mod index;
 #[path = "frame_roles/manager.rs"]
 mod manager;
 use chain::ChainState;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use index::OnDemandCommit;
+pub(crate) use index::{INDEX_MAX_PAGES, IndexMemory};
 use index::{IndexEntryLink, IndexRootLink};
-pub(crate) use index::IndexMemory;
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]
 mod test_support;

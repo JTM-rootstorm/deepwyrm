@@ -300,7 +300,9 @@ fn memory_object_info_reports_exact_logical_size() {
             size: DW_MEMORY_OBJECT_INFO_V1_SIZE,
             version: 1,
             byte_size: PAGE_SIZE + 1,
-            reserved: [0; 2],
+            flags: deepwyrm_abi::DwMemoryObjectCreateFlags(0),
+            reserved0: 0,
+            reserved: 0,
         })
     );
 

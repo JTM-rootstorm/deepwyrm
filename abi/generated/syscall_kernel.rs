@@ -16,6 +16,7 @@ pub enum DwSyscallImplementationPhase {
     Dw1D = 8,
     Dw2S = 9,
     Dw2T = 10,
+    Dw2M = 11,
 }
 
 impl DwSyscallImplementationPhase {
@@ -41,6 +42,7 @@ pub enum DwKnownSyscall {
     ThreadTerminate,
     ThreadSetFsBase,
     MemoryObjectCreate,
+    MemoryObjectCommit,
     AddressRegionMap,
     AddressRegionUnmap,
     AddressRegionProtect,
@@ -88,6 +90,7 @@ impl DwKnownSyscall {
             0x00010023 => Some(Self::ThreadTerminate),
             0x00010024 => Some(Self::ThreadSetFsBase),
             0x00020001 => Some(Self::MemoryObjectCreate),
+            0x00020002 => Some(Self::MemoryObjectCommit),
             0x00020010 => Some(Self::AddressRegionMap),
             0x00020011 => Some(Self::AddressRegionUnmap),
             0x00020012 => Some(Self::AddressRegionProtect),
@@ -136,6 +139,7 @@ impl DwKnownSyscall {
             Self::ThreadTerminate => DwSyscallId(0x00010023),
             Self::ThreadSetFsBase => DwSyscallId(0x00010024),
             Self::MemoryObjectCreate => DwSyscallId(0x00020001),
+            Self::MemoryObjectCommit => DwSyscallId(0x00020002),
             Self::AddressRegionMap => DwSyscallId(0x00020010),
             Self::AddressRegionUnmap => DwSyscallId(0x00020011),
             Self::AddressRegionProtect => DwSyscallId(0x00020012),
@@ -183,6 +187,7 @@ impl DwKnownSyscall {
             Self::ThreadTerminate => DwSyscallImplementationPhase::Dw0E,
             Self::ThreadSetFsBase => DwSyscallImplementationPhase::Dw2T,
             Self::MemoryObjectCreate => DwSyscallImplementationPhase::Dw0C,
+            Self::MemoryObjectCommit => DwSyscallImplementationPhase::Dw2M,
             Self::AddressRegionMap => DwSyscallImplementationPhase::Dw0C,
             Self::AddressRegionUnmap => DwSyscallImplementationPhase::Dw0C,
             Self::AddressRegionProtect => DwSyscallImplementationPhase::Dw0C,
@@ -230,6 +235,7 @@ impl DwKnownSyscall {
             Self::ThreadTerminate => 3,
             Self::ThreadSetFsBase => 1,
             Self::MemoryObjectCreate => 4,
+            Self::MemoryObjectCommit => 3,
             Self::AddressRegionMap => 5,
             Self::AddressRegionUnmap => 3,
             Self::AddressRegionProtect => 4,

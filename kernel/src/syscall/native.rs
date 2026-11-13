@@ -82,6 +82,11 @@ pub(crate) enum NativeSyscallRequest {
         requested_rights: DwRights,
         out_handle: DwUserAddress,
     },
+    MemoryObjectCommit {
+        memory_object: DwHandle,
+        offset: u64,
+        byte_len: u64,
+    },
     AddressRegionMap {
         address_region: DwHandle,
         memory_object: DwHandle,
@@ -305,6 +310,11 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
             flags: u32_arg(a[1])?,
             requested_rights: DwRights(a[2]),
             out_handle: DwUserAddress(a[3]),
+        },
+        DwKnownSyscall::MemoryObjectCommit => NativeSyscallRequest::MemoryObjectCommit {
+            memory_object: DwHandle(a[0]),
+            offset: a[1],
+            byte_len: a[2],
         },
         DwKnownSyscall::AddressRegionMap => NativeSyscallRequest::AddressRegionMap {
             address_region: DwHandle(a[0]),
@@ -647,6 +657,16 @@ pub(crate) trait NativeSyscallServices {
         requested_rights: DwRights,
         out_handle: DwUserAddress,
     ) -> NativeSyscallResult;
+    /// `memory_object_commit` (DW2 M6 §8.2). The live runtime serves it
+    /// through its CPU-local facade, in steps.
+    fn memory_object_commit(
+        &mut self,
+        _memory_object: DwHandle,
+        _offset: u64,
+        _byte_len: u64,
+    ) -> NativeSyscallResult {
+        NativeSyscallResult::returning(deepwyrm_abi::DW_STATUS_NOT_SUPPORTED)
+    }
     fn address_region_map(
         &mut self,
         address_region: DwHandle,
@@ -931,6 +951,11 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 requested_rights,
                 out_handle,
             } => self.memory_object_create(byte_len, flags, requested_rights, out_handle),
+            NativeSyscallRequest::MemoryObjectCommit {
+                memory_object,
+                offset,
+                byte_len,
+            } => self.memory_object_commit(memory_object, offset, byte_len),
             NativeSyscallRequest::AddressRegionMap {
                 address_region,
                 memory_object,

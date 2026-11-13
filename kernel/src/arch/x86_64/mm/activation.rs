@@ -1904,6 +1904,11 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| panic!("role table rollback lost allocation authority"));
             LiveActiveTargetError::InvalidIndex
         })?;
+        // On-demand backings reach their index pages through the same map
+        // (DW2 M6 §8.3).
+        if let Some(direct) = self.target.scratch_bindings.direct {
+            roles.set_index_memory(DIRECT_MAP_INDEX_MEMORY.init(DirectMapIndexMemory(direct)));
+        }
         Ok(layout.slot_count())
     }
 
@@ -2891,3 +2896,61 @@ pub(crate) unsafe fn activate_bootstrap_deep_paging<
 #[cfg(test)]
 #[path = "activation/tests.rs"]
 mod tests;
+
+/// On-demand index pages and committed pages, reached through the direct
+/// map (DW2 M6 §8.3). The role manager calls it only for pages it owns.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+struct DirectMapIndexMemory(&'static crate::arch::x86_64::mm::direct_map::DirectMap);
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static DIRECT_MAP_INDEX_MEMORY: crate::one_shot::OneShotStorage<DirectMapIndexMemory> =
+    crate::one_shot::OneShotStorage::new();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl DirectMapIndexMemory {
+    fn word(&self, page: u64, entry: usize) -> *mut u64 {
+        assert!(entry < ENTRY_COUNT, "an index entry lies in its node");
+        let base = self
+            .0
+            .virtual_address(page, PAGE_SIZE)
+            .expect("an index page is allocator RAM in the direct map");
+        (base as *mut u64).wrapping_add(entry)
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "index pages are allocator RAM the role manager owns, reached through the direct map"
+)]
+impl crate::memory::frame_roles::IndexMemory for DirectMapIndexMemory {
+    fn read(&self, node: u64, entry: usize) -> u64 {
+        // SAFETY: the word lies in a whole direct-map page of a node the
+        // manager owns; nodes change only under its exclusive borrow.
+        unsafe { self.word(node, entry).read_volatile() }
+    }
+
+    unsafe fn write(&self, node: u64, entry: usize, value: u64) {
+        // SAFETY: the caller owns the node exclusively (trait contract).
+        unsafe { self.word(node, entry).write_volatile(value) }
+    }
+
+    unsafe fn zero(&self, page: u64) -> bool {
+        let Some(address) = self.0.virtual_address(page, PAGE_SIZE) else {
+            return false;
+        };
+        // SAFETY: a whole direct-map page the caller owns exclusively, with
+        // no mapping naming it (trait contract); `rep stosq` writes exactly
+        // its 512 words.
+        unsafe {
+            core::arch::asm!(
+                "rep stosq",
+                inout("rdi") address => _,
+                inout("rcx") ENTRY_COUNT as u64 => _,
+                in("rax") 0_u64,
+                options(nostack, preserves_flags),
+            );
+        }
+        true
+    }
+}

@@ -136,9 +136,9 @@ fn encode_memory_info(bytes: &mut [u8; MAX_OBJECT_INFO_BYTES], info: DwMemoryObj
     put_u32(bytes, 0, info.size);
     put_u32(bytes, 4, info.version);
     put_u64(bytes, 8, info.byte_size);
-    for (index, value) in info.reserved.into_iter().enumerate() {
-        put_u64(bytes, 16 + index * 8, value);
-    }
+    put_u32(bytes, 16, info.flags.0);
+    put_u32(bytes, 20, info.reserved0);
+    put_u64(bytes, 24, info.reserved);
 }
 
 fn encode_device_resource_info(

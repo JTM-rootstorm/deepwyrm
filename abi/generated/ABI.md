@@ -260,7 +260,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_MEMORY_PROTECTION_WRITE` | `DwMemoryProtection` | `2` | Permit userspace writes to a mapping. |
 | `DW_MEMORY_PROTECTION_EXECUTE` | `DwMemoryProtection` | `4` | Permit userspace instruction fetches from a mapping. |
 | `DW_MEMORY_PROTECTION_SUPPORTED_MASK` | `DwMemoryProtection` | `7` | All mapping-protection bits recognized by ABI 0. |
-| `DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK` | `DwMemoryObjectCreateFlags` | `0` | ABI 0 supports no nonzero MemoryObject creation flags. |
+| `DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND` | `DwMemoryObjectCreateFlags` | `1` | Give each page a frame on its first touch instead of at creation (DW2 M6). Pages read as zero until written. Every frame the object gains, its pages and index nodes, is charged to MEMORY_PAGES of the object's creator, whoever touches it; creation charges one page. A user fault that cannot be served terminates the process with DW_TERMINATION_RESOURCE_POLICY; memory_object_commit fills a range in with a status instead. |
+| `DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK` | `DwMemoryObjectCreateFlags` | `1` | MemoryObject creation flags recognized by ABI 0. |
 | `DW_ADDRESS_REGION_MAP_FLAG_FIXED` | `DwAddressRegionMapFlags` | `1` | Map at requested_address exactly, without replacing an existing mapping. |
 | `DW_ADDRESS_REGION_MAP_FLAGS_SUPPORTED_MASK` | `DwAddressRegionMapFlags` | `1` | All AddressRegion mapping flags recognized by ABI 0. |
 | `DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION` | `u32` | `1` | Required version value for DwAddressRegionMapArgsV1. |
@@ -270,7 +271,7 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_TERMINATION_NORMAL_EXIT` | `DwTerminationReason` | `1` | Application exited normally with a 32-bit code. |
 | `DW_TERMINATION_AUTHORIZED` | `DwTerminationReason` | `2` | Task was terminated through authorized task control. |
 | `DW_TERMINATION_UNHANDLED_EXCEPTION` | `DwTerminationReason` | `3` | Task terminated because of an unhandled structured exception. |
-| `DW_TERMINATION_RESOURCE_POLICY` | `DwTerminationReason` | `4` | Task was terminated by a resource or policy decision. |
+| `DW_TERMINATION_RESOURCE_POLICY` | `DwTerminationReason` | `4` | Task was terminated by a resource or policy decision. A user fault on an on-demand MemoryObject page that could not be given a frame (quota or memory exhausted) records this reason with the page-fault exception type, the fault address, and the page-fault error code as detail. |
 | `DW_TERMINATION_TASK_GROUP_TEARDOWN` | `DwTerminationReason` | `5` | Task terminated during ancestor TaskGroup teardown. |
 | `DW_EXCEPTION_NONE` | `DwExceptionType` | `0` | No exception applies to this termination record. |
 | `DW_EXCEPTION_PAGE_FAULT` | `DwExceptionType` | `1` | Page fault exception. |
@@ -491,7 +492,9 @@ Read-only exact logical MemoryObject size information. Size 32, alignment 8.
 | 0 | `size` | `u32` | Byte size of this structure. |
 | 4 | `version` | `u32` | Structure version; set to one. |
 | 8 | `byte_size` | `u64` | Exact logical content byte size, fixed for the object lifetime; APIs report this value rather than page-rounded mappable capacity. |
-| 16 | `reserved` | `[u64; 2]` | Reserved; all elements must be zero. |
+| 16 | `flags` | `DwMemoryObjectCreateFlags` | The creation flags the object has, such as DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND. |
+| 20 | `reserved0` | `u32` | Reserved; must be zero. |
+| 24 | `reserved` | `u64` | Reserved; must be zero. |
 
 ### `DwDeviceResourceInfoV1`
 
@@ -809,7 +812,7 @@ Set the calling thread's FS base, its user thread pointer. fs_base must be a low
 
 ### `0x00020001` `memory_object_create` (DW0-C)
 
-Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.
+Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and unknown flags are INVALID_ARGUMENT; with DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, byte_len above 2^36 pages is INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|
@@ -817,6 +820,16 @@ Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unal
 | `RSI` | `flags` | `DwMemoryObjectCreateFlags` | in | NONE | NONE |
 | `RDX` | `requested_rights` | `DwRights` | in | NONE | NONE |
 | `R10` | `out_handle` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00020002` `memory_object_commit` (DW2-M)
+
+Give every page of the page-aligned range [offset, offset + byte_len) of an on-demand MemoryObject a zeroed frame now, charged as a touch is (DW2 M6). Returns NO_RESOURCES when the creator's MEMORY_PAGES quota is spent and NO_MEMORY when frames run out; pages committed before the failure stay committed. Zero, unaligned, or overflowing ranges, and ranges beyond the object, are INVALID_ARGUMENT. On an object that is not on demand it succeeds and changes nothing.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `memory_object` | `DwHandle` | in | MEMORY_OBJECT | MAP |
+| `RSI` | `offset` | `DwOffset` | in | NONE | NONE |
+| `RDX` | `byte_len` | `DwSize` | in | NONE | NONE |
 
 ### `0x00020010` `address_region_map` (DW0-C)
 

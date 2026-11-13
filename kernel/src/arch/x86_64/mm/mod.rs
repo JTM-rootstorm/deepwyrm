@@ -796,6 +796,43 @@ impl PageTableRoot {
         commit(access, &plan)
     }
 
+    /// The frame of the present leaf at `page`, or `None` when the leaf or
+    /// any table above it is empty. A page of an on-demand object may be
+    /// present in one address space and absent in another (DW2 M6 §8.6).
+    pub fn present_leaf<A: PageTableTransaction>(
+        &self,
+        access: &mut A,
+        page: VirtualPage,
+    ) -> Result<Option<FrameAddress>, MapError<A::Error>> {
+        validate_page_half(page)?;
+        let user = page.is_user_half();
+        let mut current = self.frame;
+        let mut traversed = [EMPTY_FRAME; 4];
+        traversed[0] = current;
+        for (depth, level) in (1..=3).rev().enumerate() {
+            let old = access
+                .read_entry(current, page.index(level))
+                .map_err(MapError::Access)?;
+            if old == 0 {
+                return Ok(None);
+            }
+            let child = decode_intermediate(old, user, self.physical_limit())
+                .map_err(|_| MapError::InvalidPath)?;
+            if traversed[..=depth].contains(&child) {
+                return Err(MapError::InvalidPath);
+            }
+            traversed[depth + 1] = child;
+            current = child;
+        }
+        let old = access
+            .read_entry(current, page.index(0))
+            .map_err(MapError::Access)?;
+        if old == 0 {
+            return Ok(None);
+        }
+        decode_leaf(old, user, self.physical_limit()).map(Some)
+    }
+
     fn walk_leaf<A: PageTableTransaction>(
         &self,
         access: &mut A,

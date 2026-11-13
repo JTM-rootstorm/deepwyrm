@@ -935,14 +935,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // MemoryObjectCreate's backing, allocated with P alone before the
         // hold, when its size is one the adapter can reach its allocation
         // with (D1 commit 6c).
-        let backing_pages = match request {
-            NativeSyscallRequest::MemoryObjectCreate { byte_len, .. }
-                if byte_len != 0
-                    && byte_len.is_multiple_of(u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE)) =>
+        // An on-demand object's backing is its index root alone, charged
+        // as one page (DW2 M6 §8.4).
+        let (backing_pages, on_demand) = match request {
+            NativeSyscallRequest::MemoryObjectCreate {
+                byte_len, flags, ..
+            } if byte_len != 0
+                && byte_len.is_multiple_of(u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE)) =>
             {
-                Some(byte_len / u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE))
+                let pages = byte_len / u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
+                match flags {
+                    0 => (Some(pages), false),
+                    flags
+                        if flags == deepwyrm_abi::DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND.0
+                            && pages <= crate::memory::frame_roles::INDEX_MAX_PAGES =>
+                    {
+                        (Some(pages), true)
+                    }
+                    _ => (None, false),
+                }
             }
-            _ => None,
+            _ => (None, false),
         };
         let cpu = self.cpu;
         let Ok(((phase, root, process), quota_allows)) = self
@@ -953,8 +966,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 let prepared = runtime.prepare_guard_free_usercopy();
                 // Frames are allocated only for a request its quota admits
                 // now; the adapter's admission under the next hold decides.
-                let allows =
-                    backing_pages.is_none_or(|pages| runtime.memory_object_quota_allows(pages));
+                let allows = backing_pages.is_none_or(|pages| {
+                    runtime.memory_object_quota_allows(if on_demand { 1 } else { pages })
+                });
                 (prepared, allows)
             })
         else {
@@ -1017,17 +1031,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 (Some(_), Some(_)) if !quota_allows => {
                     Some(Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
                 }
+                // An index root, zeroed as it is allocated (DW2 M6).
+                (Some(page_count), Some(_)) if on_demand => Some(
+                    user.allocate_on_demand_backing(page_count)
+                        .map(EarlyBacking::Ready)
+                        .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
+                ),
                 // Allocated here, zeroed below in steps (DW2 M4b).
                 (Some(page_count), Some(_)) => Some(
                     user.allocate_backing(page_count)
+                        .map(EarlyBacking::Unzeroed)
                         .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
                 ),
                 _ => None,
             };
             (atomic_pin, pinned, backing)
         };
-        let backing = backing.map(|allocation| {
-            allocation.and_then(|allocation| self.zero_backing_in_steps(root, process, allocation))
+        let backing = backing.map(|early| {
+            early.and_then(|early| match early {
+                EarlyBacking::Ready(grant) => Ok(grant),
+                EarlyBacking::Unzeroed(allocation) => {
+                    self.zero_backing_in_steps(root, process, allocation)
+                }
+            })
         });
         let pin_taken = matches!(atomic_pin, Some(Ok(_)));
         let mut deferred =
@@ -1931,6 +1957,49 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 FamilyGBegun::Published { .. } => {
                     unreachable!("a published step finishes in its last hold")
                 }
+            }
+        }
+    }
+
+    /// `memory_object_commit` (DW2 M6 §8.2): commits the range a step of at
+    /// most 16 MiB per hold of T and P, with a safe point between steps.
+    /// Each step resolves the handle again. A failure returns at once; the
+    /// pages committed before it stay committed and charged.
+    fn handle_memory_object_commit(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::MemoryObjectCommit {
+            memory_object,
+            offset,
+            byte_len,
+        } = request
+        else {
+            return None;
+        };
+        let cpu = self.cpu;
+        let mut next = offset;
+        loop {
+            let step = self.with_synchronized_runtime_at_safe_point(|runtime| {
+                if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                    runtime.service_pending_timer_expiries_on_bootstrap();
+                }
+                let result =
+                    runtime.commit_on_demand_step(memory_object, offset, byte_len, &mut next);
+                match result {
+                    Ok(false) => None,
+                    Ok(true) => Some(
+                        runtime.ready_to_return(NativeSyscallResult::returning(DW_STATUS_SUCCESS)),
+                    ),
+                    Err(status) => {
+                        Some(runtime.ready_to_return(NativeSyscallResult::returning(status)))
+                    }
+                }
+            });
+            match step {
+                Err(()) => return Some(Err(())),
+                Ok(Some(ready)) => return Some(Ok(ready)),
+                Ok(None) => {}
             }
         }
     }
@@ -6297,6 +6366,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 .or_else(|| self.handle_wait(request))
                 .or_else(|| self.handle_atomic_wait(request))
                 .or_else(|| self.handle_address_region_mutation(request))
+                .or_else(|| self.handle_memory_object_commit(request))
                 .or_else(|| self.handle_thread_start(request))
             {
                 Some(handled) => handled,
@@ -8365,6 +8435,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     "family-B requests are served by the CPU-local facade's deferred output"
                 )
             }
+            NativeSyscallRequest::MemoryObjectCommit { .. } => {
+                unreachable!("MemoryObjectCommit is served by the CPU-local facade in steps")
+            }
             NativeSyscallRequest::HandleClose { handle } => {
                 let status = crate::syscall::handle_close(
                     &mut self.core.registry,
@@ -8650,6 +8723,71 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     // Out of line (D1 option B2): its held releases stay out of the
     // ordinary handler's measured frame.
     #[inline(never)]
+    /// One hold of `memory_object_commit`: commits pages from `*next` up to
+    /// one step's end, each admitted against the object's creator in this
+    /// hold and charged to its weight once committed (DW2 M6 §8.4).
+    /// `Ok(true)` when the whole range is done.
+    fn commit_on_demand_step(
+        &mut self,
+        memory_object: deepwyrm_abi::DwHandle,
+        offset: u64,
+        byte_len: u64,
+        next: &mut u64,
+    ) -> Result<bool, deepwyrm_abi::DwStatus> {
+        let process = self.own.scheduled().process;
+        let Some((backing, object)) = crate::syscall::memory_object_commit_target(
+            &mut self.core.registry,
+            &mut self.core.tasks,
+            &self.core.memory,
+            process,
+            memory_object,
+            offset,
+            byte_len,
+        )?
+        else {
+            return Ok(true);
+        };
+        // The target checked the range lies in the object.
+        let end = offset + byte_len;
+        let step_end = end.min(next.saturating_add(FAMILY_G_STEP_BYTES));
+        let mut paging = self.paging.lock();
+        let mut session = paging.page_table_mutation_session(
+            self.own.active_root.as_ref().expect("active root"),
+            process,
+        );
+        while *next < step_end {
+            let page = *next / u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
+            let cost = session
+                .on_demand_commit_cost(backing, page)
+                .map_err(|_| DW_STATUS_BAD_STATE)?;
+            if cost != 0 {
+                crate::syscall::admit_on_demand_frames(
+                    &self.core.registry,
+                    &self.core.tasks,
+                    object,
+                    cost,
+                )?;
+                let commit = session
+                    .commit_on_demand_page(backing, page)
+                    .map_err(|error| match error {
+                        crate::memory::frame_roles::FrameRoleError::Physical(_)
+                        | crate::memory::frame_roles::FrameRoleError::Capacity
+                        | crate::memory::frame_roles::FrameRoleError::InitializationFailed => {
+                            deepwyrm_abi::DW_STATUS_NO_MEMORY
+                        }
+                        _ => DW_STATUS_BAD_STATE,
+                    })?;
+                crate::syscall::record_on_demand_frames(
+                    &mut self.core.registry,
+                    object,
+                    commit.frames,
+                );
+            }
+            *next += u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
+        }
+        Ok(*next >= end)
+    }
+
     fn map_memory(
         &mut self,
         address_region: deepwyrm_abi::DwHandle,
@@ -9909,4 +10047,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.absorb_service_cleanup();
     }
+}
+
+/// A MemoryObjectCreate backing taken before the runtime hold: an eager
+/// one still to be zeroed in steps, or an on-demand index root, ready.
+enum EarlyBacking {
+    Unzeroed(crate::memory::frame_roles::BackingAllocation),
+    Ready(crate::memory::frame_roles::ObjectBackingGrant),
 }

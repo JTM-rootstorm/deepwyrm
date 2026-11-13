@@ -609,6 +609,7 @@ impl Model {
                     | "DW1-D"
                     | "DW2-S"
                     | "DW2-T"
+                    | "DW2-M"
             ) {
                 return Err(Error::new(format!(
                     "{}: syscall `{name}` uses unsupported implementation phase `{phase}`",

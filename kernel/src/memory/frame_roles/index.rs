@@ -156,10 +156,43 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// The root of the on-demand backing `head`.
-    fn index_root(&self, head: FrameRoleIdentity) -> Result<(RoleRecord, IndexRootLink), FrameRoleError> {
+    fn index_root(
+        &self,
+        head: FrameRoleIdentity,
+    ) -> Result<(RoleRecord, IndexRootLink), FrameRoleError> {
         let record = self.record(head)?;
         match record.role {
             FrameRole::IndexRoot(root) if head.domain == self.domain => Ok((record, root)),
+            _ => Err(FrameRoleError::WrongRole),
+        }
+    }
+
+    /// Checks that `[offset, offset + byte_len)` lies in `backing`, page
+    /// aligned and nonempty, and that a writable use is allowed, without
+    /// requiring an on-demand backing's pages to have frames (DW2 M6 §8.6).
+    pub(crate) fn validate_object_range(
+        &self,
+        backing: BackingIdentity,
+        offset: u64,
+        byte_len: u64,
+        writable: bool,
+    ) -> Result<(), FrameRoleError> {
+        let Ok((_, root)) = self.index_root(backing.0) else {
+            return self
+                .object_segments(backing, offset, byte_len, writable)
+                .map(|_| ());
+        };
+        let pages = |bytes: u64| {
+            bytes
+                .is_multiple_of(BASE_PAGE_SIZE)
+                .then_some(bytes / BASE_PAGE_SIZE)
+        };
+        let first = pages(offset).ok_or(FrameRoleError::WrongRole)?;
+        let count = pages(byte_len)
+            .filter(|count| *count != 0)
+            .ok_or(FrameRoleError::WrongRole)?;
+        match first.checked_add(count) {
+            Some(end) if end <= root.pages => Ok(()),
             _ => Err(FrameRoleError::WrongRole),
         }
     }
@@ -341,7 +374,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )]
             // SAFETY: `parent` is a node of this backing, which the manager
             // owns exclusively under `&mut self`.
-            unsafe { memory.write(parent.0, parent.1, frame.identity.raw) };
+            unsafe {
+                memory.write(parent.0, parent.1, frame.identity.raw)
+            };
             frames += 1;
             physical_start = frame.range.start;
             if level != 0 {
@@ -460,13 +495,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.index_count(head)?;
         let (root_record, root) = self.index_root(head)?;
         let memory = self.memory()?;
-        self.index_free_node(
-            memory,
-            head,
-            root_record.range.start,
-            root.levels - 1,
-            0,
-        );
+        self.index_free_node(memory, head, root_record.range.start, root.levels - 1, 0);
         let root_slot = self.slot(head)?;
         self.free_index_slot(root_slot);
         Ok(())

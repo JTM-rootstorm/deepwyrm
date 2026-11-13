@@ -11828,11 +11828,11 @@ fn a_deferred_memory_object_create_consumes_or_returns_its_early_backing() {
     assert_eq!(output.written(), None);
     backing.rollback_object_backing(rolled_back.expect("rolled-back backing kept"));
 
-    // Invalid flags fail before the allocation: the early backing returns.
+    // Unknown flags fail before the allocation: the early backing returns.
     let early = backing.allocate_zeroed_backing(1);
     let mut access = DeferredMemoryObjectAccess::new(deferred(), 1, Some(early));
     assert_eq!(
-        create(&mut access, &mut registry, &mut memory, &mut tasks, 1),
+        create(&mut access, &mut registry, &mut memory, &mut tasks, 2),
         DW_STATUS_INVALID_ARGUMENT
     );
     let (output, unused) = access.into_parts();
@@ -14391,6 +14391,231 @@ fn memory_object_pages_are_limited_and_released() {
     assert!(!memory_object_quota_allows(&registry, &tasks, process, 2));
     close(&mut registry, &mut tasks, &mut backing, two);
     assert!(memory_object_quota_allows(&registry, &tasks, process, 3));
+}
+
+/// Index pages for an on-demand backing in a host test: zero once zeroed.
+#[derive(Default)]
+struct OnDemandIndexModel {
+    zeroed: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    entries: std::sync::Mutex<std::collections::BTreeMap<(u64, usize), u64>>,
+}
+
+impl crate::memory::frame_roles::IndexMemory for OnDemandIndexModel {
+    fn read(&self, node: u64, entry: usize) -> u64 {
+        assert!(self.zeroed.lock().unwrap().contains(&node));
+        self.entries
+            .lock()
+            .unwrap()
+            .get(&(node, entry))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the model implements the trait's unsafe methods"
+    )]
+    unsafe fn write(&self, node: u64, entry: usize, value: u64) {
+        self.entries.lock().unwrap().insert((node, entry), value);
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the model implements the trait's unsafe methods"
+    )]
+    unsafe fn zero(&self, page: u64) -> bool {
+        self.entries
+            .lock()
+            .unwrap()
+            .retain(|(node, _), _| *node != page);
+        self.zeroed.lock().unwrap().insert(page);
+        true
+    }
+}
+
+/// DW2 M6 §8.4: an on-demand object is admitted as its one root page,
+/// however large; each commit is admitted against the creator's tag and
+/// raises the object's weight by the frames it took, nodes included; and
+/// finalizing the object gives them all back.
+#[test]
+fn an_on_demand_object_charges_its_creator_per_commit() {
+    use deepwyrm_abi::{
+        DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE,
+    };
+
+    let (mut registry, mut tasks, _root, jobs, process, _) = limited_fixture();
+    let mut roles =
+        crate::memory::frame_roles::synthetic_frame_role_manager::<16, 16>(0x40_000, 16);
+    roles.set_index_memory(std::boxed::Box::leak(
+        std::boxed::Box::<OnDemandIndexModel>::default(),
+    ));
+    let initial_frames = roles.available_frames();
+    let mut memory = MemoryObjectAuthority::<4, 4>::new();
+    let mut cleanup = CleanupQueue::<32>::new();
+    let out = DwUserAddress(BASE + 0x100);
+    let range = output_range(out, 8, 8).unwrap();
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 4)
+        .unwrap();
+
+    // 1 GiB, far over the four-page limit: a two-level index, one page now.
+    let pages = 1_u64 << 18;
+    let mut create = |registry: &mut ObjectRegistry<32>,
+                      tasks: &mut Tasks,
+                      roles: &mut crate::memory::frame_roles::FrameRoleManager<16, 16>,
+                      memory: &mut MemoryObjectAuthority<4, 4>,
+                      cleanup: &mut CleanupQueue<32>,
+                      rights: DwRights| {
+        let early = roles.allocate_on_demand_backing(pages);
+        let mut access = DeferredMemoryObjectAccess::new(
+            crate::memory::usercopy::DeferredUserOutput::new(Some(range)),
+            pages,
+            Some(early.map_err(|_| deepwyrm_abi::DW_STATUS_NO_MEMORY)),
+        );
+        let status = memory_object_create_owned(
+            &mut access,
+            registry,
+            memory,
+            tasks,
+            process,
+            pages * 4096,
+            DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND.0,
+            rights,
+            out,
+            cleanup,
+        );
+        let (output, unused) = access.into_parts();
+        assert!(unused.is_none());
+        assert_eq!(status, DW_STATUS_SUCCESS);
+        DwHandle(u64::from_le_bytes(
+            output.written().unwrap().try_into().unwrap(),
+        ))
+    };
+    let handle = create(
+        &mut registry,
+        &mut tasks,
+        &mut roles,
+        &mut memory,
+        &mut cleanup,
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MAP.0),
+    );
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 3));
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 4));
+
+    // Ranges are checked as a map's are.
+    for (offset, byte_len) in [
+        (1, 4096),
+        (0, 0),
+        (0, (pages + 1) * 4096),
+        (u64::MAX & !4095, 8192),
+    ] {
+        assert_eq!(
+            memory_object_commit_target(
+                &mut registry,
+                &mut tasks,
+                &memory,
+                process,
+                handle,
+                offset,
+                byte_len,
+            ),
+            Err(DW_STATUS_INVALID_ARGUMENT),
+            "offset {offset:#x} length {byte_len:#x}"
+        );
+    }
+    let (backing, object) = memory_object_commit_target(
+        &mut registry,
+        &mut tasks,
+        &memory,
+        process,
+        handle,
+        0,
+        pages * 4096,
+    )
+    .unwrap()
+    .expect("an on-demand target");
+    let mut commit = |registry: &mut ObjectRegistry<32>,
+                      roles: &mut crate::memory::frame_roles::FrameRoleManager<16, 16>,
+                      page: u64| {
+        let cost = roles.on_demand_commit_cost(backing, page).unwrap();
+        admit_on_demand_frames(registry, &tasks, object, cost)?;
+        let frames = roles.commit_on_demand_page(backing, page).unwrap().frames;
+        assert_eq!(frames, cost);
+        record_on_demand_frames(registry, object, frames);
+        Ok::<u64, DwStatus>(frames)
+    };
+    // A leaf node and the page, then a neighbour in the same leaf.
+    assert_eq!(commit(&mut registry, &mut roles, 0), Ok(2));
+    assert_eq!(commit(&mut registry, &mut roles, 1), Ok(1));
+    assert!(!memory_object_quota_allows(&registry, &tasks, process, 1));
+    // Another leaf would take two more frames: refused, nothing taken.
+    let free = roles.available_frames();
+    assert_eq!(
+        commit(&mut registry, &mut roles, 512),
+        Err(DW_STATUS_NO_RESOURCES)
+    );
+    assert_eq!(roles.available_frames(), free);
+    // A committed page costs nothing more.
+    assert_eq!(commit(&mut registry, &mut roles, 1), Ok(0));
+    assert_eq!(roles.on_demand_frames(backing), Ok(4));
+
+    // Finalizing gives back every frame and every page of quota.
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, handle, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    while let Some(release) = cleanup.pop() {
+        let finalization = memory.take_finalization(release).unwrap();
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut roles,
+                finalization
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(roles.available_frames(), initial_frames);
+    assert!(memory_object_quota_allows(&registry, &tasks, process, 4));
+    assert_eq!(roles.check_invariants(), Ok(()));
+
+    // Committing needs MAP on the handle.
+    let unmappable = create(
+        &mut registry,
+        &mut tasks,
+        &mut roles,
+        &mut memory,
+        &mut cleanup,
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0),
+    );
+    assert_eq!(
+        memory_object_commit_target(
+            &mut registry,
+            &mut tasks,
+            &memory,
+            process,
+            unmappable,
+            0,
+            4096,
+        ),
+        Err(deepwyrm_abi::DW_STATUS_ACCESS_DENIED)
+    );
+    assert_eq!(
+        handle_close(&mut registry, &mut tasks, process, unmappable, &mut cleanup),
+        DW_STATUS_SUCCESS
+    );
+    while let Some(release) = cleanup.pop() {
+        let finalization = memory.take_finalization(release).unwrap();
+        assert!(
+            crate::memory::object::complete_memory_finalization(
+                &mut registry,
+                &mut roles,
+                finalization
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(roles.available_frames(), initial_frames);
 }
 
 /// F4 residual: when the live facade's early quota check refused and left

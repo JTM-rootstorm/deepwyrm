@@ -63,8 +63,32 @@ struct PageDescriptor {
     /// Two descriptors with the same backing and object offset name the
     /// same page, however many runs the backing has (DW2 M3 §6.4).
     object_offset: u64,
+    /// `None` when the backing is on demand and the page has no frame yet.
+    physical_start: Option<u64>,
+    /// The backing is on demand: a committed page may still have no leaf
+    /// in this address space (DW2 M6 §8.6).
+    on_demand: bool,
+    permissions: MappingPermissions,
+}
+
+/// One page as it stands in this address space's tables.
+#[derive(Clone, Copy)]
+struct Leaf {
+    backing: BackingIdentity,
+    object_offset: u64,
     physical_start: u64,
     permissions: MappingPermissions,
+}
+
+impl Leaf {
+    const fn of(descriptor: PageDescriptor, physical_start: u64) -> Self {
+        Self {
+            backing: descriptor.backing,
+            object_offset: descriptor.object_offset,
+            physical_start,
+            permissions: descriptor.permissions,
+        }
+    }
 }
 
 /// Sealed `AddressRegion` bridge for one typed x86 page-table root and region.
@@ -185,6 +209,92 @@ where
     /// changes nothing it returns an error for; `failed_after_publishing`
     /// then tells the coherency layer that other CPUs may still cache the
     /// undone entries.
+    /// Publishes the one leaf a touch at `address` needs (DW2 M6 §8.5):
+    /// the committed frame of the on-demand page `mapping` maps there, with
+    /// the mapping's protection. It is valid only while the leaf is empty:
+    /// empty to present needs no shootdown and changes no pinned
+    /// translation. `Ok(false)` when the leaf already maps that frame, as
+    /// after another CPU's touch.
+    #[allow(
+        dead_code,
+        reason = "the fault gate and fill-in (DW2 M6 steps 3 and 4) are its live callers"
+    )]
+    pub(crate) fn publish_touched_leaf(
+        &mut self,
+        mapping: &Mapping,
+        address: u64,
+    ) -> Result<bool, X86AddressSpacePublishError<T::Error>> {
+        validate_mapping_batch(
+            self.roles,
+            self.address_space,
+            self.region,
+            core::slice::from_ref(mapping),
+        )?;
+        if !address.is_multiple_of(BASE_PAGE_SIZE)
+            || address < mapping.virtual_start()
+            || address - mapping.virtual_start() >= mapping.byte_len()
+        {
+            return Err(X86AddressSpacePublishError::InvalidMapping);
+        }
+        let page =
+            VirtualPage::new(address).map_err(|_| X86AddressSpacePublishError::InvalidMapping)?;
+        let mut journal = OwnedPageTableJournal::<
+            _,
+            RANGE_CAPACITY,
+            ROLE_CAPACITY,
+            CANDIDATE_CAPACITY,
+            ENTRY_CAPACITY,
+            INVALIDATION_CAPACITY,
+        >::new(
+            self.target,
+            self.storage,
+            self.roles,
+            self.root_identity,
+            self.root.physical_limit(),
+            self.candidates,
+        )
+        .map_err(X86AddressSpacePublishError::FrameRole)?;
+        let descriptor = page_descriptor(journal.roles(), mapping, address, &mut None)?;
+        if !descriptor.on_demand {
+            return Err(X86AddressSpacePublishError::InvalidMapping);
+        }
+        let physical_start =
+            descriptor
+                .physical_start
+                .ok_or(X86AddressSpacePublishError::FrameRole(
+                    FrameRoleError::Absent,
+                ))?;
+        match self
+            .root
+            .present_leaf(&mut journal, page)
+            .map_err(X86AddressSpacePublishError::Map)?
+        {
+            Some(frame) if frame.address() == physical_start => return Ok(false),
+            Some(_) => return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch)),
+            None => {}
+        }
+        journal
+            .authorize_leaf(descriptor.backing, descriptor.object_offset, physical_start)
+            .map_err(X86AddressSpacePublishError::Journal)?;
+        let (candidates, count) = journal
+            .candidate_addresses_for_page(self.root, page)
+            .map_err(X86AddressSpacePublishError::Journal)?;
+        if let Err(error) = self.root.map_page(
+            &mut journal,
+            page,
+            physical_start,
+            descriptor.permissions,
+            &candidates[..count],
+        ) {
+            journal.clear_leaf_authorization();
+            return Err(X86AddressSpacePublishError::Map(error));
+        }
+        journal
+            .publish()
+            .map_err(X86AddressSpacePublishError::Journal)?;
+        Ok(true)
+    }
+
     fn publish_pages(
         &mut self,
         before: &[Mapping],
@@ -561,7 +671,7 @@ fn validate_mapping_batch<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: u
             return Err(X86AddressSpacePublishError::InvalidMapping);
         }
         roles
-            .object_segments(
+            .validate_object_range(
                 backing.backing_identity(),
                 backing.object_offset(),
                 backing.byte_len(),
@@ -610,6 +720,41 @@ where
 {
     let page =
         VirtualPage::new(address).map_err(|_| X86AddressSpacePublishError::InvalidMapping)?;
+    // What this address space's tables hold now. An on-demand page may be
+    // committed in its object yet have no leaf here; an eager page always
+    // has its leaf (DW2 M6 §8.6).
+    let before = match before {
+        Some(descriptor) => match descriptor.physical_start {
+            Some(physical_start) if descriptor.on_demand => {
+                match root
+                    .present_leaf(journal, page)
+                    .map_err(X86AddressSpacePublishError::Map)?
+                {
+                    Some(frame) if frame.address() == physical_start => {
+                        Some(Leaf::of(descriptor, physical_start))
+                    }
+                    Some(_) => {
+                        return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch));
+                    }
+                    None => None,
+                }
+            }
+            Some(physical_start) => Some(Leaf::of(descriptor, physical_start)),
+            None => None,
+        },
+        None => None,
+    };
+    // What they should hold after. An on-demand page gets a leaf here only
+    // where it already had one; elsewhere a touch publishes it. So this
+    // never builds a table for an on-demand page, and an undo never needs
+    // one.
+    let after = match after {
+        Some(descriptor) if descriptor.on_demand && before.is_none() => None,
+        Some(descriptor) => descriptor
+            .physical_start
+            .map(|physical_start| Leaf::of(descriptor, physical_start)),
+        None => None,
+    };
     let result = match (before, after) {
         (None, Some(after)) => {
             journal
@@ -827,15 +972,18 @@ fn page_descriptor<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         .and_then(|offset| offset.checked_add(backing.object_offset()))
         .ok_or(X86AddressSpacePublishError::InvalidMapping)?;
     let mut cursor = BackingCursor::for_backing(*run, backing.backing_identity());
-    let physical_start = roles
-        .resolve_at(&mut cursor, object_offset, mapping.protection().writable())
-        .map_err(X86AddressSpacePublishError::FrameRole)?
-        .physical_start;
+    let physical_start =
+        match roles.resolve_at(&mut cursor, object_offset, mapping.protection().writable()) {
+            Ok(segment) => Some(segment.physical_start),
+            Err(FrameRoleError::Absent) => None,
+            Err(error) => return Err(X86AddressSpacePublishError::FrameRole(error)),
+        };
     *run = Some(cursor);
     Ok(PageDescriptor {
         backing: backing.backing_identity(),
         object_offset,
         physical_start,
+        on_demand: roles.is_on_demand(backing.backing_identity()),
         permissions: MappingPermissions {
             user: true,
             readable: true,

@@ -262,7 +262,13 @@ fn memory_info<const MEMORY_OBJECTS: usize, const LEASES: usize>(
         size: DW_MEMORY_OBJECT_INFO_V1_SIZE,
         version: 1,
         byte_size: info.logical_byte_len(),
-        reserved: [0; 2],
+        flags: if info.kind() == crate::memory::object::MemoryObjectKind::OnDemand {
+            deepwyrm_abi::DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND
+        } else {
+            deepwyrm_abi::DwMemoryObjectCreateFlags(0)
+        },
+        reserved0: 0,
+        reserved: 0,
     }))
 }
 

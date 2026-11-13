@@ -13,6 +13,7 @@ pub(crate) mod frame_roles {
         AllocatorOwned,
         ImmutableModule { module_index: u32 },
         DeviceMmio,
+        OnDemand,
     }
 
     #[derive(Debug, Eq, PartialEq)]

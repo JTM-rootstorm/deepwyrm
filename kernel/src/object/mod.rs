@@ -336,6 +336,24 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         Ok(())
     }
 
+    /// A live object's charge: the tag it was created with and its weight
+    /// under the page class.
+    pub(crate) fn charge(
+        &self,
+        id: ObjectId,
+    ) -> Result<(charge::ChargeTag, u64), ObjectRegistryError> {
+        let slot = self.reference_slot(id)?;
+        let generation = decode_object_id(id.raw)
+            .ok_or(ObjectRegistryError::StaleReference)?
+            .1;
+        if self.slots[slot].generation != generation
+            || !matches!(self.slots[slot].state, SlotState::Live(_))
+        {
+            return Err(ObjectRegistryError::StaleReference);
+        }
+        Ok((self.tags[slot], self.pages[slot]))
+    }
+
     /// Pages of live and finalizing objects charged to `group`. A
     /// finalizing MemoryObject still holds its frames, so it still counts.
     pub(crate) fn charged_pages(&self, group: ObjectId) -> usize {

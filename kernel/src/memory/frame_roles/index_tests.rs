@@ -33,7 +33,10 @@ impl IndexMemory for Model {
         }
     }
 
-    #[allow(unsafe_code, reason = "the model implements the trait's unsafe methods")]
+    #[allow(
+        unsafe_code,
+        reason = "the model implements the trait's unsafe methods"
+    )]
     unsafe fn write(&self, node: u64, entry: usize, value: u64) {
         assert!(
             self.zeroed.lock().unwrap().contains(&node),
@@ -42,7 +45,10 @@ impl IndexMemory for Model {
         self.entries.lock().unwrap().insert((node, entry), value);
     }
 
-    #[allow(unsafe_code, reason = "the model implements the trait's unsafe methods")]
+    #[allow(
+        unsafe_code,
+        reason = "the model implements the trait's unsafe methods"
+    )]
     unsafe fn zero(&self, page: u64) -> bool {
         if *self.fail_zero.lock().unwrap() == Some(page) {
             return false;
@@ -99,7 +105,11 @@ fn a_new_backing_is_one_root_and_every_page_absent() {
 fn sizes_are_bounded_by_four_levels() {
     let (mut roles, _) = manager(16);
     assert!(roles.allocate_on_demand_backing(0).is_err());
-    assert!(roles.allocate_on_demand_backing(INDEX_MAX_PAGES + 1).is_err());
+    assert!(
+        roles
+            .allocate_on_demand_backing(INDEX_MAX_PAGES + 1)
+            .is_err()
+    );
     let largest = roles.allocate_on_demand_backing(INDEX_MAX_PAGES).unwrap();
     assert_eq!(roles.on_demand_commit_cost(largest.identity(), 0), Ok(4));
     let small = roles.allocate_on_demand_backing(1).unwrap();
@@ -118,7 +128,13 @@ fn a_commit_takes_the_nodes_its_path_lacks_and_costs_what_it_said() {
     assert_eq!(commit.frames, cost);
     assert_eq!(roles.available_frames(), before - cost);
     assert_eq!(page(&roles, &grant, 600), Ok(commit.physical_start));
-    assert!(model.zeroed.lock().unwrap().contains(&commit.physical_start));
+    assert!(
+        model
+            .zeroed
+            .lock()
+            .unwrap()
+            .contains(&commit.physical_start)
+    );
 
     // Committed already: free, and the same frame.
     assert_eq!(roles.on_demand_commit_cost(backing, 600), Ok(0));
@@ -132,10 +148,16 @@ fn a_commit_takes_the_nodes_its_path_lacks_and_costs_what_it_said() {
     // A neighbour shares the leaf node; another leaf needs its own.
     assert_eq!(roles.on_demand_commit_cost(backing, 601), Ok(1));
     assert_eq!(roles.on_demand_commit_cost(backing, 0), Ok(2));
-    assert_eq!(roles.on_demand_commit_cost(backing, THREE_LEVELS - 1), Ok(3));
+    assert_eq!(
+        roles.on_demand_commit_cost(backing, THREE_LEVELS - 1),
+        Ok(3)
+    );
     for index in [601, 0, THREE_LEVELS - 1] {
         let cost = roles.on_demand_commit_cost(backing, index).unwrap();
-        assert_eq!(roles.commit_on_demand_page(backing, index).unwrap().frames, cost);
+        assert_eq!(
+            roles.commit_on_demand_page(backing, index).unwrap().frames,
+            cost
+        );
     }
     assert_eq!(page(&roles, &grant, 602), Err(FrameRoleError::Absent));
     // Root, 3 level-1 nodes... : root + (node 0 + leaves 0 and 1) + (node
@@ -146,7 +168,9 @@ fn a_commit_takes_the_nodes_its_path_lacks_and_costs_what_it_said() {
     // A cursor resolves through the index too.
     let mut cursor = BackingCursor::new(backing);
     assert_eq!(
-        roles.resolve_at(&mut cursor, 601 * PAGE, true).map(|s| s.byte_len),
+        roles
+            .resolve_at(&mut cursor, 601 * PAGE, true)
+            .map(|s| s.byte_len),
         Ok(PAGE)
     );
     assert_eq!(
@@ -187,7 +211,13 @@ fn a_frame_that_fails_to_zero_changes_nothing() {
     assert_eq!(page(&roles, &grant, 7), Err(FrameRoleError::Absent));
     roles.check_invariants().unwrap();
     *model.fail_zero.lock().unwrap() = None;
-    assert_eq!(roles.commit_on_demand_page(grant.identity(), 7).unwrap().frames, 3);
+    assert_eq!(
+        roles
+            .commit_on_demand_page(grant.identity(), 7)
+            .unwrap()
+            .frames,
+        3
+    );
 }
 
 #[test]

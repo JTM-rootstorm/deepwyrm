@@ -221,7 +221,8 @@ pub(crate) fn complete_memory_finalization<
     );
     let mut parent_release = None;
     match (kind, backing.kind()) {
-        (MemoryObjectKind::PageBacked, ObjectBackingKind::AllocatorOwned) => {
+        (MemoryObjectKind::PageBacked, ObjectBackingKind::AllocatorOwned)
+        | (MemoryObjectKind::OnDemand, ObjectBackingKind::OnDemand) => {
             if let Err(error) = roles.cancel_object_backing(backing) {
                 panic!(
                     "allocator-backed MemoryObject finalization lost typed backing authority: {error:?}"
@@ -325,6 +326,8 @@ pub(crate) enum MemoryObjectKind {
     ImmutableBootModule,
     /// One whole PCI memory BAR (storage K3).
     DeviceMmio,
+    /// Allocator RAM given page by page on first touch (DW2 M6 §8.3).
+    OnDemand,
 }
 
 /// Opaque authority-issued identity for one page-backed object.
@@ -896,6 +899,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 MemoryObjectKind::ImmutableBootModule,
                 ObjectBackingKind::ImmutableModule { .. }
             ) | (MemoryObjectKind::DeviceMmio, ObjectBackingKind::DeviceMmio)
+                | (MemoryObjectKind::OnDemand, ObjectBackingKind::OnDemand)
         ) {
             return Err(MemoryObjectError::BackingKind);
         }
@@ -972,6 +976,26 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
+    /// The backing `memory_object_commit` fills in over `[offset, offset +
+    /// byte_len)`, after checking the range lies in the object: `None` for an
+    /// object that is not on demand, whose pages all have frames (DW2 M6
+    /// §8.2).
+    pub(crate) fn commit_range(
+        &self,
+        resolved: &ResolvedHandle,
+        offset: u64,
+        byte_len: u64,
+    ) -> Result<Option<BackingIdentity>, MemoryObjectError> {
+        if resolved.object_type() != DW_OBJECT_TYPE_MEMORY_OBJECT {
+            return Err(MemoryObjectError::ObjectReference);
+        }
+        let record = self.object_record(MemoryObjectKey {
+            object: Some(resolved.object_id()),
+        })?;
+        let range = object_range(record, offset, byte_len)?;
+        Ok((record.kind == MemoryObjectKind::OnDemand).then_some(range.backing))
+    }
+
     /// The validated range `[offset, offset + byte_len)` of a page-backed
     /// object a DMA mapping may name (storage K4). The caller resolves its
     /// pages through the role manager; they may lie in several runs (DW2 M3). Device-MMIO and boot-module
@@ -990,7 +1014,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let record = self.object_record(MemoryObjectKey {
             object: Some(resolved.object_id()),
         })?;
-        if record.kind != MemoryObjectKind::PageBacked {
+        if !matches!(
+            record.kind,
+            MemoryObjectKind::PageBacked | MemoryObjectKind::OnDemand
+        ) {
             return Err(MemoryObjectError::BackingKind);
         }
         if device_writes && !record.protection_ceiling.writable() {

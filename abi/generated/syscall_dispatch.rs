@@ -107,6 +107,12 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         argument_count: 4,
     },
     DwSyscallDispatchMetadata {
+        number: 0x00020002,
+        name: "memory_object_commit",
+        implementation_phase: "DW2-M",
+        argument_count: 3,
+    },
+    DwSyscallDispatchMetadata {
         number: 0x00020010,
         name: "address_region_map",
         implementation_phase: "DW0-C",

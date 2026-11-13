@@ -587,8 +587,10 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_MEMORY_PROTECTION_EXECUTE ((DwMemoryProtection)(4))
 /* All mapping-protection bits recognized by ABI 0. */
 #define DW_MEMORY_PROTECTION_SUPPORTED_MASK ((DwMemoryProtection)(7))
-/* ABI 0 supports no nonzero MemoryObject creation flags. */
-#define DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK ((DwMemoryObjectCreateFlags)(0))
+/* Give each page a frame on its first touch instead of at creation (DW2 M6). Pages read as zero until written. Every frame the object gains, its pages and index nodes, is charged to MEMORY_PAGES of the object's creator, whoever touches it; creation charges one page. A user fault that cannot be served terminates the process with DW_TERMINATION_RESOURCE_POLICY; memory_object_commit fills a range in with a status instead. */
+#define DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND ((DwMemoryObjectCreateFlags)(1))
+/* MemoryObject creation flags recognized by ABI 0. */
+#define DW_MEMORY_OBJECT_CREATE_FLAGS_SUPPORTED_MASK ((DwMemoryObjectCreateFlags)(1))
 /* Map at requested_address exactly, without replacing an existing mapping. */
 #define DW_ADDRESS_REGION_MAP_FLAG_FIXED ((DwAddressRegionMapFlags)(1))
 /* All AddressRegion mapping flags recognized by ABI 0. */
@@ -607,7 +609,7 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_TERMINATION_AUTHORIZED ((DwTerminationReason)(2))
 /* Task terminated because of an unhandled structured exception. */
 #define DW_TERMINATION_UNHANDLED_EXCEPTION ((DwTerminationReason)(3))
-/* Task was terminated by a resource or policy decision. */
+/* Task was terminated by a resource or policy decision. A user fault on an on-demand MemoryObject page that could not be given a frame (quota or memory exhausted) records this reason with the page-fault exception type, the fault address, and the page-fault error code as detail. */
 #define DW_TERMINATION_RESOURCE_POLICY ((DwTerminationReason)(4))
 /* Task terminated during ancestor TaskGroup teardown. */
 #define DW_TERMINATION_TASK_GROUP_TEARDOWN ((DwTerminationReason)(5))
@@ -666,8 +668,10 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_SYSCALL_THREAD_TERMINATE ((DwSyscallId)(UINT32_C(0x00010023)))
 /* Set the calling thread's FS base, its user thread pointer. fs_base must be a lower-half canonical address (below 0x0000800000000000) or DW_STATUS_INVALID_ARGUMENT is returned. The value stays with the thread across preemption and migration; a new thread starts with FS base 0. GS is never user-settable. */
 #define DW_SYSCALL_THREAD_SET_FS_BASE ((DwSyscallId)(UINT32_C(0x00010024)))
-/* Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and any nonzero flags are INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle. */
+/* Create a zero-filled page-backed MemoryObject with an immutable size. Zero, unaligned, or overflowing byte_len and unknown flags are INVALID_ARGUMENT; with DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND, byte_len above 2^36 pages is INVALID_ARGUMENT; inaccessible output storage is BAD_ADDRESS; backing exhaustion is NO_MEMORY. Requested rights must be nonzero, known, and object-compatible, and failure publishes no handle. */
 #define DW_SYSCALL_MEMORY_OBJECT_CREATE ((DwSyscallId)(UINT32_C(0x00020001)))
+/* Give every page of the page-aligned range [offset, offset + byte_len) of an on-demand MemoryObject a zeroed frame now, charged as a touch is (DW2 M6). Returns NO_RESOURCES when the creator's MEMORY_PAGES quota is spent and NO_MEMORY when frames run out; pages committed before the failure stay committed. Zero, unaligned, or overflowing ranges, and ranges beyond the object, are INVALID_ARGUMENT. On an object that is not on demand it succeeds and changes nothing. */
+#define DW_SYSCALL_MEMORY_OBJECT_COMMIT ((DwSyscallId)(UINT32_C(0x00020002)))
 /* Transactionally map a page-aligned MemoryObject range using exact-size DwAddressRegionMapArgsV1. Malformed size/version/reserved fields, unknown flags or protections, zero/W+X protections, unaligned or overflowing ranges, and offset plus length beyond the checked align_up(logical byte_size, DW_BASE_PAGE_SIZE) mappable capacity are INVALID_ARGUMENT. WRITE-only or EXECUTE-only is NOT_SUPPORTED on DW0 x86_64 and READ is never added implicitly. DwMemoryObjectInfoV1 and other size APIs report only exact logical byte_size. Any final-page tail between byte_size and mappable capacity is hardware-addressable padding, is zero-initialized before first publication, never contains unrelated data, and may be shared or modified subject to mapping protections. Callers must parse or use object content only through exact logical byte_size; the ABI promises no subpage access enforcement within that tail. Allocator-chosen placement requires address zero; FIXED requires an exact nonzero page-aligned lower-userspace address, never replaces, and returns ALREADY_EXISTS on overlap. Noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS. Every mapping requires source MAP+READ; requested WRITE additionally requires source WRITE and requested EXECUTE requires source EXECUTE. Successful mapping captures the source handle's READ/WRITE/EXECUTE authority as the ceiling for later protect operations, including after the source handle closes; violation is ACCESS_DENIED. Failure to find allocator-chosen space returns NO_MEMORY. Every failure leaves mappings and out_address unchanged. */
 #define DW_SYSCALL_ADDRESS_REGION_MAP ((DwSyscallId)(UINT32_C(0x00020010)))
 /* Transactionally remove a nonempty page-aligned fully mapped userspace range. Zero, unaligned, or overflowing ranges are INVALID_ARGUMENT; noncanonical, page-zero, kernel, or outside-region addresses are BAD_ADDRESS; any unmapped hole is NOT_FOUND; a range overlapping memory pinned for another Thread's in-flight syscall copy is BAD_STATE. Failure leaves the complete range unchanged. */
@@ -1160,8 +1164,12 @@ typedef struct DwMemoryObjectInfoV1 {
     uint32_t version;
     /* Exact logical content byte size, fixed for the object lifetime; APIs report this value rather than page-rounded mappable capacity. */
     uint64_t byte_size;
-    /* Reserved; all elements must be zero. */
-    uint64_t reserved[2];
+    /* The creation flags the object has, such as DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND. */
+    DwMemoryObjectCreateFlags flags;
+    /* Reserved; must be zero. */
+    uint32_t reserved0;
+    /* Reserved; must be zero. */
+    uint64_t reserved;
 } DwMemoryObjectInfoV1;
 #define DW_MEMORY_OBJECT_INFO_V1_SIZE ((uint32_t)(32))
 DW_STATIC_ASSERT(sizeof(DwMemoryObjectInfoV1) == 32, "DwMemoryObjectInfoV1 size");
@@ -1169,7 +1177,9 @@ DW_STATIC_ASSERT(DW_ALIGNOF(DwMemoryObjectInfoV1) == 8, "DwMemoryObjectInfoV1 al
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, size) == 0, "DwMemoryObjectInfoV1.size offset");
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, version) == 4, "DwMemoryObjectInfoV1.version offset");
 DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, byte_size) == 8, "DwMemoryObjectInfoV1.byte_size offset");
-DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, reserved) == 16, "DwMemoryObjectInfoV1.reserved offset");
+DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, flags) == 16, "DwMemoryObjectInfoV1.flags offset");
+DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, reserved0) == 20, "DwMemoryObjectInfoV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwMemoryObjectInfoV1, reserved) == 24, "DwMemoryObjectInfoV1.reserved offset");
 
 /* Read-only immutable DeviceResource identity, lease, port range, and interrupt-source information. */
 typedef struct DwDeviceResourceInfoV1 {

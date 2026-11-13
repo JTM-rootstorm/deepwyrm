@@ -2474,6 +2474,102 @@ fn revoke_foreign_dma<D: crate::device::dma::DmaService, const OBJECTS: usize>(
 
 /// Releases a lookup pin whose handle still owns the object, so the pin is
 /// never the last reference.
+/// What `memory_object_commit` fills in: an on-demand object's backing and
+/// its identity, or `None` for an object that is not on demand, whose pages
+/// all have frames (DW2 M6 §8.2). Needs `MAP` on the handle. The lookup pin
+/// is let go before returning; the caller holds T, so the object cannot be
+/// finalized before it is done with the backing.
+pub(crate) fn memory_object_commit_target<
+    const OBJECTS: usize,
+    const MEMORY_OBJECTS: usize,
+    const LEASES: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    memory: &MemoryObjectAuthority<MEMORY_OBJECTS, LEASES>,
+    current_process: ProcessKey,
+    memory_object: DwHandle,
+    offset: u64,
+    byte_len: u64,
+) -> Result<
+    Option<(
+        crate::memory::frame_roles::BackingIdentity,
+        crate::object::ObjectId,
+    )>,
+    DwStatus,
+> {
+    use crate::memory::object::MemoryObjectError;
+    let resolved = match tasks.process_handles_mut(current_process) {
+        Ok(table) => table
+            .lookup(
+                registry,
+                memory_object,
+                crate::handle::AcceptedObjectTypes::One(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
+                deepwyrm_abi::DW_RIGHT_MAP,
+            )
+            .map_err(handle_status)?,
+        Err(error) => return Err(task_status(error)),
+    };
+    let object = resolved.object_id();
+    let range = memory.commit_range(&resolved, offset, byte_len);
+    release_held_lookup_pin(registry, resolved.into_internal());
+    match range {
+        Ok(backing) => Ok(backing.map(|backing| (backing, object))),
+        Err(
+            MemoryObjectError::Empty
+            | MemoryObjectError::Unaligned
+            | MemoryObjectError::Overflow
+            | MemoryObjectError::BackingTooSmall,
+        ) => Err(DW_STATUS_INVALID_ARGUMENT),
+        Err(error) => Err(memory_object_status(error)),
+    }
+}
+
+/// Admits `frames` more pages for the on-demand object `object`, against
+/// the tag it was created with: the creator pays for every touch (DW2 M6
+/// §8.4). Runs in the same hold as the commit it admits.
+pub(crate) fn admit_on_demand_frames<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    object: crate::object::ObjectId,
+    frames: u64,
+) -> Result<(), DwStatus> {
+    let (tag, _) = registry.charge(object).map_err(|_| DW_STATUS_BAD_STATE)?;
+    let needed = usize::try_from(frames).map_err(|_| DW_STATUS_NO_RESOURCES)?;
+    tasks
+        .admit_quota(
+            &tag,
+            crate::task::quota::MEMORY_PAGES_CLASS,
+            needed,
+            |group| registry.charged_pages(group),
+        )
+        .map_err(quota_status)
+}
+
+/// Adds `frames` committed frames to the on-demand object's page weight.
+pub(crate) fn record_on_demand_frames<const OBJECTS: usize>(
+    registry: &mut ObjectRegistry<OBJECTS>,
+    object: crate::object::ObjectId,
+    frames: u64,
+) {
+    let (_, pages) = registry
+        .charge(object)
+        .unwrap_or_else(|error| panic!("an admitted on-demand object lost its slot: {error:?}"));
+    registry
+        .set_charge_pages(object, pages + frames)
+        .unwrap_or_else(|error| panic!("an on-demand object rejected its weight: {error:?}"));
+}
+
 fn release_held_lookup_pin<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     pin: crate::object::InternalRef,
@@ -8748,9 +8844,13 @@ pub(crate) fn memory_object_create_owned<
     out_handle: DwUserAddress,
     cleanup: &mut CleanupQueue<OBJECTS>,
 ) -> DwStatus {
+    let on_demand = flags == deepwyrm_abi::DW_MEMORY_OBJECT_CREATE_FLAG_ON_DEMAND.0;
     if byte_len == 0
         || !byte_len.is_multiple_of(u64::from(DW_BASE_PAGE_SIZE))
-        || flags != 0
+        || (flags != 0 && !on_demand)
+        || (on_demand
+            && byte_len / u64::from(DW_BASE_PAGE_SIZE)
+                > crate::memory::frame_roles::INDEX_MAX_PAGES)
         || requested_rights.0 == 0
         || !deepwyrm_abi::dw_rights_are_known(requested_rights)
         || !deepwyrm_abi::dw_rights_are_compatible(
@@ -8769,7 +8869,9 @@ pub(crate) fn memory_object_create_owned<
         Err(_) => return DW_STATUS_BAD_ADDRESS,
     };
     let page_count = byte_len / u64::from(DW_BASE_PAGE_SIZE);
-    let charge = match admit_memory_object(registry, tasks, current_process, page_count) {
+    // An on-demand object starts as its index root: one page (DW2 M6 §8.4).
+    let charged_pages = if on_demand { 1 } else { page_count };
+    let charge = match admit_memory_object(registry, tasks, current_process, charged_pages) {
         Ok(charge) => charge,
         Err(status) => {
             // Any early backing stays with the access for the caller's
@@ -8801,11 +8903,16 @@ pub(crate) fn memory_object_create_owned<
             return status;
         }
     };
+    let kind = if on_demand {
+        crate::memory::object::MemoryObjectKind::OnDemand
+    } else {
+        crate::memory::object::MemoryObjectKind::PageBacked
+    };
     let binding = match memory.bind_backing(
         creation,
         backing,
         byte_len,
-        crate::memory::object::MemoryObjectKind::PageBacked,
+        kind,
         crate::memory::object::MemoryProtection::READ_WRITE_EXECUTE,
     ) {
         Ok(binding) => binding,
@@ -8841,7 +8948,7 @@ pub(crate) fn memory_object_create_owned<
     });
     charge_created(registry, reference.id(), charge);
     registry
-        .set_charge_pages(reference.id(), page_count)
+        .set_charge_pages(reference.id(), charged_pages)
         .unwrap_or_else(|error| panic!("fresh MemoryObject rejected its page charge: {error:?}"));
     let handle = match tasks.process_handles_mut(current_process) {
         Ok(table) => {
