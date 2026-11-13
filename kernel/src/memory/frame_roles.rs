@@ -534,6 +534,11 @@ pub(crate) struct BackingAllocation {
 }
 
 impl BackingAllocation {
+    /// The pages allocated.
+    pub(crate) const fn pages(&self) -> u64 {
+        self.pages
+    }
+
     pub(crate) const fn byte_len(&self) -> u64 {
         self.pages * BASE_PAGE_SIZE
     }

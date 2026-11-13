@@ -166,6 +166,35 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|_| panic!("a zeroed backing allocation becomes a backing")))
     }
 
+    /// Has `zero` clear pages `[first, first + count)` of `allocation`: part
+    /// of the zeroing `allocate_zeroed_backing` does whole, so a caller can
+    /// release its locks between parts (DW2 M4b). `false` if a page fails,
+    /// or the pages are not all in the allocation.
+    pub(crate) fn zero_backing_pages(
+        &self,
+        allocation: &BackingAllocation,
+        first: u64,
+        count: u64,
+        zero: &mut dyn FnMut(u64) -> bool,
+    ) -> bool {
+        let Some(end) = first
+            .checked_add(count)
+            .filter(|end| *end <= allocation.pages)
+        else {
+            return false;
+        };
+        if self.chain_totals(allocation.head, ChainState::Allocated)
+            != Ok((allocation.pages, allocation.runs))
+        {
+            return false;
+        }
+        self.segments(allocation.head, ChainState::Allocated, first, end)
+            .all(|segment| {
+                (0..segment.byte_len / BASE_PAGE_SIZE)
+                    .all(|page| zero(segment.physical_start + page * BASE_PAGE_SIZE))
+            })
+    }
+
     /// The physical pieces of an allocation, for zeroing.
     pub(crate) fn backing_allocation_segments(
         &self,

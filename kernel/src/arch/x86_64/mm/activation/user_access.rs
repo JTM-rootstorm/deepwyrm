@@ -1268,6 +1268,63 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)
     }
 
+    /// A new MemoryObject's backing, allocated and not yet zeroed, for
+    /// zeroing in steps (DW2 M4b).
+    pub(crate) fn allocate_backing(
+        &mut self,
+        page_count: u64,
+    ) -> Result<crate::memory::frame_roles::BackingAllocation, LiveUserAccessError> {
+        self.roles
+            .allocate_backing(page_count)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+    }
+
+    /// Zeroes pages `[first, first + count)` of `allocation` through the
+    /// authenticated scratch session; `false` if any fails.
+    pub(crate) fn zero_backing_pages(
+        &mut self,
+        allocation: &crate::memory::frame_roles::BackingAllocation,
+        first: u64,
+        count: u64,
+    ) -> bool {
+        let limit = self.selected_root().physical_limit();
+        let scratch = &mut self.target.scratch;
+        let mut zero = |page: u64| {
+            FrameAddress::new(page, limit)
+                .is_ok_and(|frame| scratch.zero_allocator_frame(frame).is_ok())
+        };
+        self.roles
+            .zero_backing_pages(allocation, first, count, &mut zero)
+    }
+
+    /// Makes a zeroed allocation one object backing.
+    ///
+    /// # Safety
+    ///
+    /// `zero_backing_pages` must have zeroed every page of `allocation`.
+    #[allow(
+        unsafe_code,
+        reason = "the caller attests that every page was zeroed through the authenticated scratch session"
+    )]
+    pub(crate) unsafe fn finish_zeroed_backing(
+        &mut self,
+        allocation: crate::memory::frame_roles::BackingAllocation,
+    ) -> ObjectBackingGrant {
+        // SAFETY: the caller zeroed every page, per this function's contract.
+        unsafe { self.roles.assume_backing_zeroed(allocation) }
+            .unwrap_or_else(|_| panic!("a zeroed backing allocation becomes a backing"))
+    }
+
+    /// Frees an allocation that will not become a backing.
+    pub(crate) fn cancel_backing(
+        &mut self,
+        allocation: crate::memory::frame_roles::BackingAllocation,
+    ) {
+        self.roles
+            .cancel_backing_allocation(allocation)
+            .unwrap_or_else(|_| panic!("a fresh backing allocation frees"));
+    }
+
     #[allow(
         unsafe_code,
         reason = "the authenticated scratch session zeroes the exclusive table allocation before the typed Zeroed transition"

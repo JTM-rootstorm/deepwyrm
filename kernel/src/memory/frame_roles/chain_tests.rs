@@ -429,3 +429,42 @@ fn a_cursor_never_borrows_another_live_backings_run() {
         Some(FrameRoleError::WrongRole)
     );
 }
+
+/// DW2 M4b: a backing zeroed in parts zeroes every page of every run once,
+/// in object order, and refuses a part outside the allocation.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model never dereferences synthetic physical memory"
+)]
+fn a_backing_zeroed_in_parts_zeroes_every_page_once() {
+    let mut roles = manager(16);
+    let _held = fragment(&mut roles, &[3, 2]);
+    let allocation = roles.allocate_backing(5).unwrap();
+    let whole: Vec<u64> = roles
+        .backing_allocation_segments(&allocation)
+        .unwrap()
+        .flat_map(|segment| {
+            (0..segment.byte_len / PAGE).map(move |page| segment.physical_start + page * PAGE)
+        })
+        .collect();
+    assert_eq!(whole.len(), 5);
+    let mut zeroed = Vec::new();
+    for (first, count) in [(0, 2), (2, 2), (4, 1)] {
+        assert!(
+            roles.zero_backing_pages(&allocation, first, count, &mut |page| {
+                zeroed.push(page);
+                true
+            })
+        );
+    }
+    assert_eq!(zeroed, whole, "the parts cross the run boundary in order");
+    for (first, count) in [(4, 2), (5, 1), (u64::MAX, 2)] {
+        assert!(!roles.zero_backing_pages(&allocation, first, count, &mut |_| true));
+    }
+    assert!(!roles.zero_backing_pages(&allocation, 0, 5, &mut |page| page != whole[3]));
+    // SAFETY: the host model never dereferences the synthetic runs.
+    let grant = unsafe { roles.assume_backing_zeroed(allocation) }.unwrap();
+    assert_eq!(grant.run_count(), 2);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}

@@ -1017,15 +1017,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 (Some(_), Some(_)) if !quota_allows => {
                     Some(Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
                 }
+                // Allocated here, zeroed below in steps (DW2 M4b).
                 (Some(page_count), Some(_)) => Some(
-                    crate::syscall::MemoryObjectBackingAccess::allocate_zeroed_backing(
-                        &mut user, page_count,
-                    ),
+                    user.allocate_backing(page_count)
+                        .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
                 ),
                 _ => None,
             };
             (atomic_pin, pinned, backing)
         };
+        let backing = backing.map(|allocation| {
+            allocation.and_then(|allocation| self.zero_backing_in_steps(root, process, allocation))
+        });
         let pin_taken = matches!(atomic_pin, Some(Ok(_)));
         let mut deferred =
             crate::memory::usercopy::DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));
@@ -1921,6 +1924,48 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     unreachable!("a published step finishes in its last hold")
                 }
             }
+        }
+    }
+
+    /// Zeroes a new MemoryObject's backing one step at a time, taking P for
+    /// each step and releasing it between them, then makes it the object's
+    /// backing (DW2 M4b). Its frames are reachable only through
+    /// `allocation`, held in this frame, so nothing touches them between
+    /// steps. A page that fails frees the whole allocation.
+    #[allow(
+        unsafe_code,
+        reason = "every page was zeroed by the steps before the allocation becomes a backing"
+    )]
+    fn zero_backing_in_steps(
+        &mut self,
+        root: super::UserCopyRoot,
+        process: ProcessKey,
+        allocation: crate::memory::frame_roles::BackingAllocation,
+    ) -> Result<ObjectBackingGrant, deepwyrm_abi::DwStatus> {
+        let step_pages = PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64;
+        let mut first = 0;
+        let mut zeroed = true;
+        while zeroed && first < allocation.pages() {
+            let count = step_pages.min(allocation.pages() - first);
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
+            zeroed = user.zero_backing_pages(&allocation, first, count);
+            first += count;
+        }
+        let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+        let mut paging = access.lock();
+        let mut user = paging
+            .guard_free_value()
+            .usercopy_process_address_space(root, process);
+        if zeroed {
+            // SAFETY: the loop zeroed every page of the allocation.
+            Ok(unsafe { user.finish_zeroed_backing(allocation) })
+        } else {
+            user.cancel_backing(allocation);
+            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
         }
     }
 
