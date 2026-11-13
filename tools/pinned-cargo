@@ -296,16 +296,18 @@ export CARGO_INCREMENTAL=0
 # for diagnostics.
 if [ "$lane" = target ]; then
     export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$workspace=/source/deepwyrm\037--remap-path-prefix=$cargo_home=/cargo-home\037--remap-path-prefix=$normalized_target=/cargo-target"
-    # The stack check (DW2 M5) builds an analysis copy of the kernel with
-    # LLVM's stack-size section. `-Z emit-stack-sizes` needs the unstable
-    # gate, so only that explicit opt-in sets it, and it must use its own
-    # target directory.
+    # The stack check (`xtask kernel-check`, DW2 M5) builds an analysis copy
+    # of the kernel with LLVM's stack-size section and the linker's
+    # relocations kept (`--emit-relocs`), which locate its call sites. Neither
+    # changes the code; the check compares it with production. `-Z
+    # emit-stack-sizes` needs the unstable gate, so only that explicit opt-in
+    # sets it, and it must use its own target directory.
     if [ "${DEEPWYRM_EMIT_STACK_SIZES:-}" = 1 ]; then
         case "$normalized_target" in
             */stack-check|*/stack-check/*) ;;
             *) fail "DEEPWYRM_EMIT_STACK_SIZES needs a stack-check target directory" ;;
         esac
-        CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS\037-Zemit-stack-sizes"
+        CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS\037-Zemit-stack-sizes\037-Clink-arg=--emit-relocs"
         export RUSTC_BOOTSTRAP=1
     fi
     CARGO_ENCODED_RUSTFLAGS=$(printf '%b' "$CARGO_ENCODED_RUSTFLAGS")

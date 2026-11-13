@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 mod cli;
 mod harness;
+mod kernel_check;
 mod lint_ratchet;
 mod toolchain;
 
@@ -23,6 +24,7 @@ const COMMANDS: &[&str] = &[
     "check",
     "clippy",
     "doc",
+    "kernel-check",
     "abi",
     "build",
     "image",
@@ -129,6 +131,8 @@ Commands:
   clippy                             Warnings-denied Clippy: production kernel, then host
                                      workspace, then the lint ratchet
   doc                                Warnings-denied rustdoc over the workspace
+  kernel-check                       Production kernel image checks and the static
+                                     stack bound (DW2 plan §10.2)
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
   test host [abi|memory|handles|tasks|ipc|selectors]
@@ -168,6 +172,7 @@ enum Invocation {
     Check,
     Clippy,
     Rustdoc,
+    KernelCheck,
     AbiGenerate,
     AbiCheck,
     HostTests(Option<HostTestFilter>),
@@ -422,6 +427,7 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
             // `lint_ratchet.rs` and `tooling/lint-ratchet.txt`.
             return run_lint_ratchet();
         }
+        Invocation::KernelCheck => return kernel_check::run_kernel_check(),
         Invocation::Rustdoc => {
             command.env("RUSTDOCFLAGS", "-D warnings");
             command.args(["doc", "--locked", "--workspace", "--no-deps"]);

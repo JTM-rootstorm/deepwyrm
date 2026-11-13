@@ -25,6 +25,7 @@ pub(super) fn parse(args: &[String]) -> Action {
         "check" if args.len() == 1 => Action::Command(Invocation::Check),
         "clippy" if args.len() == 1 => Action::Command(Invocation::Clippy),
         "doc" if args.len() == 1 => Action::Command(Invocation::Rustdoc),
+        "kernel-check" if args.len() == 1 => Action::Command(Invocation::KernelCheck),
         "abi" => parse_abi(&args[1..]),
         "run" => parse_harness_command(HarnessKind::Run, &args[1..]),
         "gdb" => parse_harness_command(HarnessKind::Gdb, &args[1..]),
@@ -179,6 +180,10 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         Some("clippy") => write!(
             writer,
             "Usage: cargo xtask clippy\n\nWarnings-denied Clippy over the production kernel on the target lane first, then the host workspace, then the lint ratchet: host Clippy at warn level for clippy::wildcard_enum_match_arm and clippy::undocumented_unsafe_blocks per package, plus `unsafe {{` blocks lacking a `// SAFETY:` comment in the target-only files host Clippy cannot see. Fails if any count exceeds tooling/lint-ratchet.txt; prints any count that fell so the baseline can be tightened.\n"
+        ),
+        Some("kernel-check") => write!(
+            writer,
+            "Usage: cargo xtask kernel-check\n\nBuilds the production kernel and a stack analysis copy on the target lane. Checks that production is a static freestanding image with no test-only symbols or selector markers, that the analysis copy's code is byte-identical to production, and that the deepest direct-call chain from each kernel entry leaves a quarter of its stack spare. Calls through registers are not bounded here; dev-boot's stack high-water marks cover them.\n"
         ),
         Some("doc") => write!(
             writer,
