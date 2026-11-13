@@ -1310,6 +1310,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         count: usize,
         fill: T,
     ) -> &'static mut [T] {
+        // SAFETY: the caller guarantees the range is writable, aligned for `T`,
+        // unused and live for ever, so `count` writes and the slice stay in it.
         unsafe {
             let start = base.add(offset).cast::<T>();
             for index in 0..count {

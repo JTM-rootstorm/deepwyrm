@@ -2723,6 +2723,10 @@ pub(crate) fn dma_map_commit_rights<
 /// resource's IOMMU domain. The MemoryObject lookup pin becomes the
 /// mapping's reference.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "two MemoryObject errors read differently for DMA; the rest map as everywhere else"
+)]
 pub(crate) fn dma_map<
     U: UserPageAccess,
     D: crate::device::dma::DmaService,

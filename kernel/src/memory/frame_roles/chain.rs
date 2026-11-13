@@ -302,7 +302,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 return Err(FrameRoleError::ReadOnlyBacking);
             }
             FrameRole::ExternalImmutableModule { .. } => {}
-            _ => return Err(FrameRoleError::WrongRole),
+            FrameRole::AllocatedUninitialized
+            | FrameRole::Zeroed
+            | FrameRole::BackingAllocated(_)
+            | FrameRole::ArchitectureBootstrap(_)
+            | FrameRole::TableCandidate { .. }
+            | FrameRole::PageTable { .. }
+            | FrameRole::External(_)
+            | FrameRole::RoleTableStorage
+            | FrameRole::IndexRoot(_)
+            | FrameRole::IndexNode(_)
+            | FrameRole::ObjectPage(_) => return Err(FrameRoleError::WrongRole),
         }
         let (total, _) = self.chain_totals(backing.0, ChainState::Backing)?;
         if end > total {
@@ -354,7 +364,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 return Err(FrameRoleError::ReadOnlyBacking);
             }
             FrameRole::ExternalImmutableModule { .. } => {}
-            _ => return Err(FrameRoleError::WrongRole),
+            FrameRole::AllocatedUninitialized
+            | FrameRole::Zeroed
+            | FrameRole::BackingAllocated(_)
+            | FrameRole::ArchitectureBootstrap(_)
+            | FrameRole::TableCandidate { .. }
+            | FrameRole::PageTable { .. }
+            | FrameRole::External(_)
+            | FrameRole::RoleTableStorage
+            | FrameRole::IndexNode(_)
+            | FrameRole::ObjectPage(_) => return Err(FrameRoleError::WrongRole),
         }
         if page < cursor.run_page {
             *cursor = BackingCursor::new(BackingIdentity(head));
@@ -418,7 +437,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let (state, link) = match record.role {
                 FrameRole::BackingAllocated(link) => (ChainState::Allocated, link),
                 FrameRole::ObjectBacking(link) => (ChainState::Backing, link),
-                _ => continue,
+                FrameRole::AllocatedUninitialized
+                | FrameRole::Zeroed
+                | FrameRole::ArchitectureBootstrap(_)
+                | FrameRole::TableCandidate { .. }
+                | FrameRole::PageTable { .. }
+                | FrameRole::External(_)
+                | FrameRole::ExternalImmutableModule { .. }
+                | FrameRole::ExternalDeviceMmio
+                | FrameRole::RoleTableStorage
+                | FrameRole::IndexRoot(_)
+                | FrameRole::IndexNode(_)
+                | FrameRole::ObjectPage(_) => continue,
             };
             linked += 1;
             let identity = self.identity(slot, entry.generation)?;

@@ -21,8 +21,8 @@
 # sees them and the target has no harness, so every row stays 0: move a test
 # and the pure code it tests into a host-compiled module instead.
 
-deepwyrm-kernel clippy::undocumented_unsafe_blocks 240
-deepwyrm-kernel clippy::wildcard_enum_match_arm 88
+deepwyrm-kernel clippy::undocumented_unsafe_blocks 236
+deepwyrm-kernel clippy::wildcard_enum_match_arm 87
 kernel/src/arch/x86_64/mm/activation/primordial.rs unsafe-block-without-safety-comment 0
 kernel/src/arch/x86_64/syscall/live.rs unsafe-block-without-safety-comment 0
 kernel/src/arch/x86_64/apic_live.rs test-attribute-in-target-only-file 0

@@ -264,6 +264,7 @@ fn exact_empty_hierarchy_proof_reclaims_descendants_bottom_up() {
         .unwrap();
     let mut hierarchy = roles.finish_empty_table_hierarchy(hierarchy).unwrap();
     for table in [pt, pd, pdpt] {
+        // SAFETY: the host model owns this hierarchy alone and no CPU runs on it.
         unsafe { roles.reclaim_preflighted_table(&mut hierarchy, table) };
     }
     let empty_root = roles.finish_preflighted_hierarchy(hierarchy);
@@ -760,17 +761,21 @@ fn device_mmio_imports_are_writable_permanent_and_exclusive() {
     // SAFETY: each refused range is never imported.
     let overlapping = PhysicalRange::new(0xc0_0000_3000, 2 * BASE_PAGE_SIZE).unwrap();
     assert_eq!(
+        // SAFETY: a refused range is never imported.
         unsafe { roles.import_device_mmio(overlapping) }.unwrap_err(),
         FrameRoleError::Overlap
     );
     let in_ram = PhysicalRange::new(0x11_000, BASE_PAGE_SIZE).unwrap();
     assert_eq!(
+        // SAFETY: a refused range is never imported.
         unsafe { roles.import_device_mmio(in_ram) }.unwrap_err(),
         FrameRoleError::ExternalAllocatorOverlap
     );
     let partial_page = PhysicalRange::new(0xd0_0000_0000, 0x800).unwrap();
+    // SAFETY: a refused range is never imported.
     assert!(unsafe { roles.import_device_mmio(partial_page) }.is_err());
     let unaligned = PhysicalRange::new(0xd0_0000_0800, BASE_PAGE_SIZE).unwrap();
+    // SAFETY: a refused range is never imported.
     assert!(unsafe { roles.import_device_mmio(unaligned) }.is_err());
 
     // The role is permanent: the grant cannot be cancelled back to anything.

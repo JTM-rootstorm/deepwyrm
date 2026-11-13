@@ -93,6 +93,10 @@ pub(crate) struct RegionSteps<P, const SLOTS: usize> {
 
 impl<P: Copy, const SLOTS: usize> RegionSteps<P, SLOTS> {
     /// The plan for a family-G `request`, in steps of `step_bytes`.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "every request other than an unmap or protect starts as a pending map"
+    )]
     pub(crate) fn new(request: NativeSyscallRequest, step_bytes: u64) -> Self {
         let (kind, start, total) = match request {
             NativeSyscallRequest::AddressRegionUnmap {
@@ -165,6 +169,10 @@ impl<P: Copy, const SLOTS: usize> RegionSteps<P, SLOTS> {
 
     /// The range an unmap or protect in steps checks whole, and snapshots,
     /// before its first step, as (region handle, start, end).
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "only an unmap or protect takes a range snapshot"
+    )]
     pub(crate) fn snapshot_range(&self) -> Option<(deepwyrm_abi::DwHandle, u64, u64)> {
         match self.request {
             NativeSyscallRequest::AddressRegionUnmap { address_region, .. }
@@ -199,7 +207,7 @@ impl<P: Copy, const SLOTS: usize> RegionSteps<P, SLOTS> {
             let map = match self.kind {
                 Kind::Map { args, protection } => Some(Ok((args, protection, args.byte_len.0))),
                 Kind::MapRefused(status) => Some(Err(status)),
-                _ => None,
+                Kind::MapPending | Kind::Unmap | Kind::Protect(_) => None,
             };
             return Step {
                 request: self.request,

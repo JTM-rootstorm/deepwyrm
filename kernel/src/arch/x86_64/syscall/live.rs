@@ -595,12 +595,12 @@ unsafe fn normalize_live_cr4(mode: FpSaveMode) -> Result<(), SyscallInstallError
     }
     let expected = normalize_cr4_for_user_fp(before, mode) | protections;
     if before != expected {
-        // SAFETY: [ASM] keeps only the `CR4_KEPT` bits as found (so PAE, LA57, PCIDE, VMXE and SMXE,
+        // The write keeps only the `CR4_KEPT` bits as found (so PAE, LA57, PCIDE, VMXE and SMXE,
         // whose change could fault, never change), sets OSFXSR/OSXMMEXCPT, and OSXSAVE exactly
-        // when the CPU has XSAVE (`plan_fp_mode`). Every bit it clears may be cleared at any time
-        // outside VMX/SMX operation. No kernel code uses RD/WR{FS,GS}BASE, SSE, protection keys,
-        // CET, FRED, LASS or LAM. SMEP and SMAP are set where the CPU has them: the kernel
-        // neither executes nor touches user pages (it copies through the direct map).
+        // when the CPU has XSAVE (`plan_fp_mode`).
+        // SAFETY: [ASM] every bit cleared may be cleared outside VMX/SMX operation; no kernel code
+        // uses RD/WR{FS,GS}BASE, SSE, protection keys, CET, FRED, LASS or LAM; SMEP and SMAP are
+        // set where present, as the kernel never executes or touches user pages (direct map only).
         unsafe {
             core::arch::asm!(
                 "mov cr4, {}",

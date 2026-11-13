@@ -197,7 +197,16 @@ fn snapshot_unique_table<R: AcpiByteReader>(
 ) -> Result<Option<usize>, DmarError> {
     let read_error = |error| match error {
         AcpiTimeError::ReadFailure => DmarError::ReadFailure,
-        _ => DmarError::InvalidRootTable,
+        AcpiTimeError::InvalidRsdp
+        | AcpiTimeError::InvalidRootTable
+        | AcpiTimeError::RootEntryLimit
+        | AcpiTimeError::MissingFadt
+        | AcpiTimeError::DuplicateFadt
+        | AcpiTimeError::InvalidFadt
+        | AcpiTimeError::HardwareReduced
+        | AcpiTimeError::MissingPmTimer
+        | AcpiTimeError::ConflictingPmTimer
+        | AcpiTimeError::UnauthorizedPmTimerPort => DmarError::InvalidRootTable,
     };
     if rsdp_physical == 0 {
         return Err(DmarError::InvalidRootTable);
@@ -263,7 +272,16 @@ fn snapshot_unique_table<R: AcpiByteReader>(
     .map(Some)
     .map_err(|error| match error {
         AcpiTimeError::ReadFailure => DmarError::ReadFailure,
-        _ => DmarError::InvalidDmar,
+        AcpiTimeError::InvalidRsdp
+        | AcpiTimeError::InvalidRootTable
+        | AcpiTimeError::RootEntryLimit
+        | AcpiTimeError::MissingFadt
+        | AcpiTimeError::DuplicateFadt
+        | AcpiTimeError::InvalidFadt
+        | AcpiTimeError::HardwareReduced
+        | AcpiTimeError::MissingPmTimer
+        | AcpiTimeError::ConflictingPmTimer
+        | AcpiTimeError::UnauthorizedPmTimerPort => DmarError::InvalidDmar,
     })
 }
 

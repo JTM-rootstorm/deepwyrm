@@ -606,6 +606,7 @@ mod tests {
         let channels = ChannelAuthority::<1, 2>::new();
         let waits = WaitRegistry::<4>::new();
         let mut tasks = TaskAuthority::<1, 1, 1, 1>::new();
+        // SAFETY: this model creates the only address-space authority it uses.
         let mut spaces = unsafe { AddressSpaceAuthority::<1, 1>::new() };
         let mut regions = AddressRegionObjectAuthority::<1, 1>::new();
         let (domain, _owner) = tasks.create_root_group(&mut registry).unwrap();

@@ -14532,7 +14532,7 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
     let room = (0..=4)
         .rev()
         .find(|&pages| memory_object_quota_allows(&registry, &tasks, process, pages))
-        .unwrap() as u64;
+        .unwrap();
     assert!(room >= 2);
     for (pages, tables, admitted) in [
         (room, 1, false),
@@ -14562,7 +14562,7 @@ fn an_on_demand_object_charges_its_creator_per_commit() {
         (1, 4096),
         (0, 0),
         (0, (pages + 1) * 4096),
-        (u64::MAX & !4095, 8192),
+        (!4095_u64, 8192),
     ] {
         assert_eq!(
             memory_object_commit_target(

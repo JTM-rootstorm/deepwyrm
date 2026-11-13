@@ -50,6 +50,10 @@ fn map_step(step: &Step<u8>) -> (u32, u64, u64, u64, u64) {
 }
 
 /// (address, length, protections) of an unmap (`None`) or protect step.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "a step that is not an unmap or protect fails the test"
+)]
 fn range_step(step: &Step<u8>) -> (u64, u64, Option<u32>) {
     match step.request {
         NativeSyscallRequest::AddressRegionUnmap {

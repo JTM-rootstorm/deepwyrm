@@ -180,9 +180,12 @@ fn persistent_status_is_kept_and_one_shot_bits_are_not_replayed() {
     let commands: Vec<u32> = unit
         .log
         .iter()
-        .filter_map(|write| match write {
-            Write::W32(REG_GLOBAL_COMMAND, value) => Some(*value),
-            _ => None,
+        .filter_map(|write| {
+            if let Write::W32(REG_GLOBAL_COMMAND, value) = write {
+                Some(*value)
+            } else {
+                None
+            }
         })
         .collect();
     assert_eq!(
@@ -217,9 +220,12 @@ fn drain_bits_follow_the_capabilities() {
 fn commands(unit: &Unit) -> Vec<u32> {
     unit.log
         .iter()
-        .filter_map(|write| match write {
-            Write::W32(REG_GLOBAL_COMMAND, value) => Some(*value),
-            _ => None,
+        .filter_map(|write| {
+            if let Write::W32(REG_GLOBAL_COMMAND, value) = write {
+                Some(*value)
+            } else {
+                None
+            }
         })
         .collect()
 }

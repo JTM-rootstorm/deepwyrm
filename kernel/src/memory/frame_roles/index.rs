@@ -113,6 +113,11 @@ struct IndexStep {
     first_page: u64,
 }
 
+/// The steps an index walk took, and the committed page it reached, if any.
+type IndexWalk = (
+    [Option<IndexStep>; INDEX_MAX_LEVELS as usize],
+    Option<(FrameRoleIdentity, RoleRecord)>,
+);
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -163,7 +168,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let record = self.record(head)?;
         match record.role {
             FrameRole::IndexRoot(root) if head.domain == self.domain => Ok((record, root)),
-            _ => Err(FrameRoleError::WrongRole),
+            FrameRole::IndexRoot(_)
+            | FrameRole::AllocatedUninitialized
+            | FrameRole::Zeroed
+            | FrameRole::BackingAllocated(_)
+            | FrameRole::ObjectBacking(_)
+            | FrameRole::ArchitectureBootstrap(_)
+            | FrameRole::TableCandidate { .. }
+            | FrameRole::PageTable { .. }
+            | FrameRole::External(_)
+            | FrameRole::ExternalImmutableModule { .. }
+            | FrameRole::ExternalDeviceMmio
+            | FrameRole::RoleTableStorage
+            | FrameRole::IndexNode(_)
+            | FrameRole::ObjectPage(_) => Err(FrameRoleError::WrongRole),
         }
     }
 
@@ -229,17 +247,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Walks from the root of `head` towards `page`. Returns the steps taken
     /// down to the deepest node that exists, and the committed page if the
     /// walk reached it.
-    fn index_walk(
-        &self,
-        head: FrameRoleIdentity,
-        page: u64,
-    ) -> Result<
-        (
-            [Option<IndexStep>; INDEX_MAX_LEVELS as usize],
-            Option<(FrameRoleIdentity, RoleRecord)>,
-        ),
-        FrameRoleError,
-    > {
+    fn index_walk(&self, head: FrameRoleIdentity, page: u64) -> Result<IndexWalk, FrameRoleError> {
         let (root_record, root) = self.index_root(head)?;
         if page >= root.pages {
             return Err(FrameRoleError::WrongRole);
@@ -602,7 +610,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .index_count(identity)
                         .map_err(|_| FrameRoleError::InvariantViolation)?;
                 }
-                _ => {}
+                FrameRole::AllocatedUninitialized
+                | FrameRole::Zeroed
+                | FrameRole::BackingAllocated(_)
+                | FrameRole::ObjectBacking(_)
+                | FrameRole::ArchitectureBootstrap(_)
+                | FrameRole::TableCandidate { .. }
+                | FrameRole::PageTable { .. }
+                | FrameRole::External(_)
+                | FrameRole::ExternalImmutableModule { .. }
+                | FrameRole::ExternalDeviceMmio
+                | FrameRole::RoleTableStorage => {}
             }
         }
         if linked != reached {

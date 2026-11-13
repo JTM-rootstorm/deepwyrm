@@ -88,7 +88,8 @@ impl Fixture {
             let mut holes = std::vec::Vec::new();
             for &run in runs {
                 holes.push(roles.allocate(run).unwrap());
-                core::mem::forget(roles.allocate(1).unwrap());
+                // Held for the test's life: the range has no destructor.
+                let _ = roles.allocate(1).unwrap();
             }
             let rest = roles.allocate(roles.available_frames()).unwrap();
             for hole in holes {
