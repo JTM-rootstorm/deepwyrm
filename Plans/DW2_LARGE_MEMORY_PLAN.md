@@ -38,7 +38,7 @@ Each stage is a Deepwyrm change with its own tests, and each is useful without t
 | **M6** | Allocate on first touch: a map of anonymous memory reserves the range and publishes nothing; the first touch allocates, zeroes and maps the page, charged to the job's budget then. A fault the kernel cannot serve (budget spent, no frames) is delivered as today's exception. This shrinks M4's job to maps of existing objects | L7 | a map flag or object kind for lazily backed memory, and the fault outcome, in the schema |
 | **M7** | Fragmentation that stays fast (§6.8): the buddy allocator with the smaller role table, the object index for fragmented eager backings, then compaction. Carries M3 R1 and R4 and M4b R2 (§9) | L3's slow path | none |
 | **M8** | Lock scope and accounting: per-group usage counters instead of the linear registry scan, a first touch that does not serialise every CPU on the global T, and stepped calls that yield the CPU at their safe points. Carries M4b R3 and the M6 open items (§9) | — | none |
-| **M9** | The OOM killer (§6.7): kernel mechanism (per-job accounting, a low-memory signal) with Wyrmroot choosing the victim. Carries M6's overcommit (§9) | — | Wyrmroot policy |
+| **M9** | Overcommit and the OOM killer, as Linux handles them, tailored to Deepwyrm (Mike, 2026-11-13; §11). Carries M6's overcommit (§9) | — | a low-memory signal; Wyrmroot policy |
 | later | 2 MiB user pages for objects whose backing has 2 MiB-aligned runs (needs M3) | L8 | none |
 
 Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into scattered backing), then M5. Then M7, M8 and M9 (Mike, 2026-11-13). M2, M3 and M6 change the boot path, object finalization and fault handling, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
@@ -528,3 +528,17 @@ M5 lets a job use what M2–M6 made possible. Today a job gets 16 MiB, 4 MemoryO
 3. SDK: `mmap` by size over on-demand objects; its host tests replace the arena tests.
 4. Probes 9–13 in dev-boot.
 5. Independent security review of the stage; fixes; §9 ledger and an as-built record.
+
+## 11. M9 direction (Mike, 2026-11-13)
+
+Mike: overcommit is handled the way Linux handles it, tailored to this architecture, OOM killer included. The design comes after M5, M7 and M8; this records the mapping it starts from.
+
+| Linux | Deepwyrm and Wyrmroot |
+|---|---|
+| Overcommit modes (`vm.overcommit_memory`): heuristic (refuse one allocation larger than RAM plus swap), always, or strict commit accounting | Eager objects are already strictly committed (frames taken at create, `NO_MEMORY` when none). On-demand objects are the overcommitted reservations; the heuristic mode refuses one larger than total RAM. A strict mode, if wanted, charges an on-demand object's full size at create. The mode is a platform setting, heuristic by default |
+| `oom_badness`: a task's resident pages plus swap and page tables, adjusted by `oom_score_adj` | A job's charged pages (its TaskGroup's usage, §8.4, which already counts touched pages, index nodes and page tables), adjusted by a per-job score Wyrmroot sets at launch; resident services are protected the way `-1000` protects a task |
+| The kernel picks and kills inside the allocation path, and the OOM reaper frees the victim's memory early | Policy stays in Wyrmroot (root `CLAUDE.md` §6; §6.7): when an allocation finds no frames, the kernel parks the allocating thread instead of ending it and signals a low-memory event; Wyrmroot's OOM service, holding the jobs' TaskGroup handles, picks the worst job and terminates it, and the parked thread retries once frames are free. If the service cannot act in bounded time (it may itself need memory), the kernel falls back to ending the allocating Process, as it does today |
+| PSI and userspace killers (`systemd-oomd`, Android's `lmkd`) act before exhaustion | A watermark signal before frames run out, so the service can act early |
+
+Questions for M9's design, not decided here: what the kernel reserves so the OOM service can always run; whether a parked fault counts against the stop and preemption rules of §8.5; how the per-job score is carried; and whether kernel-internal allocations (page tables, index nodes) wait or fail.
+
