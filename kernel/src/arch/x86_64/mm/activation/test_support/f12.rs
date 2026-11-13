@@ -58,6 +58,8 @@ type F12Tasks = TaskAuthority<TASK_GROUPS, PROCESSES, THREADS, HANDLES>;
 type F12Spaces = AddressSpaceAuthority<SPACES, REGIONS>;
 type F12Regions = AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>;
 type F12Channels = ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>;
+static F12_CHANNEL_SMALL_PAYLOADS: crate::ipc::ChannelSmallPayloads<CHANNEL_PAIRS, CHANNEL_DEPTH> =
+    crate::ipc::ChannelSmallPayloads::new();
 
 const fn parse_decimal_u64(value: &str) -> u64 {
     let bytes = value.as_bytes();
@@ -717,7 +719,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         memory,
         tasks,
         execution,
-        channels: ChannelAuthority::new(),
+        channels: ChannelAuthority::with_small_payloads(&F12_CHANNEL_SMALL_PAYLOADS),
         events: EventAuthority::new(),
         timers: TimerAuthority::new(),
         waits: WaitRegistry::new(),

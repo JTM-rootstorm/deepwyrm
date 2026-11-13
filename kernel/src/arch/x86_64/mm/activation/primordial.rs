@@ -268,6 +268,12 @@ const fn parse_production_bootfs_pages() -> usize {
 type Registry = ObjectRegistry<REGISTRY_OBJECTS>;
 type Memory = MemoryObjectAuthority<MEMORY_OBJECTS, MEMORY_LEASES>;
 type Channels = ChannelAuthority<CHANNEL_PAIRS, CHANNEL_DEPTH>;
+/// Small-class payload storage of the one runtime `Channels` authority. Its
+/// type carries the same pair count and depth, so it cannot fall behind the
+/// configured geometry; it is a `static` because it is far too large to pass
+/// over a kernel stack.
+static CHANNEL_SMALL_PAYLOADS: crate::ipc::ChannelSmallPayloads<CHANNEL_PAIRS, CHANNEL_DEPTH> =
+    crate::ipc::ChannelSmallPayloads::new();
 type Tasks = TaskAuthority<TASK_GROUPS, PROCESSES, THREADS, HANDLES>;
 type Spaces = AddressSpaceAuthority<SPACES, REGIONS>;
 type Regions = AddressRegionObjectAuthority<REGION_OBJECTS, REGION_SLOTS>;
@@ -2494,7 +2500,7 @@ fn publish_runtime_shared(
     unsafe {
         (*SHARED_RUNTIME_STORAGE.0.get()).write(PrimordialRuntimeShared {
             execution,
-            channels: Channels::new(),
+            channels: Channels::with_small_payloads(&CHANNEL_SMALL_PAYLOADS),
             boot_resource_grants: crate::boot::BootResourceGrantAuthority::new(
                 boot_resource_grants,
             ),

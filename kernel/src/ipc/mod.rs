@@ -37,18 +37,22 @@ pub(crate) enum ChannelError {
     InvalidEndpoint,
     StalePair,
     WouldBlock,
-    /// The shared payload pool had no free slot, which is **not** the same
-    /// condition as the peer's queue being full.
+    /// The shared large payload class had no free slot, which is **not** the
+    /// same condition as the peer's queue being full.
     ///
     /// Card R1 could not tell which of the two refused a report send, because
     /// both arrived as `WouldBlock`. They call for different responses: a full
     /// peer queue clears when that peer receives, while pool exhaustion clears
-    /// when *any* channel in the system releases a slot. The pool is one
-    /// `static` of `PAYLOAD_POOL_SLOTS` entries shared by every pair, and each
-    /// entry is `DW_CHANNEL_MAX_PAYLOAD` (64 KiB) wide, so it cannot simply be
-    /// sized to cover every queueable datagram: selector 34's geometry alone
-    /// admits 24 pairs x 2 queues x 2 depth = 96, which at 64 KiB a slot would be
-    /// 6 MiB of static memory against the 1 MiB the pool costs today.
+    /// when *any* channel in the system releases a large slot.
+    ///
+    /// Only a payload above `SMALL_PAYLOAD_BYTES` can meet this: smaller ones
+    /// are stored in their queue's own slots (`ChannelSmallPayloads`). The
+    /// large class is one `static` of `PAYLOAD_POOL_SLOTS` entries shared by
+    /// every pair, and each entry is `DW_CHANNEL_MAX_PAYLOAD` (64 KiB) wide, so
+    /// it cannot simply be sized to cover every queueable datagram: the
+    /// production geometry admits 96 pairs x 2 queues x 2 depth = 384, which at
+    /// 64 KiB a slot would be 24 MiB of static memory against the 1 MiB the
+    /// pool costs today.
     ///
     /// This maps to the same ABI status as `WouldBlock` deliberately. Splitting
     /// it at the ABI is a separate, deliberate decision; splitting it inside the
@@ -122,8 +126,9 @@ struct EndpointRecord {
 const PAYLOAD_POOL_SLOTS: usize = 16;
 const PAYLOAD_BYTES: usize = DW_CHANNEL_MAX_PAYLOAD as usize;
 
-/// A second, small size class, and the reason the pool stopped being the thing
-/// that decides how many datagrams may be in flight.
+/// The bound of the small size class: a payload of at most this many bytes is
+/// stored in its destination queue's own small slots and never competes with
+/// another channel for storage.
 ///
 /// Every non-empty send used to take one of sixteen slots of
 /// `DW_CHANNEL_MAX_PAYLOAD`, so a 64-byte record reserved 64 KiB. The pool was
@@ -131,40 +136,141 @@ const PAYLOAD_BYTES: usize = DW_CHANNEL_MAX_PAYLOAD as usize;
 /// an unrelated one: card R1's probe was refused at its report-send site while
 /// the pool held a megabyte for sixteen tiny records.
 ///
-/// Sizing the large class to match the queues would cost 6 MiB. Sizing a small
-/// class to match them costs 128 KiB, because the largest configured
-/// `CHANNEL_PAIRS` is 32 and each pair has two queues of `DEPTH` 2: at most 128
-/// datagrams can be in flight at once, so 128 small slots cannot be exhausted by
-/// small traffic at all. Cross-channel denial for such traffic is removed rather
-/// than made less likely.
-///
 /// 1 KiB is chosen against real payloads, not by round number: an `R1SP` record
-/// is 64 bytes and the launch/job frame is 416. A send larger than this still
-/// takes a large slot, and a small send falls back to one if the small class is
-/// somehow full, so nothing that used to be admitted is refused now.
+/// is 64 bytes and the launch/job frame is 416. A send larger than this takes a
+/// slot of the shared large class, which is still exhaustible (see
+/// [`ChannelError::PayloadExhausted`]).
 const SMALL_PAYLOAD_BYTES: usize = 1024;
-const SMALL_PAYLOAD_SLOTS: usize = 128;
 
-/// The bound the small class is sized against. If a product ever configures more
-/// pairs or a deeper queue, this fails the build rather than quietly restoring
-/// the exhaustion this class exists to remove.
-const _: () = assert!(
-    SMALL_PAYLOAD_SLOTS >= 32 * 2 * 2,
-    "the small payload class must cover every datagram the largest configured \
-     channel authority can hold in flight"
-);
+#[derive(Clone, Copy)]
+struct SmallPayloadSlot {
+    generation: u64,
+    in_use: bool,
+    bytes: [u8; SMALL_PAYLOAD_BYTES],
+}
+
+const EMPTY_SMALL_PAYLOAD_SLOT: SmallPayloadSlot = SmallPayloadSlot {
+    generation: 0,
+    in_use: false,
+    bytes: [0; SMALL_PAYLOAD_BYTES],
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PayloadClass {
-    Small,
-    Large,
+struct SmallPayloadToken {
+    index: usize,
+    generation: u64,
+}
+
+/// Small-class payload storage for one `ChannelAuthority<PAIRS, DEPTH>`.
+///
+/// The storage is positional: every queue of every pair owns exactly `DEPTH`
+/// small slots, so the class is `PAIRS * 2 * DEPTH` slots *by type* and cannot
+/// be configured apart from the authority it serves (an earlier global pool was
+/// sized against a literal pair count and silently fell behind the production
+/// geometry). A queue admits at most `DEPTH` reservations plus queued
+/// datagrams, each holds at most one small slot of that queue, and every path
+/// that retires a reservation or a datagram frees its slot under the same
+/// `pairs` lock. A send that passed queue admission therefore always finds a
+/// free small slot: small traffic is never refused for payload storage, and one
+/// channel cannot deny another.
+///
+/// This is a separate object with a `const` constructor, rather than a field
+/// built by `ChannelAuthority::new`, so that it lives in a `static`. At the
+/// production geometry it is roughly 400 KiB, which must never be materialized
+/// on a kernel stack on its way into the runtime storage.
+///
+/// Lock order: `ChannelAuthority::pairs`, then this store.
+pub(crate) struct ChannelSmallPayloads<const PAIRS: usize, const DEPTH: usize> {
+    slots: SpinMutex<[[[SmallPayloadSlot; DEPTH]; 2]; PAIRS]>,
+}
+
+impl<const PAIRS: usize, const DEPTH: usize> ChannelSmallPayloads<PAIRS, DEPTH> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: SpinMutex::new([[[EMPTY_SMALL_PAYLOAD_SLOT; DEPTH]; 2]; PAIRS]),
+        }
+    }
+
+    /// Stores `payload` in a free slot of one queue, or reports that all
+    /// `DEPTH` of that queue's slots are held.
+    fn allocate(
+        &self,
+        pair_slot: usize,
+        queue: ChannelSide,
+        payload: &[u8],
+    ) -> Option<SmallPayloadToken> {
+        let mut slots = self.slots.lock();
+        for (index, slot) in slots[pair_slot][queue.index()].iter_mut().enumerate() {
+            if slot.in_use {
+                continue;
+            }
+            // A u64 generation cannot wrap in the life of a kernel; a slot that
+            // somehow did is skipped rather than reused ambiguously.
+            let Some(generation) = slot.generation.checked_add(1) else {
+                continue;
+            };
+            slot.generation = generation;
+            slot.bytes[..payload.len()].copy_from_slice(payload);
+            slot.in_use = true;
+            return Some(SmallPayloadToken { index, generation });
+        }
+        None
+    }
+
+    fn copy_and_release(
+        &self,
+        pair_slot: usize,
+        queue: ChannelSide,
+        token: SmallPayloadToken,
+        byte_len: usize,
+        output: &mut [u8],
+    ) {
+        let mut slots = self.slots.lock();
+        let slot = &mut slots[pair_slot][queue.index()][token.index];
+        assert!(
+            slot.in_use && slot.generation == token.generation,
+            "queued small payload token became stale before receive"
+        );
+        output[..byte_len].copy_from_slice(&slot.bytes[..byte_len]);
+        slot.in_use = false;
+    }
+
+    /// Frees the slot a token names. A token whose queue was drained since it
+    /// was issued (its endpoint was finalized under an outstanding send
+    /// reservation) no longer owns anything; the generation tells, and such a
+    /// release does nothing.
+    fn release(&self, pair_slot: usize, queue: ChannelSide, token: SmallPayloadToken) {
+        let mut slots = self.slots.lock();
+        if let Some(slot) = slots
+            .get_mut(pair_slot)
+            .and_then(|pair| pair[queue.index()].get_mut(token.index))
+            && slot.in_use
+            && slot.generation == token.generation
+        {
+            slot.in_use = false;
+        }
+    }
+
+    /// Frees every slot of one queue. Draining a queue discards its datagrams
+    /// and its send reservations together, so nothing may keep a slot of it.
+    fn reset_queue(&self, pair_slot: usize, queue: ChannelSide) {
+        let mut slots = self.slots.lock();
+        for slot in &mut slots[pair_slot][queue.index()] {
+            slot.in_use = false;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PayloadToken {
-    class: PayloadClass,
+struct LargePayloadToken {
     slot: u8,
     generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PayloadToken {
+    Small(SmallPayloadToken),
+    Large(LargePayloadToken),
 }
 
 #[derive(Clone, Copy)]
@@ -172,13 +278,6 @@ struct PayloadSlot {
     generation: u32,
     in_use: bool,
     bytes: [u8; PAYLOAD_BYTES],
-}
-
-#[derive(Clone, Copy)]
-struct SmallPayloadSlot {
-    generation: u32,
-    in_use: bool,
-    bytes: [u8; SMALL_PAYLOAD_BYTES],
 }
 
 #[allow(
@@ -191,58 +290,22 @@ const EMPTY_PAYLOAD_SLOT: PayloadSlot = PayloadSlot {
     bytes: [0; PAYLOAD_BYTES],
 };
 
-const EMPTY_SMALL_PAYLOAD_SLOT: SmallPayloadSlot = SmallPayloadSlot {
-    generation: 0,
-    in_use: false,
-    bytes: [0; SMALL_PAYLOAD_BYTES],
-};
-
-struct PayloadPool {
+/// The large size class: `PAYLOAD_POOL_SLOTS` slots of `DW_CHANNEL_MAX_PAYLOAD`
+/// shared by every channel of every authority, for payloads above
+/// `SMALL_PAYLOAD_BYTES`. Unlike the small class it can be exhausted, and one
+/// channel's large traffic can then refuse another's.
+struct LargePayloadPool {
     slots: SpinMutex<[PayloadSlot; PAYLOAD_POOL_SLOTS]>,
-    small: SpinMutex<[SmallPayloadSlot; SMALL_PAYLOAD_SLOTS]>,
 }
 
-impl PayloadPool {
+impl LargePayloadPool {
     const fn new() -> Self {
         Self {
             slots: SpinMutex::new([EMPTY_PAYLOAD_SLOT; PAYLOAD_POOL_SLOTS]),
-            small: SpinMutex::new([EMPTY_SMALL_PAYLOAD_SLOT; SMALL_PAYLOAD_SLOTS]),
         }
     }
 
-    /// Takes a small slot, or reports that the class is full so the caller can
-    /// fall back. Never refuses the send on its own.
-    fn allocate_small(&self, payload: &[u8]) -> Option<PayloadToken> {
-        let mut slots = self.small.lock();
-        for (index, slot) in slots.iter_mut().enumerate() {
-            if slot.in_use {
-                continue;
-            }
-            let generation = slot
-                .generation
-                .checked_add(1)
-                .filter(|generation| *generation != 0)?;
-            slot.generation = generation;
-            slot.bytes[..payload.len()].copy_from_slice(payload);
-            slot.in_use = true;
-            return Some(PayloadToken {
-                class: PayloadClass::Small,
-                slot: u8::try_from(index).expect("small payload pool fits u8 token"),
-                generation,
-            });
-        }
-        None
-    }
-
-    fn allocate(&self, payload: &[u8]) -> Result<Option<PayloadToken>, ChannelError> {
-        if payload.is_empty() {
-            return Ok(None);
-        }
-        if payload.len() <= SMALL_PAYLOAD_BYTES
-            && let Some(token) = self.allocate_small(payload)
-        {
-            return Ok(Some(token));
-        }
+    fn allocate(&self, payload: &[u8]) -> Result<LargePayloadToken, ChannelError> {
         let mut slots = self.slots.lock();
         for (index, slot) in slots.iter_mut().enumerate() {
             if slot.in_use {
@@ -258,11 +321,10 @@ impl PayloadPool {
             slot.generation = generation;
             slot.bytes[..payload.len()].copy_from_slice(payload);
             slot.in_use = true;
-            return Ok(Some(PayloadToken {
-                class: PayloadClass::Large,
+            return Ok(LargePayloadToken {
                 slot: u8::try_from(index).expect("payload pool fits u8 token"),
                 generation,
-            }));
+            });
         }
         crate::debug::liveness::note_channel_refusal(
             crate::debug::liveness::ChannelRefusal::PayloadExhausted,
@@ -270,20 +332,7 @@ impl PayloadPool {
         Err(ChannelError::PayloadExhausted)
     }
 
-    fn copy_and_release(&self, token: PayloadToken, byte_len: usize, output: &mut [u8]) {
-        if token.class == PayloadClass::Small {
-            let mut slots = self.small.lock();
-            let slot = slots
-                .get_mut(usize::from(token.slot))
-                .expect("queued small payload token slot remains in range");
-            assert!(
-                slot.in_use && slot.generation == token.generation,
-                "queued payload token became stale before receive"
-            );
-            output[..byte_len].copy_from_slice(&slot.bytes[..byte_len]);
-            slot.in_use = false;
-            return;
-        }
+    fn copy_and_release(&self, token: LargePayloadToken, byte_len: usize, output: &mut [u8]) {
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(usize::from(token.slot))
@@ -296,19 +345,7 @@ impl PayloadPool {
         slot.in_use = false;
     }
 
-    fn release(&self, token: PayloadToken) {
-        if token.class == PayloadClass::Small {
-            let mut slots = self.small.lock();
-            let slot = slots
-                .get_mut(usize::from(token.slot))
-                .expect("queued small payload token slot remains in range");
-            assert!(
-                slot.in_use && slot.generation == token.generation,
-                "queued payload token became stale before queue drain"
-            );
-            slot.in_use = false;
-            return;
-        }
+    fn release(&self, token: LargePayloadToken) {
         let mut slots = self.slots.lock();
         let slot = slots
             .get_mut(usize::from(token.slot))
@@ -321,7 +358,7 @@ impl PayloadPool {
     }
 }
 
-static PAYLOAD_POOL: PayloadPool = PayloadPool::new();
+static LARGE_PAYLOAD_POOL: LargePayloadPool = LargePayloadPool::new();
 
 struct QueuedMessage {
     byte_len: u32,
@@ -475,8 +512,9 @@ impl<const DEPTH: usize> ByteQueue<DEPTH> {
         let mut transfers = core::array::from_fn(|_| None);
         let mut transfer_count = 0;
         while let Some(message) = self.pop() {
-            if let Some(token) = message.payload {
-                PAYLOAD_POOL.release(token);
+            // The caller resets this queue's small slots as a whole.
+            if let Some(PayloadToken::Large(token)) = message.payload {
+                LARGE_PAYLOAD_POOL.release(token);
             }
             if !message.transfers.is_empty() {
                 transfers[transfer_count] = Some(message.transfers);
@@ -593,10 +631,7 @@ impl ChannelReceiveReservation {
 
 #[must_use = "ready Channel pins and registrations must be released by the blocking operation owner"]
 pub(crate) enum ChannelWaitOutcome {
-    Ready {
-        observed: DwSignals,
-        pin: InternalRef,
-    },
+    Ready { pin: InternalRef },
     Registered(crate::wait::WaitRegistration),
 }
 
@@ -609,18 +644,73 @@ pub(crate) struct ChannelWaitFailure {
 pub(crate) struct ChannelAuthority<const PAIRS: usize, const DEPTH: usize> {
     domain: u64,
     pairs: SpinMutex<[PairSlot<DEPTH>; PAIRS]>,
+    /// Typed by the same `PAIRS` and `DEPTH`, so the small class always covers
+    /// every datagram this authority's queues can hold.
+    small: &'static ChannelSmallPayloads<PAIRS, DEPTH>,
 }
 
 impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
-    pub(crate) fn new() -> Self {
+    /// Builds an authority over its small-payload storage. The storage must be
+    /// dedicated to this authority: its slots are addressed by pair slot.
+    pub(crate) fn with_small_payloads(small: &'static ChannelSmallPayloads<PAIRS, DEPTH>) -> Self {
         assert!(PAIRS > 0, "Channel pair pool must be nonempty");
         assert!(DEPTH > 0, "Channel queue depth must be nonzero");
         Self {
+            small,
             domain: mint_channel_domain(),
             pairs: SpinMutex::new(core::array::from_fn(|_| PairSlot {
                 generation: 0,
                 pair: None,
             })),
+        }
+    }
+
+    /// Stores a datagram's bytes for a send that already holds a reservation in
+    /// `queue` of `pair_slot`. An empty payload takes no storage; one within the
+    /// small bound takes one of that queue's own slots, which the reservation
+    /// guarantees is free; a larger one competes for the shared large class.
+    fn store_payload(
+        &self,
+        pair_slot: usize,
+        queue: ChannelSide,
+        payload: &[u8],
+    ) -> Result<Option<PayloadToken>, ChannelError> {
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        if payload.len() <= SMALL_PAYLOAD_BYTES {
+            let small = self.small.allocate(pair_slot, queue, payload);
+            debug_assert!(
+                small.is_some(),
+                "a reserved Channel send found none of its queue's small slots free"
+            );
+            if let Some(token) = small {
+                return Ok(Some(PayloadToken::Small(token)));
+            }
+            // Unreachable while the reservation invariant holds. Falling back
+            // keeps a broken invariant a refusal at worst, never a panic.
+        }
+        LARGE_PAYLOAD_POOL
+            .allocate(payload)
+            .map(|token| Some(PayloadToken::Large(token)))
+    }
+
+    /// Frees the storage of a send reservation of this authority's `queue`.
+    fn release_payload(&self, pair_slot: usize, queue: ChannelSide, payload: Option<PayloadToken>) {
+        match payload {
+            Some(PayloadToken::Small(token)) => self.small.release(pair_slot, queue, token),
+            Some(PayloadToken::Large(token)) => LARGE_PAYLOAD_POOL.release(token),
+            None => {}
+        }
+    }
+
+    /// Frees what can be freed of a reservation another authority issued: the
+    /// large class is global, while a small slot belongs to that authority's
+    /// storage, where it stays paired with the queue reservation this one
+    /// cannot cancel either.
+    fn release_foreign_payload(payload: Option<PayloadToken>) {
+        if let Some(PayloadToken::Large(token)) = payload {
+            LARGE_PAYLOAD_POOL.release(token);
         }
     }
 
@@ -974,7 +1064,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             return Err(ChannelError::PeerClosed);
         }
         let generation = pair.inbound[peer.index()].reserve_send()?;
-        let payload_token = match PAYLOAD_POOL.allocate(payload) {
+        let payload_token = match self.store_payload(slot_index, peer, payload) {
             Ok(token) => token,
             Err(error) => {
                 pair.inbound[peer.index()]
@@ -1029,9 +1119,13 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             } else {
                 result = Err(ChannelError::StalePair);
             }
-        }
-        if let Some(token) = payload {
-            PAYLOAD_POOL.release(token);
+            // Inside the lock, so the queue slot and the payload slot of one
+            // reservation are never seen free separately.
+            if pair_key.domain == self.domain {
+                self.release_payload(usize::from(pair_key.slot), side.peer(), payload);
+            } else {
+                Self::release_foreign_payload(payload);
+            }
         }
         result
     }
@@ -1055,28 +1149,20 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         } = reservation;
         let mut slots = self.pairs.lock();
         if pair_key.domain != self.domain {
-            if let Some(token) = payload {
-                PAYLOAD_POOL.release(token);
-            }
+            Self::release_foreign_payload(payload);
             return Err((ChannelError::StalePair, transfers));
         }
         let slot_index = usize::from(pair_key.slot);
         let Some(slot) = slots.get(slot_index) else {
-            if let Some(token) = payload {
-                PAYLOAD_POOL.release(token);
-            }
+            self.release_payload(slot_index, side.peer(), payload);
             return Err((ChannelError::StalePair, transfers));
         };
         if slot.generation != pair_key.generation {
-            if let Some(token) = payload {
-                PAYLOAD_POOL.release(token);
-            }
+            self.release_payload(slot_index, side.peer(), payload);
             return Err((ChannelError::StalePair, transfers));
         }
         let Some(pair) = slot.pair.as_ref() else {
-            if let Some(token) = payload {
-                PAYLOAD_POOL.release(token);
-            }
+            self.release_payload(slot_index, side.peer(), payload);
             return Err((ChannelError::StalePair, transfers));
         };
         if pair.endpoints[side.index()].is_none() {
@@ -1085,9 +1171,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
                 .as_mut()
                 .expect("validated Channel pair remains live");
             let _ = pair.inbound[side.peer().index()].cancel_send(generation);
-            if let Some(token) = payload {
-                PAYLOAD_POOL.release(token);
-            }
+            self.release_payload(slot_index, side.peer(), payload);
             return Err((ChannelError::InvalidEndpoint, transfers));
         }
         let peer = side.peer();
@@ -1097,9 +1181,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
                 .as_mut()
                 .expect("validated Channel pair remains live");
             let _ = pair.inbound[peer.index()].cancel_send(generation);
-            if let Some(token) = payload {
-                PAYLOAD_POOL.release(token);
-            }
+            self.release_payload(slot_index, side.peer(), payload);
             return Err((ChannelError::PeerClosed, transfers));
         }
         let destination = pair.endpoints[peer.index()]
@@ -1118,9 +1200,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
                     .as_mut()
                     .expect("validated Channel pair remains live");
                 let _ = pair.inbound[peer.index()].cancel_send(generation);
-                if let Some(token) = payload {
-                    PAYLOAD_POOL.release(token);
-                }
+                self.release_payload(slot_index, peer, payload);
                 return Err((ChannelError::InvalidArgument, transfers));
             }
             Err(error) => {
@@ -1129,9 +1209,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
                     .as_mut()
                     .expect("validated Channel pair remains live");
                 let _ = pair.inbound[peer.index()].cancel_send(generation);
-                if let Some(token) = payload {
-                    PAYLOAD_POOL.release(token);
-                }
+                self.release_payload(slot_index, peer, payload);
                 return Err((error, transfers));
             }
         }
@@ -1154,6 +1232,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn send<const WAITERS: usize>(
         &self,
         endpoint: ChannelEndpointKey,
@@ -1170,6 +1249,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn peek_receive(
         &self,
         endpoint: ChannelEndpointKey,
@@ -1272,8 +1352,18 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             message.transfers.len(),
             reservation.info.required_handles as usize
         );
-        if let Some(token) = message.payload {
-            PAYLOAD_POOL.copy_and_release(token, required, output);
+        match message.payload {
+            Some(PayloadToken::Small(token)) => self.small.copy_and_release(
+                usize::from(reservation.pair.slot),
+                reservation.side,
+                token,
+                required,
+                output,
+            ),
+            Some(PayloadToken::Large(token)) => {
+                LARGE_PAYLOAD_POOL.copy_and_release(token, required, output);
+            }
+            None => {}
         }
         let wakes = Self::collect_changed(pair, waits, reservation.side.peer(), reservation.side)?;
         Ok(ChannelReceivedMessage {
@@ -1363,7 +1453,6 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
         };
         if observed.0 & desired.0 != 0 {
             return Ok(ChannelWaitOutcome::Ready {
-                observed,
                 pin: target.into_internal(),
             });
         }
@@ -1411,6 +1500,7 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             return Err((ChannelError::StalePair, final_release));
         }
         let drained_transfers = pair.inbound[side.index()].drain_transfers();
+        self.small.reset_queue(slot_index, side);
         let mut wakes = WakeBatch::empty();
         let peer = side.peer();
         if let Some(peer_endpoint) = pair.endpoints[peer.index()].as_ref() {
@@ -1427,6 +1517,16 @@ impl<const PAIRS: usize, const DEPTH: usize> ChannelAuthority<PAIRS, DEPTH> {
             wakes,
             drained_transfers,
         })
+    }
+
+    /// Host tests build many short-lived authorities; each gets its own leaked
+    /// small-payload storage instead of a hand-written `static`.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        extern crate std;
+        Self::with_small_payloads(std::boxed::Box::leak(std::boxed::Box::new(
+            ChannelSmallPayloads::new(),
+        )))
     }
 
     #[cfg(test)]

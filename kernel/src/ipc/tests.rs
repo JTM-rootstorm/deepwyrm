@@ -1074,49 +1074,175 @@ fn exhausted_vacant_pair_slot_does_not_mask_later_slots() {
 /// Card R1 spent three VM runs unable to say which resource refused a report
 /// send, because a full peer queue and an exhausted payload pool both arrived as
 /// `WouldBlock`. They clear on different events -- a full peer queue when that
-/// peer receives, an exhausted pool when *any* channel releases a slot -- so they
-/// are different answers to "when should I retry".
+/// peer receives, an exhausted pool when *any* channel releases a large slot --
+/// so they are different answers to "when should I retry".
 ///
-/// The exhaustion path itself is deliberately not exercised here. `PayloadPool`
-/// is `PAYLOAD_POOL_SLOTS` entries of `DW_CHANNEL_MAX_PAYLOAD` bytes, so a local
-/// instance is a megabyte and overflows the test thread's stack, while the real
-/// pool is a `static` shared by every test in this binary -- draining it would
-/// make unrelated IPC tests fail by resource starvation rather than by defect.
-/// Covering it needs the pool to become an owned instance with a caller-chosen
-/// capacity, which is a refactor and not a test.
+/// Exhausting the large class is deliberately not exercised here: it is a
+/// `static` shared by every test in this binary, so draining it would make
+/// unrelated IPC tests fail by resource starvation rather than by defect.
 #[test]
 fn queue_full_and_payload_exhaustion_are_distinct_within_the_kernel() {
     assert_ne!(ChannelError::WouldBlock, ChannelError::PayloadExhausted);
     // An empty payload takes no slot at all, which is why folding pool
     // availability into DW_SIGNAL_WRITABLE would be wrong as a blanket rule: it
     // would deny a zero-length send that can in fact always proceed.
-    assert_eq!(PAYLOAD_POOL.allocate(&[]), Ok(None));
+    let channels = Channels::new();
+    assert_eq!(channels.store_payload(0, ChannelSide::Zero, &[]), Ok(None));
 }
 
-/// The small class exists so the pool stops deciding how many datagrams may be
-/// in flight. Every non-empty send used to take one of sixteen 64 KiB slots, so
-/// a 64-byte record reserved 64 KiB and one busy channel could deny an unrelated
-/// one -- card R1's probe was refused at its report-send site while the pool held
-/// a megabyte for sixteen tiny records.
-#[test]
-fn small_payloads_do_not_consume_the_large_class() {
-    // More small sends than the large class has slots, all admitted.
-    let mut tokens = std::vec::Vec::new();
-    for _ in 0..(PAYLOAD_POOL_SLOTS * 4) {
-        let token = PAYLOAD_POOL
-            .allocate(&[0xab; 64])
-            .expect("a small payload is admitted")
-            .expect("a non-empty payload takes a slot");
-        tokens.push(token);
+/// A recognisable small payload for one datagram, so that two datagrams sharing
+/// a storage slot cannot both read back intact.
+fn fill_payload(pair: usize, side: usize, index: usize) -> Vec<u8> {
+    let ordinal = (pair * 2 + side) * 7 + index;
+    let len = match ordinal % 4 {
+        0 => 1,
+        1 => 64,
+        2 => 416,
+        _ => SMALL_PAYLOAD_BYTES,
+    };
+    (0..len)
+        .map(|offset| (ordinal.wrapping_mul(31).wrapping_add(offset) % 251) as u8)
+        .collect()
+}
+
+/// Fills both queues of every pair an authority can hold with small datagrams
+/// and requires that none is refused, then that each reads back intact.
+///
+/// The small class used to be 128 global slots checked against a literal 32
+/// pairs while the production product configured 96 (384 datagrams in flight),
+/// so unrelated channels could refuse each other with `PayloadExhausted` while
+/// WRITABLE stayed asserted. The class is now `PAIRS * 2 * DEPTH` by type.
+fn fill_every_queue_with_small_datagrams<
+    const PAIRS: usize,
+    const DEPTH: usize,
+    const OBJECTS: usize,
+>() {
+    assert_eq!(OBJECTS, PAIRS * 2);
+    let mut registry = std::boxed::Box::new(ObjectRegistry::<OBJECTS>::new());
+    let channels = std::boxed::Box::new(ChannelAuthority::<PAIRS, DEPTH>::new());
+    let waits = WaitRegistry::<4>::new();
+    // Three rounds. The first is torn down with every queue full, so the
+    // second also requires teardown to have given every small slot back; the
+    // second reads everything back before its teardown, and the third runs
+    // over queues that were torn down empty.
+    for round in 0..3 {
+        let mut pairs = Vec::new();
+        for _ in 0..PAIRS {
+            pairs.push(channels.create_pair(&mut registry).unwrap());
+        }
+        for (pair, (keys, _)) in pairs.iter().enumerate() {
+            for (side, key) in keys.iter().enumerate() {
+                for index in 0..DEPTH {
+                    let payload = fill_payload(pair, side, index);
+                    let sent = channels.send(*key, &payload, &waits);
+                    assert!(
+                        sent.is_ok(),
+                        "round {round}: pair {pair} side {side} datagram {index} refused: {:?}",
+                        sent.err()
+                    );
+                }
+            }
+        }
+        // With every queue full the only refusal left is the queue's own.
+        for (keys, _) in &pairs {
+            for key in keys {
+                assert_eq!(
+                    channels.send(*key, &[0x5a; 8], &waits).unwrap_err(),
+                    ChannelError::WouldBlock
+                );
+            }
+        }
+        if round == 1 {
+            let mut output = std::vec![0_u8; SMALL_PAYLOAD_BYTES];
+            for (pair, (keys, _)) in pairs.iter().enumerate() {
+                for side in 0..2 {
+                    for index in 0..DEPTH {
+                        let (len, _) = channels
+                            .receive_into(keys[1 - side], &mut output, &waits)
+                            .unwrap();
+                        assert_eq!(
+                            &output[..len],
+                            fill_payload(pair, side, index).as_slice(),
+                            "pair {pair} side {side} datagram {index} read back"
+                        );
+                    }
+                }
+            }
+        }
+        for (_, handles) in pairs {
+            for handle in handles {
+                let release = registry.release_handle(handle).unwrap().unwrap();
+                let finalization = channels.take_finalization(release, &waits).unwrap();
+                let _ = complete_no_transfer_finalization(&mut registry, finalization);
+            }
+        }
     }
-    // The large class is untouched, so a maximum-size send still fits.
-    let large = PAYLOAD_POOL
-        .allocate(&[0xcd; PAYLOAD_BYTES])
-        .expect("the large class is still free")
-        .expect("a non-empty payload takes a slot");
-    PAYLOAD_POOL.release(large);
-    for token in tokens {
-        PAYLOAD_POOL.release(token);
+}
+
+#[test]
+fn small_datagrams_fill_every_queue_of_every_pair_without_payload_refusal() {
+    // The authorities are built by value before they are boxed, which at the
+    // production geometry needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            fill_every_queue_with_small_datagrams::<1, 1, 2>();
+            fill_every_queue_with_small_datagrams::<3, 2, 6>();
+            fill_every_queue_with_small_datagrams::<8, 5, 16>();
+            // The production geometry: 384 datagrams, more than the 128 small
+            // plus 16 large slots that used to exist in total.
+            fill_every_queue_with_small_datagrams::<96, 2, 192>();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// The control for the fill test: the property it relies on is that a queue has
+/// exactly `DEPTH` small slots of its own. A request beyond that is refused by
+/// the storage, and the other queues are unaffected, so the fill test would
+/// fail if a queue had fewer slots than its depth or shared them.
+#[test]
+fn a_queue_has_exactly_depth_small_slots_of_its_own() {
+    let store = ChannelSmallPayloads::<2, 1>::new();
+    let held = store.allocate(0, ChannelSide::Zero, b"held").unwrap();
+    assert_eq!(store.allocate(0, ChannelSide::Zero, b"over"), None);
+    let sibling = store.allocate(0, ChannelSide::One, b"sibling").unwrap();
+    let other_pair = store.allocate(1, ChannelSide::Zero, b"other").unwrap();
+    let mut output = [0_u8; 8];
+    store.copy_and_release(0, ChannelSide::One, sibling, 7, &mut output);
+    assert_eq!(&output[..7], b"sibling");
+    store.copy_and_release(1, ChannelSide::Zero, other_pair, 5, &mut output);
+    assert_eq!(&output[..5], b"other");
+    store.release(0, ChannelSide::Zero, held);
+    assert!(store.allocate(0, ChannelSide::Zero, b"again").is_some());
+}
+
+/// A send reservation can outlive its pair: both endpoints close under it and
+/// the pair slot is reused. Its small slot went back with the drained queue, so
+/// the new pair still gets its full depth, and settling the stale reservation
+/// afterwards must not free a slot the new pair now owns.
+#[test]
+fn a_stale_send_reservation_neither_holds_nor_frees_a_reused_small_slot() {
+    let (mut registry, channels, waits, keys, handles) = pair();
+    let stale = channels.reserve_send(keys[0], b"stale").unwrap();
+    for handle in handles {
+        let _ = finalize(&mut registry, &channels, &waits, handle);
+    }
+    let (keys, handles) = channels.create_pair(&mut registry).unwrap();
+    assert_eq!(channels.send(keys[0], b"first", &waits).unwrap().len(), 0);
+    assert_eq!(channels.send(keys[0], b"second", &waits).unwrap().len(), 0);
+    assert_eq!(
+        channels.cancel_send(stale).unwrap_err(),
+        ChannelError::StalePair
+    );
+    let mut output = [0_u8; 8];
+    let (len, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(&output[..len], b"first");
+    let (len, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+    assert_eq!(&output[..len], b"second");
+    for handle in handles {
+        let _ = finalize(&mut registry, &channels, &waits, handle);
     }
 }
 
@@ -1124,18 +1250,17 @@ fn small_payloads_do_not_consume_the_large_class() {
 /// released slot must be reusable.
 #[test]
 fn both_classes_round_trip_their_bytes() {
+    let (mut registry, channels, waits, keys, handles) = pair();
     for len in [1_usize, 64, SMALL_PAYLOAD_BYTES, SMALL_PAYLOAD_BYTES + 1] {
-        let mut payload = std::vec::Vec::new();
-        for index in 0..len {
-            payload.push((index % 251) as u8);
-        }
-        let token = PAYLOAD_POOL
-            .allocate(&payload)
-            .expect("payload is admitted")
-            .expect("a non-empty payload takes a slot");
+        let payload: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        assert_eq!(channels.send(keys[0], &payload, &waits).unwrap().len(), 0);
         let mut output = std::vec![0_u8; len];
-        PAYLOAD_POOL.copy_and_release(token, len, &mut output);
+        let (received, _) = channels.receive_into(keys[1], &mut output, &waits).unwrap();
+        assert_eq!(received, len);
         assert_eq!(output, payload, "payload of {len} bytes round-tripped");
+    }
+    for handle in handles {
+        let _ = finalize(&mut registry, &channels, &waits, handle);
     }
 }
 
@@ -1143,17 +1268,16 @@ fn both_classes_round_trip_their_bytes() {
 /// bound does not. The boundary is the whole reason the class is safe to add.
 #[test]
 fn the_small_bound_is_exact() {
-    let at_bound = PAYLOAD_POOL
-        .allocate(&[0_u8; SMALL_PAYLOAD_BYTES])
-        .unwrap()
+    let channels = Channels::new();
+    let at_bound = channels
+        .store_payload(0, ChannelSide::Zero, &[0_u8; SMALL_PAYLOAD_BYTES])
         .unwrap();
-    assert_eq!(at_bound.class, PayloadClass::Small);
-    PAYLOAD_POOL.release(at_bound);
+    assert!(matches!(at_bound, Some(PayloadToken::Small(_))));
+    channels.release_payload(0, ChannelSide::Zero, at_bound);
 
-    let over_bound = PAYLOAD_POOL
-        .allocate(&[0_u8; SMALL_PAYLOAD_BYTES + 1])
-        .unwrap()
+    let over_bound = channels
+        .store_payload(0, ChannelSide::Zero, &[0_u8; SMALL_PAYLOAD_BYTES + 1])
         .unwrap();
-    assert_eq!(over_bound.class, PayloadClass::Large);
-    PAYLOAD_POOL.release(over_bound);
+    assert!(matches!(over_bound, Some(PayloadToken::Large(_))));
+    channels.release_payload(0, ChannelSide::Zero, over_bound);
 }
