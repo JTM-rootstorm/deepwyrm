@@ -41,7 +41,7 @@ Each stage is a Deepwyrm change with its own tests, and each is useful without t
 | **M9** | The OOM killer (§6.7): kernel mechanism (per-job accounting, a low-memory signal) with Wyrmroot choosing the victim. Carries M6's overcommit (§9) | — | Wyrmroot policy |
 | later | 2 MiB user pages for objects whose backing has 2 MiB-aligned runs (needs M3) | L8 | none |
 
-Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into scattered backing), then M5. Then M7, M8 and M9 (proposed 2026-11-13; Mike may reorder). M2, M3 and M6 change the boot path, object finalization and fault handling, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
+Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into scattered backing), then M5. Then M7, M8 and M9 (Mike, 2026-11-13). M2, M3 and M6 change the boot path, object finalization and fault handling, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
 
 ## 3. Decisions (Mike, 2026-11-12)
 
@@ -475,7 +475,7 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 | M4 and M4b never exercised in a guest (no job maps over 16 MiB) | §7, §7.2 | M5 (its guest proof maps past 16 MiB) |
 | The stepped-call facade loop (stop between steps, a published inner step, the output) is live-only | §7.3 | M5 (a guest probe stopped between steps) |
 | L6's 44 ms fixed cost per new arena, never explained | §1 | M5 (re-measured on the direct map with large maps) |
-| R1: the role table is one contiguous run of about 2.5% of RAM | §6.9a | M7 |
+| R1: the role table is one contiguous run of about 2.5% of RAM (§6.9a), and its first-fit carve (§5.3a R1) | §5.3a, §6.9a | M7 |
 | R4: allocation costs runs × free ranges | §6.9a | M7 |
 | R2: a step's hold grows with the backing's run count | §7.3 | M7 |
 | R3: stepped calls never yield the CPU; creation's zeroing has no safe point | §7.3 | M8 |
@@ -483,6 +483,6 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 | The fault gate, fill-in and commit step have no host tests (spurious fault, table refusal, BSP expiries during a long fill-in) | §8.11 | M8 (its lock work makes them host-testable units) |
 | Global frame exhaustion kills whichever process touches next | §8.9 | M9 |
 
-**Accepted by Claude in review records, not yet by Mike** (awaiting his decision; each needs his yes or a stage):
-§5.2a R3 (AP trampoline's writable alias), R4 (1 GiB pages gated on the BSP's CPUID), R5 (a map needing over 2048 tables stops the boot), R6 (large leaves and MTRRs), R10 (guest-test usercopy uses user addresses); §5.3a R1 (one contiguous first-fit run for the role table; superseded by M7), R3 (a second proof on one root panics), R4 (O(slots) scans), R5 (`start_position` scans); §6.9a R2 (whole-table scans at boot); §7.1 R3 (a racing pin sees `Conflict` for the whole call), R4 (tables built by undone batches stay uncharged until teardown); §7.3 R1 (handles re-resolved per step), R4 (a protect in steps can refuse a W+X alias), R5 (pieces left by a stopped caller keep their leases).
+**Accepted by Mike (2026-11-13)**, as recommended; §5.3a R1 is instead superseded by M7, which carves the role table from buddy blocks:
+§5.2a R3 (AP trampoline's writable alias), R4 (1 GiB pages gated on the BSP's CPUID), R5 (a map needing over 2048 tables stops the boot), R6 (large leaves and MTRRs), R10 (guest-test usercopy uses user addresses); §5.3a R3 (a second proof on one root panics), R4 (O(slots) scans), R5 (`start_position` scans); §6.9a R2 (whole-table scans at boot); §7.1 R3 (a racing pin sees `Conflict` for the whole call), R4 (tables built by undone batches stay uncharged until teardown); §7.3 R1 (handles re-resolved per step), R4 (a protect in steps can refuse a W+X alias), R5 (pieces left by a stopped caller keep their leases).
 
