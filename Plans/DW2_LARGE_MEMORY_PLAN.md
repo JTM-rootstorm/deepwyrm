@@ -47,7 +47,7 @@ Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into sca
 
 1. **Direct map, with SMAP and SMEP:** yes to both (M2).
 2. **Allocate on first touch:** yes, as stage M6, not deferred.
-3. **The job budget rule:** both: a fraction of installed RAM, capped or overridden by a size in the platform config (M5).
+3. **The job budget rule:** both: a fraction of installed RAM, capped or overridden by a size in the platform config (M5). **The fraction (Mike, 2026-11-13):** half of the RAM free at boot, after the kernel and resident services, for each job, capped by the platform config's size when one is set.
 4. **Order:** M1 now; then SQLite; then M2–M6 before any port that needs large memory.
 
 ## 4. Sources used
