@@ -453,14 +453,18 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 
 | Item | From | Fix |
 |---|---|---|
-| Root proof does not check that another owner's tables point into this hierarchy | §5.3a | pending |
-| A pin overlapping a large teardown's span panics (R2); a map's output pin widens it (R6) | §7.1, §7.3 | pending |
-| G1: `TrackedActiveTarget`'s span untested on the host | §7.1 | pending |
-| G4: a batch starting mid-run of a multi-run backing untested | §7.1 | pending |
-| R7: concurrent creates allocate past the quota before admission | §7.3 | pending |
-| No test finalizes an object after a merge; none fails a zeroing step mid-allocation | §7.3 | pending |
-| No check that an on-demand object's weight equals its frames after commits and faults | §8.11 | pending |
-| No guest touch of a read-only syscall buffer on an untouched on-demand page | §8.11 | pending |
+| Root proof does not check that another owner's tables point into this hierarchy | §5.3a | Reviewed safe by construction (below). Its tests found the fault path trusting a present leaf without checking whose tables it walked; fixed, with tests for a foreign candidate and a planted foreign entry (`e3edf97`) |
+| A pin overlapping a large teardown's span panics (R2); a map's output pin widens it (R6) | §7.1, §7.3 | Reviewed safe (below): no pin or permit can exist then. The precondition is now checked before any unmap (`e3edf97`) |
+| G1: `TrackedActiveTarget`'s span untested on the host | §7.1 | Generic `PinTrackedTarget`, host-tested (`4b2b7ab`) |
+| G4: a batch starting mid-run of a multi-run backing untested | §7.1 | Tested (`e16e961`) |
+| R7: concurrent creates allocate past the quota before admission | §7.3 | Per-CPU page reservations counted in usage (`e16e961`) |
+| No test finalizes an object after a merge; none fails a zeroing step mid-allocation | §7.3 | Tested (`e16e961`) |
+| No check that an on-demand object's weight equals its frames after commits and faults | §8.11 | Tested for commits (`e16e961`); a fault records its frames through the same `record_charged_pages` |
+| No guest touch of a read-only syscall buffer on an untouched on-demand page | §8.11 | `bin/hello on-demand` sends a Channel message from an untouched page (Wyrmroot `43f8bc2`) |
+
+**Review of the two soundness questions:** Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `e16e961`, read-only. Q1 (§7.1 R2): safe. Permits borrow the tracker under P, which teardown holds; every owned pin is drained with its blocked operation or held by a CPU still resident on the root, which teardown refuses. Q2 (§5.3a): safe for the low half. Every link goes through the journal's owner checks, and teardown walks only indices 0..256; the kernel half's primordial tables are never reclaimed.
+
+**Also fixed outside the ledger (2026-11-13):** the SDK had drifted from Wyrmroot's Deepwyrm pin through M2–M6. Wyrmroot `5b62761` makes dev-boot refuse an SDK that does not pair, and SDK `f1fca4c` repins it.
 
 **Already fixed, recorded here:** M4's "not yet" (locks held for the whole call) and G5 (lock-hold bound) were fixed by M4b (§7.2).
 
