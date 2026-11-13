@@ -107,8 +107,10 @@ const HANDLES: usize = super::production_resource_geometry::SELECTED.handles;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
-/// DW2 M5: 64 mapping slots per region (plan §10.2 item 2).
-const REGION_SLOTS: usize = 64;
+/// DW2 M5 raises this to 64 only once the map, unmap and protect frames no
+/// longer grow with it: at 64 the stepped map's direct call chain needs about
+/// 487 KB of the 512 KiB thread stack (plan §10.2 item 2).
+const REGION_SLOTS: usize = 10;
 const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // WYR1-F production is selected explicitly for the same reason selectors 33
 // and 34 are: the freestanding product must not inherit the bootstrap-era DW0
