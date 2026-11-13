@@ -36,9 +36,12 @@ Each stage is a Deepwyrm change with its own tests, and each is useful without t
 | **M4** | Chunked publication: a map call publishes in batches of at most the journal's capacity. Each batch is a complete D7 journal. If a later batch fails, the call unmaps the batches it already published and returns the error, so the call is still all-or-nothing as userspace sees it. The global locks are released between batches, which also bounds the lock-hold time (R1) | L2 | none |
 | **M5** | Wyrmroot: init gives a job a budget derived from installed RAM (Mike to set the rule, for example half of RAM less the resident set), more MemoryObjects, and the D6 mapping slots. The SDK layer drops the four-arena scheme for one `mmap` per large allocation | L1 | Wyrmroot policy only |
 | **M6** | Allocate on first touch: a map of anonymous memory reserves the range and publishes nothing; the first touch allocates, zeroes and maps the page, charged to the job's budget then. A fault the kernel cannot serve (budget spent, no frames) is delivered as today's exception. This shrinks M4's job to maps of existing objects | L7 | a map flag or object kind for lazily backed memory, and the fault outcome, in the schema |
+| **M7** | Fragmentation that stays fast (§6.8): the buddy allocator with the smaller role table, the object index for fragmented eager backings, then compaction. Carries M3 R1 and R4 and M4b R2 (§9) | L3's slow path | none |
+| **M8** | Lock scope and accounting: per-group usage counters instead of the linear registry scan, a first touch that does not serialise every CPU on the global T, and stepped calls that yield the CPU at their safe points. Carries M4b R3 and the M6 open items (§9) | — | none |
+| **M9** | The OOM killer (§6.7): kernel mechanism (per-job accounting, a low-memory signal) with Wyrmroot choosing the victim. Carries M6's overcommit (§9) | — | Wyrmroot policy |
 | later | 2 MiB user pages for objects whose backing has 2 MiB-aligned runs (needs M3) | L8 | none |
 
-Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into scattered backing), then M5. M2, M3 and M6 change the boot path, object finalization and fault handling, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
+Order: M1, then M2, then M3, M4 and M6 (M6 after M3, since it allocates into scattered backing), then M5. Then M7, M8 and M9 (proposed 2026-11-13; Mike may reorder). M2, M3 and M6 change the boot path, object finalization and fault handling, so each needs the independent security review of CLAUDE.md §1. M2 especially: a direct map gives the kernel a writable alias of every user page, which widens what a kernel bug can reach. Its mappings must be supervisor-only and no-execute. Deepwyrm currently clears CR4.SMAP at entry (`arch/x86_64/entry.rs`) and does not set SMEP. A direct map raises the value of both, so M2's review should decide whether they are enabled with it.
 
 ## 3. Decisions (Mike, 2026-11-12)
 
@@ -441,4 +444,41 @@ Deepwyrm `bc0b6cf` (index), `915b58a` (ABI, creation, commit, publisher), `829d7
 - **Behaviour changes, accepted:** a missing stack top is a kernel `ud2` and a missing runtime binding halts, as at the other gates; a thread or binding mismatch in the gate ends the process with its page-fault record.
 - **R1 (Low): fixed** (`40c0f23`). One commit step admitted each page with a linear registry scan and zeroed up to 16 MiB in a hold of T. A step is now 2 MiB, admitted once at its whole cost (nodes shared by its pages counted once); past the quota the longest start that fits is found by halving, at most ten admissions, so a commit still fills the quota exactly.
 - **Test gaps:** §8.6's teardown and undo cases are closed in `40c0f23` (two Processes sharing an object with one torn down; an unmap and a protect over two mappings whose second batch fails). Open: the gate, the fill-in and the commit step run only in the guest probe, which does not reach a spurious fault, a table refusal or a read-only buffer; a weight-equals-frames check after mixed commits and faults; BSP expiries during a long fill-in.
+
+## 9. Open-item ledger (2026-11-13)
+
+Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk and test gap in this plan is fixed, accepted by Mike, or scheduled into a named stage whose exit depends on it. A stage does not close while any item below names it.
+
+**Fixed in the 2026-11-13 sweep** (each with its commit when it lands):
+
+| Item | From | Fix |
+|---|---|---|
+| Root proof does not check that another owner's tables point into this hierarchy | §5.3a | pending |
+| A pin overlapping a large teardown's span panics (R2); a map's output pin widens it (R6) | §7.1, §7.3 | pending |
+| G1: `TrackedActiveTarget`'s span untested on the host | §7.1 | pending |
+| G4: a batch starting mid-run of a multi-run backing untested | §7.1 | pending |
+| R7: concurrent creates allocate past the quota before admission | §7.3 | pending |
+| No test finalizes an object after a merge; none fails a zeroing step mid-allocation | §7.3 | pending |
+| No check that an on-demand object's weight equals its frames after commits and faults | §8.11 | pending |
+| No guest touch of a read-only syscall buffer on an untouched on-demand page | §8.11 | pending |
+
+**Already fixed, recorded here:** M4's "not yet" (locks held for the whole call) and G5 (lock-hold bound) were fixed by M4b (§7.2).
+
+**Scheduled:**
+
+| Item | From | Stage |
+|---|---|---|
+| M4 and M4b never exercised in a guest (no job maps over 16 MiB) | §7, §7.2 | M5 (its guest proof maps past 16 MiB) |
+| The stepped-call facade loop (stop between steps, a published inner step, the output) is live-only | §7.3 | M5 (a guest probe stopped between steps) |
+| L6's 44 ms fixed cost per new arena, never explained | §1 | M5 (re-measured on the direct map with large maps) |
+| R1: the role table is one contiguous run of about 2.5% of RAM | §6.9a | M7 |
+| R4: allocation costs runs × free ranges | §6.9a | M7 |
+| R2: a step's hold grows with the backing's run count | §7.3 | M7 |
+| R3: stepped calls never yield the CPU; creation's zeroing has no safe point | §7.3 | M8 |
+| Every first touch takes the global T, and usage is a linear scan | §8.9 | M8 |
+| The fault gate, fill-in and commit step have no host tests (spurious fault, table refusal, BSP expiries during a long fill-in) | §8.11 | M8 (its lock work makes them host-testable units) |
+| Global frame exhaustion kills whichever process touches next | §8.9 | M9 |
+
+**Accepted by Claude in review records, not yet by Mike** (awaiting his decision; each needs his yes or a stage):
+§5.2a R3 (AP trampoline's writable alias), R4 (1 GiB pages gated on the BSP's CPUID), R5 (a map needing over 2048 tables stops the boot), R6 (large leaves and MTRRs), R10 (guest-test usercopy uses user addresses); §5.3a R1 (one contiguous first-fit run for the role table; superseded by M7), R3 (a second proof on one root panics), R4 (O(slots) scans), R5 (`start_position` scans); §6.9a R2 (whole-table scans at boot); §7.1 R3 (a racing pin sees `Conflict` for the whole call), R4 (tables built by undone batches stay uncharged until teardown); §7.3 R1 (handles re-resolved per step), R4 (a protect in steps can refuse a W+X alias), R5 (pieces left by a stopped caller keep their leases).
 
