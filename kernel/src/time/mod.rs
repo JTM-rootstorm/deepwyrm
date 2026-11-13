@@ -28,8 +28,8 @@ mod timer;
     reason = "F3 deadline primitives are staged for F4/F8 consumers while model tests exercise them now"
 )]
 pub(crate) use deadline::{
-    ApicOneShot, DEADLINE_QUEUE_CAPACITY, DeadlineClass, DeadlineQueue, DeadlineQueueError,
-    DeadlineRegistration, apic_one_shot_for_delta, classify_deadline,
+    ApicOneShot, DEADLINE_QUEUE_CAPACITY, DeadlineQueue, DeadlineQueueError, DeadlineRegistration,
+    apic_one_shot_for_delta,
 };
 #[allow(
     unused_imports,

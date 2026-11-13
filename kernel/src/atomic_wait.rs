@@ -69,15 +69,7 @@ pub(crate) struct AtomicWaitRegistration {
     wake: BlockWakeKey,
 }
 
-impl AtomicWaitRegistration {
-    pub(crate) const fn key(self) -> AtomicWaitKey {
-        self.key
-    }
-
-    pub(crate) const fn wake_key(self) -> BlockWakeKey {
-        self.wake
-    }
-}
+impl AtomicWaitRegistration {}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +332,10 @@ fn oldest_keyed_slot<const CAPACITY: usize>(
 /// deadline are returned only by exact winner completion.
 #[must_use = "atomic wait resources must be resumed or terminally discarded"]
 pub(crate) struct AtomicWaitOperation<PIN> {
+    #[allow(
+        dead_code,
+        reason = "recorded but never read; removing it changes settle_atomic_wait's signature and every caller"
+    )]
     process: ProcessKey,
     thread: ThreadKey,
     blocked: BlockedOperation<()>,
@@ -365,14 +361,6 @@ impl<PIN> AtomicWaitOperation<PIN> {
             registration,
             deadline,
         }
-    }
-
-    pub(crate) const fn process(&self) -> ProcessKey {
-        self.process
-    }
-
-    pub(crate) const fn thread(&self) -> ThreadKey {
-        self.thread
     }
 
     pub(crate) fn wake_key(&self) -> BlockWakeKey {

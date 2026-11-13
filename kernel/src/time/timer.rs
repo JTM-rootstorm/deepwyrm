@@ -28,7 +28,6 @@ fn mint_timer_domain() -> u64 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TimerDeadlineError {
-    Expired,
     Capacity,
     Fault,
 }
@@ -663,6 +662,7 @@ pub(crate) fn complete_timer_finalization<const OBJECTS: usize>(
 #[must_use = "ready Timer pins and registrations must be released by the blocking operation owner"]
 pub(crate) enum TimerWaitOutcome {
     Ready {
+        #[cfg_attr(not(test), allow(dead_code, reason = "read only by host tests"))]
         observed: DwSignals,
         pin: InternalRef,
     },

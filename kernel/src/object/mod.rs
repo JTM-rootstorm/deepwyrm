@@ -103,9 +103,23 @@ pub(crate) struct BoundCreation {
 }
 
 impl BoundCreation {
+    #[cfg_attr(
+        deepwyrm_production_product,
+        allow(
+            dead_code,
+            reason = "used by host tests and by the compile-fail UI contracts, which build this file without cfg(test)"
+        )
+    )]
     pub(crate) const fn id(&self) -> ObjectId {
         self.reference.id()
     }
+    #[cfg_attr(
+        deepwyrm_production_product,
+        allow(
+            dead_code,
+            reason = "used by host tests and by the compile-fail UI contracts, which build this file without cfg(test)"
+        )
+    )]
     pub(crate) const fn object_type(&self) -> DwObjectType {
         self.reference.object_type()
     }
@@ -542,6 +556,13 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         })
     }
 
+    #[cfg_attr(
+        deepwyrm_production_product,
+        allow(
+            dead_code,
+            reason = "used by host tests and by the compile-fail UI contracts, which build this file without cfg(test)"
+        )
+    )]
     pub(crate) fn handle_into_internal(
         &mut self,
         reference: HandleRef,
@@ -642,6 +663,13 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         Ok(())
     }
 
+    #[cfg_attr(
+        deepwyrm_production_product,
+        allow(
+            dead_code,
+            reason = "used by host tests and by the compile-fail UI contracts, which build this file without cfg(test)"
+        )
+    )]
     pub(crate) fn release_creation(
         &mut self,
         reference: CreationRef,

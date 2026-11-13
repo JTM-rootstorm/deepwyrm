@@ -8,9 +8,12 @@
 #![deny(unsafe_code)]
 
 pub mod arch;
-#[allow(
-    dead_code,
-    reason = "DW0-F9 atomic wait/wake foundations are consumed by the selector-16 runtime"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod atomic_wait;
 pub mod boot;
@@ -18,24 +21,33 @@ pub(crate) mod cpu;
 pub mod debug;
 #[allow(
     dead_code,
-    reason = "DW1-D2 DeviceResource payload and PIO authority precede D5 boot-grant publication"
+    reason = "the interrupt-platform model and q35 terminal-freeze machinery are consumed only by host tests and selector platforms, interleaved with production types; unpicked"
 )]
 pub(crate) mod device;
-#[allow(
-    dead_code,
-    reason = "DW0-D5 exposes handle/object services ahead of DW0-E syscall consumers"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod handle;
 pub mod interrupt;
-#[allow(
-    dead_code,
-    reason = "DW0-F5 Channel foundations precede F6 transfer and F7 live wait consumers"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod ipc;
 pub mod memory;
-#[allow(
-    dead_code,
-    reason = "DW0-D5 consumes generic lifetime primitives ahead of DW0-E process/syscall ownership"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod object;
 
@@ -44,34 +56,46 @@ const _: () = assert!(object::RESERVATION_THREADS >= memory::kernel_stack::E3_TH
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) mod one_shot;
 #[path = "handle/service.rs"]
-#[allow(
-    dead_code,
-    reason = "DW0-D5 services precede their DW0-E syscall adapters"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod service;
-#[allow(
-    dead_code,
-    reason = "DW0-E3 synchronization precedes E4/E5 shared execution consumers"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod sync;
 #[allow(
     dead_code,
-    reason = "DW0-E1 syscall decoding precedes E4 architecture entry and E5 handler integration"
+    reason = "about 80 adapters and wait/termination entry points are reached only from host tests or single selectors through re-exports; unpicked"
 )]
 pub(crate) mod syscall;
 #[allow(
     dead_code,
-    reason = "DW0-E2 task payload authority precedes E3 scheduling and E5 syscall consumers"
+    reason = "about 50 scheduler and execution model entry points are reached only from host tests or single selectors; unpicked"
 )]
 pub(crate) mod task;
-#[allow(
-    dead_code,
-    reason = "DW0-F3 time/deadline services precede F4 wait and F8 Timer consumers"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod time;
-#[allow(
-    dead_code,
-    reason = "DW0-F4 wait/Event foundations precede F7 generic wait syscall activation"
+#[cfg_attr(
+    not(deepwyrm_production_product),
+    allow(
+        dead_code,
+        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+    )
 )]
 pub(crate) mod wait;
 

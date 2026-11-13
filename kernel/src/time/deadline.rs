@@ -1,6 +1,8 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use deepwyrm_abi::{DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DwDeadline};
+#[cfg(test)]
+use deepwyrm_abi::DwDeadline;
+use deepwyrm_abi::{DW_DEADLINE_INFINITE, DW_DEADLINE_NOW};
 
 use crate::task::BlockWakeKey;
 
@@ -16,6 +18,7 @@ fn mint_domain() -> u64 {
         .expect("deadline domain space exhausted")
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeadlineClass {
     Now,
@@ -23,6 +26,7 @@ pub(crate) enum DeadlineClass {
     Infinite,
 }
 
+#[cfg(test)]
 pub(crate) const fn classify_deadline(deadline: DwDeadline) -> DeadlineClass {
     if deadline.0 == DW_DEADLINE_NOW.0 {
         DeadlineClass::Now

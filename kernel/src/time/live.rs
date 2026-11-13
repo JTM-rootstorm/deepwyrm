@@ -229,6 +229,7 @@ pub(crate) struct DeadlineRegistrationFailure {
 }
 
 impl DeadlineRegistrationFailure {
+    #[cfg(test)]
     pub(crate) const fn error(&self) -> LiveTimeError {
         self.error
     }

@@ -1,8 +1,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use deepwyrm_abi::DW_RIGHT_INSPECT;
 use deepwyrm_abi::{
-    DW_CHANNEL_MAX_HANDLES, DW_HANDLE_INVALID, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
-    DW_RIGHT_TRANSFER, DwHandle, DwObjectType, DwRights,
+    DW_CHANNEL_MAX_HANDLES, DW_HANDLE_INVALID, DW_RIGHT_DUPLICATE, DW_RIGHT_TRANSFER, DwHandle,
+    DwObjectType, DwRights,
 };
 
 static NEXT_HANDLE_TABLE_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +47,7 @@ pub(crate) enum HandleReservationError {
 pub(crate) enum AcceptedObjectTypes<'a> {
     Any,
     One(DwObjectType),
+    #[cfg_attr(not(test), allow(dead_code, reason = "constructed only by host tests"))]
     Set(&'a [DwObjectType]),
 }
 impl AcceptedObjectTypes<'_> {
@@ -57,6 +60,7 @@ impl AcceptedObjectTypes<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BasicHandleInfo {
     pub(crate) object_type: DwObjectType,
@@ -99,6 +103,7 @@ impl ResolvedHandle {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn basic_info(&self) -> BasicHandleInfo {
         BasicHandleInfo {
             object_type: self.reference.object_type(),
@@ -140,15 +145,21 @@ impl InstallError {
 }
 
 #[must_use = "drained final-release tokens require subsystem cleanup"]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the releases are read back only by host tests")
+)]
 pub(crate) struct DrainResult<const CAPACITY: usize> {
     final_releases: [Option<FinalRelease>; CAPACITY],
     final_release_count: usize,
 }
 impl<const CAPACITY: usize> DrainResult<CAPACITY> {
+    #[cfg(test)]
     pub(crate) const fn final_release_count(&self) -> usize {
         self.final_release_count
     }
 
+    #[cfg(test)]
     pub(crate) fn into_final_releases(self) -> [Option<FinalRelease>; CAPACITY] {
         self.final_releases
     }
@@ -290,6 +301,13 @@ pub(crate) struct PreparedHandleMoveRollback {
 #[derive(Debug)]
 pub(crate) struct HandleTransferPublishError {
     error: HandleReservationError,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "production callers read only error(); the carried ownership is recovered only by host tests"
+        )
+    )]
     token: HandleTransferToken,
 }
 
@@ -298,6 +316,7 @@ impl HandleTransferPublishError {
         self.error
     }
 
+    #[cfg(test)]
     pub(crate) fn into_token(self) -> HandleTransferToken {
         self.token
     }
@@ -322,6 +341,13 @@ impl HandleReferencePublishError {
 #[derive(Debug)]
 pub(crate) struct HandlePairPublishError {
     error: HandleReservationError,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "production callers read only error(); the carried ownership is recovered only by host tests"
+        )
+    )]
     references: [HandleRef; 2],
 }
 
@@ -330,17 +356,20 @@ impl HandlePairPublishError {
         self.error
     }
 
+    #[cfg(test)]
     pub(crate) fn into_references(self) -> [HandleRef; 2] {
         self.references
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct HandleTransferRollbackError {
     error: HandleReservationError,
     token: HandleTransferToken,
 }
 
+#[cfg(test)]
 impl HandleTransferRollbackError {
     pub(crate) const fn error(&self) -> HandleReservationError {
         self.error
@@ -762,6 +791,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
         Ok(entry.reference.id())
     }
 
+    #[cfg(test)]
     pub(crate) fn inspect_basic(
         &self,
         handle: DwHandle,
@@ -1124,6 +1154,7 @@ impl<const CAPACITY: usize> HandleTable<CAPACITY> {
 }
 
 impl<'a, const CAPACITY: usize> PreparedHandleMoveBatch<'a, CAPACITY> {
+    #[cfg(test)]
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
@@ -1267,6 +1298,7 @@ impl PreparedHandleMoveRollback {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn try_rollback<const CAPACITY: usize>(
         &mut self,
         table: &mut HandleTable<CAPACITY>,
@@ -1417,10 +1449,6 @@ impl HandleTransferToken {
 
     pub(crate) const fn object_type(&self) -> DwObjectType {
         self.reference.object_type()
-    }
-
-    pub(crate) const fn rights(&self) -> DwRights {
-        self.requested_rights
     }
 }
 

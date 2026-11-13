@@ -6,16 +6,17 @@ mod table;
 #[cfg(test)]
 mod model_tests;
 
+#[cfg(test)]
+pub(crate) use table::BasicHandleInfo;
 #[allow(
     unused_imports,
     reason = "DW0-D4/D5 consume core table types while process ownership arrives in DW0-E"
 )]
 pub(crate) use table::{
-    AcceptedObjectTypes, BasicHandleInfo, DrainResult, DrainWindow, HANDLE_TRANSFER_LIMIT,
-    HandleBatchReservation, HandleMovePrepareError, HandleMoveRequest, HandlePairPublishError,
-    HandlePairReservation, HandleReferencePublishError, HandleReservationError,
-    HandleReservationSpec, HandleTable, HandleTableError, HandleTransferBatch,
-    HandleTransferPublishError, HandleTransferReservation, HandleTransferRollbackError,
+    AcceptedObjectTypes, DrainResult, DrainWindow, HANDLE_TRANSFER_LIMIT, HandleBatchReservation,
+    HandleMovePrepareError, HandleMoveRequest, HandlePairPublishError, HandlePairReservation,
+    HandleReferencePublishError, HandleReservationError, HandleReservationSpec, HandleTable,
+    HandleTableError, HandleTransferBatch, HandleTransferPublishError, HandleTransferReservation,
     InstallError, PreparedHandleMove, PreparedHandleMoveRollback, PublishedHandleInfo,
     ResolvedHandle, TypedHandlePairReservation,
 };

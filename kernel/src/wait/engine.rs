@@ -434,7 +434,7 @@ fn register_one<
             thread,
             wake,
         ) {
-            Ok(ChannelWaitOutcome::Ready { pin, .. }) => Ok(RegisterOutcome::Ready(pin)),
+            Ok(ChannelWaitOutcome::Ready { pin }) => Ok(RegisterOutcome::Ready(pin)),
             Ok(ChannelWaitOutcome::Registered(_registration)) => Ok(RegisterOutcome::Registered),
             Err(failure) => Err((WaitSetError::Channel(failure.error), failure.pin)),
         },

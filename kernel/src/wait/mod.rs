@@ -43,7 +43,15 @@ pub(crate) enum WaitError {
     InvalidSignals,
     AccessDenied,
     UnsupportedSource,
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "constructed only by the host-test cancel path")
+    )]
     ForeignRegistration,
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "constructed only by the host-test cancel path")
+    )]
     StaleRegistration,
     EventFinalizationMismatch,
     EventReference,
@@ -422,6 +430,13 @@ struct WaitSlot {
 }
 
 #[must_use = "published wait registrations must be cancelled or completed by a wake"]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "a registration is a move-only ownership token; only the host-test cancel path reads its identity"
+    )
+)]
 pub(crate) struct WaitRegistration {
     domain: u64,
     slot: u16,
@@ -512,6 +527,7 @@ impl<const CAPACITY: usize> WakeBatch<CAPACITY> {
         self.wake_len
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_empty(&self) -> bool {
         self.wake_len == 0 && self.pin_len == 0
     }
@@ -669,6 +685,7 @@ impl<const CAPACITY: usize> WaitRegistry<CAPACITY> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn cancel(&self, registration: WaitRegistration) -> Result<InternalRef, WaitError> {
         if registration.domain != self.domain {
             return Err(WaitError::ForeignRegistration);
@@ -841,6 +858,7 @@ impl<const CAPACITY: usize> WaitRegistrationSink for WaitRegistry<CAPACITY> {
 #[must_use = "ready Event pins and registrations must be released by the blocking operation owner"]
 pub(crate) enum EventWaitOutcome {
     Ready {
+        #[cfg_attr(not(test), allow(dead_code, reason = "read only by host tests"))]
         observed: DwSignals,
         pin: InternalRef,
     },

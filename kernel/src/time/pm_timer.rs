@@ -48,20 +48,13 @@ impl PmTimerDescriptor {
         self.port
     }
 
-    pub(crate) const fn width(self) -> PmTimerWidth {
-        self.width
-    }
-
+    #[cfg(test)]
     pub(crate) fn maximum_unambiguous_gap_nanoseconds(self) -> Result<u64, PmTimerError> {
         ticks_to_nanoseconds(self.width.maximum_unambiguous_gap_ticks())
     }
 
     pub(crate) fn maintenance_arm_nanoseconds(self) -> Result<u64, PmTimerError> {
         ticks_to_nanoseconds(self.width.maintenance_arm_ticks())
-    }
-
-    pub(crate) fn full_wrap_nanoseconds(self) -> Result<u64, PmTimerError> {
-        ticks_to_nanoseconds(self.width.modulus())
     }
 }
 

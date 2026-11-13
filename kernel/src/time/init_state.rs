@@ -19,10 +19,6 @@ impl TimeInitState {
             _ => None,
         }
     }
-
-    pub(crate) const fn byte(self) -> u8 {
-        self as u8
-    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ pub(crate) enum WaitOperationError {
 /// resume and terminal teardown cannot accidentally split cleanup authority.
 #[must_use = "suspended wait resources must be resumed or terminally discarded"]
 pub(crate) struct WaitOperation<OUTPUT> {
+    #[cfg_attr(not(test), allow(dead_code, reason = "read only by host tests"))]
     process: ProcessKey,
     thread: ThreadKey,
     blocked: BlockedOperation<()>,
@@ -42,10 +43,12 @@ impl<OUTPUT> WaitOperation<OUTPUT> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn process(&self) -> ProcessKey {
         self.process
     }
 
+    #[cfg(test)]
     pub(crate) const fn thread(&self) -> ThreadKey {
         self.thread
     }

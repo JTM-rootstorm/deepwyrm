@@ -5,14 +5,15 @@
 
 use deepwyrm_abi::{
     DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
-    DW_OBJECT_INFO_INTERRUPT_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1, DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1,
-    DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_TYPE_TASK_GROUP, DW_TASK_GROUP_MEMORY_INFO_V1_SIZE,
-    DW_OBJECT_INFO_V1_SIZE, DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_INTERRUPT,
-    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT,
+    DW_OBJECT_INFO_INTERRUPT_V1, DW_OBJECT_INFO_MEMORY_OBJECT_V1,
+    DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1, DW_OBJECT_INFO_TASK_STATE_V1, DW_OBJECT_INFO_V1_SIZE,
+    DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_INTERRUPT, DW_OBJECT_TYPE_MEMORY_OBJECT,
+    DW_OBJECT_TYPE_PROCESS, DW_OBJECT_TYPE_TASK_GROUP, DW_OBJECT_TYPE_THREAD, DW_RIGHT_INSPECT,
     DW_STATUS_ACCESS_DENIED, DW_STATUS_BAD_HANDLE, DW_STATUS_INVALID_ARGUMENT,
     DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_WRONG_OBJECT_TYPE,
-    DwDeviceResourceInfoV1, DwHandle, DwInterruptInfoV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
-    DwRights, DwStatus, DwTaskGroupMemoryInfoV1, DwTaskTerminationInfoV1,
+    DW_TASK_GROUP_MEMORY_INFO_V1_SIZE, DwDeviceResourceInfoV1, DwHandle, DwInterruptInfoV1,
+    DwMemoryObjectInfoV1, DwObjectInfoV1, DwRights, DwStatus, DwTaskGroupMemoryInfoV1,
+    DwTaskTerminationInfoV1,
 };
 
 use crate::device::{DeviceResourceInfoProvider, InterruptInfoProvider};
@@ -55,6 +56,7 @@ pub(crate) fn handle_duplicate<const HANDLES: usize, const OBJECTS: usize>(
         .map_err(table_status)
 }
 
+#[cfg(test)]
 pub(crate) fn object_get_info_v1<
     const HANDLES: usize,
     const OBJECTS: usize,
@@ -359,6 +361,7 @@ fn task_group_memory_info<
     })
 }
 
+#[cfg(test)]
 fn task_info_reserved<const OBJECTS: usize>(
     topic: u32,
     resolved: &ResolvedHandle,
