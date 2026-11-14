@@ -306,14 +306,14 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         self.notice_queued[slot] = true;
     }
 
-    /// Pops the oldest MemoryObject release notice: `None` when there is
-    /// none, `Some(None)` when its slot no longer holds a live MemoryObject,
-    /// else that object.
     /// Whether any release-on-unmap notice is queued (DW2 §10.9 item 4).
     pub(crate) fn memory_notices_pending(&self) -> bool {
         self.notice_len != 0
     }
 
+    /// Pops the oldest MemoryObject release notice: `None` when there is
+    /// none, `Some(None)` when its slot no longer holds a live MemoryObject,
+    /// else that object.
     pub(crate) fn pop_memory_notice(&mut self) -> Option<Option<ObjectId>> {
         if self.notice_len == 0 {
             return None;

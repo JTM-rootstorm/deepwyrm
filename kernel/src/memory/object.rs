@@ -1335,7 +1335,8 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
 
     /// One step of the owed finalizations (DW2 §10.12 item 2), oldest
     /// first: at most `budget` index entries are visited, the budget left
-    /// by an object that completes going on to the next (step-6 review R3).
+    /// by an object that completes going on to the next (step-6 review R3),
+    /// less the root's entries its completion reads.
     /// Each step lowers the object's weight by the frames it freed; an
     /// object whose index is empty is completed. `true` if any remain.
     #[cfg(deepwyrm_integrated)]
@@ -1379,7 +1380,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             self.owed_len -= 1;
             let parent = complete_memory_finalization(registry, roles, owed.finalization);
             assert!(parent.is_none(), "an on-demand object has no parent");
-            left = left.saturating_sub(1);
+            // Completion re-reads the root's entries to check the index
+            // empty before freeing it: charged in full (second security
+            // pass D-2).
+            left = left.saturating_sub(crate::memory::frame_roles::INDEX_FANOUT);
         }
         self.owed_len != 0
     }

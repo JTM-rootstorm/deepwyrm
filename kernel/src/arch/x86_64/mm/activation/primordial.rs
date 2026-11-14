@@ -676,11 +676,6 @@ impl crate::syscall::native::NativeQuantumExpiry for QuantumExpiryPublisher {
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    /// The idle BSP's teardown visit (DW2 §10.10 item 5): with nothing to
-    /// run, teardown owed and the bootstrap's own root retired, it switches
-    /// from the kernel root to the primordial publisher root (the terminal
-    /// reaper's switch), takes one queued teardown step, and switches back.
-    /// `true` if teardown is still owed afterwards.
     /// The idle BSP's finalization step (DW2 §10.12 item 5): on the kernel
     /// root, which needs no switch. `true` if finalization is still owed.
     fn idle_finalize_step(&mut self) -> bool {
@@ -689,6 +684,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         runtime.finalize_owed_step()
     }
 
+    /// The idle BSP's teardown visit (DW2 §10.10 item 5): with nothing to
+    /// run, teardown owed and the bootstrap's own root retired, it switches
+    /// from the kernel root to the primordial publisher root (the terminal
+    /// reaper's switch), takes one queued teardown step, and switches back.
+    /// `true` if teardown is still owed afterwards.
     fn idle_teardown_visit(&mut self) -> bool {
         let prepared = {
             let mut guard = self.runtime.lock();
@@ -6760,12 +6760,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if was_suspended {
             let thread = self.own.scheduled().thread;
             let control = &mut self.own.wait_control;
-            self.core
+            let cancelled_quantum = self
+                .core
                 .services
                 .retire_idle_control_for_stop(control, thread, claim.generation())
                 .unwrap_or_else(|_| {
                     panic!("remote stop suspended idle control drifted before precommit")
                 });
+            // A suspension still pending (its Stop taken before
+            // `prepare_suspend`) carries the quantum cancellation that call
+            // would have staged (step-6 review D-1).
+            self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
             self.transfer_suspended_service_cleanup_for_stop();
         }
         self.stage_rendezvous_cleanup();

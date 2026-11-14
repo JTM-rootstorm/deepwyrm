@@ -2310,6 +2310,94 @@ fn the_unreachable_user_access_panics_on_any_use() {
     );
 }
 
+/// DW2 M5 step 6's `--smp` panic ("remote stop suspended idle control
+/// drifted before precommit"; second security pass D-1). A blocking wait
+/// commits its block and leaves the control `Pending`; the settle check
+/// after the dispatch takes a remote Stop before `prepare_suspend` runs, so
+/// the stop's precommit finds the continuation suspended with its control
+/// still pending. The precommit retires that exact suspension too, and is
+/// handed the quantum cancellation `prepare_suspend` would have staged.
+#[test]
+fn a_remote_stop_retires_a_pending_suspension() {
+    let mut fixture = Fixture::new();
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventCreate {
+                requested_rights: DW_RIGHT_WAIT,
+                out_event: DwUserAddress(BASE + 0x500),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let event = DwHandle(u64_at(&fixture.user, BASE + 0x500));
+    let wait = fixture.handled(NativeSyscallRequest::WaitOne {
+        handle: event,
+        signals: DW_SIGNAL_SIGNALED,
+        deadline: DwDeadline(50),
+        out_result: DwUserAddress(BASE + 0x580),
+    });
+    assert_eq!(
+        wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    let wake = fixture
+        .services
+        .wait_operations
+        .wake_key_for_thread(fixture.thread)
+        .unwrap();
+    let cancelled = fixture.control.pending_quantum_cancellation();
+    assert!(!fixture.control.is_clear());
+    assert_eq!(
+        fixture.services.retire_idle_control_for_stop(
+            &mut fixture.control,
+            wake.thread(),
+            wake.execution_generation() + 1,
+        ),
+        Err(WaitSuspendError::InvalidDecision),
+        "a stale generation must not retire it"
+    );
+    assert!(!fixture.control.is_clear());
+    assert_eq!(
+        fixture.services.retire_idle_control_for_stop(
+            &mut fixture.control,
+            wake.thread(),
+            wake.execution_generation(),
+        ),
+        Ok(cancelled)
+    );
+    assert!(fixture.control.is_clear());
+    // Nothing is left for a later suspension's `prepare_suspend`, and a
+    // second retire finds nothing.
+    assert_eq!(
+        fixture.services.retire_idle_control_for_stop(
+            &mut fixture.control,
+            wake.thread(),
+            wake.execution_generation(),
+        ),
+        Err(WaitSuspendError::InvalidDecision)
+    );
+    // The operation itself is retired by the stop's cleanup; here its
+    // timeout wins and a resume completes it.
+    let mut expired = [None; 8];
+    assert_eq!(fixture.wait_deadlines.queue.expire(50, &mut expired), 1);
+    assert!(claim_timeout_and_wake(&fixture.execution, wake).unwrap());
+    let resumed = fixture
+        .services
+        .resume_suspended(
+            &mut fixture.user,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            fixture.thread,
+            Some(&mut fixture.wait_deadlines),
+        )
+        .unwrap();
+    assert_eq!(resumed.status(), DW_STATUS_TIMED_OUT);
+    assert!(fixture.services.is_quiescent());
+    close_event(&mut fixture, event);
+}
+
 /// The `f3a/d1h3-normal-01/smp` panic ("remote stop suspended idle control
 /// drifted before precommit"). A live idle suspension's poll finds its
 /// winner and returns `ResumeCurrent`; before the resume reaches its
@@ -2400,7 +2488,7 @@ fn a_remote_stop_retires_a_resuming_idle_suspension() {
             wake.thread(),
             wake.execution_generation(),
         ),
-        Ok(())
+        Ok(None)
     );
     assert!(fixture.control.is_clear());
     // The operation itself is retired as the stop's cleanup would; here the

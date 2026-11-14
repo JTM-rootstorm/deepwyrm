@@ -31,7 +31,7 @@ mod manager;
 use chain::ChainState;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use index::OnDemandCommit;
-pub(crate) use index::{INDEX_MAX_PAGES, IndexMemory};
+pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory};
 use index::{IndexEntryLink, IndexRootLink};
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]

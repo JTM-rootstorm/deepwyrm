@@ -1537,10 +1537,34 @@ mod owed_finalization {
         // A step too small for the first leaves the second untouched.
         assert!(authority.finalize_owed_step(&mut registry, &mut roles, 1));
         assert!(registry.charged_pages(group) >= 2);
-        // One step with room for both completes both.
-        assert!(!authority.finalize_owed_step(&mut registry, &mut roles, 1024));
+        // A step with room for both, each completion counted as the root's
+        // 512 entries it reads, completes both.
+        assert!(!authority.finalize_owed_step(&mut registry, &mut roles, 2048));
         assert_eq!(registry.charged_pages(group), 0);
         roles.check_invariants().unwrap();
+    }
+
+    /// Second security pass D-2: a completion reads the root's entries, so
+    /// one step of the live budget completes one object, however small.
+    #[test]
+    fn a_completion_costs_its_root_s_entries() {
+        let mut roles = roles();
+        let mut registry = ObjectRegistry::<4>::new();
+        let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let mut authority = MemoryObjectAuthority::<2, 1>::new();
+        for _ in 0..2 {
+            let (owner, _) =
+                on_demand(&mut authority, &mut registry, &mut roles, group, 1, &[0]).unwrap();
+            finalize(&mut authority, &mut registry, owner);
+        }
+        assert!(authority.finalize_owed_step(&mut registry, &mut roles, 512));
+        assert_eq!(
+            registry.charged_pages(group),
+            2,
+            "the second's root and page"
+        );
+        assert!(!authority.finalize_owed_step(&mut registry, &mut roles, 512));
+        assert_eq!(registry.charged_pages(group), 0);
     }
 
     #[test]

@@ -1181,7 +1181,7 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         control: &mut NativeWaitControl,
         thread: ThreadKey,
         execution_generation: u64,
-    ) -> Result<(), WaitSuspendError> {
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, WaitSuspendError> {
         control.retire_idle_for_stop(thread, execution_generation)
     }
 

@@ -5443,23 +5443,29 @@ impl NativeWaitControl {
 
     /// Consumes only the exact idle control handoff retained by a physical
     /// blocked continuation that an e1 safe point is about to retire: still
-    /// idle, or already resuming but short of its physical handoff.
+    /// pending (its block committed, the Stop taken at the settle check
+    /// before `prepare_suspend`; DW2 M5 step-6 review D-1), idle, or already
+    /// resuming but short of its physical handoff. A pending suspension's
+    /// quantum cancellation, which `prepare_suspend` would have staged, is
+    /// returned for the stop to stage instead.
     pub(crate) fn retire_idle_for_stop(
         &mut self,
         thread: ThreadKey,
         execution_generation: u64,
-    ) -> Result<(), WaitSuspendError> {
-        let (NativeWaitControlState::Idle(state) | NativeWaitControlState::Resuming(state)) =
-            self.state
-        else {
-            return Err(WaitSuspendError::InvalidDecision);
+    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, WaitSuspendError> {
+        let (cancelled, state) = match self.state {
+            NativeWaitControlState::Pending(state) => (state.cancelled_quantum(), state),
+            NativeWaitControlState::Idle(state) | NativeWaitControlState::Resuming(state) => {
+                (None, state)
+            }
+            NativeWaitControlState::Clear => return Err(WaitSuspendError::InvalidDecision),
         };
         let wake = state.wake_key();
         if wake.thread() != thread || wake.execution_generation() != execution_generation {
             return Err(WaitSuspendError::InvalidDecision);
         }
         self.state = NativeWaitControlState::Clear;
-        Ok(())
+        Ok(cancelled)
     }
 }
 
