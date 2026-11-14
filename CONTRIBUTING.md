@@ -1,9 +1,9 @@
 # Contributing to Deepwyrm
 
-Deepwyrm is implementing DW0 in ordered phases. The native ABI schema and its
-host validation tooling exist, but the repository does not yet contain a
-bootable kernel or implemented syscall behavior. See
-[the bootstrap status](docs/BOOTSTRAP_STATUS.md) for the current claim boundary.
+Deepwyrm boots Wyrmroot's product under QEMU; nothing has run on physical
+hardware. [The kernel as built](Plans/AS_BUILT_ARCHITECTURE.md) says what the
+code does now, and the [architecture index](Plans/ARCHITECTURE_INDEX.md) says
+which documents govern and which plans are active.
 
 ## Read the architecture first
 

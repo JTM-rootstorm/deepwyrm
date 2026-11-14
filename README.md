@@ -22,7 +22,7 @@ Shared boot and ABI contracts are coordinated across both projects. Wyrmroot con
 - [Pre-phase-zero invariants](Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md)
 - [DW0 implementation plan](Plans/DW0_IMPLEMENTATION_PLAN.md)
 - [Native ABI schema and generated artifacts](abi/README.md)
-- [Bootstrap and validation status](docs/BOOTSTRAP_STATUS.md)
+- [The kernel as built](Plans/AS_BUILT_ARCHITECTURE.md)
 - [Licensing policy](LICENSING.md)
 - [Contributing](CONTRIBUTING.md)
 

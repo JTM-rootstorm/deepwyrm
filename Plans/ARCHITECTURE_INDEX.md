@@ -5,7 +5,18 @@
 
 This file defines the minimum architecture reading set for Deepwyrm implementation work. Codex coordinators and human contributors should read the applicable documents before changing kernel or kernel/userspace contracts.
 
-## Mandatory pre-DW0 reading order
+Four kinds of document live here, and this index keeps them apart:
+
+- **As built:** what the code does now. Start here.
+- **Governing:** invariants, contracts and designs that bind changes to what they cover.
+- **Active plans:** work in progress, here and in the OS-Project root.
+- **Archive:** records of closed phases and superseded designs. History, not authority (root `CLAUDE.md` §5).
+
+## As built
+
+- [`AS_BUILT_ARCHITECTURE.md`](AS_BUILT_ARCHITECTURE.md) describes the kernel as it is: boot, objects and pools, tasks, memory, IPC, time, interrupts, locking and the syscall surface, with what it does not do yet and who owns each gap. Update it in the change that alters what it describes.
+
+## Mandatory reading order for kernel or contract changes
 
 1. [`README.md`](../README.md) - project identity and broad kernel goals.
 2. [`Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md`](DEEPWYRM_PRE_PHASE0_INVARIANTS.md) - kernel-side pre-phase-0 invariants.
@@ -40,7 +51,7 @@ Do not add speculative kernel architecture merely because a distant subsystem wi
 
 The purpose of ABI 0 is to learn from real code, tests, and hardware rather than preserve speculative mistakes.
 
-## Reached subsystem contracts
+## Governing contracts and designs
 
 - [`DW0_D0_OBJECT_HANDLE_CONTRACT.md`](DW0_D0_OBJECT_HANDLE_CONTRACT.md) defines the locked DW0-D object/handle rights, liveness, reclamation, mapping-pin, transaction, and downstream-preservation contract. Read it before DW0-D implementation.
 - [`DW0_E0_TASK_SYSCALL_CONTRACT.md`](DW0_E0_TASK_SYSCALL_CONTRACT.md) defines the locked DW0-E task lifecycle/ownership, typed construction/finalization, public `process_create` staging, and x86_64 CPL3/syscall-entry contract. Read it before DW0-E implementation.
@@ -49,7 +60,6 @@ The purpose of ABI 0 is to learn from real code, tests, and hardware rather than
 - [`DW0_H0_SMP_CONCURRENCY_CONTRACT.md`](DW0_H0_SMP_CONCURRENCY_CONTRACT.md) defines the paired cooperative-SMP CPU identity, per-CPU ownership, IPI, rendezvous, TLB, timer-service, publication, lock-order, and userspace-loader enablement contract. Read it before DW0-H implementation.
 - [`DW0_I0_ADDRESS_SPACE_ROOT_BINDING_DESIGN.md`](DW0_I0_ADDRESS_SPACE_ROOT_BINDING_DESIGN.md) refines H0 sections 5 and 9 with the implemented bounded `AddressSpaceKey`/Process-to-PML4 binding, typed lifetime-pinned kernel-half sharing, root-switch ordering, rollback, and conservative teardown boundary used by the I0 runtime lane.
 - [`DW0_I1_KERNEL_EXECUTION_ROOT_DESIGN.md`](DW0_I1_KERNEL_EXECUTION_ROOT_DESIGN.md) defines the implemented CPU-private retained kernel/reaper roots, exact root-generation stop identity, and fail-closed Process/kernel transitions. It was written while AP execution was parked; APs have run ordinary userspace since `83856db` (corrected 2026-09-28).
-- [`DW0_I1_STATIONARY_RUNTIME_FOUNDATION.md`](DW0_I1_STATIONARY_RUNTIME_FOUNDATION.md) is **superseded** by the S2K runtime authority design below. It remains the historical record of the staged stationary-authority/carrier split and its three unfinished adapter, paging and terminal transaction steps; it is not authority for new runtime-authority work.
 - [`DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md`](DW1_S2K_RUNTIME_AUTHORITY_DESIGN.md) is the approved (2026-09-28) design for the kernel runtime split in the DW1/WYR1 structural refactor: it replaces `RuntimeCore`/`PagingAuthority`, divides `PrimordialRuntimeCarrier`'s six responsibilities, stages S2K-0 through S2K-6 and D1, and records Mike's decisions in its section 11 (which override its sections 5.2, 5.3 and 8). Read it before changing the primordial runtime carrier, `RuntimeAuthorityLock`, per-CPU runtime identity, root-switch transactions, or guard-free physical boundaries.
 - [`DW0_I1_PER_CPU_SCRATCH_DESIGN.md`](DW0_I1_PER_CPU_SCRATCH_DESIGN.md) defines fixed CPU-private scratch windows, atomic leaf ownership, and migration/session cleanup. Read it before changing live usercopy, MMIO scratch, or page-table scratch access.
 - [`DW1_A0_PREEMPTIVE_SCHEDULER_CONTRACT.md`](DW1_A0_PREEMPTIVE_SCHEDULER_CONTRACT.md) defines the reached normal-class per-CPU FIFO round-robin policy, quantum/timer identity, safe userspace-return preemption boundary, eligibility/migration rules, instrumentation, lock ordering, and exact preservation of DW0-H/I execution invariants. Read it before DW1 scheduler implementation.
@@ -57,6 +67,18 @@ The purpose of ABI 0 is to learn from real code, tests, and hardware rather than
 - [`DW1_C0_SMP_PREEMPTION_DESIGN.md`](DW1_C0_SMP_PREEMPTION_DESIGN.md) reconciles the current AP idle/rendezvous carrier with DW1-A0, defines the generation-bound Parked-to-Schedulable publication order, inventories CPU-private root/entry/reaper/scratch/mailbox/deadline/return ownership, fixes the per-CPU quantum transition, and reserves selector 28's structured four-vCPU evidence contract. Read it before changing AP scheduler admission, per-CPU quantum ownership, placement, stealing, migration, or SMP preemption evidence.
 - [`DW1_D0_DEVICE_RESOURCE_INTERRUPT_CONTRACT.md`](DW1_D0_DEVICE_RESOURCE_INTERRUPT_CONTRACT.md) defines the paired rights-scoped DeviceResource and waitable Interrupt ABI, immutable boot-device table, protected COM1 boundary, TaskGroup resource-domain claim custody, checked scalar PIO, generation-safe synthetic Interrupt state, typed finalization, and exact WYR1-C4 bundle handoff. Read it before activating object types 16/17 or changing device-resource, Interrupt, boot-device, resource-domain, PIO, or WYR1-C hardware-authority semantics.
 - [`DW1_E0_Q35_EXTERNAL_INTERRUPT_CONTRACT.md`](DW1_E0_Q35_EXTERNAL_INTERRUPT_CONTRACT.md) defines the private q35 COM2 IRQ3 edge/high MADT/IOAPIC route, vector `0x30` BSP delivery, kernel EOI versus userspace ack, edge-unmasked platform seam, fixed-vector retirement quarantine, returning-entry/scheduler rule, and selector-31 evidence identities. Read it before changing external-vector IDT surface, IOAPIC/xAPIC delivery, physical Interrupt binding, or DW1-E evidence.
+- [`DW2_PCI_DEVICE_DMA_CONTRACT.md`](DW2_PCI_DEVICE_DMA_CONTRACT.md) defines storage K1–K4: boot device table V2 with a PCI-function kind, kernel-checked PCI identity and BAR admission, config read, filtered command writes, uncached BAR mapping, and per-function VT-d domains with kernel-chosen IOVAs and ordered teardown. Read it before changing device resources, PCI access, device MMIO or DMA.
+
+## Active plans
+
+- [`DW2_LARGE_MEMORY_PLAN.md`](DW2_LARGE_MEMORY_PLAN.md) is the active plan (decided 2026-11-12; its own status line says which stages are done) for running on machines with 64 GiB or more: the limits a large job hits today (job budget, map ceiling, contiguous backing, the 128-range free list, the 4096-slot role table, the single physical window, eager mapping) and stages M1–M5. Read it before changing the frame allocator, MemoryObject backing, physical access or the map path.
+- In the OS-Project root: [`OS_STACK_ARCHITECTURE_PLAN.md`](../../OS_STACK_ARCHITECTURE_PLAN.md) (the stack-wide plan: capacity, IPC, locking, interrupts, ABI lifetime, mitigations, the i386 seam), [`HARDWARE_BRINGUP_PLAN.md`](../../HARDWARE_BRINGUP_PLAN.md) (draft), [`I386_EXECUTION_MODE_CONTRACT.md`](../../I386_EXECUTION_MODE_CONTRACT.md) (draft, E1) and [`CARRIED_OPEN_ITEMS.md`](../../CARRIED_OPEN_ITEMS.md) (the owned ledger of open items).
+
+## Archive
+
+Records of closed phases and superseded designs. The guest selectors several of them describe are test-build evidence paths, not production behaviour.
+
+- [`DW0_I1_STATIONARY_RUNTIME_FOUNDATION.md`](DW0_I1_STATIONARY_RUNTIME_FOUNDATION.md) is **superseded** by the S2K runtime authority design below. It remains the historical record of the staged stationary-authority/carrier split and its three unfinished adapter, paging and terminal transaction steps; it is not authority for new runtime-authority work.
 - [`DW1_E1_IMPLEMENTATION_STATUS.md`](DW1_E1_IMPLEMENTATION_STATUS.md) records the reached host-only MADT type-1/type-2 snapshot, q35 COM2 route, pure IOAPIC redirection codec, and route-lifecycle model. Read it before E2 live IOAPIC mapping or vector-entry work.
 - [`DW1_E2A_IMPLEMENTATION_STATUS.md`](DW1_E2A_IMPLEMENTATION_STATUS.md) records the target-only staged q35 IOAPIC candidate probe, permanent UC/NX controller ownership, serialized selector/window access, and the E2B product-cfg dependency. Read it before E2 vector or physical platform binding work.
 - [`DW1_E2B_IMPLEMENTATION_STATUS.md`](DW1_E2B_IMPLEMENTATION_STATUS.md) records the selected-product vector `0x30` IDT surface, complete returning entry, one-shot q35 dispatch binder, and local-APIC EOI seam. Read it before E2C q35 route unmask or external-vector integration.
@@ -65,8 +87,6 @@ The purpose of ABI 0 is to learn from real code, tests, and hardware rather than
 - [`DW1_E3B_IMPLEMENTATION_STATUS.md`](DW1_E3B_IMPLEMENTATION_STATUS.md) records selector 31's explicit E3A/E3B-full build split, barrier-time leg materialization, actual U1 retirement and fresh-U2 joins, controller-only terminal preparation, quiescent U2 terminal mask, generation-bound CPU0 deferred completion, saved real-U1 delivery replay, coherent bounded accounting, and atomic 26-record PASS path. Read it before paired Wyrmroot E3B integration or selector-31 live acceptance.
 - [`../docs/DW1_E_VALIDATION.md`](../docs/DW1_E_VALIDATION.md) records DW1-E's accepted exact revision tuple, selector-31 UP/SMP product and structured evidence, GDB-led E4 scheduler repairs, fresh selector-28/29/30 regressions, host/quality gates, unsafe-boundary audit, provenance, cleanup, and explicit closure nonclaims. It closes DW1-E only; DW1 remains open.
 - [`../docs/DW1_COMPLETION_REPORT.md`](../docs/DW1_COMPLETION_REPORT.md) closes DW1 (2026-11-10) on Deepwyrm `831e2ad` / Wyrmroot `45a45e0`: what DW1 adds to DW0, its evidence, F4 security disposition and nonclaims. Read it before planning post-DW1 kernel work.
-- [`DW2_PCI_DEVICE_DMA_CONTRACT.md`](DW2_PCI_DEVICE_DMA_CONTRACT.md) defines storage K1–K4: boot device table V2 with a PCI-function kind, kernel-checked PCI identity and BAR admission, config read, filtered command writes, uncached BAR mapping, and per-function VT-d domains with kernel-chosen IOVAs and ordered teardown. Read it before changing device resources, PCI access, device MMIO or DMA.
-- [`DW2_LARGE_MEMORY_PLAN.md`](DW2_LARGE_MEMORY_PLAN.md) is the plan (decided 2026-11-12; M1 done) for running on machines with 64 GiB or more: the limits a large job hits today (job budget, map ceiling, contiguous backing, the 128-range free list, the 4096-slot role table, the single physical window, eager mapping) and stages M1–M5. Read it before changing the frame allocator, MemoryObject backing, physical access or the map path.
 - [`WYR1_B0_REGISTRY_LAUNCH_EVIDENCE_DESIGN.md`](WYR1_B0_REGISTRY_LAUNCH_EVIDENCE_DESIGN.md) defines selector 27's test-build-only permanent-controller WRB1 relay, post-primordial reporter authority, exact 14-record validation, private raw operation, atomic terminal transcript, and selector-local capacities. Read it before changing Deepwyrm's WYR1-B live-evidence support.
 - [`WYR1_C6_DEVICE_COORDINATOR_RESTART_EVIDENCE_DESIGN.md`](WYR1_C6_DEVICE_COORDINATOR_RESTART_EVIDENCE_DESIGN.md) defines selector 29's test-build-only permanent-controller WRC6 relay, exact 27-record restart/custody sequence, private raw operation `0xffff_ff1e`, atomic terminal transcript, selector-local capacities, and exact-pair live disposition. Read it before changing Deepwyrm's WYR1-C6 evidence support.
 - [`WYR1_D5_KERNEL_INTEGRATION_STATUS.md`](WYR1_D5_KERNEL_INTEGRATION_STATUS.md) records selector 32's private WRD1/readiness relay, q35 platform selection, permanent-controller retirement, atomic twelve-record terminal certificate, replacement identity semantics, and host/target validation boundary. Read it before changing the D5 kernel evidence integration; the later exact-pair live acceptance and D6 regressions are recorded in the [DW1-E validation addendum](../docs/DW1_E_VALIDATION.md#wyr1-d6-exact-current-regression-addendum).
