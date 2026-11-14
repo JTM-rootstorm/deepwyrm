@@ -2019,6 +2019,7 @@ unsafe fn native_runtime_trampoline<
     {
         halt_forever();
     }
+    end_teardown_allowance_here();
     // The syscall gate entered with IF clear. A remote Stop may therefore be
     // published in the stationary mailbox while its e1 delivery is still
     // pending in the local APIC. Poll the authoritative mailbox before any
@@ -2471,11 +2472,24 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_restore(&saved) };
 }
 
-/// A timer interrupt of user code on this CPU: one queued teardown step may
-/// run before the next (DW2 §10.10 items 2 and 7).
+/// A timer interrupt of user code on the BSP: one queued teardown step may
+/// run before the next (DW2 §10.10 items 2 and 7). Only the BSP's gate
+/// drains (its timer service), so an AP's tick grants nothing: an allowance
+/// with no drain behind it would be spent by a later, unrelated entry.
 fn allow_teardown_step_here() {
+    if current_cpu_index() == Some(crate::cpu::CpuIndex::BOOTSTRAP.index()) {
+        crate::arch::x86_64::step_report::allow_teardown_step(
+            crate::cpu::CpuIndex::BOOTSTRAP.index(),
+        );
+    }
+}
+
+/// A syscall entry on this CPU: it grants no teardown step (DW2 §10.10
+/// item 2), and ends any allowance an earlier entry left unspent, so its own
+/// drains cannot step on that entry's behalf (step-5 review D-1).
+fn end_teardown_allowance_here() {
     if let Some(cpu) = current_cpu_index() {
-        crate::arch::x86_64::step_report::allow_teardown_step(cpu);
+        crate::arch::x86_64::step_report::take_teardown_step(cpu);
     }
 }
 

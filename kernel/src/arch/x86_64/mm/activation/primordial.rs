@@ -5692,21 +5692,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         root_key: crate::memory::address_region::AddressRegionObjectKey,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
-        self.unmap_inactive_pieces(process, root_key, proof, u64::MAX)
+        self.unmap_inactive_pieces(process, root_key, proof, None)
             .map(|_| ())
     }
 
-    /// Removes at most `limit` bytes of an exited, quiesced Process's
-    /// mappings, lowest first, a mapping's front at a time: all of them for
-    /// `u64::MAX`, one queued-teardown step for `FAMILY_G_STEP_BYTES` (DW2
-    /// §10.10 item 3).
-    /// `true` if mappings remain.
+    /// Removes an exited, quiesced Process's mappings, lowest first. With no
+    /// `step`, all of them, one transaction per mapping. With `step`, one
+    /// queued-teardown step (DW2 §10.10 item 3): a single transaction that
+    /// removes at most that many bytes from the front of the lowest mapping,
+    /// so a step's hold is one transaction however small the mappings are
+    /// (step-5 review D-2). `true` if mappings remain.
     fn unmap_inactive_pieces(
         &mut self,
         process: ProcessKey,
         root_key: crate::memory::address_region::AddressRegionObjectKey,
         proof: &crate::task::ProcessQuiescenceProof,
-        limit: u64,
+        step: Option<u64>,
     ) -> Result<bool, ()> {
         let current_process = self.own.active_root.as_ref().ok_or(())?.process();
         if process == current_process {
@@ -5731,7 +5732,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             !user.pins_hold_any(address_space),
             "an exited Process's address space still holds a user pin at teardown"
         );
-        let mut left = limit;
+        let mut stepped = false;
         let remain = loop {
             let mapping = self
                 .core
@@ -5746,11 +5747,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let Some(mapping) = mapping else {
                 break false;
             };
-            if left == 0 {
+            if stepped {
                 break true;
             }
-            let length = mapping.byte_len().min(left);
-            left -= length;
+            let length = match step {
+                Some(bytes) => {
+                    stepped = true;
+                    mapping.byte_len().min(bytes)
+                }
+                None => mapping.byte_len(),
+            };
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
                 let region = self
@@ -5882,6 +5888,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// releases for the caller's drain to finalize.
     #[inline(never)]
     fn owed_teardown_step(&mut self) -> bool {
+        // One step per entry from user mode (§10.10 item 7). The allowance
+        // is spent by the first drain after its grant whether or not that
+        // drain can step, so it never carries to a later drain or entry
+        // (step-5 review D-1).
+        if !step_report::take_teardown_step(self.cpu().index()) {
+            return false;
+        }
         if self.core.owed_teardown.is_empty() {
             return false;
         }
@@ -5903,10 +5916,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .process_info(current)
                 .map_or(true, |info| info.state == DW_TASK_STATE_EXITED)
         {
-            return false;
-        }
-        // One step per entry from user mode (§10.10 item 7).
-        if !step_report::take_teardown_step(self.cpu().index()) {
             return false;
         }
         let Some((slot, process)) = self.core.owed_teardown.pop() else {
@@ -5952,7 +5961,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cpu = self.cpu().index();
         step_report::timed(cpu, StepCall::Teardown, || {
             let remain = self
-                .unmap_inactive_pieces(process, root_key, &proof, FAMILY_G_STEP_BYTES)
+                .unmap_inactive_pieces(process, root_key, &proof, Some(FAMILY_G_STEP_BYTES))
                 .unwrap_or_else(|()| panic!("an owed teardown step drifted"));
             if remain {
                 self.core.owed_teardown.push(slot, process);
