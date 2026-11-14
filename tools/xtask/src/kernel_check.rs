@@ -122,6 +122,14 @@ const RESOLVED_INDIRECT: &[(&str, &str)] = &[
 const BOUNDED_RECURSION: &[(&str, u64)] = &[
     // `vtd/tables.rs`: one call per page-table level, entered at level 4.
     ("10free_level", 4),
+    // `memory/frame_roles/index.rs`: one call per index level below the
+    // root, at most `INDEX_MAX_LEVELS` (4) deep.
+    ("15index_free_node", 4),
+    ("16index_count_node", 4),
+    // `mm/activation/address_space.rs`: one call per page-table level
+    // below the root, stopping at the PT.
+    ("27observe_empty_owned_subtree", 4),
+    ("28reclaim_disconnected_subtree", 4),
 ];
 
 /// A panic or formatting path is terminal: the kernel halts, and an overflow
@@ -208,7 +216,10 @@ fn print_path(out: &mut impl Write, graph: &CallGraph, path: &[usize]) -> io::Re
 
 /// Checks one analysis image's stack bounds; returns the failures.
 fn check_stacks(elf: &Elf<'_>, out: &mut impl Write) -> Result<Vec<String>, String> {
-    let mut graph = CallGraph::build(elf.functions()?, &elf.stack_sizes()?, &elf.branches()?)?;
+    let functions = elf.functions()?;
+    let mut branches = elf.branches()?;
+    branches.extend(elf.self_branches(&functions)?);
+    let mut graph = CallGraph::build(functions, &elf.stack_sizes()?, &branches)?;
     for index in 0..graph.functions.len() {
         if graph.frames[index].is_none() {
             graph.frames[index] = Some(elf.prologue_frame(&graph.functions[index])?);

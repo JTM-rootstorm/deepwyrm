@@ -221,6 +221,34 @@ impl<'a> Elf<'a> {
         Ok(prologue_frame(&code[start..end]))
     }
 
+    /// Calls and jumps from a function to its own start. A self-call to a
+    /// local symbol in the function's own section is resolved by the
+    /// assembler and leaves no relocation, so [`Self::branches`] cannot see
+    /// it (second security pass D-3, DW2 M5 step 6). Every `E8`/`E9` byte
+    /// whose rel32 lands on the function's start counts: a byte that only
+    /// looks like one adds an edge, which can fail the check but never
+    /// hides a recursion.
+    pub(crate) fn self_branches(&self, functions: &[Function]) -> Result<Vec<Branch>, String> {
+        let text = self.named(".text")?;
+        let base = self.sections[text].addr;
+        let code = self.contents(text)?;
+        let mut branches = Vec::new();
+        for function in functions {
+            let Some(offset) = function.addr.checked_sub(base) else {
+                continue;
+            };
+            let start = usize_of(offset)?;
+            let Some(end) = start
+                .checked_add(usize_of(function.size)?)
+                .filter(|end| *end <= code.len())
+            else {
+                continue;
+            };
+            branches.extend(self_branches_in(&code[start..end], function.addr));
+        }
+        Ok(branches)
+    }
+
     pub(crate) fn functions(&self) -> Result<Vec<Function>, String> {
         let symtab = self
             .sections
@@ -373,6 +401,32 @@ pub(crate) struct Branch {
     pub(crate) site: u64,
     pub(crate) kind: BranchKind,
     pub(crate) target: u64,
+}
+
+/// The `call rel32` and `jmp rel32` in `code`, a function at `addr`, whose
+/// destination is `addr` itself.
+pub(crate) fn self_branches_in(code: &[u8], addr: u64) -> Vec<Branch> {
+    let mut branches = Vec::new();
+    for at in 0..code.len().saturating_sub(4) {
+        let kind = match code[at] {
+            0xe8 => BranchKind::Call,
+            0xe9 => BranchKind::Jump,
+            _ => continue,
+        };
+        let field = [code[at + 1], code[at + 2], code[at + 3], code[at + 4]];
+        let place = addr.wrapping_add(at as u64 + 1);
+        let destination = (place as i64)
+            .wrapping_add(4)
+            .wrapping_add(i64::from(i32::from_le_bytes(field))) as u64;
+        if destination == addr {
+            branches.push(Branch {
+                site: place,
+                kind,
+                target: addr,
+            });
+        }
+    }
+    branches
 }
 
 /// What instruction owns a 32-bit PC-relative field at `at` (`place` is its

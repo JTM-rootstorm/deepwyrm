@@ -1,6 +1,6 @@
 use super::elf::{
     BoundError, Branch, BranchKind, CallGraph, Elf, Function, classify, deepest_path, display_name,
-    parse_stack_sizes, prologue_frame,
+    parse_stack_sizes, prologue_frame, self_branches_in,
 };
 use std::collections::BTreeMap;
 
@@ -252,4 +252,35 @@ fn the_reader_refuses_files_that_are_not_little_endian_elf64() {
     header[4] = 1; // ELFCLASS32
     header[5] = 1;
     assert!(Elf::parse(&header).is_err());
+}
+
+/// A self-call leaves no relocation when the assembler resolves it, so it
+/// is found from the code (second security pass D-3, DW2 M5 step 6).
+#[test]
+fn a_call_or_jump_to_a_function_s_own_start_is_found_in_its_code() {
+    let addr = 0xffff_ffff_8000_1000_u64;
+    // push rbp; call addr (from offset 1); nop; jmp addr (from offset 7);
+    // call elsewhere (from offset 12).
+    let mut code = vec![0x55, 0xe8];
+    code.extend_from_slice(&(-6_i32).to_le_bytes());
+    code.extend_from_slice(&[0x90, 0xe9]);
+    code.extend_from_slice(&(-12_i32).to_le_bytes());
+    code.push(0xe8);
+    code.extend_from_slice(&0x100_i32.to_le_bytes());
+    let found = self_branches_in(&code, addr);
+    assert_eq!(
+        found,
+        [
+            Branch {
+                site: addr + 2,
+                kind: BranchKind::Call,
+                target: addr,
+            },
+            Branch {
+                site: addr + 8,
+                kind: BranchKind::Jump,
+                target: addr,
+            },
+        ]
+    );
 }
