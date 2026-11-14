@@ -37,6 +37,7 @@ Deepwyrm is a single x86_64 kernel (`K/`) with a generated native ABI. It runs o
 - TaskGroup → Process → Thread; children retain their parents (`K/src/task/`).
 - One FIFO round-robin class per CPU, 5 ms quantum; a Thread that blocks keeps its unused quantum and runs ahead of those without one (`K/src/task/scheduler.rs`). No priorities.
 - Kernel stacks: 32 Thread stacks of 512 KiB with guard pages; per CPU one 256 KiB privilege-entry stack, one 256 KiB terminal-reaper stack and three 16 KiB IST stacks (#DF, NMI, #MC) (`K/arch/x86_64/task_layout.toml`, `linker.ld`). `xtask kernel-check` bounds every direct call chain on each with a quarter spare; calls through function pointers are not bounded.
+- A Thread starts in the `DwExecutionMode` its `thread_start` arguments name; only `X86_64` is admitted, `X86_COMPAT32` is refused as NOT_SUPPORTED until i386 contract E3 (`K/src/syscall/adapters.rs`, `validate_thread_start`).
 - A Thread's saved user state is every GPR, the FP/vector area, FS base and the DS/ES/FS/GS selectors (`K/src/arch/x86_64/user_state.rs`).
 
 ## 5. Memory
@@ -76,4 +77,4 @@ Deepwyrm is a single x86_64 kernel (`K/`) with a generated native ABI. It runs o
 
 ## 11. What it does not do yet
 
-Each has an owner in root `OS_STACK_ARCHITECTURE_PLAN.md` or `CARRIED_OPEN_ITEMS.md`: no kernel heap or boot-sized pools (C2–C6); no port object or per-object waiter lists (P1–P5); one runtime lock and no priorities (L2–L6); one external interrupt and no exception delivery or thread control (I1–I5); no CSPRNG, Spectre controls or ASLR (MT1–MT4); no compatibility mode (E1–E4); no physical hardware (`HARDWARE_BRINGUP_PLAN.md`).
+Each has an owner in root `OS_STACK_ARCHITECTURE_PLAN.md` or `CARRIED_OPEN_ITEMS.md`: no kernel heap or boot-sized pools (C2–C6); no port object or per-object waiter lists (P1–P5); one runtime lock and no priorities (L2–L6); one external interrupt and no exception delivery or thread control (I1–I5); no CSPRNG, Spectre controls or ASLR (MT1–MT4); no compatibility mode beyond the reserved `DwExecutionMode` (E3–E4); no physical hardware (`HARDWARE_BRINGUP_PLAN.md`).
