@@ -482,8 +482,7 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 | Every first touch takes the global T, and usage is a linear scan | §8.9 | M8 |
 | The fault gate, fill-in and commit step have no host tests (spurious fault, table refusal, BSP expiries during a long fill-in) | §8.11 | M8 (its lock work makes them host-testable units) |
 | Global frame exhaustion kills whichever process touches next | §8.9 | M9 |
-| Finalizing a large on-demand object frees every page in one hold (`release_index`), unmeasured (step-5 review R-1) | §10.11 | M5 step 6 |
-| The first kernel pass (low effort) did not cover stack depth beyond the recorded `kernel-check`, APs idling in place and their Stop path, child AddressRegions under a root, or timing | §10.11 | M5 step 6 (second pass) |
+| A remote Stop meeting a Thread mid-handoff into or out of a suspension: three failures of one class, the last ("remote stop released execution ownership before deferred cleanup quiesced") unexplained; stopped under the stop rule | §10.13 | M5 step 6 (diagnosis and a design review before any fix) |
 | The arena bookkeeping has no lock (step-5 review R4) | §10.11 | Root `TOOLCHAIN_PLAN.md` step 3, with threads |
 | Review D-1's two-thread probe: a map parked mid-call whose output page another thread unmaps returns `BAD_ADDRESS` with its steps unmapped (jobs cannot start threads; Mike, 2026-11-14) | §10.8 | Root `TOOLCHAIN_PLAN.md` step 3, once jobs can start threads |
 
@@ -536,7 +535,7 @@ M5 lets a job use what M2–M6 made possible. Today a job gets 16 MiB, 4 MemoryO
 3. SDK: `mmap` by size over on-demand objects, scalable arenas and `ENOMEM`; its host tests replace the arena tests.
 4. Probes 12–16 in dev-boot, with §10.8's yield coverage (review D-1).
 5. Independent security review of the stage; fixes; §9 ledger and an as-built record. *Review done and its batch fixed, 2026-11-14 (§10.11); the as-built record waits for step 6.*
-6. *Added by step 5 (§10.11):* step the finalization of an on-demand backing (kernel R-1), designed and reviewed first; measure the holds the step report does not see (that finalization, §10.9 item 8's release cost, §10.10 item 8's teardown latency); close probe 14's per-page cost; then a second kernel security pass at default effort over what the first did not cover. Also from §10.11: cap the fallback jobs limit at free − reserve, and check that the SDK run reads `memory-test slots`' exit status. M5 does not close before this step.
+6. *Built 2026-11-14 except the Stop failure that stopped it (§10.13).* *Added by step 5 (§10.11):* step the finalization of an on-demand backing (kernel R-1), designed and reviewed first; measure the holds the step report does not see (that finalization, §10.9 item 8's release cost, §10.10 item 8's teardown latency); close probe 14's per-page cost; then a second kernel security pass at default effort over what the first did not cover. Also from §10.11: cap the fallback jobs limit at free − reserve, and check that the SDK run reads `memory-test slots`' exit status. M5 does not close before this step.
 
 **Step 2 as built (2026-11-14).** Wyrmroot `505198a` and SDK `d62590a`, pinning Deepwyrm `23972de` (the typed `object_get_task_group_memory_info_v1` in `deepwyrm-syscall`). Items 6–8 as designed, with these as-built facts and changes:
 - *The record is 48 bytes,* not 32 (the generated `DwTaskGroupMemoryInfoV1`). Bootstrap passes init the root TaskGroup, so init's read carries the free count.
@@ -808,6 +807,48 @@ From the coordinator's read of Deepwyrm `4b4dd5c`; paths are under `kernel/src/`
 4. *Report.* `[steps]` gains `release` and `finalize` calls; per call its longest step, its steps and their total (`call-longest-us`, `call-steps`, `call-total-us`); and `owed-longest-us`, the longest stretch teardown, and finalization, stayed owed without the queue emptying, sampled at each drain.
 
 **Measurements (the rest of step 6).** The step report gains a `Release` call for §10.9's release step (its lease-pool scans, item 8) and a `Finalize` call (item 7). Teardown latency (§10.10 item 8) is the time from a job's termination to its group's usage settling, read by dev-boot from `memory` samples. Probe 14's per-page cost is broken down by step call. Init's worst reply delay after a settle pause (step-5 review W R1) is measured with 16 sessions.
+
+**Measured (2026-11-14, development tier, QEMU TCG, not hardware times).** From the `[steps]` report of `dev-boot --check` on Deepwyrm `0ac2147`, Wyrmroot `e3d06a1`, SDK `56eb579`; the measurement changed from the design above in one way: teardown latency is the kernel's own `owed-longest-us` (the longest stretch the queue stayed non-empty, sampled at each drain), not `memory` samples, which are 0.5 s apart.
+
+| | One CPU | `--smp` (4) | `--sdk` |
+|---|---|---|---|
+| Longest finalize step | 0.46 ms | 0.88 ms | 0.51 ms |
+| Longest release step (§10.9 item 8) | 0.52 ms | 0.86 ms | 1.8 ms |
+| Longest teardown step | 5.4 ms | 38.9 ms | 7.7 ms |
+| Finalization owed, longest stretch | 0.18 s | 0.90 s | 0.14 s |
+| Teardown owed, longest stretch | 0.23 s | 2.47 s | 1.68 s |
+
+- *K R-1 closed.* Before, a 512 MiB object's finalization freed about 131,000 frames in one hold; now no finalize step exceeded 0.9 ms.
+- *§10.9 item 8 closed.* The release step's lease-pool scans stayed under 2 ms; building the intervals once per step is not needed.
+- *§10.10 item 8 measured.* With the probes ending jobs back to back and the hogs running, the teardown queue stayed non-empty up to 2.5 s on four CPUs: a bound on one dead job's wait, not its typical wait. Steps come from others' entries, so the time depends on load, as §10.10 says. The longest teardown step on four CPUs, 38.9 ms, includes waits for P and T inside the timed step; the one-CPU figure (5.4 ms) is the step's own work.
+- *Probe 14's per-page cost, closed.* Per call, total over steps (one CPU), each step at most 2 MiB: map 1.2 ms a step (about 2.4 µs a page), unmap 1.6 ms (3.1 µs), protect 1.9 ms (3.8 µs), teardown 1.3 ms (2.5 µs). A 256 MiB eager create takes about 40 ms (zeroing through the direct map) and a 4 MiB map 7 ms, so L6's "44 ms fixed cost" is gone: map, protect and unmap cost page-table work per page. Of the 0.39 s a 256 MiB map takes beside the CPU hogs, its steps hold about 0.16 s; the rest is time given to the hogs between steps (§10.8).
+- *Init's reply after a settle pause (step-5 review W R1).* Measured by a host test with 16 sessions waiting through a whole pause: the last answered 875 ms after it began (one session per 25 ms tick), against wyrmsh's 1 s. *Mike (2026-11-14): drain after a pause.* In the tick a pause ends every session takes a turn (Wyrmroot `420b2fb`); the test now has all 16 answered in that tick, about 500 ms after the pause began.
+
+### 10.13 Step 6: second kernel security pass and as built (2026-11-14)
+
+Independent, read-only, Claude Opus 5.5, which reported **low** effort though asked for the second pass at default effort; at Deepwyrm `0ac2147` (`0ac214736b88b54b623d69353bd70425f47cd22a`), covering the four areas §10.11 left (§9) and §10.12's code. Findings checked against the code by the coordinator.
+
+| # | Sev. | Finding | Disposition |
+|---|---|---|---|
+| D-1 | High | A blocking wait leaves its wait control `Pending` until `prepare_suspend`; a remote Stop taken at `settle_dispatched_control` before that reaches the precommit with the continuation suspended, and `retire_idle_for_stop` accepted only `Idle` and `Resuming`: the kernel panicked ("remote stop suspended idle control drifted before precommit"). Seen once in an `--smp` dev-boot (`terminate` of a job mid create-loop); four more passed. Predates M5; every drain's extra work since `0ac2147` widened the window | Fixed: Deepwyrm `56d9081`. The precommit retires a pending suspension too and stages the quantum cancellation `prepare_suspend` would have; host test `a_remote_stop_retires_a_pending_suspension` (fails before the fix) |
+| D-2 | Low | A finalize completion re-reads the root's 512 entries (`release_index`) but was charged one: one step could complete about 256 small objects, about 131,000 reads | Fixed: `56d9081`, a completion is charged 512, so a step completes about one object |
+| D-3 | Low | `kernel-check` built its call graph from relocations, and a self-call in a function's own section leaves none: `index_free_node`, `index_count_node`, `observe_empty_owned_subtree` and `reclaim_disconnected_subtree` recursed unseen | Fixed: `6215514`. It also finds rel32 calls and jumps to a function's own start, and lists the four, each bounded by four levels. The thread stack bound is unchanged (246,984 of 393,216 bytes) |
+| D-4 | Low | Two doc comments sat on the wrong functions after an insertion | Fixed: `56d9081` |
+| Q1 | — | Other Stop checkpoints that run with the control `Pending` or `Clear` while the CPU's suspended claim is set | None found beyond `settle_dispatched_control`; the `TerminateCurrent` resume goes to the terminal reaper |
+| Q2 | — | The terminal teardown completes owed finalizations, not owed teardowns | Already recorded: §10.10 item 6 (not built, R-4), never reached in a WYR1 product |
+
+The pass's answers on its four areas: (1) stack depth: the new code is iterative with fixed arrays; D-3 was the gap. (2) APs never take teardown or finalize steps (BSP only), and the BSP's polling loops service the rendezvous latch every pass; D-1 is on the syscall path, not in idle. (3) No child AddressRegion can exist at this revision: every region owns its address space and the ABI has no sub-region call; mapping into an exited Process is refused, so nothing re-maps between teardown steps. If sub-regions come, teardown must change with them. (4) Holds of T and P in one drain are each bounded: cleanup pops, one release step (up to 4,096 entries, the largest by structure work), one teardown step (2 MiB), one finalize step (512 entries plus a completion), plus any family-G step the drain runs inside. Nothing found lets a job make one unbounded.
+
+**Step 6 as built.** Deepwyrm `0ac2147` (stepped finalization, the step report), `56d9081` and `6215514` (the pass's fixes); Wyrmroot `e3d06a1` (the fallback jobs limit capped at free − reserve, Mike: a zero limit launches no job, refused as `Capacity`), `4f4d2b6` and `420b2fb` (the reply delay, measured and fixed); the SDK unchanged at `56eb579`. `memory-test slots`' exit status was already checked: `run_sdk` requires `application=0`.
+
+**Checked (development tier).** Kernel host tests (1,341), `xtask clippy`, `format` and `kernel-check` on Deepwyrm `6215514`; Wyrmroot's system-init (139) and xtask tests, `xtask test fmt` and `clippy` on `420b2fb`. `dev-boot --check` on that pair: one CPU passed (longest step 5.3 ms, teardown), `--sdk` passed (26.1 ms, a commit), and `--smp` passed twice and failed once (below).
+
+**Stopped under the stop rule (2026-11-14).** The third `--smp` boot panicked on CPU 3 at shutdown, after the last command: "remote stop released execution ownership before deferred cleanup quiesced" (`arch/x86_64/rendezvous.rs:642`, `commit_prepared_stop_at_safe_point`). The assertion is `deferred_cleanup_is_quiescent` (`primordial.rs`): the cleanup queue empty, rendezvous cleanup staged, the stopped Thread's service state quiescent (no operation owner, wait control clear), no deferred current, and no Running claim of the stopped Thread on that CPU. Which of these failed is not known: the panic does not say. No earlier retained log shows it. It is the third failure of one class, a remote Stop meeting a Thread in the middle of handing itself into or out of a suspension:
+1. `f3a/d1h3-normal-01/smp`: a Stop at the precommit while the idle poll's resume was short of its handoff (`Resuming`), fixed then by keeping that state for the precommit to retire.
+2. This step's D-1: a Stop at `settle_dispatched_control` while the wait control was still `Pending`, fixed by `56d9081` the same way.
+3. This assertion, in the commit after such a precommit, on the first boots with `56d9081`. Whether it follows from (2)'s fix (a pending suspension now reaching a commit whose cleanup expected `prepare_suspend` to have run) is not known.
+
+What they share: the precommit and commit decide from the CPU's suspended claim and its wait control, which `accept`, `prepare_suspend`, the idle poll and the resume each move separately, and each fix so far taught the stop one more intermediate state. No fourth fix is made. The evidence is kept: `.tmp/dev-boot/1794694412071081946` (D-1's panic) and `.tmp/dev-boot/1794695507441309393` (this one), COM1 and COM2 logs. Next, for Mike: a diagnostic build that names the failed condition, repeated `--smp` boots to reproduce it, and an independent design review of the stop and suspension handoff as a whole (every state the control and the claims pass through, and what the stop must do in each) before any fix. M5 does not close while this stands.
 
 ## 11. M9 direction (Mike, 2026-11-13)
 
