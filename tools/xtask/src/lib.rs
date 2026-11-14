@@ -384,6 +384,14 @@ fn dispatch(action: Action) -> io::Result<u8> {
     }
 }
 
+/// `tools/pinned-cargo host`, run from the workspace root.
+pub(crate) fn pinned_host_cargo() -> Command {
+    let workspace = workspace_root();
+    let mut command = Command::new(workspace.join("tools/pinned-cargo"));
+    command.current_dir(&workspace).arg("host");
+    command
+}
+
 fn run_invocation(invocation: Invocation) -> io::Result<u8> {
     let mut command = Command::new("cargo");
     command.current_dir(workspace_root());
@@ -410,16 +418,22 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
             if production != 0 {
                 return Ok(production);
             }
-            command.args([
-                "clippy",
-                "--locked",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ]);
-            let status = command.status()?;
+            // Through the pinned host lane, never the host's own Cargo, whose
+            // newer Clippy fails on deprecations the pinned toolchain does not
+            // have. The lane refuses `--all-targets`; libraries and tests are
+            // every target the ratchet baseline counts.
+            let status = pinned_host_cargo()
+                .args([
+                    "clippy",
+                    "--locked",
+                    "--workspace",
+                    "--lib",
+                    "--tests",
+                    "--",
+                    "-D",
+                    "warnings",
+                ])
+                .status()?;
             if !status.success() {
                 return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
             }

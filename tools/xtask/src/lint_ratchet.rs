@@ -69,15 +69,15 @@ pub(super) fn run_lint_ratchet() -> io::Result<u8> {
         "clippy",
         "--locked",
         "--workspace",
-        "--all-targets",
+        "--lib",
+        "--tests",
         "--message-format=json",
         "--",
     ];
     for lint in RATCHET_LINTS {
         arguments.extend(["-W", lint]);
     }
-    let output = Command::new("cargo")
-        .current_dir(&workspace)
+    let output = pinned_host_cargo()
         .args(arguments)
         .stderr(Stdio::inherit())
         .output()?;

@@ -5,7 +5,7 @@
 # in the same change that lowers the count. Never raise a row to admit new
 # findings.
 #
-# Clippy rows: host `cargo clippy --workspace --all-targets` at warn level,
+# Clippy rows: pinned host-lane `clippy --workspace --lib --tests` at warn level,
 # per package, each primary location once. Host Clippy does not see
 # `target_os = "none"` code or `test-support`/selector builds.
 #
