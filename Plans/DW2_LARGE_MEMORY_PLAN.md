@@ -871,6 +871,28 @@ What they share: the precommit and commit decide from the CPU's suspended claim 
 
 **Questions for review.** Whether any code reads or validates leaf entries of a table it frees (role checks, the journal, `check_invariants`); whether the detached transaction keeps every §10.9 invariant when the leaves stay in place until phase 2; whether a dead root can be the publisher root or be selected for return validation during phase 2; how table charges work.
 
+**Review of §10.14 (2026-11-14).** Independent, read-only, Claude Opus 5.5 at low effort, against `d92ead3`; checked by the coordinator. The core argument was confirmed: PCID and global pages are refused at activation and the publisher refuses a global leaf; residency is entered before a CR3 load and cleared only after the switch-away flush, the stop path's guard-free window included; a freed table frame is zeroed before any reuse; nothing reads a dead root's leaves after phase 1 except phase 3's proof; a whole-mapping transaction costs the same at any size (`rebuild`, `prepare_replace` and `commit` have no per-page work); the bootstrap root is unaffected.
+
+| # | Sev. | Finding | Disposition |
+|---|---|---|---|
+| D-1 | Medium | No frame-role operation frees one table of a live hierarchy: `reclaim_preflighted_table` needs an `EmptyTableHierarchyGrant`, which only a proof of empty tables gives. Phase 2 needs a new per-table reclaim that lowers the root's `tables` count, refuses a table with child records (none are counted per table today) and checks owner, level and parent | Revision 2, item 2 |
+| D-2 | Medium | The residency gate stays open until phase 3, so phases 1–2 rest on a residents read in another P hold; a wrong resident would walk freed, reused table frames | Revision 2, item 0 |
+| D-3 | Medium | A publisher that writes no leaf breaks `AddressSpacePublisher`'s contract (publish exactly `after`); the synchronous bootstrap path shares `unmap_inactive_pieces(step: None)` | Revision 2, item 1 |
+| D-4 | Low | A synchronous teardown of a root left by a detached phase 1 would fail its proof and panic; unreachable today | Revision 2, item 4: asserted |
+| D-5 | Low | Table charges do not fall per table: fault- and fill-in-built tables are in the Process's weight, eager-map tables are uncharged, and the weight goes at Process finalization | Revision 2, item 2: phase 2 touches no charge |
+| R-1 | Low | Counting tables does not bound reads: each PD or PDPT scanned costs 512 | Revision 2, item 2: entries read are counted; the cursor is rebuilt from the tables each step |
+| R-2 | Low | §8.4's bound on uncharged eager-map tables (1/512 of backing) does not hold with aliases: 64 aliases make it 1/8, about 64 MiB of tables for a 512 MiB budget | Accepted (Low): bounded by mapping slots, and phase 2 frees them in about 256 steps where today takes about 8,192 |
+| R-3 | Low | A large leaf in a PD must be refused, not read as a table | Revision 2, item 2, with a test |
+| R-4 | Low | `reserve_teardown` is one global slot | Revision 2, item 2: each step takes and drops it in its own hold, with the `pins_hold_any` check |
+
+**Revision 2 (supersedes items 1–4 above).**
+0. **Retiring.** At its first step a queued root's binding moves one way into a retiring state in which `AddressSpaceCoherency::enter` is refused; every step re-reads residents in the same P hold as its work and requires zero.
+1. **Leases first, by mapping, through a sealed teardown publisher.** A distinct type, not an `AddressSpacePublisher` that skips writes: constructible only from a quiescence proof, for an owned (never the primordial) binding in the retiring state. The region removes one whole mapping per step through the same transaction and settles its releases locally. `unmap_inactive_pieces(step: None)` (the synchronous bootstrap path) keeps the clearing publisher.
+2. **Then tables.** A new unsafe frame-role operation frees one user table of a retiring hierarchy: it checks role, owner, level and parent, refuses a table that still has child records, lowers the root's `tables`, and is called bottom-up. Each step rebuilds its cursor from the tables (the first non-zero PML4 user entry, then the first non-zero PDPT and PD entry below it), frees PTs without reading them, reads PDs and PDPTs, refuses a large leaf, and stops after 512 entries read or 64 tables freed, whichever comes first. It takes and drops the pin reservation in its own hold. Charges are untouched: tables' usage falls at Process finalization, as today.
+3. **Then the root,** whose proof now reads only the PML4's user entries.
+4. **A queued root is torn down only by steps;** a synchronous teardown of a retiring root is refused by an assertion.
+5. **Logic placement and tests.** Phase 2 lives in `AddressSpaceRootBindings` and `FrameRoleManager`, which have host fixtures. Tests: the per-table reclaim refuses live children and wrong owner, level, parent or the PML4, and brings `tables` to zero, after which the empty-hierarchy proof passes with none observed; a counting page-table target shows a PT freed without being read and each step's reads bounded; a freed PT with leaves, reused as a candidate, reads zero; the teardown publisher cannot be built for the primordial binding or with residents, and `enter` is refused once retiring; a synchronous teardown of a retiring root fails closed; the Process's weight is unchanged across phase 2; a large leaf in a PD is refused.
+
 ### 10.15 No hold ends with the shared cleanup queue non-empty: design (2026-11-14)
 
 *Mike (2026-11-14): fix by design.* Answers §10.13's shutdown panic (unconfirmed, review D-A) and the review's D-B and D-C. To be reviewed independently before it is built.
