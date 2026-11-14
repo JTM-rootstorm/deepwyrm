@@ -278,3 +278,53 @@ fn zero_capacity_registry_fails_closed() {
         Err(ObjectRegistryError::Capacity)
     );
 }
+
+#[test]
+fn memory_release_notices_are_deduplicated_and_judge_the_slot_when_popped() {
+    let mut registry = ObjectRegistry::<1>::new();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let first = creation.id;
+    let owner = registry.creation_into_internal(creation).unwrap();
+    let lease = registry.retain_internal(&owner).unwrap();
+    let device = registry.retain_internal(&owner).unwrap();
+    assert_eq!(registry.pop_memory_notice(), None);
+
+    // Two releases that leave no handle: one notice.
+    assert_eq!(registry.release_internal(device).unwrap(), None);
+    assert_eq!(registry.release_internal(lease).unwrap(), None);
+    // A final release notes nothing; the queued notice outlives the object
+    // and its slot's reuse.
+    let final_release = registry.release_internal(owner).unwrap().unwrap();
+    registry.complete_finalization(final_release).unwrap();
+    let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+    let second = creation.id;
+    assert_ne!(first, second);
+    let owner = registry.creation_into_internal(creation).unwrap();
+    let to_handle = registry.retain_internal(&owner).unwrap();
+    let handle = registry.internal_into_handle(to_handle).unwrap();
+    // The live notice is judged by the slot's new occupant.
+    assert_eq!(registry.pop_memory_notice(), Some(Some(second)));
+    assert_eq!(registry.pop_memory_notice(), None);
+
+    // With a handle open nothing is noted; closing it is.
+    let extra = registry.retain_internal(&owner).unwrap();
+    assert_eq!(registry.release_internal(extra).unwrap(), None);
+    assert_eq!(registry.pop_memory_notice(), None);
+    assert_eq!(registry.release_handle(handle).unwrap(), None);
+    assert_eq!(registry.pop_memory_notice(), Some(Some(second)));
+
+    // A requeue of a stale identity is ignored; of a live one, kept once.
+    registry.requeue_memory_notice(first);
+    registry.requeue_memory_notice(second);
+    registry.requeue_memory_notice(second);
+    assert_eq!(registry.pop_memory_notice(), Some(Some(second)));
+    assert_eq!(registry.pop_memory_notice(), None);
+
+    // A notice for a slot that no longer holds a MemoryObject pops empty.
+    let lease = registry.retain_internal(&owner).unwrap();
+    assert_eq!(registry.release_internal(lease).unwrap(), None);
+    let final_release = registry.release_internal(owner).unwrap().unwrap();
+    registry.complete_finalization(final_release).unwrap();
+    assert_eq!(registry.pop_memory_notice(), Some(None));
+    assert_eq!(registry.pop_memory_notice(), None);
+}

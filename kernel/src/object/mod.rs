@@ -15,7 +15,7 @@ mod finalizer;
 )]
 pub(crate) use finalizer::PayloadFinalizer;
 
-use deepwyrm_abi::{DwObjectType, dw_object_compatible_rights};
+use deepwyrm_abi::{DW_OBJECT_TYPE_MEMORY_OBJECT, DwObjectType, dw_object_compatible_rights};
 
 static NEXT_REGISTRY_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -260,6 +260,16 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     /// creates see each other's, so they cannot together allocate past a
     /// limit.
     reserved: [Option<(ObjectId, charge::ChargeTag, u64)>; RESERVATION_THREADS],
+    /// MemoryObject slots whose last handle is gone while internal
+    /// references remain, noted at each such release for the release-on-
+    /// unmap step (DW2 §10.9 item 4). A slot is queued at most once: its
+    /// flag is set on push and cleared only when its entry is popped, so
+    /// the ring cannot overflow whatever finalizes or reuses the slot
+    /// meanwhile. A popped slot is judged by whatever occupies it then.
+    notices: [u32; CAPACITY],
+    notice_head: usize,
+    notice_len: usize,
+    notice_queued: [bool; CAPACITY],
 }
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
@@ -270,6 +280,69 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             tags: [charge::ChargeTag::EMPTY; CAPACITY],
             pages: [0; CAPACITY],
             reserved: [None; RESERVATION_THREADS],
+            notices: [0; CAPACITY],
+            notice_head: 0,
+            notice_len: 0,
+            notice_queued: [false; CAPACITY],
+        }
+    }
+
+    fn push_notice(&mut self, slot: usize) {
+        if self.notice_queued[slot] {
+            return;
+        }
+        assert!(
+            self.notice_len < CAPACITY,
+            "a deduplicated notice ring cannot overflow"
+        );
+        self.notices[(self.notice_head + self.notice_len) % CAPACITY] =
+            u32::try_from(slot).expect("registry slots fit u32");
+        self.notice_len += 1;
+        self.notice_queued[slot] = true;
+    }
+
+    /// Pops the oldest MemoryObject release notice: `None` when there is
+    /// none, `Some(None)` when its slot no longer holds a live MemoryObject,
+    /// else that object.
+    pub(crate) fn pop_memory_notice(&mut self) -> Option<Option<ObjectId>> {
+        if self.notice_len == 0 {
+            return None;
+        }
+        let slot = self.notices[self.notice_head] as usize;
+        self.notice_head = (self.notice_head + 1) % CAPACITY;
+        self.notice_len -= 1;
+        self.notice_queued[slot] = false;
+        let entry = self.slots[slot];
+        Some(match entry.state {
+            SlotState::Live(live) if live.object_type == DW_OBJECT_TYPE_MEMORY_OBJECT => {
+                encode_object_id(slot, entry.generation).map(|raw| ObjectId::new(self.domain, raw))
+            }
+            _ => None,
+        })
+    }
+
+    /// Queues `id` again, for a release that needs more steps. Does nothing
+    /// for a stale identity.
+    pub(crate) fn requeue_memory_notice(&mut self, id: ObjectId) {
+        if self.live_reference_counts(id).is_some() {
+            if let Ok(slot) = self.reference_slot(id) {
+                self.push_notice(slot);
+            }
+        }
+    }
+
+    /// A live object's handle and internal reference counts; `None` unless
+    /// `id` names a `Live` slot of its generation.
+    pub(crate) fn live_reference_counts(&self, id: ObjectId) -> Option<(u32, u32)> {
+        let slot = self.reference_slot(id).ok()?;
+        let (_, generation) = decode_object_id(id.raw)?;
+        let entry = &self.slots[slot];
+        if entry.generation != generation {
+            return None;
+        }
+        match entry.state {
+            SlotState::Live(live) => Some((live.handle_refs, live.internal_refs)),
+            _ => None,
         }
     }
 
@@ -868,6 +941,15 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         if becomes_final {
             self.slots[slot].state = SlotState::Finalizing(object_type);
             return Ok(Some(FinalRelease { id, object_type }));
+        }
+        // A MemoryObject left with internal references and no handle may
+        // have unmapped pages to release (DW2 §10.9 item 4): a handle
+        // close, a DMA unmap, or a held lease pin released on its
+        // shootdown's settlement.
+        if object_type == DW_OBJECT_TYPE_MEMORY_OBJECT
+            && matches!(self.slots[slot].state, SlotState::Live(live) if live.handle_refs == 0)
+        {
+            self.push_notice(slot);
         }
         Ok(None)
     }

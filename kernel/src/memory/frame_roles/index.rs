@@ -539,6 +539,63 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(self.index_count(backing.0)? + 1)
     }
 
+    /// Frees the committed pages of the on-demand backing in object pages
+    /// `[start, end)` (clamped to the object), visiting at most `budget`
+    /// index entries: a committed page, or an absent entry, whose whole span
+    /// is skipped at once. Nodes stay. Returns the first page not examined,
+    /// the pages freed and the entries visited (DW2 §10.9 item 5).
+    ///
+    /// The caller guarantees no mapping, TLB, device or kernel access can
+    /// still reach a page of the range.
+    pub(crate) fn decommit_on_demand_range(
+        &mut self,
+        backing: BackingIdentity,
+        start: u64,
+        end: u64,
+        budget: u64,
+    ) -> Result<(u64, u64, u64), FrameRoleError> {
+        let head = backing.0;
+        let (_, root) = self.index_root(head)?;
+        let end = end.min(root.pages);
+        let memory = self.memory()?;
+        let mut cursor = start;
+        let mut freed = 0_u64;
+        let mut visited = 0_u64;
+        while cursor < end && visited < budget {
+            let (steps, found) = self.index_walk(head, cursor)?;
+            let deepest = *steps
+                .iter()
+                .flatten()
+                .last()
+                .ok_or(FrameRoleError::InvariantViolation)?;
+            visited += 1;
+            match found {
+                Some((identity, _)) => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "the manager owns its index nodes exclusively under `&mut self`"
+                    )]
+                    // SAFETY: `deepest.node` is a node of this backing, which
+                    // the manager owns exclusively under `&mut self`.
+                    unsafe {
+                        memory.write(deepest.node, deepest.entry, 0)
+                    };
+                    let slot = self.slot(identity)?;
+                    self.free_index_slot(slot);
+                    freed += 1;
+                    cursor += 1;
+                }
+                None => {
+                    cursor = deepest
+                        .first_page
+                        .checked_add(entry_span(deepest.level))
+                        .ok_or(FrameRoleError::InvariantViolation)?;
+                }
+            }
+        }
+        Ok((cursor.min(end.max(start)), freed, visited))
+    }
+
     /// Frees an on-demand backing whole, after checking every node and
     /// page.
     pub(super) fn release_index(&mut self, head: FrameRoleIdentity) -> Result<(), FrameRoleError> {

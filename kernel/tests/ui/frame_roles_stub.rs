@@ -51,5 +51,15 @@ pub(crate) mod frame_roles {
         ) -> Result<(), GrantTransitionError<ObjectBackingGrant>> {
             Ok(())
         }
+
+        pub(crate) fn decommit_on_demand_range(
+            &mut self,
+            _backing: BackingIdentity,
+            start: u64,
+            _end: u64,
+            _budget: u64,
+        ) -> Result<(u64, u64, u64), GrantTransitionError<()>> {
+            Ok((start, 0, 0))
+        }
     }
 }

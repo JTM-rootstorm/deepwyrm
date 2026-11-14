@@ -499,6 +499,8 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 spec.protection,
             );
         }
+        let (removed, removed_len) =
+            removed_translations::<SLOTS>(&old[..old_len], &specs[..spec_len]);
         let mut plan = ReplacePlan::<SLOTS>::new();
         let prepared = match authority.prepare_replace::<SLOTS, REGISTRY_OBJECTS>(
             registry,
@@ -507,6 +509,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             self.region,
             &released[..old_len],
             &requests[..spec_len],
+            &removed[..removed_len],
             authorization,
         ) {
             Ok(prepared) => prepared,
@@ -637,4 +640,52 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         }
         Ok(())
     }
+}
+
+/// Per old mapping, the hull of the object pages whose (virtual address,
+/// object offset) translations no new mapping reproduces (DW2 §10.9 item 1).
+/// A new mapping reproduces a translation when it maps the same object at
+/// the same address-to-offset delta over that address. Pages another lease
+/// still covers through a different address count as removed: the release
+/// judges coverage separately.
+fn removed_translations<const SLOTS: usize>(
+    old: &[Mapping],
+    specs: &[Option<MappingSpec>],
+) -> ([RemovedRange; SLOTS], usize) {
+    let mut removed = [RemovedRange::EMPTY; SLOTS];
+    let mut len = 0;
+    for mapping in old {
+        let start = mapping.virtual_start;
+        let end = start + mapping.byte_len;
+        let offset = mapping.backing.object_offset();
+        // The same translations: same object, same delta. Addresses and
+        // offsets are page-aligned and bounded, so the deltas compare as
+        // wrapping differences.
+        let delta = start.wrapping_sub(offset);
+        let covers = || {
+            specs.iter().flatten().filter(move |spec| {
+                spec.object == mapping.object
+                    && spec.virtual_start.wrapping_sub(spec.object_offset) == delta
+            })
+        };
+        let mut low = start;
+        while let Some(spec) = covers().find(|spec| spec.virtual_start <= low && low < spec.end()) {
+            low = spec.end();
+        }
+        if low >= end {
+            continue;
+        }
+        let mut high = end;
+        while let Some(spec) = covers().find(|spec| spec.virtual_start < high && high <= spec.end())
+        {
+            high = spec.virtual_start;
+        }
+        removed[len] = RemovedRange::new(
+            mapping.object,
+            (low - delta) / PAGE_SIZE,
+            (high - delta) / PAGE_SIZE,
+        );
+        len += 1;
+    }
+    (removed, len)
 }

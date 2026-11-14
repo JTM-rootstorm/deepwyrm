@@ -505,6 +505,7 @@ fn final_page_tail_is_mapping_capacity_but_not_logical_object_size() {
                 PAGE_SIZE,
                 MemoryProtection::READ,
             )],
+            &[],
             Some(authorization),
         )
         .unwrap();
@@ -549,6 +550,7 @@ fn replacement_rejects_bad_ranges_and_wx_aliases_without_commit() {
                 PAGE_SIZE,
                 MemoryProtection::READ,
             )],
+            &[],
             Some(authorization),
         )
         .err()
@@ -581,6 +583,7 @@ fn replacement_rejects_bad_ranges_and_wx_aliases_without_commit() {
                 PAGE_SIZE,
                 MemoryProtection::READ_WRITE,
             )],
+            &[],
             Some(authorization),
         )
         .unwrap();
@@ -612,6 +615,7 @@ fn replacement_rejects_bad_ranges_and_wx_aliases_without_commit() {
                 PAGE_SIZE,
                 MemoryProtection::READ_EXECUTE,
             )],
+            &[],
             Some(authorization),
         )
         .err()
@@ -657,6 +661,7 @@ fn protection_ceiling_is_captured_per_object() {
                 PAGE_SIZE,
                 MemoryProtection::READ_EXECUTE,
             )],
+            &[],
             Some(authorization),
         )
         .err()
@@ -716,6 +721,7 @@ fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
                 PAGE_SIZE,
                 MemoryProtection::READ,
             )],
+            &[],
             Some(authorization),
         )
         .unwrap();
@@ -726,7 +732,16 @@ fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
     assert!(registry.release_internal(owner).unwrap().is_none());
     let mut plan = ReplacePlan::<1>::new();
     let prepared = authority
-        .prepare_replace::<1, 1>(&mut registry, &mut plan, space, region, &[lease], &[], None)
+        .prepare_replace::<1, 1>(
+            &mut registry,
+            &mut plan,
+            space,
+            region,
+            &[lease],
+            &[],
+            &[],
+            None,
+        )
         .unwrap();
     let final_release = only_final(prepared.commit().settle_locally(&mut registry));
     let finalization = authority.take_finalization(final_release).unwrap();
@@ -786,6 +801,7 @@ fn exhausted_lease_slot_is_skipped_when_later_capacity_exists() {
                 PAGE_SIZE,
                 MemoryProtection::READ,
             )],
+            &[],
             Some(authorization),
         )
         .unwrap();
@@ -847,6 +863,7 @@ fn failed_mapping_preparation_drops_last_authorization_pin() {
                 PAGE_SIZE,
                 MemoryProtection::READ,
             )],
+            &[],
             Some(authorization),
         )
         .err()
@@ -908,6 +925,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
                 PAGE_SIZE * 2,
                 MemoryProtection::READ,
             )],
+            &[],
             Some(authorization),
         )
         .unwrap();
@@ -942,6 +960,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
             region,
             &[whole_lease],
             &split_requests,
+            &[],
             None,
         )
         .unwrap();
@@ -958,6 +977,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
             region,
             &[whole_lease],
             &split_requests,
+            &[],
             None,
         )
         .unwrap();
@@ -974,6 +994,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
             space,
             region,
             &[first_split, second_split],
+            &[],
             &[],
             None,
         )
@@ -1025,6 +1046,7 @@ fn d6_handle_close_and_mapping_commit_interleavings_preserve_backing() {
                     PAGE_SIZE,
                     MemoryProtection::READ,
                 )],
+                &[],
                 Some(authorization),
             )
             .unwrap();
@@ -1042,7 +1064,16 @@ fn d6_handle_close_and_mapping_commit_interleavings_preserve_backing() {
 
         let mut plan = ReplacePlan::<1>::new();
         let prepared = authority
-            .prepare_replace::<1, 2>(&mut registry, &mut plan, space, region, &[lease], &[], None)
+            .prepare_replace::<1, 2>(
+                &mut registry,
+                &mut plan,
+                space,
+                region,
+                &[lease],
+                &[],
+                &[],
+                None,
+            )
             .unwrap();
         let final_release = only_final(prepared.commit().settle_locally(&mut registry));
         complete_memory_release(&mut registry, &mut authority, &mut roles, final_release);
@@ -1147,7 +1178,7 @@ fn empty_replacements_and_sentinels_never_enter_lease_transitions() {
 
     let mut plan = ReplacePlan::<1>::new();
     let error = authority
-        .prepare_replace::<1, 1>(&mut registry, &mut plan, space, region, &[], &[], None)
+        .prepare_replace::<1, 1>(&mut registry, &mut plan, space, region, &[], &[], &[], None)
         .err()
         .expect("mapping preparation must fail");
     assert_eq!(error.error(), MemoryObjectError::Empty);
@@ -1162,6 +1193,7 @@ fn empty_replacements_and_sentinels_never_enter_lease_transitions() {
             region,
             &[],
             &[LeaseRequest::EMPTY],
+            &[],
             None,
         )
         .err()
@@ -1176,6 +1208,7 @@ fn empty_replacements_and_sentinels_never_enter_lease_transitions() {
             &mut plan,
             AddressSpaceKey::EMPTY,
             RegionKey::EMPTY,
+            &[],
             &[],
             &[],
             None,

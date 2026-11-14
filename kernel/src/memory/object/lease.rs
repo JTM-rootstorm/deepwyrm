@@ -21,6 +21,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         region: RegionKey,
         released: &[MappingLease],
         requested: &[LeaseRequest],
+        removed: &[RemovedRange],
         authorization: Option<MapAuthorization>,
     ) -> Result<PreparedReplace<'a, OBJECTS, LEASES, BATCH, REGISTRY_OBJECTS>, PrepareReplaceError>
     {
@@ -88,14 +89,134 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             }
         }
 
+        // Removed translations of on-demand objects (DW2 §10.9 items 1, 3):
+        // the hull for the record, and a coverage pin for each object no
+        // removed lease's pin stays held for, retained while failure is
+        // still allowed. Each object needs at most max(its held pins, 1)
+        // entries, at most its released leases, so `UnmappedLeasePins`
+        // keeps its bound.
+        let mut coverage_pins: [Option<InternalRef>; BATCH] = core::array::from_fn(|_| None);
+        let coverage = self
+            .plan_removed(plan, released.len(), removed)
+            .and_then(|()| {
+                for index in 0..plan.removed_len {
+                    let (object_slot, _, _) = plan.removed[index].expect("planned removal");
+                    let Some(source) = self.unreused_or_any_released_pin(plan, object_slot) else {
+                        return Err(MemoryObjectError::ObjectReference);
+                    };
+                    let Some(source) = source else {
+                        continue;
+                    };
+                    let pin = registry
+                        .retain_internal(source)
+                        .map_err(|_| MemoryObjectError::ObjectReference)?;
+                    coverage_pins[index] = Some(pin);
+                }
+                Ok(())
+            });
+        if let Err(error) = coverage {
+            let mut final_releases = MappingFinalReleases::empty();
+            for pin in extra_pins
+                .iter_mut()
+                .chain(coverage_pins.iter_mut())
+                .filter_map(Option::take)
+            {
+                release_internal_pin(registry, pin, &mut final_releases);
+            }
+            if let Some(authorization) = authorization {
+                release_map_authorization(registry, authorization, &mut final_releases);
+            }
+            return Err(PrepareReplaceError {
+                error,
+                final_releases,
+            });
+        }
+
         Ok(PreparedReplace {
             authority: self,
             registry,
             plan,
             extra_pins,
+            coverage_pins,
             authorization,
             finished: false,
         })
+    }
+
+    /// Fills `plan.removed` with one hull per on-demand object of `removed`.
+    fn plan_removed<const BATCH: usize>(
+        &self,
+        plan: &mut ReplacePlan<BATCH>,
+        released_len: usize,
+        removed: &[RemovedRange],
+    ) -> Result<(), MemoryObjectError> {
+        plan.removed.fill(None);
+        plan.removed_len = 0;
+        for range in removed {
+            if range.first_page >= range.end_page {
+                continue;
+            }
+            let object_slot = self.object_slot(range.object)?;
+            let record = self.objects[object_slot]
+                .record
+                .expect("validated object slot has a record");
+            if record.kind != MemoryObjectKind::OnDemand {
+                continue;
+            }
+            // Only an object some released lease belonged to can lose a
+            // translation.
+            if !plan.released[..released_len].iter().any(|&slot| {
+                self.leases[slot]
+                    .record
+                    .as_ref()
+                    .is_some_and(|lease| lease.metadata.object_slot == object_slot)
+            }) {
+                return Err(MemoryObjectError::ObjectReference);
+            }
+            if let Some(entry) = plan.removed[..plan.removed_len]
+                .iter_mut()
+                .flatten()
+                .find(|(slot, _, _)| *slot == object_slot)
+            {
+                entry.1 = entry.1.min(range.first_page);
+                entry.2 = entry.2.max(range.end_page);
+                continue;
+            }
+            if plan.removed_len == BATCH {
+                return Err(MemoryObjectError::LeaseCapacity);
+            }
+            plan.removed[plan.removed_len] = Some((object_slot, range.first_page, range.end_page));
+            plan.removed_len += 1;
+        }
+        Ok(())
+    }
+
+    /// For an object losing translations: `Some(None)` when one of its
+    /// released leases' pins is not reused, so commit holds it anyway;
+    /// `Some(Some(pin))` naming a released lease's pin to retain a
+    /// coverage pin from; `None` if no released lease is the object's.
+    fn unreused_or_any_released_pin<const BATCH: usize>(
+        &self,
+        plan: &ReplacePlan<BATCH>,
+        object_slot: usize,
+    ) -> Option<Option<&InternalRef>> {
+        let mut any = None;
+        for (position, &slot) in plan.released[..plan.released_len].iter().enumerate() {
+            let Some(record) = self.leases[slot].record.as_ref() else {
+                continue;
+            };
+            if record.metadata.object_slot != object_slot {
+                continue;
+            }
+            let reused = plan.pending[..plan.pending_len].iter().flatten().any(|pending| {
+                matches!(pending.pin_source, PendingPinSource::Released(used) if used == position)
+            });
+            if !reused {
+                return Some(None);
+            }
+            any = Some(&record.pin);
+        }
+        any.map(Some)
     }
 
     /// Validates a replacement and fills `plan` in place.
@@ -126,6 +247,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             tickets,
             extra_sources,
             extra_len: plan_extra_len,
+            ..
         } = plan;
         release_slots.fill(usize::MAX);
         pending.fill(None);
@@ -371,6 +493,23 @@ impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGIST
         for record in released_records.into_iter().flatten() {
             final_releases.push_unmapped(record.pin);
         }
+        for pin in self.coverage_pins.iter_mut().filter_map(Option::take) {
+            final_releases.push_unmapped(pin);
+        }
+        for (object_slot, first, end) in self.plan.removed[..self.plan.removed_len]
+            .iter()
+            .flatten()
+            .copied()
+        {
+            let record = self.authority.objects[object_slot]
+                .record
+                .as_mut()
+                .expect("a planned on-demand object outlives its transaction");
+            record.released = Some(match record.released {
+                Some((low, high)) => (low.min(first), high.max(end)),
+                None => (first, end),
+            });
+        }
         if let Some(authorization) = self.authorization.take() {
             release_map_authorization(self.registry, authorization, &mut final_releases);
         }
@@ -386,7 +525,12 @@ impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGIST
     /// authorization pins are released.
     pub(in super::super) fn rollback(mut self) -> MappingFinalReleases {
         let mut final_releases = MappingFinalReleases::empty();
-        for pin in self.extra_pins.iter_mut().filter_map(Option::take) {
+        for pin in self
+            .extra_pins
+            .iter_mut()
+            .chain(self.coverage_pins.iter_mut())
+            .filter_map(Option::take)
+        {
             release_internal_pin(self.registry, pin, &mut final_releases);
         }
         if let Some(authorization) = self.authorization.take() {

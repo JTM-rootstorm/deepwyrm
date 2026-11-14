@@ -66,7 +66,8 @@ struct Fixture {
     backing: crate::memory::frame_roles::BackingIdentity,
     registry: ObjectRegistry<1>,
     objects: MemoryObjectAuthority<1, 4>,
-    owner: InternalRef,
+    /// The object's own reference; tests drop it or make it a handle.
+    owner: Option<InternalRef>,
     region: AddressRegion<2>,
     spaces: AddressSpaceAuthority<2, 2>,
     target: FakeTarget,
@@ -162,7 +163,7 @@ impl Fixture {
             backing,
             registry,
             objects,
-            owner,
+            owner: Some(owner),
             region,
             spaces,
             target: FakeTarget::default(),
@@ -237,7 +238,7 @@ impl Fixture {
         );
         let resolved = crate::handle::resolve_test_internal_owner(
             &mut self.registry,
-            &self.owner,
+            self.owner.as_ref().expect("an owner to map through"),
             deepwyrm_abi::dw_object_compatible_rights(DW_OBJECT_TYPE_MEMORY_OBJECT),
         );
         let authorization = self
@@ -704,3 +705,6 @@ fn a_root_refuses_an_entry_naming_another_owners_table() {
     assert_eq!(fixture.leaf(START), Some((frame, true)));
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }
+
+#[path = "release_tests.rs"]
+mod release_tests;

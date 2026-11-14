@@ -1233,6 +1233,7 @@ fn space_region_and_lease_identities_reject_swaps_overlaps_and_stale_releases() 
                 second.region,
                 &[stale_lease],
                 &[],
+                &[],
                 None,
             )
             .err()
@@ -1259,6 +1260,7 @@ fn space_region_and_lease_identities_reject_swaps_overlaps_and_stale_releases() 
                 first_space,
                 first.region,
                 &[stale_lease],
+                &[],
                 &[],
                 None,
             )

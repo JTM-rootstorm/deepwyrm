@@ -758,6 +758,10 @@ struct ObjectRecord {
     rounded_byte_len: u64,
     kind: MemoryObjectKind,
     protection_ceiling: MemoryProtection,
+    /// On demand: the hull `[first, end)` of object pages whose
+    /// translations transactions removed and no release has examined yet
+    /// (DW2 §10.9 item 2). Gone with the record at finalization.
+    released: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -834,6 +838,10 @@ pub(crate) struct ReplacePlan<const BATCH: usize> {
     tickets: [Option<LeaseTicket>; BATCH],
     extra_sources: [Option<ExistingPinSource>; BATCH],
     extra_len: usize,
+    /// Per on-demand object losing translations: its slot and the hull of
+    /// the removed object pages, widened into its record at commit.
+    removed: [Option<(usize, u64, u64)>; BATCH],
+    removed_len: usize,
 }
 
 impl<const BATCH: usize> ReplacePlan<BATCH> {
@@ -846,6 +854,60 @@ impl<const BATCH: usize> ReplacePlan<BATCH> {
             tickets: [None; BATCH],
             extra_sources: [None; BATCH],
             extra_len: 0,
+            removed: [None; BATCH],
+            removed_len: 0,
+        }
+    }
+}
+
+/// Index entries one release step may visit (DW2 §10.9 items 5, 8).
+pub(crate) const RELEASE_STEP_ENTRIES: u64 = 4096;
+
+/// What one release step did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReleaseStep {
+    /// Nothing to release, or the object may not release now.
+    Idle,
+    /// The hull is done.
+    Done { freed: u64 },
+    /// Hull remains: queue the object again.
+    More { freed: u64 },
+}
+
+/// Live lease records of a lease table.
+trait LeaseRecords<'a> {
+    fn flatten_records(self) -> impl Iterator<Item = &'a LeaseRecord>;
+}
+
+impl<'a, I: Iterator<Item = &'a LeaseSlot>> LeaseRecords<'a> for I {
+    fn flatten_records(self) -> impl Iterator<Item = &'a LeaseRecord> {
+        self.filter_map(|lease| lease.record.as_ref())
+    }
+}
+
+/// Object pages `[first_page, end_page)` of `object` whose (virtual address,
+/// object offset) translations a transaction removes and none of its new
+/// mappings reproduces (DW2 §10.9 item 1). The region computes them; it
+/// alone knows each mapping's virtual address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RemovedRange {
+    pub(super) object: MemoryObjectKey,
+    pub(super) first_page: u64,
+    pub(super) end_page: u64,
+}
+
+impl RemovedRange {
+    pub(crate) const EMPTY: Self = Self {
+        object: MemoryObjectKey::EMPTY,
+        first_page: 0,
+        end_page: 0,
+    };
+
+    pub(crate) const fn new(object: MemoryObjectKey, first_page: u64, end_page: u64) -> Self {
+        Self {
+            object,
+            first_page,
+            end_page,
         }
     }
 }
@@ -1016,6 +1078,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 rounded_byte_len,
                 kind,
                 protection_ceiling,
+                released: None,
             }),
         };
         self.backings[slot] = Some(backing);
@@ -1308,6 +1371,131 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         })
     }
 
+    /// One step of releasing an on-demand object's unmapped pages (DW2
+    /// §10.9 item 5). Runs under T and P where the cleanup queue drains,
+    /// after its pops. The object must be `Live` in the registry, have no
+    /// handle and no internal reference beyond its live leases' pins: then
+    /// no removal of its translations is unacknowledged and nothing but a
+    /// live lease can reach its pages. Frees up to [`RELEASE_STEP_ENTRIES`]
+    /// index entries' worth of committed pages in its hull that no live
+    /// lease covers, lowering its charge by the pages freed.
+    pub(crate) fn release_unmapped_step<
+        const REGISTRY_OBJECTS: usize,
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        object: ObjectId,
+    ) -> ReleaseStep {
+        let Some(slot) = self
+            .objects
+            .iter()
+            .position(|slot| slot.record.is_some_and(|record| record.object == object))
+        else {
+            return ReleaseStep::Idle;
+        };
+        let record = self.objects[slot]
+            .record
+            .expect("found object slot has a record");
+        let (MemoryObjectKind::OnDemand, Some((first, end))) = (record.kind, record.released)
+        else {
+            return ReleaseStep::Idle;
+        };
+        let Some((handles, internal)) = registry.live_reference_counts(object) else {
+            return ReleaseStep::Idle;
+        };
+        let leases = self
+            .leases
+            .iter()
+            .flatten_records()
+            .filter(|lease| lease.metadata.object_slot == slot)
+            .count();
+        if handles != 0 || usize::try_from(internal).ok() != Some(leases) {
+            return ReleaseStep::Idle;
+        }
+        let mut cursor = first;
+        let mut visited = 0_u64;
+        let mut freed = 0_u64;
+        while cursor < end && visited < RELEASE_STEP_ENTRIES {
+            let Some((low, high)) = self.next_uncovered(slot, cursor, end) else {
+                cursor = end;
+                break;
+            };
+            let (next, pages, entries) = roles
+                .decommit_on_demand_range(record.backing, low, high, RELEASE_STEP_ENTRIES - visited)
+                .unwrap_or_else(|error| {
+                    panic!("a live on-demand object's index failed to release: {error:?}")
+                });
+            freed += pages;
+            visited += entries;
+            cursor = next;
+            if entries == 0 {
+                break;
+            }
+        }
+        if freed != 0 {
+            let (_, weight) = registry
+                .charge(object)
+                .unwrap_or_else(|error| panic!("a live object lost its charge: {error:?}"));
+            let weight = weight
+                .checked_sub(freed)
+                .expect("an object's weight counts every page it committed");
+            registry
+                .set_charge_pages(object, weight)
+                .unwrap_or_else(|error| panic!("a live object rejected its weight: {error:?}"));
+        }
+        let record = self.objects[slot]
+            .record
+            .as_mut()
+            .expect("found object slot has a record");
+        if cursor >= end {
+            record.released = None;
+            ReleaseStep::Done { freed }
+        } else {
+            record.released = Some((cursor, end));
+            ReleaseStep::More { freed }
+        }
+    }
+
+    /// The first run `[low, high)` of object pages at or after `from` and
+    /// before `end` that no live lease of the object at `slot` covers.
+    fn next_uncovered(&self, slot: usize, from: u64, end: u64) -> Option<(u64, u64)> {
+        let covers = || {
+            self.leases
+                .iter()
+                .flatten_records()
+                .filter(move |lease| lease.metadata.object_slot == slot)
+                .map(|lease| {
+                    let first = lease.metadata.range.object_offset / PAGE_SIZE;
+                    (first, first + lease.metadata.range.byte_len / PAGE_SIZE)
+                })
+        };
+        let mut low = from;
+        while let Some((_, cover_end)) =
+            covers().find(|&(cover_first, cover_end)| cover_first <= low && low < cover_end)
+        {
+            low = cover_end;
+        }
+        if low >= end {
+            return None;
+        }
+        let high = covers()
+            .map(|(cover_first, _)| cover_first)
+            .filter(|&cover_first| cover_first > low)
+            .fold(end, u64::min);
+        Some((low, high))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn released_hull(&self, object: ObjectId) -> Option<(u64, u64)> {
+        self.objects
+            .iter()
+            .find_map(|slot| slot.record.filter(|record| record.object == object))
+            .and_then(|record| record.released)
+    }
+
     pub(crate) const fn active_lease_count(&self) -> usize {
         let mut count = 0;
         let mut index = 0;
@@ -1389,6 +1577,9 @@ pub(super) struct PreparedReplace<
     registry: &'a mut ObjectRegistry<REGISTRY_OBJECTS>,
     plan: &'a mut ReplacePlan<BATCH>,
     extra_pins: [Option<InternalRef>; BATCH],
+    /// One per on-demand object losing translations with no removed lease
+    /// pin held for it, held to settlement (DW2 §10.9 item 3, review B-1).
+    coverage_pins: [Option<InternalRef>; BATCH],
     authorization: Option<MapAuthorization>,
     finished: bool,
 }

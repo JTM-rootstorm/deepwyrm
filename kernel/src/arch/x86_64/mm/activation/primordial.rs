@@ -5728,7 +5728,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             self.core.cleanup.push(parent_release);
         }
+        self.release_unmapped_step();
         Ok(())
+    }
+
+    /// One step of releasing a handle-less on-demand object's unmapped
+    /// pages, after the cleanup queue's pops (DW2 §10.9 item 5). Notices
+    /// that cannot release now cost one check each and are dropped; the
+    /// first that can does at most one step's work, and is queued again
+    /// if its hull remains.
+    fn release_unmapped_step(&mut self) {
+        let mut paging = self.paging.lock();
+        while let Some(notice) = self.core.registry.pop_memory_notice() {
+            let Some(object) = notice else {
+                continue;
+            };
+            match self.core.memory.release_unmapped_step(
+                &mut self.core.registry,
+                &mut *paging.target.roles,
+                object,
+            ) {
+                crate::memory::object::ReleaseStep::Idle => continue,
+                crate::memory::object::ReleaseStep::Done { .. } => break,
+                crate::memory::object::ReleaseStep::More { .. } => {
+                    self.core.registry.requeue_memory_notice(object);
+                    break;
+                }
+            }
+        }
     }
 
     fn service_pending_timer_expiries_on_bootstrap(&mut self) {
