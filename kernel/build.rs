@@ -1737,6 +1737,19 @@ impl Pools {
                 .ok_or_else(|| format!("`{key}` must be a nonzero 32-bit count"))?;
             *slot = value;
         }
+        // Ceilings that `xtask kernel-check` measured the kernel stacks at:
+        // the map path's frames scale with the region's slots, and the handle
+        // tables are static storage in every Process. Raising either is a
+        // reviewed edit here, with kernel-check rerun (security review
+        // 2026-11-13, R1).
+        for (key, ceiling) in [("region_slots", 64), ("handles_per_process", 96)] {
+            if pools.get(key) > ceiling {
+                return Err(format!(
+                    "`{key}` ({}) exceeds the {ceiling} the kernel's stack bound was measured at",
+                    pools.get(key)
+                ));
+            }
+        }
         if u64::from(pools.get("identities")) > task_layout.thread_kernel_stack_count {
             return Err(format!(
                 "`identities` ({}) exceeds the {} thread kernel stacks of task_layout.toml; \

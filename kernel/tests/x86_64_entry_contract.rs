@@ -719,3 +719,30 @@ impl Drop for TemporaryDirectory {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
+
+/// The production pools file parses, and the build refuses pools the kernel
+/// was never measured at: more slots or handles than kernel-check bounded,
+/// or more identities than kernel stacks (security review 2026-11-13, R1).
+#[test]
+fn pools_are_bounded_by_what_the_kernel_was_measured_at() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let task_layout = kernel_build::TaskLayout::parse(
+        &fs::read_to_string(manifest.join("arch/x86_64/task_layout.toml")).unwrap(),
+    )
+    .unwrap();
+    let pools = fs::read_to_string(manifest.join("arch/x86_64/pools.toml")).unwrap();
+    let parsed = kernel_build::Pools::parse(&pools, task_layout).unwrap();
+    assert_eq!(parsed.get("region_slots"), 64);
+    for (from, to) in [
+        ("region_slots = 64", "region_slots = 65"),
+        ("handles_per_process = 96", "handles_per_process = 97"),
+        ("identities = 32", "identities = 33"),
+        ("timers = 2", "timers = 0"),
+    ] {
+        assert!(pools.contains(from), "{from}");
+        assert!(
+            kernel_build::Pools::parse(&pools.replace(from, to), task_layout).is_err(),
+            "{to}"
+        );
+    }
+}

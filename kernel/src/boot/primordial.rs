@@ -416,9 +416,9 @@ pub fn parse_primordial_elf(bytes: &[u8]) -> Result<PrimordialElfLoadPlan, Primo
             }
             // The ABI note every native binary carries (root
             // `OS_STACK_ARCHITECTURE_PLAN.md` V1). The kernel loads nothing
-            // from it and only bounds it: init compares its own fingerprint
-            // with the kernel's at startup, and Wyrmroot's loader checks every
-            // image it loads.
+            // from it and only bounds it: the bootstrap image compares its own
+            // fingerprint with the kernel's before any other syscall, and
+            // Wyrmroot's loader checks every image it loads after that.
             PT_NOTE => {
                 if seen_note {
                     return Err(PrimordialElfError::DuplicateMetadataHeader);

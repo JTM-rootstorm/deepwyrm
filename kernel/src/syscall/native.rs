@@ -286,11 +286,6 @@ impl NativeSyscallRequest {
                 out_size,
                 out_required_size,
             }
-            | Self::KernelGetLimits {
-                out_info,
-                out_size,
-                out_required_size,
-            }
             | Self::ObjectGetInfoV1 {
                 out_info,
                 out_size,
@@ -298,6 +293,20 @@ impl NativeSyscallRequest {
                 ..
             } => [
                 out(out_info, out_size.min(INFO_MAX)),
+                out(out_required_size, 8),
+                None,
+            ],
+            // The limits record is wider than the object-info records, so it
+            // has its own cap (security review 2026-11-13, D2).
+            Self::KernelGetLimits {
+                out_info,
+                out_size,
+                out_required_size,
+            } => [
+                out(
+                    out_info,
+                    out_size.min(u64::from(deepwyrm_abi::DW_KERNEL_LIMITS_V1_SIZE)),
+                ),
                 out(out_required_size, 8),
                 None,
             ],

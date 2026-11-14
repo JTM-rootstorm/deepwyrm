@@ -462,6 +462,25 @@ fn user_buffers_are_the_copied_ranges() {
             None,
         ]
     );
+    // The limits record is wider than the object-info records; the fill-in
+    // pass must cover all of it (security review 2026-11-13, D2).
+    let limits = NativeSyscallRequest::KernelGetLimits {
+        out_info: DwUserAddress(0x6fc0),
+        out_size: 4096,
+        out_required_size: DwUserAddress(0x7000),
+    };
+    assert_eq!(
+        limits.user_buffers(),
+        [
+            buffer(
+                0x6fc0,
+                u64::from(deepwyrm_abi::DW_KERNEL_LIMITS_V1_SIZE),
+                true
+            ),
+            buffer(0x7000, 8, true),
+            None,
+        ]
+    );
     // Unmap names a target range it does not copy.
     let unmap = NativeSyscallRequest::AddressRegionUnmap {
         address_region: DwHandle(2),
@@ -502,6 +521,19 @@ fn user_buffers_are_capped_at_what_the_syscall_copies() {
         out_required_size: DwUserAddress(0x2000),
     });
     assert_eq!(info, [Some(u64::from(DW_ABI_INFO_V1_SIZE)), Some(8), None]);
+    let limits = lengths(NativeSyscallRequest::KernelGetLimits {
+        out_info: DwUserAddress(0x1000),
+        out_size: huge,
+        out_required_size: DwUserAddress(0x2000),
+    });
+    assert_eq!(
+        limits,
+        [
+            Some(u64::from(deepwyrm_abi::DW_KERNEL_LIMITS_V1_SIZE)),
+            Some(8),
+            None
+        ]
+    );
     let object_info = lengths(NativeSyscallRequest::ObjectGetInfoV1 {
         handle: DwHandle(1),
         topic: 0,
