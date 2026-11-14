@@ -33,6 +33,7 @@ use crate::arch::x86_64::syscall::GuardFree;
 )]
 pub(crate) fn soft_off_then_halt(_guard_free: GuardFree<'_>) -> ! {
     crate::arch::x86_64::stack_watermark::report();
+    crate::arch::x86_64::step_report::report();
     match sleep::authorized_soft_off() {
         Some(command) => sleep::request_soft_off(&mut X86PortIo, command),
         None => {

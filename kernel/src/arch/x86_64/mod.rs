@@ -58,6 +58,12 @@ pub(crate) mod smp;
     )
 ))]
 pub(crate) mod stack_watermark;
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live facade runs calls in steps")
+)]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) mod step_report;
 pub(crate) mod syscall;
 pub mod tss;
 #[cfg_attr(

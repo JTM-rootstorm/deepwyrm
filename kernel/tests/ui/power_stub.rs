@@ -17,6 +17,9 @@ mod arch {
         pub(crate) mod stack_watermark {
             pub(crate) fn report() {}
         }
+        pub(crate) mod step_report {
+            pub(crate) fn report() {}
+        }
         pub(crate) mod acpi {
             pub(crate) mod sleep {
                 pub(crate) struct S5SoftOff;

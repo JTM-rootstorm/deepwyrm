@@ -23,6 +23,7 @@ use super::runtime_authority::{
     PagingAccess, PagingLock, RuntimeAuthorityGuard, RuntimeAuthorityHandle, RuntimeAuthorityLock,
     ShootdownInitiatorGuard, ShootdownInitiatorLock,
 };
+use crate::arch::x86_64::step_report::{self, StepCall};
 use crate::one_shot::init_fields;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -1922,6 +1923,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         resumed: bool,
     ) -> Result<crate::syscall::native::ReturnReady, ()> {
         let request = steps.request();
+        let call = step_call(&request);
         let mut output = None;
         let mut user = None;
         let mut previous = None;
@@ -1931,7 +1933,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let cpu = self.cpu;
             let snapshot_range = steps.snapshot_range();
             let previous_phase = previous.take();
-            let Ok(prepared) = self.at_step_safe_point(stepped, |runtime, yielding| {
+            let Ok(prepared) = self.at_step_safe_point(stepped, call, |runtime, yielding| {
                 if let Some(phase) = previous_phase {
                     runtime.commit_runtime_phase(phase);
                 }
@@ -2149,7 +2151,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     _ => buffer.address & !(PAGE_SIZE - 1),
                 };
                 while next < end {
-                    match self.at_step_safe_point(stepped, |runtime, yielding| {
+                    match self.at_step_safe_point(stepped, StepCall::FillIn, |runtime, yielding| {
                         if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                             runtime.service_pending_timer_expiries_on_bootstrap();
                         }
@@ -2192,7 +2194,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 FillCursor::Dma { next: None } | FillCursor::Buffer { .. } => offset,
             };
             loop {
-                match self.at_step_safe_point(stepped, |runtime, yielding| {
+                match self.at_step_safe_point(stepped, StepCall::Commit, |runtime, yielding| {
                     if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                         runtime.service_pending_timer_expiries_on_bootstrap();
                     }
@@ -2280,7 +2282,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cpu = self.cpu;
         let mut stepped = false;
         loop {
-            let step = self.at_step_safe_point(stepped, |runtime, yielding| {
+            let step = self.at_step_safe_point(stepped, StepCall::Commit, |runtime, yielding| {
                 if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                     runtime.service_pending_timer_expiries_on_bootstrap();
                 }
@@ -2342,10 +2344,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut zeroed = true;
         let mut stepped = false;
         let cpu = self.cpu;
+        // The first step has no safe point before it.
+        step_report::step_began(cpu.index());
         while zeroed && first < allocation.pages() {
             if stepped {
                 let previous = phase.take();
-                match self.at_step_safe_point(true, |runtime, yielding| {
+                match self.at_step_safe_point(true, StepCall::Create, |runtime, yielding| {
                     if let Some(phase) = previous {
                         runtime.commit_runtime_phase(phase);
                     }
@@ -2499,23 +2503,40 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// `may_yield` only once it has taken a step since it last started or
     /// resumed, so a resumed call always makes progress before it yields
     /// again (review R2).
+    ///
+    /// `call` names the call for the power-off step report: the step that
+    /// ends here is timed, and a Stop after a step is counted.
     #[inline(always)]
     fn at_step_safe_point<T>(
         &mut self,
         may_yield: bool,
+        call: StepCall,
         operation: impl FnOnce(
             &mut PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
             bool,
         ) -> T,
     ) -> Result<T, ()> {
+        let cpu = self.cpu.index();
+        let now = step_report::at_safe_point(cpu, call, may_yield);
         if may_yield {
             crate::time::service_current_scheduler_quantum_deadline()
                 .unwrap_or_else(|_| panic!("a step safe point could not service its quantum"));
         }
-        self.with_synchronized_runtime_at_safe_point(|runtime| {
+        let mut stepping = false;
+        let result = self.with_synchronized_runtime_at_safe_point(|runtime| {
             let yielding = may_yield && runtime.has_reschedule_request();
+            stepping = !yielding;
             operation(runtime, yielding)
-        })
+        });
+        step_report::after_safe_point(
+            cpu,
+            call,
+            may_yield,
+            now,
+            result.is_err(),
+            stepping && result.is_ok(),
+        );
+        result
     }
 
     /// Parks the running Thread's call under T (DW2 §10.8 item 5), for the
@@ -6019,6 +6040,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             else {
                 return;
             };
+            step_report::parked_call_ended(match &call {
+                ParkedCall::Region(steps) => step_call(&steps.request()),
+                ParkedCall::Commit { .. } => StepCall::Commit,
+                ParkedCall::FillIn { .. } => StepCall::FillIn,
+                ParkedCall::Create(_) => StepCall::Create,
+            });
             let allocation = match call {
                 ParkedCall::Create(create) => Some(create.allocation),
                 ParkedCall::Region(_) | ParkedCall::Commit { .. } | ParkedCall::FillIn { .. } => {
@@ -11188,5 +11215,14 @@ impl<M: crate::syscall::ThreadStartRetarget> crate::syscall::ThreadStartRetarget
         process: ProcessKey,
     ) -> Result<(), deepwyrm_abi::DwStatus> {
         self.inner.retarget_for_thread_start(process)
+    }
+}
+
+/// The step report's name for a family-G call in steps.
+fn step_call(request: &NativeSyscallRequest) -> StepCall {
+    match request {
+        NativeSyscallRequest::AddressRegionUnmap { .. } => StepCall::Unmap,
+        NativeSyscallRequest::AddressRegionProtect { .. } => StepCall::Protect,
+        _ => StepCall::Map,
     }
 }
