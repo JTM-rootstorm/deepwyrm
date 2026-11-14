@@ -259,7 +259,11 @@ impl Fixture {
             ),
         };
         let result = match changed {
-            Ok(_releases) => Ok(()),
+            Ok(releases) => {
+                // A host target publishes no shootdown.
+                drop(releases.settle_locally(&mut self.registry));
+                Ok(())
+            }
             Err(failure) => match failure.error() {
                 AddressSpaceTransactionError::Publish(error) => Err(*error),
                 other => panic!("change failed outside the publisher: {other:?}"),

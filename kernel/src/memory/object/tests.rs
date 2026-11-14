@@ -508,7 +508,7 @@ fn final_page_tail_is_mapping_capacity_but_not_logical_object_size() {
             Some(authorization),
         )
         .unwrap();
-    assert!(prepared.commit().is_empty());
+    assert!(prepared.commit().settle_locally(&mut registry).is_empty());
     assert_eq!(authority.active_lease_count(), 1);
 }
 
@@ -584,7 +584,7 @@ fn replacement_rejects_bad_ranges_and_wx_aliases_without_commit() {
             Some(authorization),
         )
         .unwrap();
-    assert!(prepared.commit().is_empty());
+    assert!(prepared.commit().settle_locally(&mut registry).is_empty());
     assert_eq!(authority.active_lease_count(), 1);
 
     let (read_execute, authorization) = mapping(
@@ -720,7 +720,7 @@ fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
         )
         .unwrap();
     let lease = prepared.tickets()[0].unwrap().lease();
-    assert!(prepared.commit().is_empty());
+    assert!(prepared.commit().settle_locally(&mut registry).is_empty());
     assert_eq!(authority.active_lease_count(), 1);
 
     assert!(registry.release_internal(owner).unwrap().is_none());
@@ -728,7 +728,7 @@ fn authorization_pin_transfers_to_lease_and_final_unmap_reclaims_backing() {
     let prepared = authority
         .prepare_replace::<1, 1>(&mut registry, &mut plan, space, region, &[lease], &[], None)
         .unwrap();
-    let final_release = only_final(prepared.commit());
+    let final_release = only_final(prepared.commit().settle_locally(&mut registry));
     let finalization = authority.take_finalization(final_release).unwrap();
     assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
     let recycled = roles.allocate(1).unwrap();
@@ -791,7 +791,7 @@ fn exhausted_lease_slot_is_skipped_when_later_capacity_exists() {
         .unwrap();
     let lease = prepared.tickets()[0].unwrap().lease();
     assert_eq!(decode_raw_key(lease.raw).unwrap().0, 1);
-    assert!(prepared.commit().is_empty());
+    assert!(prepared.commit().settle_locally(&mut registry).is_empty());
     assert_eq!(authority.active_lease_count(), 1);
 }
 
@@ -912,7 +912,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
         )
         .unwrap();
     let whole_lease = prepared.tickets()[0].unwrap().lease();
-    assert!(prepared.commit().is_empty());
+    assert!(prepared.commit().settle_locally(&mut registry).is_empty());
     assert_eq!(authority.active_lease_count(), 1);
 
     let split_requests = [
@@ -963,7 +963,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
         .unwrap();
     let first_split = prepared.tickets()[0].unwrap().lease();
     let second_split = prepared.tickets()[1].unwrap().lease();
-    assert!(prepared.commit().is_empty());
+    assert!(prepared.commit().settle_locally(&mut registry).is_empty());
     assert_eq!(authority.active_lease_count(), 2);
 
     let mut plan = ReplacePlan::<2>::new();
@@ -978,7 +978,7 @@ fn mapping_split_retains_positive_delta_and_rollback_is_exact() {
             None,
         )
         .unwrap();
-    let final_release = only_final(prepared.commit());
+    let final_release = only_final(prepared.commit().settle_locally(&mut registry));
     assert_eq!(authority.active_lease_count(), 0);
     let finalization = authority.take_finalization(final_release).unwrap();
     assert!(complete_memory_finalization(&mut registry, &mut roles, finalization).is_none());
@@ -1029,7 +1029,7 @@ fn d6_handle_close_and_mapping_commit_interleavings_preserve_backing() {
             )
             .unwrap();
         let lease = prepared.tickets()[0].unwrap().lease();
-        assert!(prepared.commit().is_empty());
+        assert!(prepared.commit().settle_locally(&mut registry).is_empty());
         assert_eq!(authority.active_lease_count(), 1);
 
         if !close_before_authorization {
@@ -1044,7 +1044,7 @@ fn d6_handle_close_and_mapping_commit_interleavings_preserve_backing() {
         let prepared = authority
             .prepare_replace::<1, 2>(&mut registry, &mut plan, space, region, &[lease], &[], None)
             .unwrap();
-        let final_release = only_final(prepared.commit());
+        let final_release = only_final(prepared.commit().settle_locally(&mut registry));
         complete_memory_release(&mut registry, &mut authority, &mut roles, final_release);
         assert_eq!(roles.allocate(1).unwrap().physical_start(), physical_start);
     }

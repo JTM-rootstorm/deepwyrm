@@ -2450,7 +2450,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 DwUserAddress(BASE + 0x300),
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_BAD_ADDRESS
@@ -2483,7 +2483,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 DwUserAddress(BASE + 0x300),
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_SUCCESS
@@ -2518,7 +2518,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_SUCCESS
@@ -2539,7 +2539,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 4096,
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_SUCCESS
@@ -2715,7 +2715,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 DwUserAddress(BASE + 0x300),
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_SUCCESS
@@ -2739,7 +2739,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_SUCCESS
@@ -2770,7 +2770,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_BAD_STATE
@@ -2806,7 +2806,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_BAD_STATE
@@ -2913,20 +2913,8 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
         ),
         DW_STATUS_SUCCESS
     );
-    held.merge_without_shootdown(&mut cleanup);
+    held.merge_without_shootdown(&mut registry, &mut cleanup);
     let mapped = u64_at(&user, BASE + 0x300);
-    // The mapping now holds the MemoryObject's last reference.
-    assert_eq!(
-        handle_close(
-            &mut registry,
-            &mut tasks,
-            process,
-            memory_handle,
-            &mut cleanup,
-        ),
-        DW_STATUS_SUCCESS
-    );
-    assert!(cleanup.is_empty());
 
     // The unmap runs through a coherent publisher, as the live one does, with
     // no CPU resident, so its shootdown completes at once.
@@ -2981,13 +2969,31 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
         cleanup.is_empty(),
         "a family-G adapter pushed a release past its held set"
     );
-    assert!(!held.is_empty());
+    assert_eq!(held.unmapped_pins(), 1);
+    // The MemoryObject's handle closes while the unmap's shootdown is still
+    // unsettled: the held lease pin keeps it alive, so this close is not the
+    // last release and no finalizer can free frames a remote TLB may still
+    // map (DW2 §10.9 review, finding F1).
+    assert_eq!(
+        handle_close(
+            &mut registry,
+            &mut tasks,
+            process,
+            memory_handle,
+            &mut cleanup,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert!(
+        cleanup.is_empty(),
+        "an object finalized before its unmap's shootdown settled"
+    );
     let settlement = coherent.finish();
     assert!(matches!(
         settlement,
         crate::memory::address_region::ShootdownOutcome::Completed(_)
     ));
-    held.merge(settlement, &mut cleanup);
+    held.merge(settlement, &mut registry, &mut cleanup);
     assert!(held.is_empty());
     let release = cleanup.pop().expect("the merged final release");
     assert_eq!(
@@ -3960,7 +3966,7 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
                 DwUserAddress(BASE + 0x300),
                 &mut held,
             );
-            held.merge_without_shootdown(&mut cleanup);
+            held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
         },
         DW_STATUS_SUCCESS
@@ -4025,7 +4031,8 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
         .region_mut_for_quiesced_teardown(&tasks, &proof, root_key)
         .unwrap()
         .unmap(&mut memory, &mut registry, &mut publisher, mapped, 4096)
-        .unwrap();
+        .unwrap()
+        .settle_locally(&mut registry);
     for release in releases.into_items().into_iter().flatten() {
         cleanup.push(release);
     }

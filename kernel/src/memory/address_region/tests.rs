@@ -253,7 +253,7 @@ fn test_map<
         protection,
     ) {
         Ok(final_releases) => {
-            assert!(final_releases.is_empty());
+            assert!(final_releases.settle_locally(registry).is_empty());
             Ok(())
         }
         Err(failure) => {
@@ -313,7 +313,7 @@ fn test_unmap<
     let (authority, registry) = objects.split_mut();
     match region.unmap(authority, registry, publisher, start, byte_len) {
         Ok(final_releases) => {
-            assert!(final_releases.is_empty());
+            assert!(final_releases.settle_locally(registry).is_empty());
             Ok(())
         }
         Err(failure) => {
@@ -339,7 +339,7 @@ fn test_protect<
     let (authority, registry) = objects.split_mut();
     match region.protect(authority, registry, publisher, start, byte_len, protection) {
         Ok(final_releases) => {
-            assert!(final_releases.is_empty());
+            assert!(final_releases.settle_locally(registry).is_empty());
             Ok(())
         }
         Err(failure) => {
@@ -1700,8 +1700,14 @@ fn an_object_finalizes_once_after_its_merged_mapping_is_unmapped() {
             PAGE_SIZE * 8,
         )
         .unwrap();
-    assert_eq!(releases.len(), 1);
+    // The removed lease's pin is held, not released, until the removal is
+    // acknowledged: the object cannot finalize before then (DW2 §10.9 review
+    // F1).
+    assert_eq!(releases.len(), 0);
+    assert!(!releases.is_empty());
     assert_eq!(objects.active_lease_count(), 0);
+    let releases = releases.settle_locally(&mut objects.registry);
+    assert_eq!(releases.len(), 1);
     let release = releases.into_items().into_iter().flatten().next().unwrap();
     assert!(objects.authority.take_finalization(release).is_ok());
     assert!(region.mappings().iter().flatten().next().is_none());

@@ -19,30 +19,54 @@ use super::*;
 /// reclaim permit of the published shootdown, or the publisher's proof that
 /// it published none. So acknowledgement precedes reclamation (H0 §12.6) is a
 /// type fact for every family-G release. Dropping unmerged releases panics.
+///
+/// It also holds the pins of the leases the transaction removed. Until they
+/// are released no other holder's release can be the last, so no object
+/// whose frames a remote TLB may still map can finalize (DW2 §10.9 review,
+/// finding F1). `merge` releases them under the registry.
 #[must_use = "held family-G releases reach the cleanup queue only on their shootdown's settlement"]
 pub(crate) struct HeldReleases<const OBJECTS: usize> {
     queue: CleanupQueue<OBJECTS>,
+    unmapped: crate::memory::object::UnmappedLeasePins,
 }
 
 impl<const OBJECTS: usize> HeldReleases<OBJECTS> {
     pub(crate) fn new() -> Self {
         Self {
             queue: CleanupQueue::new(),
+            unmapped: crate::memory::object::UnmappedLeasePins::empty(),
         }
     }
 
-    fn queue(&mut self) -> &mut CleanupQueue<OBJECTS> {
-        &mut self.queue
+    fn parts(
+        &mut self,
+    ) -> (
+        &mut CleanupQueue<OBJECTS>,
+        &mut crate::memory::object::UnmappedLeasePins,
+    ) {
+        (&mut self.queue, &mut self.unmapped)
     }
 
-    /// Moves every held release into `cleanup` on the settlement of the
-    /// transaction's shootdown, which this consumes.
-    pub(crate) fn merge<const OTHER: usize>(
+    /// Releases every held lease pin and moves every held release into
+    /// `cleanup` on the settlement of the transaction's shootdown, which this
+    /// consumes.
+    pub(crate) fn merge<const REGISTRY: usize, const OTHER: usize>(
         &mut self,
         _settlement: crate::memory::address_region::ShootdownOutcome,
+        registry: &mut ObjectRegistry<REGISTRY>,
+        cleanup: &mut CleanupQueue<OTHER>,
+    ) {
+        self.settle(registry, cleanup);
+    }
+
+    fn settle<const REGISTRY: usize, const OTHER: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY>,
         cleanup: &mut CleanupQueue<OTHER>,
     ) {
         self.queue.drain_into(cleanup);
+        self.unmapped
+            .release(registry, |release| cleanup.push(release));
     }
 
     #[cfg(test)]
@@ -52,41 +76,57 @@ impl<const OBJECTS: usize> HeldReleases<OBJECTS> {
 
     #[cfg(test)]
     pub(crate) const fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.is_empty() && self.unmapped.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn unmapped_pins(&self) -> usize {
+        self.unmapped.len()
     }
 
     /// Host adapters drive non-coherent publishers, which publish no
     /// shootdown and so settle none.
     #[cfg(test)]
-    pub(crate) fn merge_without_shootdown<const OTHER: usize>(
+    pub(crate) fn merge_without_shootdown<const REGISTRY: usize, const OTHER: usize>(
         &mut self,
+        registry: &mut ObjectRegistry<REGISTRY>,
         cleanup: &mut CleanupQueue<OTHER>,
     ) {
-        self.queue.drain_into(cleanup);
+        self.settle(registry, cleanup);
     }
 }
 
 impl<const OBJECTS: usize> Drop for HeldReleases<OBJECTS> {
     fn drop(&mut self) {
-        if !self.queue.is_empty() {
-            // The releases are leaked, not dropped: each would fail stop on
-            // its own and turn this report into a double panic.
-            let _leaked = core::mem::ManuallyDrop::new(core::mem::replace(
-                &mut self.queue,
-                CleanupQueue::new(),
+        if !self.queue.is_empty() || !self.unmapped.is_empty() {
+            // The releases and pins are leaked, not dropped: each would fail
+            // stop on its own and turn this report into a double panic.
+            let _leaked = core::mem::ManuallyDrop::new((
+                core::mem::replace(&mut self.queue, CleanupQueue::new()),
+                core::mem::replace(
+                    &mut self.unmapped,
+                    crate::memory::object::UnmappedLeasePins::empty(),
+                ),
             ));
             panic!("family-G releases were dropped before their shootdown settled");
         }
     }
 }
 
+/// Queues a transaction's final releases and holds its unmapped lease pins,
+/// both until the transaction's shootdown settles.
 pub(super) fn queue_mapping_releases<const OBJECTS: usize>(
-    cleanup: &mut CleanupQueue<OBJECTS>,
+    (cleanup, unmapped): (
+        &mut CleanupQueue<OBJECTS>,
+        &mut crate::memory::object::UnmappedLeasePins,
+    ),
     releases: crate::memory::object::MappingFinalReleases,
 ) {
-    for release in releases.into_items().into_iter().flatten() {
+    let (items, mut pins) = releases.into_parts();
+    for release in items.into_iter().flatten() {
         cleanup.push(release);
     }
+    unmapped.absorb(&mut pins);
 }
 
 pub(super) fn address_region_status(
@@ -709,7 +749,7 @@ pub(crate) fn address_region_map_model<
 where
     P::Error: AddressSpacePublishStatus,
 {
-    let cleanup = held.queue();
+    let (cleanup, unmapped) = held.parts();
     let region_resolved = resolve_current(
         tasks,
         registry,
@@ -786,7 +826,7 @@ where
                 .unwrap_or_else(|(release_error, _)| {
                     panic!("F11 map authorization leaked process lease: {release_error:?}")
                 });
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
             return Err(match memory_error {
                 crate::memory::object::MemoryObjectError::InsufficientRights
@@ -840,12 +880,12 @@ where
     release_lookup_pin(registry, region_resolved.into_internal(), cleanup);
     match result {
         Ok((address, releases)) => {
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             Ok(address)
         }
         Err(failure) => {
             let (error, releases) = failure.into_parts();
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             Err(note_map_capacity(
                 address_transaction_status(&error),
                 address_transaction_capacity_resource(&error),
@@ -932,7 +972,7 @@ pub(crate) fn address_region_unmap<
 where
     P::Error: AddressSpacePublishStatus,
 {
-    let cleanup = held.queue();
+    let (cleanup, unmapped) = held.parts();
     let resolved = match resolve_current(
         tasks,
         registry,
@@ -979,12 +1019,12 @@ where
     release_lookup_pin(registry, resolved.into_internal(), cleanup);
     match result {
         Ok(releases) => {
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             DW_STATUS_SUCCESS
         }
         Err(failure) => {
             let (error, releases) = failure.into_parts();
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             address_transaction_status(&error)
         }
     }
@@ -1065,7 +1105,7 @@ pub(crate) fn address_region_protect<
 where
     P::Error: AddressSpacePublishStatus,
 {
-    let cleanup = held.queue();
+    let (cleanup, unmapped) = held.parts();
     if protections & !deepwyrm_abi::DW_MEMORY_PROTECTION_SUPPORTED_MASK.0 != 0 {
         return DW_STATUS_INVALID_ARGUMENT;
     }
@@ -1122,12 +1162,12 @@ where
     release_lookup_pin(registry, resolved.into_internal(), cleanup);
     match result {
         Ok(releases) => {
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             DW_STATUS_SUCCESS
         }
         Err(failure) => {
             let (error, releases) = failure.into_parts();
-            queue_mapping_releases(cleanup, releases);
+            queue_mapping_releases((cleanup, unmapped), releases);
             address_transaction_status(&error)
         }
     }

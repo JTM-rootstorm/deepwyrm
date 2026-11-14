@@ -525,13 +525,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         use crate::object::ObjectRegistry;
         use deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT;
 
-        fn require_clean_mapping<E>(
+        fn require_clean_mapping<E, const REGISTRY: usize>(
             result: Result<MappingFinalReleases, AddressSpaceTransactionFailure<E>>,
+            registry: &mut ObjectRegistry<REGISTRY>,
             detail: u32,
         ) -> Result<(), u32> {
             match result {
-                Ok(releases) if releases.is_empty() => Ok(()),
-                Ok(_) => Err(detail),
+                // A single-CPU guest test publisher invalidates locally.
+                Ok(releases) => {
+                    if releases.settle_locally(registry).is_empty() {
+                        Ok(())
+                    } else {
+                        Err(detail)
+                    }
+                }
                 Err(failure) => {
                     let _clean = failure.into_final_releases().is_empty();
                     Err(detail)
@@ -624,6 +631,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         PAGE_SIZE,
                         MemoryProtection::READ_WRITE,
                     ),
+                    &mut registry,
                     0x0407_u32,
                 )?;
             }
@@ -664,6 +672,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 first,
                                 PAGE_SIZE,
                             ),
+                            &mut registry,
                             0x0420_u32,
                         )?;
                     }
@@ -707,6 +716,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
                                 ),
+                                &mut registry,
                                 0x0430_u32,
                             )?;
                         }
@@ -739,6 +749,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ_EXECUTE,
                                 ),
+                                &mut registry,
                                 0x0432_u32,
                             )?;
                         }
@@ -775,7 +786,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let rejected_clean = match rejected {
                             Err(failure) => failure.into_final_releases().is_empty(),
                             Ok(releases) => {
-                                let _clean = releases.is_empty();
+                                drop(releases.settle_locally(&mut registry));
                                 false
                             }
                         };
@@ -807,6 +818,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
                                 ),
+                                &mut registry,
                                 0x0435_u32,
                             )?;
                         }
@@ -961,6 +973,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
                                 ),
+                                &mut registry,
                                 0x043f_u32,
                             )?;
                         }
@@ -1056,6 +1069,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ_WRITE,
                                 ),
+                                &mut registry,
                                 0x0477_u32,
                             )?;
                         }
@@ -1088,6 +1102,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ_WRITE,
                                 ),
+                                &mut registry,
                                 0x047a_u32,
                             )?;
                         }
@@ -1107,6 +1122,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ,
                                 ),
+                                &mut registry,
                                 0x047b_u32,
                             )?;
                         }
@@ -1224,7 +1240,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 error
                             }
                             Ok(releases) => {
-                                let _clean = releases.is_empty();
+                                drop(releases.settle_locally(&mut registry));
                                 return Err(0x0446);
                             }
                         };
@@ -1272,6 +1288,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     PAGE_SIZE,
                                     MemoryProtection::READ_WRITE,
                                 ),
+                                &mut registry,
                                 0x0451_u32,
                             )?;
                         }
@@ -1303,6 +1320,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                     first,
                                     PAGE_SIZE,
                                 ),
+                                &mut registry,
                                 0x0453_u32,
                             )?;
                         }

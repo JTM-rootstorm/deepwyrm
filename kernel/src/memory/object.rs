@@ -425,11 +425,107 @@ pub(crate) const MAX_MAPPING_BATCH: usize = 64;
 /// §10.2 item 2).
 pub(crate) const MAPPING_FINAL_RELEASE_CAPACITY: usize = 2 * MAX_MAPPING_BATCH + 1;
 
+/// The pins of the leases a committed replace took out of the page tables.
+///
+/// Each pin keeps its object alive, so its frames stay allocated, until every
+/// CPU has acknowledged the removal: acknowledgement precedes reclamation
+/// (H0 §12.6). Releasing a pin at commit, before the shootdown settled, let
+/// another holder's last release finalize the object and free frames a remote
+/// TLB still mapped (DW2 §10.9 review, finding F1). Family G hands these to
+/// [`crate::syscall::HeldReleases`], which releases them on the settlement;
+/// a path where no other CPU can hold the translation releases them at once
+/// with [`MappingFinalReleases::settle_locally`]. Dropping a non-empty set
+/// fails stop.
+#[must_use = "unmapped lease pins are released only after their removal is acknowledged"]
+#[derive(Debug)]
+pub(crate) struct UnmappedLeasePins {
+    pins: [Option<InternalRef>; MAX_MAPPING_BATCH],
+    count: usize,
+}
+
+impl UnmappedLeasePins {
+    pub(crate) fn empty() -> Self {
+        Self {
+            pins: core::array::from_fn(|_| None),
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, pin: InternalRef) {
+        assert!(
+            self.count < MAX_MAPPING_BATCH,
+            "unmapped lease pin batch overflow"
+        );
+        self.pins[self.count] = Some(pin);
+        self.count += 1;
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Moves every pin of `other` into this set.
+    pub(crate) fn absorb(&mut self, other: &mut Self) {
+        for pin in other.take_all() {
+            self.push(pin);
+        }
+    }
+
+    fn take_all(&mut self) -> impl Iterator<Item = InternalRef> + '_ {
+        self.count = 0;
+        self.pins.iter_mut().filter_map(Option::take)
+    }
+
+    /// Releases every pin, handing each final release to `sink`. The caller
+    /// guarantees no CPU can still hold a translation of the removed leases.
+    pub(crate) fn release<const REGISTRY_OBJECTS: usize>(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        mut sink: impl FnMut(FinalRelease),
+    ) {
+        for pin in self.take_all() {
+            match registry.release_internal(pin) {
+                Ok(Some(final_release)) => sink(final_release),
+                Ok(None) => {}
+                Err(error) => {
+                    panic!(
+                        "unmapped lease pin release violated generic object invariants: {error:?}"
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl Drop for UnmappedLeasePins {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            extern crate std;
+            // A failing host test unwinds through its pins; a second panic
+            // would abort the whole test binary.
+            if std::thread::panicking() {
+                return;
+            }
+        }
+        if self.count != 0 {
+            // The pins are leaked with the panic: their objects stay alive,
+            // which is the safe side of the failure.
+            panic!("unmapped lease pins were dropped before their removal was acknowledged");
+        }
+    }
+}
+
 #[must_use = "mapping reference releases may contain final MemoryObject cleanup authority"]
 #[derive(Debug)]
 pub(crate) struct MappingFinalReleases {
     items: [Option<FinalRelease>; MAPPING_FINAL_RELEASE_CAPACITY],
     count: usize,
+    unmapped: UnmappedLeasePins,
 }
 
 impl MappingFinalReleases {
@@ -437,7 +533,37 @@ impl MappingFinalReleases {
         Self {
             items: core::array::from_fn(|_| None),
             count: 0,
+            unmapped: UnmappedLeasePins::empty(),
         }
+    }
+
+    fn push_unmapped(&mut self, pin: InternalRef) {
+        self.unmapped.push(pin);
+    }
+
+    /// Releases the unmapped lease pins now, into this batch. Only for a path
+    /// where no other CPU can hold a translation of the removed range: the
+    /// teardown of a quiesced Process no CPU is resident on, a rollback of
+    /// mappings no CPU has entered, or a host model that publishes no
+    /// shootdown. The batch keeps its `2 * BATCH + 1` bound: these pins were
+    /// part of it before they were held.
+    pub(crate) fn settle_locally<const REGISTRY_OBJECTS: usize>(
+        mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+    ) -> Self {
+        let mut unmapped = core::mem::replace(&mut self.unmapped, UnmappedLeasePins::empty());
+        unmapped.release(registry, |release| self.push(release));
+        self
+    }
+
+    /// The final releases and the unmapped lease pins, apart.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        [Option<FinalRelease>; MAPPING_FINAL_RELEASE_CAPACITY],
+        UnmappedLeasePins,
+    ) {
+        (self.items, self.unmapped)
     }
 
     fn push(&mut self, release: FinalRelease) {
@@ -454,11 +580,15 @@ impl MappingFinalReleases {
     }
 
     pub(crate) const fn is_empty(&self) -> bool {
-        self.count == 0
+        self.count == 0 && self.unmapped.is_empty()
     }
 
+    /// The final releases. Fails stop if unmapped lease pins remain: those
+    /// go through [`Self::into_parts`] or [`Self::settle_locally`] first.
     pub(crate) fn into_items(self) -> [Option<FinalRelease>; MAPPING_FINAL_RELEASE_CAPACITY] {
-        self.items
+        let (items, unmapped) = self.into_parts();
+        drop(unmapped);
+        items
     }
 }
 

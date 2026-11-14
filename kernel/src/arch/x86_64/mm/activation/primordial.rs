@@ -3078,12 +3078,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .cancel_table_candidate(candidate)
                 .unwrap_or_else(|_| panic!("primordial teardown table reclaim drifted"));
         }
-        result.unwrap_or_else(|failure| {
-            panic!(
-                "primordial live mapping teardown diverged: {:?}",
-                failure.error()
-            )
-        })
+        // Primordial construction runs on this CPU alone and its publisher
+        // invalidates locally, so the unmapped lease pins are released now.
+        result
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "primordial live mapping teardown diverged: {:?}",
+                    failure.error()
+                )
+            })
+            .settle_locally(registry)
     }
 }
 
@@ -5319,6 +5323,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);
             }
+            // The Process is quiesced and no CPU is resident on its root, so
+            // no TLB can hold the removed translations: the unmapped lease
+            // pins are released now.
+            let releases = releases.settle_locally(&mut self.core.registry);
             for release in releases.into_items().into_iter().flatten() {
                 self.core.cleanup.push(release);
             }
@@ -5405,6 +5413,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);
             }
+            // The Process is quiesced and no CPU is resident on its root, so
+            // no TLB can hold the removed translations: the unmapped lease
+            // pins are released now.
+            let releases = releases.settle_locally(&mut self.core.registry);
             for release in releases.into_items().into_iter().flatten() {
                 self.core.cleanup.push(release);
             }
@@ -8898,7 +8910,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         status: deepwyrm_abi::DwStatus,
         last: bool,
     ) -> FamilyGBegun {
-        held.merge(settlement, &mut self.core.cleanup);
+        held.merge(settlement, &mut self.core.registry, &mut self.core.cleanup);
         if !last {
             self.drain_step_finalizers();
             return FamilyGBegun::Stepped { phase, status };
@@ -8914,12 +8926,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         initiator: ShootdownInitiatorGuard<'static>,
         driver: user_access::LiveTlbShootdownDriver,
         held: &mut crate::syscall::HeldReleases<REGISTRY_OBJECTS>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
         cleanup: &mut crate::syscall::CleanupQueue<CLEANUP>,
     ) -> Option<FamilyGShootdown> {
         match published {
             crate::memory::address_region::PublishedShootdown::Settled(settlement) => {
                 let settlement = initiator.release(settlement);
-                held.merge(settlement, cleanup);
+                held.merge(settlement, registry, cleanup);
                 None
             }
             crate::memory::address_region::PublishedShootdown::Pending(pending) => {
@@ -9351,6 +9364,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             initiator,
                             driver,
                             held,
+                            &mut self.core.registry,
                             &mut self.core.cleanup,
                         );
                         result
@@ -9450,6 +9464,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 initiator,
                 driver,
                 held,
+                &mut self.core.registry,
                 &mut self.core.cleanup,
             );
             (status, shootdown)
@@ -9543,6 +9558,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 initiator,
                 driver,
                 held,
+                &mut self.core.registry,
                 &mut self.core.cleanup,
             );
             (status, shootdown)

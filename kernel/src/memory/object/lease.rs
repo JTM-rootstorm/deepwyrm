@@ -321,6 +321,9 @@ impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGIST
     /// Finalizes reference ownership only after page-table publication.
     /// Existing pins transfer where possible; surplus pins are released only
     /// after every replacement lease has acquired its exact lifetime owner.
+    /// The pins of removed leases come back unreleased, as
+    /// [`super::UnmappedLeasePins`]: remote TLBs may still map their frames
+    /// until the shootdown settles.
     pub(in super::super) fn commit(mut self) -> MappingFinalReleases {
         let mut released_records: [Option<LeaseRecord>; BATCH] = core::array::from_fn(|_| None);
         for (position, record) in released_records
@@ -363,8 +366,10 @@ impl<const OBJECTS: usize, const LEASES: usize, const BATCH: usize, const REGIST
         }
 
         let mut final_releases = MappingFinalReleases::empty();
+        // Removed leases keep their pins until the removal is acknowledged
+        // (H0 §12.6): the caller releases them on the settlement.
         for record in released_records.into_iter().flatten() {
-            release_internal_pin(self.registry, record.pin, &mut final_releases);
+            final_releases.push_unmapped(record.pin);
         }
         if let Some(authorization) = self.authorization.take() {
             release_map_authorization(self.registry, authorization, &mut final_releases);

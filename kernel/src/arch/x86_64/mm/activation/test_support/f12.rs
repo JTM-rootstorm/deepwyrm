@@ -170,18 +170,23 @@ fn publish_execution(
     &target.execution
 }
 
-fn require_clean_mapping(
+fn require_clean_mapping<const REGISTRY: usize>(
     result: Result<
         crate::memory::object::MappingFinalReleases,
         crate::memory::address_region::AddressSpaceTransactionFailure<
             crate::arch::x86_64::mm::journal::X86AddressSpacePublishError<LiveActiveTargetError>,
         >,
     >,
+    registry: &mut crate::object::ObjectRegistry<REGISTRY>,
     detail: u32,
 ) {
     match result {
-        Ok(releases) if releases.is_empty() => {}
-        Ok(_) => fail(detail + 7),
+        // A single-CPU guest test publisher invalidates locally.
+        Ok(releases) => {
+            if !releases.settle_locally(registry).is_empty() {
+                fail(detail + 7)
+            }
+        }
         Err(failure) => {
             let (error, _releases) = failure.into_parts();
             match error {
@@ -295,7 +300,7 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     tasks
         .release_process_operation(lease)
         .unwrap_or_else(|_| fail(detail + 3));
-    require_clean_mapping(result, detail + 3);
+    require_clean_mapping(result, registry, detail + 3);
 }
 
 #[allow(
@@ -337,7 +342,7 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     tasks
         .release_process_operation(lease)
         .unwrap_or_else(|_| fail(detail + 2));
-    require_clean_mapping(result, detail + 2);
+    require_clean_mapping(result, registry, detail + 2);
 }
 
 #[allow(
@@ -1344,6 +1349,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     address,
                     PAGE_SIZE,
                 ),
+                &mut self.registry,
                 detail + 2,
             );
         }

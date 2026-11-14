@@ -840,6 +840,7 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
                     BASE_PAGE_SIZE,
                 )
                 .unwrap()
+                .settle_locally(&mut registry)
                 .is_empty()
         );
         assert!(
@@ -853,6 +854,7 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
                     Protection::READ_EXECUTE,
                 )
                 .unwrap()
+                .settle_locally(&mut registry)
                 .is_empty()
         );
         assert_eq!(region.mappings().iter().flatten().count(), 1);
@@ -911,6 +913,7 @@ fn address_region_bridge_commits_replacements_and_rolls_back_target_failure() {
                     Protection::READ_EXECUTE,
                 )
                 .unwrap()
+                .settle_locally(&mut registry)
                 .is_empty()
         );
     }
@@ -1054,7 +1057,8 @@ fn one_page_map_unmap_rounds_never_accumulate_publisher_capacity() {
                 0x4000,
                 BASE_PAGE_SIZE,
             )
-            .unwrap_or_else(|failure| panic!("round {round} unmap failed: {:?}", failure.error()));
+            .unwrap_or_else(|failure| panic!("round {round} unmap failed: {:?}", failure.error()))
+            .settle_locally(&mut registry);
         assert!(unmapped.is_empty());
         assert_eq!(objects.active_lease_count(), 0);
         assert!(region.mappings().iter().all(Option::is_none));
@@ -1670,6 +1674,7 @@ fn a_backing_split_across_runs_maps_each_page_to_its_run() {
                 3 * BASE_PAGE_SIZE,
             )
             .unwrap_or_else(|failure| panic!("unmap failed: {:?}", failure.error()))
+            .settle_locally(&mut registry)
             .is_empty()
     );
     assert_eq!(objects.active_lease_count(), 0);

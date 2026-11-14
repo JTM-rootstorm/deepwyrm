@@ -173,7 +173,8 @@ impl PrimordialPlatform for HostPlatform {
         let mut publisher = PrimordialHostPublisher::for_region(region);
         let releases = region
             .unmap(memory, registry, &mut publisher, virtual_start, byte_len)
-            .expect("host rollback unmaps a committed primordial range");
+            .expect("host rollback unmaps a committed primordial range")
+            .settle_locally(registry);
         for release in releases.into_items().into_iter().flatten() {
             let finalization = memory.take_finalization(release).unwrap();
             let physical_start = finalization.backing_physical_start();

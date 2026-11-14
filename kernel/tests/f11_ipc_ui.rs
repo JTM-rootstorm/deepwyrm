@@ -157,7 +157,7 @@ fn f11_move_only_ipc_wait_time_and_architecture_contracts() {
         // on their shootdown's settlement, which cannot be forged.
         CompileFailCase {
             fixture: "d1_held_releases_merge_without_settlement.rs",
-            expected_error: "error[E0061]: this method takes 2 arguments but 1 argument was supplied",
+            expected_error: "error[E0061]: this method takes 3 arguments but 2 arguments were supplied",
         },
         CompileFailCase {
             fixture: "d1_nothing_published_forged.rs",
