@@ -1,16 +1,17 @@
 use deepwyrm_abi::{
-    DW_ABI_INFO_V1_SIZE, DW_ABI_VERSION, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_BASE_PAGE_SIZE,
-    DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD, DW_CHANNEL_RECEIVE_RESULT_V1_SIZE,
-    DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
-    DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE,
-    DW_PROCESS_CREATE_RESULT_V1_SIZE, DW_RECEIVED_HANDLE_INFO_V1_SIZE,
-    DW_TASK_GROUP_MEMORY_INFO_V1_SIZE, DW_TASK_TERMINATION_INFO_V1_SIZE,
-    DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE, DW_WAIT_RESULT_V1_SIZE, DwAbiInfoV1,
-    DwAddressRegionMapArgsV1, DwChannelReceiveResultV1, DwDeviceResourceInfoV1, DwHandle,
-    DwHandleTransferOperation, DwHandleTransferV1, DwInterruptInfoV1, DwMemoryObjectInfoV1,
-    DwObjectInfoV1, DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1,
-    DwRights, DwSignals, DwTaskGroupMemoryInfoV1, DwTaskTerminationInfoV1, DwThreadStartArgsV1,
-    DwWaitItemV1, DwWaitResultV1,
+    DW_ABI_FINGERPRINT, DW_ABI_INFO_V1_SIZE, DW_ABI_VERSION, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
+    DW_BASE_PAGE_SIZE, DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_HANDLE_TRANSFER_V1_SIZE,
+    DW_INTERRUPT_INFO_V1_SIZE, DW_KERNEL_LIMITS_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE,
+    DW_OBJECT_INFO_V1_SIZE, DW_PROCESS_CREATE_ARGS_V1_SIZE, DW_PROCESS_CREATE_RESULT_V1_SIZE,
+    DW_RECEIVED_HANDLE_INFO_V1_SIZE, DW_TASK_GROUP_MEMORY_INFO_V1_SIZE,
+    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_THREAD_START_ARGS_V1_SIZE, DW_WAIT_ITEM_V1_SIZE,
+    DW_WAIT_RESULT_V1_SIZE, DwAbiInfoV1, DwAddressRegionMapArgsV1, DwChannelReceiveResultV1,
+    DwDeviceResourceInfoV1, DwHandle, DwHandleTransferOperation, DwHandleTransferV1,
+    DwInterruptInfoV1, DwKernelLimitsV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
+    DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DwTaskGroupMemoryInfoV1, DwTaskTerminationInfoV1, DwThreadStartArgsV1, DwWaitItemV1,
+    DwWaitResultV1,
 };
 
 use crate::service::ObjectInfoResult;
@@ -77,7 +78,7 @@ pub(crate) fn encode_abi_info(feature_bits: u64) -> [u8; DW_ABI_INFO_V1_SIZE as 
         feature_bits,
         max_channel_payload: DW_CHANNEL_MAX_PAYLOAD,
         max_channel_handles: DW_CHANNEL_MAX_HANDLES,
-        reserved: [0; 4],
+        abi_fingerprint: DW_ABI_FINGERPRINT,
     };
     let mut bytes = [0; DW_ABI_INFO_V1_SIZE as usize];
     put_u32(&mut bytes, 0, info.size);
@@ -87,6 +88,58 @@ pub(crate) fn encode_abi_info(feature_bits: u64) -> [u8; DW_ABI_INFO_V1_SIZE as 
     put_u64(&mut bytes, 16, info.feature_bits);
     put_u32(&mut bytes, 24, info.max_channel_payload);
     put_u32(&mut bytes, 28, info.max_channel_handles);
+    bytes[32..64].copy_from_slice(&info.abi_fingerprint);
+    bytes
+}
+
+/// The running kernel's pool capacities (`kernel_get_limits`).
+pub(crate) fn encode_kernel_limits(
+    limits: &DwKernelLimitsV1,
+) -> [u8; DW_KERNEL_LIMITS_V1_SIZE as usize] {
+    let DwKernelLimitsV1 {
+        size,
+        version,
+        handles_per_process,
+        processes,
+        threads,
+        task_groups,
+        registry_objects,
+        memory_objects,
+        mapping_leases,
+        region_slots,
+        channel_pairs,
+        channel_depth,
+        wait_registrations,
+        timers,
+        events,
+        reserved0,
+        reserved,
+    } = *limits;
+    let mut bytes = [0; DW_KERNEL_LIMITS_V1_SIZE as usize];
+    let words = [
+        size,
+        version,
+        handles_per_process,
+        processes,
+        threads,
+        task_groups,
+        registry_objects,
+        memory_objects,
+        mapping_leases,
+        region_slots,
+        channel_pairs,
+        channel_depth,
+        wait_registrations,
+        timers,
+        events,
+        reserved0,
+    ];
+    for (index, word) in words.into_iter().enumerate() {
+        put_u32(&mut bytes, index * 4, word);
+    }
+    for (index, word) in reserved.into_iter().enumerate() {
+        put_u64(&mut bytes, 64 + index * 8, word);
+    }
     bytes
 }
 

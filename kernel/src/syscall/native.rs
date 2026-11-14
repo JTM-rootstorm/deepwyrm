@@ -13,6 +13,11 @@ pub(crate) enum NativeSyscallRequest {
         out_size: u64,
         out_required_size: DwUserAddress,
     },
+    KernelGetLimits {
+        out_info: DwUserAddress,
+        out_size: u64,
+        out_required_size: DwUserAddress,
+    },
     HandleClose {
         handle: DwHandle,
     },
@@ -281,6 +286,11 @@ impl NativeSyscallRequest {
                 out_size,
                 out_required_size,
             }
+            | Self::KernelGetLimits {
+                out_info,
+                out_size,
+                out_required_size,
+            }
             | Self::ObjectGetInfoV1 {
                 out_info,
                 out_size,
@@ -442,6 +452,11 @@ fn decode_decoded(decoded: DecodedSyscall) -> Result<NativeSyscallRequest, DwSta
     let a = decoded.arguments().as_array();
     let request = match decoded.identity() {
         DwKnownSyscall::AbiGetInfo => NativeSyscallRequest::AbiGetInfo {
+            out_info: DwUserAddress(a[0]),
+            out_size: a[1],
+            out_required_size: DwUserAddress(a[2]),
+        },
+        DwKnownSyscall::KernelGetLimits => NativeSyscallRequest::KernelGetLimits {
             out_info: DwUserAddress(a[0]),
             out_size: a[1],
             out_required_size: DwUserAddress(a[2]),
@@ -789,6 +804,16 @@ pub(crate) trait NativeSyscallServices {
         out_size: u64,
         out_required_size: DwUserAddress,
     ) -> NativeSyscallResult;
+    /// `kernel_get_limits`. The live runtime serves it guard-free beside
+    /// `abi_get_info`; a runtime without fixed pools refuses it.
+    fn kernel_get_limits(
+        &mut self,
+        _out_info: DwUserAddress,
+        _out_size: u64,
+        _out_required_size: DwUserAddress,
+    ) -> NativeSyscallResult {
+        NativeSyscallResult::returning(DW_STATUS_NOT_SUPPORTED)
+    }
     fn handle_close(&mut self, handle: DwHandle) -> NativeSyscallResult;
     fn handle_duplicate(
         &mut self,
@@ -1094,6 +1119,11 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
                 out_size,
                 out_required_size,
             } => self.abi_get_info(out_info, out_size, out_required_size),
+            NativeSyscallRequest::KernelGetLimits {
+                out_info,
+                out_size,
+                out_required_size,
+            } => self.kernel_get_limits(out_info, out_size, out_required_size),
             NativeSyscallRequest::HandleClose { handle } => self.handle_close(handle),
             NativeSyscallRequest::HandleDuplicate {
                 handle,

@@ -45,6 +45,37 @@ pub(super) fn render_rust(model: &Model) -> Result<String> {
         model.abi.version
     )
     .unwrap();
+    let digest = sha256(canonical_form(model).as_bytes());
+    writeln!(
+        out,
+        "/// The semantic ABI fingerprint (`abi_fingerprint.toml`) as bytes. It is\n\
+         /// the descriptor of the `.note.deepwyrm.abi` ELF note every native binary\n\
+         /// carries, and `abi_get_info` reports the running kernel's in\n\
+         /// `DwAbiInfoV1::abi_fingerprint`.\n\
+         pub const DW_ABI_FINGERPRINT: [u8; 32] = {digest:?};\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// `DW_ABI_FINGERPRINT` as four little-endian words, for assemblers.\n\
+         pub const DW_ABI_FINGERPRINT_WORDS: [u64; 4] = [{}];\n",
+        fingerprint_words(&digest)
+            .iter()
+            .map(|word| format!("{word:#018x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "/// Owner name of the ABI note, NUL-terminated as ELF requires.\n\
+         pub const DW_ABI_NOTE_NAME: [u8; {}] = *b\"{}\\0\";\n\n\
+         /// Type of the ABI note whose descriptor is `DW_ABI_FINGERPRINT`.\n\
+         pub const DW_ABI_NOTE_TYPE_FINGERPRINT: u32 = {ABI_NOTE_TYPE_FINGERPRINT};\n",
+        ABI_NOTE_NAME.len() + 1,
+        ABI_NOTE_NAME
+    )
+    .unwrap();
 
     for item in &model.newtypes {
         writeln!(out, "/// {}", item.doc).unwrap();
@@ -434,6 +465,31 @@ pub(super) fn render_c(model: &Model) -> Result<String> {
         out,
         "#define DW_ABI_VERSION UINT32_C({})\n",
         model.abi.version
+    )
+    .unwrap();
+    let digest = sha256(canonical_form(model).as_bytes());
+    writeln!(
+        out,
+        "/* The semantic ABI fingerprint as the descriptor bytes of the\n * `.note.deepwyrm.abi` ELF note, and as four little-endian words. */"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "#define DW_ABI_FINGERPRINT_BYTES {}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:#04x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .unwrap();
+    for (index, word) in fingerprint_words(&digest).iter().enumerate() {
+        writeln!(out, "#define DW_ABI_FINGERPRINT_WORD{index} {word:#018x}").unwrap();
+    }
+    writeln!(out, "#define DW_ABI_NOTE_NAME \"{ABI_NOTE_NAME}\"").unwrap();
+    writeln!(
+        out,
+        "#define DW_ABI_NOTE_TYPE_FINGERPRINT {ABI_NOTE_TYPE_FINGERPRINT}\n"
     )
     .unwrap();
     let layouts = type_layouts(&model.newtypes);

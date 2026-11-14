@@ -17,6 +17,16 @@
 
 #define DW_ABI_VERSION UINT32_C(0)
 
+/* The semantic ABI fingerprint as the descriptor bytes of the
+ * `.note.deepwyrm.abi` ELF note, and as four little-endian words. */
+#define DW_ABI_FINGERPRINT_BYTES 0x5a, 0xa0, 0x45, 0xd0, 0xe7, 0x32, 0x8b, 0x15, 0xa9, 0xe2, 0x5a, 0xfd, 0x6c, 0x3a, 0xa9, 0xc3, 0x81, 0xe4, 0x81, 0x22, 0x0b, 0xe0, 0x50, 0xb8, 0xf9, 0xf4, 0x42, 0x22, 0x94, 0xd1, 0xfc, 0x44
+#define DW_ABI_FINGERPRINT_WORD0 0x158b32e7d045a05a
+#define DW_ABI_FINGERPRINT_WORD1 0xc3a93a6cfd5ae2a9
+#define DW_ABI_FINGERPRINT_WORD2 0xb850e00b2281e481
+#define DW_ABI_FINGERPRINT_WORD3 0x44fcd1942242f4f9
+#define DW_ABI_NOTE_NAME "Deepwyrm"
+#define DW_ABI_NOTE_TYPE_FINGERPRINT 1
+
 /* Signed native status value; zero is success and negative values are failures. */
 typedef int32_t DwStatus;
 
@@ -642,6 +652,8 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 
 /* Write DwAbiInfoV1 and report required size without relying on a release string. */
 #define DW_SYSCALL_ABI_GET_INFO ((DwSyscallId)(UINT32_C(0x00000001)))
+/* Write DwKernelLimitsV1 and report required size; no handle or right is required. */
+#define DW_SYSCALL_KERNEL_GET_LIMITS ((DwSyscallId)(UINT32_C(0x00000002)))
 /* Close one caller-local handle; no right is required beyond possession. */
 #define DW_SYSCALL_HANDLE_CLOSE ((DwSyscallId)(UINT32_C(0x00000010)))
 /* Create a duplicate with a nonzero rights subset; zero or escalating rights fail. */
@@ -1081,8 +1093,8 @@ typedef struct DwAbiInfoV1 {
     uint32_t max_channel_payload;
     /* Maximum handles per channel message. */
     uint32_t max_channel_handles;
-    /* Reserved; all elements must be zero. */
-    uint64_t reserved[4];
+    /* The running kernel's semantic ABI fingerprint, DW_ABI_FINGERPRINT; a native binary's .note.deepwyrm.abi carries the one it was built for. */
+    uint8_t abi_fingerprint[32];
 } DwAbiInfoV1;
 #define DW_ABI_INFO_V1_SIZE ((uint32_t)(64))
 DW_STATIC_ASSERT(sizeof(DwAbiInfoV1) == 64, "DwAbiInfoV1 size");
@@ -1094,7 +1106,65 @@ DW_STATIC_ASSERT(offsetof(DwAbiInfoV1, page_size) == 12, "DwAbiInfoV1.page_size 
 DW_STATIC_ASSERT(offsetof(DwAbiInfoV1, feature_bits) == 16, "DwAbiInfoV1.feature_bits offset");
 DW_STATIC_ASSERT(offsetof(DwAbiInfoV1, max_channel_payload) == 24, "DwAbiInfoV1.max_channel_payload offset");
 DW_STATIC_ASSERT(offsetof(DwAbiInfoV1, max_channel_handles) == 28, "DwAbiInfoV1.max_channel_handles offset");
-DW_STATIC_ASSERT(offsetof(DwAbiInfoV1, reserved) == 32, "DwAbiInfoV1.reserved offset");
+DW_STATIC_ASSERT(offsetof(DwAbiInfoV1, abi_fingerprint) == 32, "DwAbiInfoV1.abi_fingerprint offset");
+
+/* Capacities of the running kernel's object pools, written by kernel_get_limits. A capacity is the most that may exist at once across every TaskGroup; TaskGroup limits divide it. */
+typedef struct DwKernelLimitsV1 {
+    /* Byte size of this structure. */
+    uint32_t size;
+    /* Structure version; set to one. */
+    uint32_t version;
+    /* Handle-table entries each Process has. */
+    uint32_t handles_per_process;
+    /* Processes that may exist at once. */
+    uint32_t processes;
+    /* Threads that may exist at once. */
+    uint32_t threads;
+    /* TaskGroups that may exist at once. */
+    uint32_t task_groups;
+    /* Kernel objects of every type that may exist at once. */
+    uint32_t registry_objects;
+    /* MemoryObjects that may exist at once. */
+    uint32_t memory_objects;
+    /* Mappings of MemoryObjects that may exist at once. */
+    uint32_t mapping_leases;
+    /* Mapping slots in each address region. */
+    uint32_t region_slots;
+    /* Channel pairs that may exist at once. */
+    uint32_t channel_pairs;
+    /* Messages one Channel endpoint may queue. */
+    uint32_t channel_depth;
+    /* Wait registrations that may exist at once. */
+    uint32_t wait_registrations;
+    /* Timers that may exist at once. */
+    uint32_t timers;
+    /* Events that may exist at once. */
+    uint32_t events;
+    /* Reserved; must be zero. */
+    uint32_t reserved0;
+    /* Reserved; all elements must be zero. */
+    uint64_t reserved[4];
+} DwKernelLimitsV1;
+#define DW_KERNEL_LIMITS_V1_SIZE ((uint32_t)(96))
+DW_STATIC_ASSERT(sizeof(DwKernelLimitsV1) == 96, "DwKernelLimitsV1 size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwKernelLimitsV1) == 8, "DwKernelLimitsV1 alignment");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, size) == 0, "DwKernelLimitsV1.size offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, version) == 4, "DwKernelLimitsV1.version offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, handles_per_process) == 8, "DwKernelLimitsV1.handles_per_process offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, processes) == 12, "DwKernelLimitsV1.processes offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, threads) == 16, "DwKernelLimitsV1.threads offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, task_groups) == 20, "DwKernelLimitsV1.task_groups offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, registry_objects) == 24, "DwKernelLimitsV1.registry_objects offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, memory_objects) == 28, "DwKernelLimitsV1.memory_objects offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, mapping_leases) == 32, "DwKernelLimitsV1.mapping_leases offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, region_slots) == 36, "DwKernelLimitsV1.region_slots offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, channel_pairs) == 40, "DwKernelLimitsV1.channel_pairs offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, channel_depth) == 44, "DwKernelLimitsV1.channel_depth offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, wait_registrations) == 48, "DwKernelLimitsV1.wait_registrations offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, timers) == 52, "DwKernelLimitsV1.timers offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, events) == 56, "DwKernelLimitsV1.events offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, reserved0) == 60, "DwKernelLimitsV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwKernelLimitsV1, reserved) == 64, "DwKernelLimitsV1.reserved offset");
 
 /* Basic rights-controlled object information returned by object_get_info_v1. */
 typedef struct DwObjectInfoV1 {

@@ -27,6 +27,7 @@ impl DwSyscallImplementationPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DwKnownSyscall {
     AbiGetInfo,
+    KernelGetLimits,
     HandleClose,
     HandleDuplicate,
     ObjectGetInfoV1,
@@ -75,6 +76,7 @@ impl DwKnownSyscall {
     pub const fn from_id(id: DwSyscallId) -> Option<Self> {
         match id.0 {
             0x00000001 => Some(Self::AbiGetInfo),
+            0x00000002 => Some(Self::KernelGetLimits),
             0x00000010 => Some(Self::HandleClose),
             0x00000011 => Some(Self::HandleDuplicate),
             0x00000012 => Some(Self::ObjectGetInfoV1),
@@ -124,6 +126,7 @@ impl DwKnownSyscall {
     pub const fn id(self) -> DwSyscallId {
         match self {
             Self::AbiGetInfo => DwSyscallId(0x00000001),
+            Self::KernelGetLimits => DwSyscallId(0x00000002),
             Self::HandleClose => DwSyscallId(0x00000010),
             Self::HandleDuplicate => DwSyscallId(0x00000011),
             Self::ObjectGetInfoV1 => DwSyscallId(0x00000012),
@@ -172,6 +175,7 @@ impl DwKnownSyscall {
     pub const fn implementation_phase(self) -> DwSyscallImplementationPhase {
         match self {
             Self::AbiGetInfo => DwSyscallImplementationPhase::Dw0A,
+            Self::KernelGetLimits => DwSyscallImplementationPhase::Dw2M,
             Self::HandleClose => DwSyscallImplementationPhase::Dw0D,
             Self::HandleDuplicate => DwSyscallImplementationPhase::Dw0D,
             Self::ObjectGetInfoV1 => DwSyscallImplementationPhase::Dw0D,
@@ -220,6 +224,7 @@ impl DwKnownSyscall {
     pub const fn argument_count(self) -> u8 {
         match self {
             Self::AbiGetInfo => 3,
+            Self::KernelGetLimits => 3,
             Self::HandleClose => 1,
             Self::HandleDuplicate => 3,
             Self::ObjectGetInfoV1 => 5,

@@ -308,7 +308,10 @@ fn abi_get_info_reports_size_and_writes_only_after_pointer_validation() {
         ),
         DW_STATUS_BUFFER_TOO_SMALL
     );
-    assert_eq!(u64_at(&user, BASE + 0x20), u64::from(DW_ABI_INFO_V1_SIZE));
+    assert_eq!(
+        u64_at(&user, BASE + 0x20),
+        u64::from(deepwyrm_abi::DW_ABI_INFO_V1_SIZE)
+    );
     assert_eq!(&user.bytes[0x100..0x140], &[0; 64]);
 
     user.deny_write = true;
@@ -319,6 +322,56 @@ fn abi_get_info_reports_size_and_writes_only_after_pointer_validation() {
             DwUserAddress(BASE + 0x100),
             64,
             DwUserAddress(BASE + 0x20),
+        ),
+        DW_STATUS_BAD_ADDRESS
+    );
+    assert_eq!(user.bytes, before);
+}
+
+#[test]
+fn kernel_get_limits_shares_the_discovery_contract() {
+    let limits = deepwyrm_abi::DwKernelLimitsV1 {
+        size: deepwyrm_abi::DW_KERNEL_LIMITS_V1_SIZE,
+        version: 1,
+        handles_per_process: 96,
+        ..Default::default()
+    };
+    let mut user = FakeUserMemory::new();
+    assert_eq!(
+        kernel_get_limits_with(
+            &mut user,
+            DwUserAddress(BASE + 0x100),
+            64,
+            DwUserAddress(BASE + 0x20),
+            &limits,
+        ),
+        DW_STATUS_BUFFER_TOO_SMALL
+    );
+    assert_eq!(u64_at(&user, BASE + 0x20), 96);
+    assert_eq!(&user.bytes[0x100..0x160], &[0; 96]);
+
+    assert_eq!(
+        kernel_get_limits_with(
+            &mut user,
+            DwUserAddress(BASE + 0x100),
+            96,
+            DwUserAddress(BASE + 0x20),
+            &limits,
+        ),
+        DW_STATUS_SUCCESS
+    );
+    assert_eq!(&user.bytes[0x100..0x104], &96_u32.to_le_bytes());
+    assert_eq!(&user.bytes[0x108..0x10c], &96_u32.to_le_bytes());
+
+    user.deny_write = true;
+    let before = user.bytes;
+    assert_eq!(
+        kernel_get_limits_with(
+            &mut user,
+            DwUserAddress(BASE + 0x200),
+            96,
+            DwUserAddress(BASE + 0x20),
+            &limits,
         ),
         DW_STATUS_BAD_ADDRESS
     );

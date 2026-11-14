@@ -25,6 +25,22 @@ use super::*;
 /// Generated file carrying the fingerprint beside the other ABI artifacts.
 pub(super) const FINGERPRINT_FILE: &str = "abi_fingerprint.toml";
 
+/// Owner name of the ELF note that stamps a native binary with the
+/// fingerprint (`OS_STACK_ARCHITECTURE_PLAN.md` V1). The note's descriptor is
+/// the 32 digest bytes; its type is [`ABI_NOTE_TYPE_FINGERPRINT`].
+pub(super) const ABI_NOTE_NAME: &str = "Deepwyrm";
+pub(super) const ABI_NOTE_TYPE_FINGERPRINT: u32 = 1;
+
+/// The digest as four little-endian words, in order.
+pub(super) fn fingerprint_words(digest: &[u8; 32]) -> [u64; 4] {
+    let (chunks, _) = digest.as_chunks::<8>();
+    let mut words = [0; 4];
+    for (word, bytes) in words.iter_mut().zip(chunks) {
+        *word = u64::from_le_bytes(*bytes);
+    }
+    words
+}
+
 /// Identity of the encoding below; bump it whenever the encoding changes.
 pub(super) const FINGERPRINT_SCHEMA: &str = "deepwyrm-abi-fingerprint-v1";
 

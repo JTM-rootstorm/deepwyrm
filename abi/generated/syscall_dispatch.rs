@@ -17,6 +17,12 @@ pub const DW_SYSCALL_DISPATCH_METADATA: &[DwSyscallDispatchMetadata] = &[
         argument_count: 3,
     },
     DwSyscallDispatchMetadata {
+        number: 0x00000002,
+        name: "kernel_get_limits",
+        implementation_phase: "DW2-M",
+        argument_count: 3,
+    },
+    DwSyscallDispatchMetadata {
         number: 0x00000010,
         name: "handle_close",
         implementation_phase: "DW0-D",

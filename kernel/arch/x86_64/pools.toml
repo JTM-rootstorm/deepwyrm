@@ -1,0 +1,30 @@
+schema = "deepwyrm-x86_64-pools"
+version = 1
+
+# The production kernel's object pools (root OS_STACK_ARCHITECTURE_PLAN.md C1).
+# The kernel builds its pools from this file and reports them through
+# `kernel_get_limits`; Wyrmroot's product build reads it from the paired
+# checkout and fails when the product's demand does not fit. The kernel holds
+# no census of Wyrmroot's roles: the demand ledger is Wyrmroot's
+# (`tools/xtask/src/kernel_demand.rs`). C2 replaces these fixed counts with
+# pools carved at boot; until then they are the capacity every product gets.
+
+# Handle-table entries in each Process.
+handles_per_process = 96
+# Processes, Threads, TaskGroups and address spaces each; one pool size until
+# C3 splits them. A Thread needs one of the `task_layout.toml` kernel stacks,
+# so this may not exceed `thread_kernel_stack_count`.
+identities = 32
+# Kernel objects of every type at once.
+registry_objects = 640
+memory_objects = 384
+mapping_leases = 320
+# Mapping slots in each address region. A job may map an object into every
+# slot, and xtask kernel-check bounds the map path's stack at this count.
+region_slots = 64
+channel_pairs = 96
+# Messages one Channel endpoint queues (P1 makes this per pair).
+channel_depth = 2
+wait_registrations = 160
+timers = 2
+events = 1

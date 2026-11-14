@@ -4,6 +4,21 @@
 /// Native Deepwyrm ABI version.
 pub const DW_ABI_VERSION: u32 = 0;
 
+/// The semantic ABI fingerprint (`abi_fingerprint.toml`) as bytes. It is
+/// the descriptor of the `.note.deepwyrm.abi` ELF note every native binary
+/// carries, and `abi_get_info` reports the running kernel's in
+/// `DwAbiInfoV1::abi_fingerprint`.
+pub const DW_ABI_FINGERPRINT: [u8; 32] = [90, 160, 69, 208, 231, 50, 139, 21, 169, 226, 90, 253, 108, 58, 169, 195, 129, 228, 129, 34, 11, 224, 80, 184, 249, 244, 66, 34, 148, 209, 252, 68];
+
+/// `DW_ABI_FINGERPRINT` as four little-endian words, for assemblers.
+pub const DW_ABI_FINGERPRINT_WORDS: [u64; 4] = [0x158b32e7d045a05a, 0xc3a93a6cfd5ae2a9, 0xb850e00b2281e481, 0x44fcd1942242f4f9];
+
+/// Owner name of the ABI note, NUL-terminated as ELF requires.
+pub const DW_ABI_NOTE_NAME: [u8; 9] = *b"Deepwyrm\0";
+
+/// Type of the ABI note whose descriptor is `DW_ABI_FINGERPRINT`.
+pub const DW_ABI_NOTE_TYPE_FINGERPRINT: u32 = 1;
+
 /// Signed native status value; zero is success and negative values are failures.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -780,6 +795,9 @@ pub const DW_DMA_ACCESS_SUPPORTED_MASK: u32 = 3;
 /// Write DwAbiInfoV1 and report required size without relying on a release string.
 pub const DW_SYSCALL_ABI_GET_INFO: DwSyscallId = DwSyscallId(0x00000001);
 
+/// Write DwKernelLimitsV1 and report required size; no handle or right is required.
+pub const DW_SYSCALL_KERNEL_GET_LIMITS: DwSyscallId = DwSyscallId(0x00000002);
+
 /// Close one caller-local handle; no right is required beyond possession.
 pub const DW_SYSCALL_HANDLE_CLOSE: DwSyscallId = DwSyscallId(0x00000010);
 
@@ -1176,11 +1194,53 @@ pub struct DwAbiInfoV1 {
     pub max_channel_payload: u32,
     /// Maximum handles per channel message.
     pub max_channel_handles: u32,
+    /// The running kernel's semantic ABI fingerprint, DW_ABI_FINGERPRINT; a native binary's .note.deepwyrm.abi carries the one it was built for.
+    pub abi_fingerprint: [u8; 32],
+}
+
+pub const DW_ABI_INFO_V1_SIZE: u32 = 64;
+
+/// Capacities of the running kernel's object pools, written by kernel_get_limits. A capacity is the most that may exist at once across every TaskGroup; TaskGroup limits divide it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DwKernelLimitsV1 {
+    /// Byte size of this structure.
+    pub size: u32,
+    /// Structure version; set to one.
+    pub version: u32,
+    /// Handle-table entries each Process has.
+    pub handles_per_process: u32,
+    /// Processes that may exist at once.
+    pub processes: u32,
+    /// Threads that may exist at once.
+    pub threads: u32,
+    /// TaskGroups that may exist at once.
+    pub task_groups: u32,
+    /// Kernel objects of every type that may exist at once.
+    pub registry_objects: u32,
+    /// MemoryObjects that may exist at once.
+    pub memory_objects: u32,
+    /// Mappings of MemoryObjects that may exist at once.
+    pub mapping_leases: u32,
+    /// Mapping slots in each address region.
+    pub region_slots: u32,
+    /// Channel pairs that may exist at once.
+    pub channel_pairs: u32,
+    /// Messages one Channel endpoint may queue.
+    pub channel_depth: u32,
+    /// Wait registrations that may exist at once.
+    pub wait_registrations: u32,
+    /// Timers that may exist at once.
+    pub timers: u32,
+    /// Events that may exist at once.
+    pub events: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
     /// Reserved; all elements must be zero.
     pub reserved: [u64; 4],
 }
 
-pub const DW_ABI_INFO_V1_SIZE: u32 = 64;
+pub const DW_KERNEL_LIMITS_V1_SIZE: u32 = 96;
 
 /// Basic rights-controlled object information returned by object_get_info_v1.
 #[repr(C)]
@@ -1708,7 +1768,26 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwAbiInfoV1, feature_bits), 16);
         assert_eq!(offset_of!(DwAbiInfoV1, max_channel_payload), 24);
         assert_eq!(offset_of!(DwAbiInfoV1, max_channel_handles), 28);
-        assert_eq!(offset_of!(DwAbiInfoV1, reserved), 32);
+        assert_eq!(offset_of!(DwAbiInfoV1, abi_fingerprint), 32);
+        assert_eq!(size_of::<DwKernelLimitsV1>(), 96);
+        assert_eq!(align_of::<DwKernelLimitsV1>(), 8);
+        assert_eq!(offset_of!(DwKernelLimitsV1, size), 0);
+        assert_eq!(offset_of!(DwKernelLimitsV1, version), 4);
+        assert_eq!(offset_of!(DwKernelLimitsV1, handles_per_process), 8);
+        assert_eq!(offset_of!(DwKernelLimitsV1, processes), 12);
+        assert_eq!(offset_of!(DwKernelLimitsV1, threads), 16);
+        assert_eq!(offset_of!(DwKernelLimitsV1, task_groups), 20);
+        assert_eq!(offset_of!(DwKernelLimitsV1, registry_objects), 24);
+        assert_eq!(offset_of!(DwKernelLimitsV1, memory_objects), 28);
+        assert_eq!(offset_of!(DwKernelLimitsV1, mapping_leases), 32);
+        assert_eq!(offset_of!(DwKernelLimitsV1, region_slots), 36);
+        assert_eq!(offset_of!(DwKernelLimitsV1, channel_pairs), 40);
+        assert_eq!(offset_of!(DwKernelLimitsV1, channel_depth), 44);
+        assert_eq!(offset_of!(DwKernelLimitsV1, wait_registrations), 48);
+        assert_eq!(offset_of!(DwKernelLimitsV1, timers), 52);
+        assert_eq!(offset_of!(DwKernelLimitsV1, events), 56);
+        assert_eq!(offset_of!(DwKernelLimitsV1, reserved0), 60);
+        assert_eq!(offset_of!(DwKernelLimitsV1, reserved), 64);
         assert_eq!(size_of::<DwObjectInfoV1>(), 56);
         assert_eq!(align_of::<DwObjectInfoV1>(), 8);
         assert_eq!(offset_of!(DwObjectInfoV1, size), 0);
@@ -2071,6 +2150,7 @@ mod generated_layout_tests {
         assert_eq!(DW_DMA_ACCESS_DEVICE_WRITE, 2);
         assert_eq!(DW_DMA_ACCESS_SUPPORTED_MASK, 3);
         assert_eq!(DW_SYSCALL_ABI_GET_INFO.0, 0x00000001);
+        assert_eq!(DW_SYSCALL_KERNEL_GET_LIMITS.0, 0x00000002);
         assert_eq!(DW_SYSCALL_HANDLE_CLOSE.0, 0x00000010);
         assert_eq!(DW_SYSCALL_HANDLE_DUPLICATE.0, 0x00000011);
         assert_eq!(DW_SYSCALL_OBJECT_GET_INFO_V1.0, 0x00000012);

@@ -52,6 +52,7 @@ fn run() -> Result<(), String> {
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR")?);
     let layout_path = manifest_dir.join("arch/x86_64/layout.toml");
     let task_layout_path = manifest_dir.join("arch/x86_64/task_layout.toml");
+    let pools_path = manifest_dir.join("arch/x86_64/pools.toml");
     let linker_path = manifest_dir.join("arch/x86_64/linker.ld");
     let entry_path = manifest_dir.join("src/arch/x86_64/entry.S");
     let exceptions_path = manifest_dir.join("src/arch/x86_64/exceptions.S");
@@ -71,6 +72,7 @@ fn run() -> Result<(), String> {
 
     println!("cargo:rerun-if-changed={}", layout_path.display());
     println!("cargo:rerun-if-changed={}", task_layout_path.display());
+    println!("cargo:rerun-if-changed={}", pools_path.display());
     println!("cargo:rerun-if-changed={}", linker_path.display());
     println!("cargo:rerun-if-changed={}", entry_path.display());
     println!("cargo:rerun-if-changed={}", exceptions_path.display());
@@ -142,7 +144,12 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
     let task_layout = TaskLayout::parse(&task_layout_source)
         .map_err(|error| format!("{}: {error}", task_layout_path.display()))?;
+    let pools_source = fs::read_to_string(&pools_path)
+        .map_err(|error| format!("{}: {error}", pools_path.display()))?;
+    let pools = Pools::parse(&pools_source, task_layout)
+        .map_err(|error| format!("{}: {error}", pools_path.display()))?;
     emit_task_layout_env(task_layout);
+    pools.emit_env();
 
     configure_guest_test(&guest_harness_path)?;
     if env::var("DEEPWYRM_GUEST_TEST_SELECTOR")
@@ -1668,6 +1675,93 @@ impl TaskLayout {
             terminal_reaper_stack_guard_size: terminal_guard,
             terminal_reaper_stack_alignment: terminal_alignment,
         })
+    }
+}
+
+/// The production kernel's pool capacities (`arch/x86_64/pools.toml`).
+#[allow(
+    dead_code,
+    reason = "the artifact contract tests include this build script and use only its layouts"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Pools {
+    pub(crate) values: [(&'static str, u32); POOL_KEYS.len()],
+}
+
+pub(crate) const POOL_KEYS: [&str; 11] = [
+    "handles_per_process",
+    "identities",
+    "registry_objects",
+    "memory_objects",
+    "mapping_leases",
+    "region_slots",
+    "channel_pairs",
+    "channel_depth",
+    "wait_registrations",
+    "timers",
+    "events",
+];
+
+#[allow(
+    dead_code,
+    reason = "the artifact contract tests include this build script and use only its layouts"
+)]
+impl Pools {
+    pub(crate) fn parse(source: &str, task_layout: TaskLayout) -> Result<Self, String> {
+        let values = parse_flat_toml(source)?;
+        let expected = ["schema", "version"]
+            .into_iter()
+            .chain(POOL_KEYS)
+            .collect::<BTreeSet<_>>();
+        let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if actual != expected {
+            let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+            let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+            return Err(format!(
+                "pool keys do not match contract; missing={missing:?}, unknown={unknown:?}"
+            ));
+        }
+        expect_string(&values, "schema", "deepwyrm-x86_64-pools")?;
+        expect_u64(&values, "version", 1)?;
+        let mut pools = Self {
+            values: POOL_KEYS.map(|key| (key, 0)),
+        };
+        for (key, slot) in POOL_KEYS
+            .iter()
+            .zip(pools.values.iter_mut().map(|(_, value)| value))
+        {
+            let value = parse_u64(required_value(&values, key)?)?;
+            let value = u32::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("`{key}` must be a nonzero 32-bit count"))?;
+            *slot = value;
+        }
+        if u64::from(pools.get("identities")) > task_layout.thread_kernel_stack_count {
+            return Err(format!(
+                "`identities` ({}) exceeds the {} thread kernel stacks of task_layout.toml; \
+                 every Thread needs one",
+                pools.get("identities"),
+                task_layout.thread_kernel_stack_count
+            ));
+        }
+        Ok(pools)
+    }
+
+    pub(crate) fn get(&self, key: &str) -> u32 {
+        self.values
+            .iter()
+            .find_map(|(name, value)| (*name == key).then_some(*value))
+            .unwrap_or(0)
+    }
+
+    fn emit_env(&self) {
+        for (key, value) in self.values {
+            println!(
+                "cargo:rustc-env=DEEPWYRM_POOL_{}={value}",
+                key.to_ascii_uppercase()
+            );
+        }
     }
 }
 

@@ -18,13 +18,49 @@ compile_error!("deepwyrm-syscall currently supports only x86_64 guests");
 
 // This is the generated, audited SysV-to-Deepwyrm register shuffle.  Keeping
 // it in the ABI output prevents guest users from reproducing the convention.
+//
+// The same block stamps the binary with the ABI it was built for: the
+// `.note.deepwyrm.abi` note (root `OS_STACK_ARCHITECTURE_PLAN.md` V1), whose
+// descriptor is `DW_ABI_FINGERPRINT`. Any binary that makes a syscall links
+// `dw_syscall6`, so it links this object and carries the note; loaders refuse
+// a binary without it. An unreferenced `SHT_NOTE` section outside a group is
+// kept by the linker's section garbage collection.
 global_asm!(
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../abi/generated/syscall_veneer_x86_64.S"
     )),
+    ".pushsection .note.deepwyrm.abi,\"a\",@note",
+    ".balign 4",
+    ".long {name_size}",
+    ".long {descriptor_size}",
+    ".long {note_type}",
+    ".asciz \"Deepwyrm\"",
+    ".balign 4",
+    ".quad {word0}",
+    ".quad {word1}",
+    ".quad {word2}",
+    ".quad {word3}",
+    ".popsection",
+    name_size = const DW_ABI_NOTE_NAME.len(),
+    descriptor_size = const DW_ABI_FINGERPRINT.len(),
+    note_type = const DW_ABI_NOTE_TYPE_FINGERPRINT,
+    word0 = const DW_ABI_FINGERPRINT_WORDS[0],
+    word1 = const DW_ABI_FINGERPRINT_WORDS[1],
+    word2 = const DW_ABI_FINGERPRINT_WORDS[2],
+    word3 = const DW_ABI_FINGERPRINT_WORDS[3],
     options(att_syntax)
 );
+// The assembler spells the owner name; this keeps it the generated one.
+const _: () = {
+    let name = b"Deepwyrm\0";
+    assert!(name.len() == DW_ABI_NOTE_NAME.len());
+    let mut index = 0;
+    while index < name.len() {
+        assert!(name[index] == DW_ABI_NOTE_NAME[index]);
+        index += 1;
+    }
+};
 
 unsafe extern "C" {
     /// Invoke the generated raw six-argument syscall veneer.

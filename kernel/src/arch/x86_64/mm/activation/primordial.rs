@@ -64,38 +64,45 @@ use deepwyrm_abi::{
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
+// Production capacities come from `arch/x86_64/pools.toml` (C1); the other
+// arms are the guest-test geometry, which never boots a product.
+#[cfg(deepwyrm_production_product)]
+use super::production_pools as pools;
 #[cfg(not(deepwyrm_production_product))]
 const REGISTRY_OBJECTS: usize = 32;
 #[cfg(deepwyrm_production_product)]
-const REGISTRY_OBJECTS: usize = super::production_resource_geometry::SELECTED.registry;
+const REGISTRY_OBJECTS: usize = pools::REGISTRY_OBJECTS;
 #[cfg(not(deepwyrm_production_product))]
 const MEMORY_OBJECTS: usize = 10;
 #[cfg(deepwyrm_production_product)]
-const MEMORY_OBJECTS: usize = super::production_resource_geometry::SELECTED.memory;
+const MEMORY_OBJECTS: usize = pools::MEMORY_OBJECTS;
 #[cfg(not(deepwyrm_production_product))]
 const MEMORY_LEASES: usize = 10;
 #[cfg(deepwyrm_production_product)]
-const MEMORY_LEASES: usize = super::production_resource_geometry::SELECTED.mappings;
+const MEMORY_LEASES: usize = pools::MAPPING_LEASES;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
 // parent performs bounded READY/exit supervision of its direct child. The
 // selector-24 controller adds exactly one temporary supervised child.
 #[cfg(not(deepwyrm_production_product))]
 const USERSPACE_CHAIN_PROCESSES: usize = 3;
 #[cfg(deepwyrm_production_product)]
-const USERSPACE_CHAIN_PROCESSES: usize = super::production_resource_geometry::SELECTED.identities;
+const USERSPACE_CHAIN_PROCESSES: usize = pools::IDENTITIES;
 #[cfg(not(deepwyrm_production_product))]
 const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
 #[cfg(deepwyrm_production_product)]
-const CHANNEL_PAIRS: usize = super::production_resource_geometry::SELECTED.channel_pairs;
+const CHANNEL_PAIRS: usize = pools::CHANNEL_PAIRS;
+#[cfg(not(deepwyrm_production_product))]
 const CHANNEL_DEPTH: usize = 2;
+#[cfg(deepwyrm_production_product)]
+const CHANNEL_DEPTH: usize = pools::CHANNEL_DEPTH;
 #[cfg(not(deepwyrm_production_product))]
 const WAITERS: usize = 4;
 #[cfg(deepwyrm_production_product)]
-const WAITERS: usize = super::production_resource_geometry::SELECTED.waits;
+const WAITERS: usize = pools::WAIT_REGISTRATIONS;
 #[cfg(not(deepwyrm_production_product))]
 const TASK_GROUPS: usize = 1;
 #[cfg(deepwyrm_production_product)]
-const TASK_GROUPS: usize = super::production_resource_geometry::SELECTED.identities;
+const TASK_GROUPS: usize = pools::IDENTITIES;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // The bootstrap handle deltas and peak live in `handle_capacity.rs`.
@@ -103,7 +110,7 @@ use super::handle_capacity::{BOOTSTRAP_HANDLE_PEAK, INIT_MOVED_HANDLES};
 #[cfg(not(deepwyrm_production_product))]
 const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
 #[cfg(deepwyrm_production_product)]
-const HANDLES: usize = super::production_resource_geometry::SELECTED.handles;
+const HANDLES: usize = pools::HANDLES_PER_PROCESS;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
 const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -112,58 +119,40 @@ const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
 /// final-release batches by the transaction, so `xtask kernel-check` bounds
 /// every kernel stack with a quarter spare at this count (plan §10.2 item 2;
 /// before those changes the stepped map needed about 487 KB here).
+#[cfg(not(deepwyrm_production_product))]
 const REGION_SLOTS: usize = 64;
-const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
-// WYR1-F production is selected explicitly for the same reason selectors 33
-// and 34 are: the freestanding product must not inherit the bootstrap-era DW0
-// geometry merely because no evidence cfg named it. The same demand model
-// drives the host fixtures and these target assertions.
 #[cfg(deepwyrm_production_product)]
-const _: () = {
-    use super::production_resource_geometry::{Capacity, SELECTED, fits};
-    assert!(HANDLES == SELECTED.handles);
-    assert!(REGION_SLOTS == super::production_resource_geometry::JOB_REGION_MAPPINGS);
-    assert!(MEMORY_OBJECTS == SELECTED.memory);
-    assert!(MEMORY_LEASES == SELECTED.mappings);
-    assert!(PROCESSES == SELECTED.identities);
-    assert!(THREADS == SELECTED.identities);
-    assert!(SPACES == SELECTED.identities);
-    assert!(REGIONS == SELECTED.identities);
-    assert!(REGION_OBJECTS == SELECTED.identities);
-    assert!(TASK_GROUPS == SELECTED.identities);
-    assert!(EXECUTION_THREADS == SELECTED.identities);
-    assert!(REGISTRY_OBJECTS == SELECTED.registry);
-    assert!(CHANNEL_PAIRS == SELECTED.channel_pairs);
-    assert!(WAITERS == SELECTED.waits);
-    assert!(TIMERS >= super::production_resource_geometry::TIMER_PEAK);
-    assert!(EVENTS >= super::production_resource_geometry::EVENT_PEAK);
-    assert!(REGION_SLOTS >= super::production_resource_geometry::REGION_MAPPING_PEAK);
-    assert!(REGION_SLOTS <= super::production_resource_geometry::JOB_REGION_MAPPINGS);
-    assert!(fits(Capacity {
-        handles: HANDLES,
-        memory: MEMORY_OBJECTS,
-        mappings: MEMORY_LEASES,
-        identities: PROCESSES,
-        registry: REGISTRY_OBJECTS,
-        channel_pairs: CHANNEL_PAIRS,
-        waits: WAITERS,
-        evidence: SELECTED.evidence,
-    }));
-};
+const REGION_SLOTS: usize = pools::REGION_SLOTS;
+const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
+#[cfg(not(deepwyrm_production_product))]
 const EVENTS: usize = 1;
+#[cfg(deepwyrm_production_product)]
+const EVENTS: usize = pools::EVENTS;
 #[cfg(not(deepwyrm_production_product))]
 const TIMERS: usize = 1;
-// Selector 31 overlaps system-init's resident control-tick Timer with one
-// production UART driver's bounded TEMT-pacing Timer. Keep that exact
-// product peak separate from the ordinary single-Timer geometry.
-//
-// F2A.2: the WYR1-F production product has the same overlap for the same
-// reason -- it runs the real uart16550d against a real console -- and was
-// getting the one-Timer geometry because no cfg marked it. That is the same
-// silent inheritance the production ledger exists to stop, found by the
-// ledger's own `TIMER_PEAK` rather than by a boot.
 #[cfg(deepwyrm_production_product)]
-const TIMERS: usize = 2;
+const TIMERS: usize = pools::TIMERS;
+
+/// What `kernel_get_limits` reports: the pools this kernel was built with.
+const KERNEL_LIMITS: deepwyrm_abi::DwKernelLimitsV1 = deepwyrm_abi::DwKernelLimitsV1 {
+    size: deepwyrm_abi::DW_KERNEL_LIMITS_V1_SIZE,
+    version: 1,
+    handles_per_process: HANDLES as u32,
+    processes: PROCESSES as u32,
+    threads: THREADS as u32,
+    task_groups: TASK_GROUPS as u32,
+    registry_objects: REGISTRY_OBJECTS as u32,
+    memory_objects: MEMORY_OBJECTS as u32,
+    mapping_leases: MEMORY_LEASES as u32,
+    region_slots: REGION_SLOTS as u32,
+    channel_pairs: CHANNEL_PAIRS as u32,
+    channel_depth: CHANNEL_DEPTH as u32,
+    wait_registrations: WAITERS as u32,
+    timers: TIMERS as u32,
+    events: EVENTS as u32,
+    reserved0: 0,
+    reserved: [0; 4],
+};
 // A bounded mapping can cross one boundary at each non-root level. Keep two
 // candidates for PDPT, PD, and PT creation so the live publisher can construct
 // both paths without depending on where the requested range lands. The I2
@@ -844,7 +833,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
         if !matches!(
             request,
-            NativeSyscallRequest::AbiGetInfo { .. } | NativeSyscallRequest::ClockGet { .. }
+            NativeSyscallRequest::AbiGetInfo { .. }
+                | NativeSyscallRequest::KernelGetLimits { .. }
+                | NativeSyscallRequest::ClockGet { .. }
         ) {
             return None;
         }
@@ -874,6 +865,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     out_size,
                     out_required_size,
                     deepwyrm_abi::DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT,
+                ),
+                NativeSyscallRequest::KernelGetLimits {
+                    out_info,
+                    out_size,
+                    out_required_size,
+                } => crate::syscall::kernel_get_limits_with(
+                    &mut user,
+                    out_info,
+                    out_size,
+                    out_required_size,
+                    &KERNEL_LIMITS,
                 ),
                 NativeSyscallRequest::ClockGet {
                     clock_id,
@@ -8626,8 +8628,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 {
     fn handle_fallthrough(&mut self, request: NativeSyscallRequest) -> NativeSyscallResult {
         match request {
-            NativeSyscallRequest::AbiGetInfo { .. } => {
-                unreachable!("AbiGetInfo must be served guard-free by the CPU-local facade")
+            NativeSyscallRequest::AbiGetInfo { .. }
+            | NativeSyscallRequest::KernelGetLimits { .. } => {
+                unreachable!("ABI discovery must be served guard-free by the CPU-local facade")
             }
             NativeSyscallRequest::HandleDuplicate { .. }
             | NativeSyscallRequest::TaskGroupCreate { .. }

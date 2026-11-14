@@ -452,7 +452,31 @@ Kernel ABI and bounded implementation-limit discovery. Size 64, alignment 8.
 | 16 | `feature_bits` | `u64` | Open feature bitset; unknown bits remain representable. |
 | 24 | `max_channel_payload` | `u32` | Maximum channel payload bytes. |
 | 28 | `max_channel_handles` | `u32` | Maximum handles per channel message. |
-| 32 | `reserved` | `[u64; 4]` | Reserved; all elements must be zero. |
+| 32 | `abi_fingerprint` | `[u8; 32]` | The running kernel's semantic ABI fingerprint, DW_ABI_FINGERPRINT; a native binary's .note.deepwyrm.abi carries the one it was built for. |
+
+### `DwKernelLimitsV1`
+
+Capacities of the running kernel's object pools, written by kernel_get_limits. A capacity is the most that may exist at once across every TaskGroup; TaskGroup limits divide it. Size 96, alignment 8.
+
+| Offset | Field | Type | Meaning |
+|---:|---|---|---|
+| 0 | `size` | `u32` | Byte size of this structure. |
+| 4 | `version` | `u32` | Structure version; set to one. |
+| 8 | `handles_per_process` | `u32` | Handle-table entries each Process has. |
+| 12 | `processes` | `u32` | Processes that may exist at once. |
+| 16 | `threads` | `u32` | Threads that may exist at once. |
+| 20 | `task_groups` | `u32` | TaskGroups that may exist at once. |
+| 24 | `registry_objects` | `u32` | Kernel objects of every type that may exist at once. |
+| 28 | `memory_objects` | `u32` | MemoryObjects that may exist at once. |
+| 32 | `mapping_leases` | `u32` | Mappings of MemoryObjects that may exist at once. |
+| 36 | `region_slots` | `u32` | Mapping slots in each address region. |
+| 40 | `channel_pairs` | `u32` | Channel pairs that may exist at once. |
+| 44 | `channel_depth` | `u32` | Messages one Channel endpoint may queue. |
+| 48 | `wait_registrations` | `u32` | Wait registrations that may exist at once. |
+| 52 | `timers` | `u32` | Timers that may exist at once. |
+| 56 | `events` | `u32` | Events that may exist at once. |
+| 60 | `reserved0` | `u32` | Reserved; must be zero. |
+| 64 | `reserved` | `[u64; 4]` | Reserved; all elements must be zero. |
 
 ### `DwObjectInfoV1`
 
@@ -687,6 +711,16 @@ Unknown or debug-disabled syscall IDs return `DW_STATUS_NOT_SUPPORTED`. Fixed-si
 ### `0x00000001` `abi_get_info` (DW0-A)
 
 Write DwAbiInfoV1 and report required size without relying on a release string.
+
+| Register | Argument | Type | Direction | Object | Rights |
+|---|---|---|---|---|---|
+| `RDI` | `out_info` | `DwUserAddress` | out | NONE | NONE |
+| `RSI` | `out_size` | `u64` | in | NONE | NONE |
+| `RDX` | `out_required_size` | `DwUserAddress` | out | NONE | NONE |
+
+### `0x00000002` `kernel_get_limits` (DW2-M)
+
+Write DwKernelLimitsV1 and report required size; no handle or right is required.
 
 | Register | Argument | Type | Direction | Object | Rights |
 |---|---|---|---|---|---|

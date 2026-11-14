@@ -10,7 +10,7 @@
 )]
 
 use deepwyrm_abi::{
-    DW_ABI_INFO_V1_SIZE, DW_BASE_PAGE_SIZE, DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD,
+    DW_BASE_PAGE_SIZE, DW_CHANNEL_MAX_HANDLES, DW_CHANNEL_MAX_PAYLOAD,
     DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_CLOCK_MONOTONIC_ACTIVE, DW_DEVICE_RESOURCE_INFO_V1_SIZE,
     DW_HANDLE_TRANSFER_MOVE, DW_HANDLE_TRANSFER_V1_SIZE, DW_INTERRUPT_INFO_V1_SIZE,
     DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_OBJECT_INFO_BASIC_V1, DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
@@ -25,9 +25,9 @@ use deepwyrm_abi::{
     DW_STATUS_WOULD_BLOCK, DW_STATUS_WRONG_OBJECT_TYPE, DW_TASK_STATE_EXITED,
     DW_TERMINATION_AUTHORIZED, DW_WAIT_MANY_MAX_ITEMS, DW_WAIT_MODE_ALL, DW_WAIT_MODE_ANY,
     DW_WAIT_RESULT_V1_SIZE, DwChannelReceiveResultV1, DwClockId, DwDeadline, DwHandle,
-    DwHandleTransferV1, DwProcessCreateArgsV1, DwProcessCreateResultV1, DwReceivedHandleInfoV1,
-    DwRights, DwSignals, DwStatus, DwTerminationReason, DwUserAddress, DwWaitItemV1,
-    DwWaitResultV1,
+    DwHandleTransferV1, DwKernelLimitsV1, DwProcessCreateArgsV1, DwProcessCreateResultV1,
+    DwReceivedHandleInfoV1, DwRights, DwSignals, DwStatus, DwTerminationReason, DwUserAddress,
+    DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::device::InterruptWaitSource;
@@ -78,9 +78,9 @@ use super::native::{
 use super::abi_bytes::{
     HANDLE_TRANSFER_BYTES, PROCESS_CREATE_ARGS_BYTES, THREAD_START_BYTES, WAIT_ITEM_BYTES,
     decode_handle_transfer, decode_process_create_args, decode_thread_start, decode_wait_item,
-    encode_abi_info, encode_channel_receive_result, encode_handle, encode_object_info,
-    encode_process_create_result, encode_received_handle_info, encode_u32, encode_u64,
-    encode_wait_result,
+    encode_abi_info, encode_channel_receive_result, encode_handle, encode_kernel_limits,
+    encode_object_info, encode_process_create_result, encode_received_handle_info, encode_u32,
+    encode_u64, encode_wait_result,
 };
 
 mod address_region;
@@ -493,7 +493,44 @@ pub(crate) fn abi_get_info_with_features<U: UserPageAccess>(
     out_required_size: DwUserAddress,
     feature_bits: u64,
 ) -> DwStatus {
-    let required = u64::from(DW_ABI_INFO_V1_SIZE);
+    write_fixed_record(
+        user,
+        out_info,
+        out_size,
+        out_required_size,
+        &encode_abi_info(feature_bits),
+    )
+}
+
+/// `kernel_get_limits`: the same contract as `abi_get_info` for the pool
+/// capacities record.
+pub(crate) fn kernel_get_limits_with<U: UserPageAccess>(
+    user: &mut U,
+    out_info: DwUserAddress,
+    out_size: u64,
+    out_required_size: DwUserAddress,
+    limits: &DwKernelLimitsV1,
+) -> DwStatus {
+    write_fixed_record(
+        user,
+        out_info,
+        out_size,
+        out_required_size,
+        &encode_kernel_limits(limits),
+    )
+}
+
+/// Write one fixed-size discovery record and its size. An undersized buffer
+/// receives only the required size and `BUFFER_TOO_SMALL`; otherwise both
+/// ranges are checked before the first output byte is written.
+fn write_fixed_record<U: UserPageAccess>(
+    user: &mut U,
+    out_info: DwUserAddress,
+    out_size: u64,
+    out_required_size: DwUserAddress,
+    record: &[u8],
+) -> DwStatus {
+    let required = record.len() as u64;
     let required_range = match user_range(out_required_size, 8, 8, UserAccess::WRITE) {
         Ok(range) => range,
         Err(status) => return status,
@@ -504,20 +541,19 @@ pub(crate) fn abi_get_info_with_features<U: UserPageAccess>(
             Err(error) => usercopy_status(error),
         };
     }
-    let info_range = match user_range(out_info, DW_ABI_INFO_V1_SIZE as usize, 8, UserAccess::WRITE)
-    {
+    let info_range = match user_range(out_info, record.len(), 8, UserAccess::WRITE) {
         Ok(range) => range,
         Err(status) => return status,
     };
     // These calls do not mutate kernel business state. Both ranges are fully
     // checked before the first output byte is written.
-    if let Err(error) = preflight_user_output(user, info_range, DW_ABI_INFO_V1_SIZE as usize) {
+    if let Err(error) = preflight_user_output(user, info_range, record.len()) {
         return usercopy_status(error);
     }
     if let Err(error) = preflight_user_output(user, required_range, 8) {
         return usercopy_status(error);
     }
-    if let Err(error) = copy_to_user(user, info_range, &encode_abi_info(feature_bits)) {
+    if let Err(error) = copy_to_user(user, info_range, record) {
         return usercopy_status(error);
     }
     match copy_to_user(user, required_range, &encode_u64(required)) {

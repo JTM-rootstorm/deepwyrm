@@ -26,11 +26,64 @@ fn abi_info_encoding_is_padding_free_and_exact() {
         &bytes[16..24],
         &DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT.to_le_bytes()
     );
-    assert_eq!(&bytes[32..64], &[0; 32]);
+    assert_eq!(&bytes[32..64], &deepwyrm_abi::DW_ABI_FINGERPRINT);
 
     let historical = encode_abi_info(0);
     assert_eq!(&historical[16..24], &0_u64.to_le_bytes());
-    assert_eq!(&historical[32..64], &[0; 32]);
+    assert_eq!(&historical[32..64], &deepwyrm_abi::DW_ABI_FINGERPRINT);
+}
+
+#[test]
+fn kernel_limits_encoding_places_every_count_at_its_generated_offset() {
+    let limits = deepwyrm_abi::DwKernelLimitsV1 {
+        size: deepwyrm_abi::DW_KERNEL_LIMITS_V1_SIZE,
+        version: 1,
+        handles_per_process: 3,
+        processes: 4,
+        threads: 5,
+        task_groups: 6,
+        registry_objects: 7,
+        memory_objects: 8,
+        mapping_leases: 9,
+        region_slots: 10,
+        channel_pairs: 11,
+        channel_depth: 12,
+        wait_registrations: 13,
+        timers: 14,
+        events: 15,
+        reserved0: 0,
+        reserved: [0; 4],
+    };
+    let bytes = super::encode_kernel_limits(&limits);
+    assert_eq!(bytes.len(), 96);
+    let word = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    assert_eq!(word(0), 96);
+    assert_eq!(word(4), 1);
+    for (field, offset) in [
+        (
+            limits.handles_per_process,
+            core::mem::offset_of!(deepwyrm_abi::DwKernelLimitsV1, handles_per_process),
+        ),
+        (
+            limits.threads,
+            core::mem::offset_of!(deepwyrm_abi::DwKernelLimitsV1, threads),
+        ),
+        (
+            limits.mapping_leases,
+            core::mem::offset_of!(deepwyrm_abi::DwKernelLimitsV1, mapping_leases),
+        ),
+        (
+            limits.wait_registrations,
+            core::mem::offset_of!(deepwyrm_abi::DwKernelLimitsV1, wait_registrations),
+        ),
+        (
+            limits.events,
+            core::mem::offset_of!(deepwyrm_abi::DwKernelLimitsV1, events),
+        ),
+    ] {
+        assert_eq!(word(offset), field);
+    }
+    assert_eq!(&bytes[60..96], &[0; 36]);
 }
 
 #[test]

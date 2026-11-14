@@ -79,18 +79,15 @@ mod runtime_authority;
 impl runtime_authority::ShootdownSettled for crate::memory::address_region::ShootdownOutcome {}
 // The e2 TLB mailbox `user_access.rs` uses, host-compiled under `test` so its
 // tests run (S2K-0).
+#[cfg(any(test, deepwyrm_production_product))]
+#[path = "activation/production_pools.rs"]
+mod production_pools;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 #[path = "activation/tlb_mailbox.rs"]
 mod tlb_mailbox;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
-// Compiled in the host lane as well so the ledger's own tests and the
-// bootstrap-era negative case run where every other geometry model's do; the
-// production arm itself is target-only.
-#[cfg(any(test, deepwyrm_production_product))]
-#[path = "activation/production_resource_geometry.rs"]
-mod production_resource_geometry;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 use crate::arch::x86_64::syscall::GuardFree;
 #[allow(
@@ -150,11 +147,10 @@ const DW1C_LIVE_USER_PIN_FLOOR: usize =
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[cfg(not(deepwyrm_production_product))]
 const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
-// WYR1-F production keeps the six resident roots, one replacement generation
-// and one shell job live together, matched to the same identity pool so root
-// bindings and Process identities cannot drift apart.
+// Root bindings and Process identities come from the same pool, so they
+// cannot drift apart.
 #[cfg(deepwyrm_production_product)]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_resource_geometry::SELECTED.identities;
+const LIVE_ADDRESS_SPACE_CAPACITY: usize = production_pools::IDENTITIES;
 // The image, the scratch window and the trampoline need a few tables; the
 // direct map needs at most a PT and a PD at each end of each range plus one
 // PD per GiB it maps without 1 GiB pages (DW2 M2).
