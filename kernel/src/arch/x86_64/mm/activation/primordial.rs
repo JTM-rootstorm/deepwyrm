@@ -2523,7 +2523,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// its phase.
     fn park_call(&mut self, call: ParkedCall) -> crate::syscall::native::ReturnReady {
         let mut guard = self.runtime.lock();
-        let runtime = guard.on(&mut self.owned);
+        let mut runtime = guard.on(&mut self.owned);
+        // A Thread that ended may have had its kernel stack reclaimed, and
+        // the stack reused by this one, before any drain swept its record:
+        // settle such records first, so the table's one slot per stack is
+        // free when it is needed (review R-1).
+        runtime.settle_ended_parked_calls();
         let thread = runtime.own.scheduled().thread;
         runtime.core.parked.park(thread, call);
         crate::syscall::native::ReturnReady::yield_current()
@@ -6001,8 +6006,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Settles every call parked by a Thread that has since ended (DW2
     /// §10.8 item 5). Such a Thread never runs again, so it never takes its
-    /// record back; this runs in each finalizer drain, so the termination
-    /// that ended it settles the record before it returns.
+    /// record back. This runs in each finalizer drain, so the termination
+    /// that ended it settles the record when it returns, and before every
+    /// park, so a record is never kept past the stack its Thread ran on.
     fn settle_ended_parked_calls(&mut self) {
         loop {
             let tasks = &self.core.tasks;
