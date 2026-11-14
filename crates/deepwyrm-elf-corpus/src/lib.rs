@@ -40,6 +40,12 @@ pub const LIMITS: &[Limit] = &[
               against the kernel's before any other syscall (V1)",
     },
     Limit {
+        name: "phdr",
+        why: "wyrmroot-loader passes the program-header table's address to the child as \
+              AT_PHDR, so it refuses a PT_PHDR naming an address no PT_LOAD maps there; \
+              the kernel gives bootstrap no auxiliary vector and only bounds the header",
+    },
+    Limit {
         name: "tls",
         why: "wyrmroot-loader accepts a checked PT_TLS for SDK programs; bootstrap has no \
               thread-local storage, so the kernel refuses the header",
@@ -359,9 +365,8 @@ pub fn cases() -> Vec<Case> {
             put64(bytes, field(STACK, 48), 8);
         }),
     ];
-    // A program-header table that names itself, both where the text segment
-    // maps it and where it does not.
-    cases.push(both("phdr-unmapped", Accept, |bytes| {
+    // A program-header table that names an address no segment maps there.
+    cases.push(differ("phdr-unmapped", Accept, Reject, "phdr", |bytes| {
         put32(bytes, field(STACK, 0), PT_PHDR);
         put32(bytes, field(STACK, 4), PF_R);
         put64(bytes, field(STACK, 8), HEADER as u64);
