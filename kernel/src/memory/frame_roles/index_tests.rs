@@ -316,3 +316,129 @@ fn a_range_costs_what_committing_its_pages_in_order_takes() {
     );
     roles.check_invariants().unwrap();
 }
+
+/// Finalizes `backing` in steps of `budget` entries (DW2 §10.12 item 2),
+/// checking the role table after every step: each step frees what it says,
+/// visits no more than its budget plus a cascade of node frees, and the
+/// frames left are the root once the cursor reaches the end. Returns the
+/// steps taken.
+fn release_in_steps(roles: &mut Manager, grant: &ObjectBackingGrant, budget: u64) -> u64 {
+    let backing = grant.identity();
+    let pages = grant.byte_len() / PAGE;
+    let mut cursor = 0;
+    let mut steps = 0;
+    while cursor < pages {
+        let before = roles.available_frames();
+        let held = roles.on_demand_frames(backing).unwrap();
+        let (next, freed, visited) = roles.release_index_step(backing, cursor, budget).unwrap();
+        assert!(next > cursor || cursor == pages, "a step makes progress");
+        assert!(visited < budget + u64::from(INDEX_MAX_LEVELS));
+        assert_eq!(roles.available_frames(), before + freed);
+        assert_eq!(roles.on_demand_frames(backing).unwrap(), held - freed);
+        roles.check_invariants().unwrap();
+        cursor = next;
+        steps += 1;
+    }
+    assert_eq!(
+        roles.on_demand_frames(backing),
+        Ok(1),
+        "only the root is left"
+    );
+    steps
+}
+
+#[test]
+fn a_stepped_release_frees_pages_and_nodes_whatever_the_budget() {
+    for budget in [1, 2, 3, 5, 512] {
+        let (mut roles, _) = manager(32);
+        let initial = roles.available_frames();
+        let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+        // The last page sits in a level-1 node and a leaf whose spans run
+        // past the object's end.
+        for index in [0, 1, 511, 513, 512 * 512 - 1, 512 * 512, THREE_LEVELS - 1] {
+            roles
+                .commit_on_demand_page(grant.identity(), index)
+                .unwrap();
+        }
+        release_in_steps(&mut roles, &grant, budget);
+        roles.cancel_object_backing(grant).unwrap();
+        assert_eq!(roles.available_frames(), initial, "budget {budget}");
+        roles.check_invariants().unwrap();
+    }
+}
+
+#[test]
+fn a_last_leaf_cut_short_by_the_object_is_freed() {
+    // Two levels, the second leaf covering only 88 pages.
+    let (mut roles, _) = manager(16);
+    let initial = roles.available_frames();
+    let grant = roles.allocate_on_demand_backing(600).unwrap();
+    for index in [0, 599] {
+        roles
+            .commit_on_demand_page(grant.identity(), index)
+            .unwrap();
+    }
+    release_in_steps(&mut roles, &grant, 2);
+    roles.cancel_object_backing(grant).unwrap();
+    assert_eq!(roles.available_frames(), initial);
+}
+
+#[test]
+fn a_step_that_ends_at_a_node_s_end_frees_that_node() {
+    let (mut roles, _) = manager(16);
+    let grant = roles.allocate_on_demand_backing(2048).unwrap();
+    let backing = grant.identity();
+    for index in [510, 511, 1024] {
+        roles.commit_on_demand_page(backing, index).unwrap();
+    }
+    // Root, two leaves and three pages.
+    assert_eq!(roles.on_demand_frames(backing), Ok(6));
+    // From page 509: its absent entry, 510, 511. The budget is spent at
+    // the leaf's end, and the leaf goes with it.
+    let (cursor, freed, visited) = roles.release_index_step(backing, 509, 3).unwrap();
+    assert_eq!((cursor, freed, visited), (512, 3, 4));
+    assert_eq!(roles.on_demand_frames(backing), Ok(3));
+    roles.check_invariants().unwrap();
+    release_in_steps(&mut roles, &grant, 3);
+}
+
+#[test]
+fn one_and_four_level_indexes_release_in_steps() {
+    let (mut roles, _) = manager(16);
+    let initial = roles.available_frames();
+    let small = roles.allocate_on_demand_backing(512).unwrap();
+    for index in [0, 7, 511] {
+        roles
+            .commit_on_demand_page(small.identity(), index)
+            .unwrap();
+    }
+    // Each absent page of a leaf is one entry visited.
+    assert_eq!(release_in_steps(&mut roles, &small, 2), 256);
+    roles.cancel_object_backing(small).unwrap();
+    let largest = roles.allocate_on_demand_backing(INDEX_MAX_PAGES).unwrap();
+    for index in [0, INDEX_MAX_PAGES - 1] {
+        roles
+            .commit_on_demand_page(largest.identity(), index)
+            .unwrap();
+    }
+    release_in_steps(&mut roles, &largest, 4);
+    roles.cancel_object_backing(largest).unwrap();
+    assert_eq!(roles.available_frames(), initial);
+}
+
+#[test]
+fn nodes_left_empty_by_a_decommit_are_freed() {
+    let (mut roles, _) = manager(16);
+    let initial = roles.available_frames();
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    let backing = grant.identity();
+    roles.commit_on_demand_page(backing, 700).unwrap();
+    roles
+        .decommit_on_demand_range(backing, 0, THREE_LEVELS, 4096)
+        .unwrap();
+    // Two nodes and the root, no pages.
+    assert_eq!(roles.on_demand_frames(backing), Ok(3));
+    release_in_steps(&mut roles, &grant, 1);
+    roles.cancel_object_backing(grant).unwrap();
+    assert_eq!(roles.available_frames(), initial);
+}

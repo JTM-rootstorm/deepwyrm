@@ -229,11 +229,15 @@ impl<
                                 failure.error()
                             )
                         });
-                push_pending(
-                    pending,
-                    pending_len,
-                    complete_memory_finalization(self.registry, self.roles, finalization),
-                );
+                // An on-demand object's frees are owed and done in steps
+                // (DW2 §10.12); its slot stays finalizing until then.
+                if let Some(finalization) = self.memory.defer_finalization(finalization) {
+                    push_pending(
+                        pending,
+                        pending_len,
+                        complete_memory_finalization(self.registry, self.roles, finalization),
+                    );
+                }
             }
             DW_OBJECT_TYPE_ADDRESS_REGION => {
                 let finalization = self

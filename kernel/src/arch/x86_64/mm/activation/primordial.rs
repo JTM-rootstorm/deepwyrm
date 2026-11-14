@@ -619,6 +619,9 @@ type MapStep = crate::syscall::MapStep<MemoryProtection>;
 /// job mapping in a loop then kept init from answering the shell within its
 /// one-second deadline on four CPUs (DW2 M5 step 4).
 const FAMILY_G_STEP_BYTES: u64 = 2 * 1024 * 1024;
+/// Index entries one step of queued finalization visits (DW2 §10.12 item
+/// 2): 512, a 2 MiB step's pages, like a teardown step.
+const FINALIZE_STEP_ENTRIES: u64 = 512;
 const _: () = assert!(FAMILY_G_STEP_BYTES <= PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE);
 /// One hold of an on-demand commit (DW2 M6 §8.2, §8.11 R1): it zeroes every
 /// frame it takes, so it is kept well below a family-G step.
@@ -678,6 +681,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// from the kernel root to the primordial publisher root (the terminal
     /// reaper's switch), takes one queued teardown step, and switches back.
     /// `true` if teardown is still owed afterwards.
+    /// The idle BSP's finalization step (DW2 §10.12 item 5): on the kernel
+    /// root, which needs no switch. `true` if finalization is still owed.
+    fn idle_finalize_step(&mut self) -> bool {
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        runtime.finalize_owed_step()
+    }
+
     fn idle_teardown_visit(&mut self) -> bool {
         let prepared = {
             let mut guard = self.runtime.lock();
@@ -6183,11 +6194,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn drain_finalizers(&mut self) -> Result<(), ()> {
         self.drain_cleanup_queue();
         self.settle_ended_parked_calls();
-        self.release_unmapped_step();
+        let cpu = self.cpu().index();
+        if self.core.registry.memory_notices_pending() {
+            step_report::timed_nested(cpu, StepCall::Release, || self.release_unmapped_step());
+        }
         if self.owed_teardown_step() {
             self.drain_cleanup_queue();
         }
+        // Last, so objects the teardown step just finalized share it.
+        self.finalize_owed_step();
+        step_report::owed(
+            step_report::Owed::Teardown,
+            !self.core.owed_teardown.is_empty(),
+        );
         Ok(())
+    }
+
+    /// One step of the queued finalization of on-demand objects (DW2
+    /// §10.12 item 5), in every drain: it needs only T, P and the direct
+    /// map, so it runs on whatever root is active. `true` if any remain.
+    fn finalize_owed_step(&mut self) -> bool {
+        let owed = if self.core.memory.finalization_owed() {
+            let cpu = self.cpu().index();
+            step_report::timed_nested(cpu, StepCall::Finalize, || {
+                let mut paging = self.paging.lock();
+                self.core.memory.finalize_owed_step(
+                    &mut self.core.registry,
+                    &mut *paging.target.roles,
+                    FINALIZE_STEP_ENTRIES,
+                )
+            })
+        } else {
+            false
+        };
+        step_report::owed(step_report::Owed::Finalize, owed);
+        owed
     }
 
     /// Pops the cleanup queue until it is empty, cascading.
@@ -6531,6 +6572,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             );
             self.drain_finalizers().map_err(|_| 0x7000_000e_u32)?;
         }
+        // The system is ending: every owed finalization completes here, so
+        // the capacity proof below sees each slot free (DW2 §10.12, step-6
+        // review D1). Bounded by what the last drains queued.
+        while self.finalize_owed_step() {}
         if self.core.memory.active_lease_count() != 0
             || self
                 .core
@@ -7714,13 +7759,15 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::UserPageFaultOutcome {
         self.with_synchronized_runtime_at_safe_point(|runtime| {
             let outcome = runtime.serve_user_page_fault(cr2, error);
-            // A touch refused while a dead job's teardown is owed frees
-            // owed memory first (§10.10 item 7): this entry's one step, in
-            // a whole drain, then the touch comes again.
+            // A touch refused while a dead job's teardown or an object's
+            // finalization is owed frees owed memory first (§10.10 item 7,
+            // §10.12 item 6): this entry's one step, in a whole drain, then
+            // the touch comes again.
             if matches!(
                 outcome,
                 crate::syscall::native::UserPageFaultOutcome::Exhausted(_)
-            ) && !runtime.core.owed_teardown.is_empty()
+            ) && (!runtime.core.owed_teardown.is_empty()
+                || runtime.core.memory.finalization_owed())
             {
                 step_report::allow_teardown_step(runtime.cpu().index());
                 let _ = runtime.drain_finalizers();
@@ -8073,8 +8120,8 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                 }
                 None => {
-                    let teardown_owed =
-                        this.cpu == crate::cpu::CpuIndex::BOOTSTRAP && this.idle_teardown_visit();
+                    let teardown_owed = this.cpu == crate::cpu::CpuIndex::BOOTSTRAP
+                        && (this.idle_teardown_visit() | this.idle_finalize_step());
                     let notification = if teardown_owed {
                         // Teardown remains: no halt. Take any pending
                         // interrupt, then visit again (DW2 §10.10 item 5).
@@ -8195,7 +8242,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let mut guard = self.runtime.lock();
         let runtime = guard.on(&mut self.owned);
-        !runtime.core.owed_teardown.is_empty()
+        !runtime.core.owed_teardown.is_empty() || runtime.core.memory.finalization_owed()
     }
 
     fn resume_suspended(

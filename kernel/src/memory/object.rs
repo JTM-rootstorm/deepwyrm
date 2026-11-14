@@ -933,6 +933,21 @@ pub(crate) struct MemoryObjectAuthority<const OBJECTS: usize, const LEASES: usiz
     /// DeviceMmio objects' DeviceResource references, by object slot.
     parents: [Option<InternalRef>; OBJECTS],
     leases: [LeaseSlot; LEASES],
+    /// On-demand objects whose finalization is owed and done in steps
+    /// (DW2 §10.12), each holding the slot it sits in until it completes,
+    /// so the queue is bounded by the slots and a slot is not reused while
+    /// its frames are held.
+    owed: [Option<OwedFinalization>; OBJECTS],
+    /// The owed slots, oldest first: a ring of `owed_len` from `owed_head`.
+    owed_order: [usize; OBJECTS],
+    owed_head: usize,
+    owed_len: usize,
+}
+
+/// A finalization owed in steps, and how far its index has been freed.
+struct OwedFinalization {
+    finalization: MemoryObjectFinalization,
+    cursor: u64,
 }
 
 impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, LEASES> {
@@ -946,6 +961,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                 generation: 0,
                 record: None,
             }),
+            owed: core::array::from_fn(|_| None),
+            owed_order: [0; OBJECTS],
+            owed_head: 0,
+            owed_len: 0,
         }
     }
 
@@ -1156,7 +1175,10 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             .objects
             .iter()
             .zip(self.backings.iter())
-            .position(|(slot, backing)| slot.record.is_none() && backing.is_none())
+            .zip(self.owed.iter())
+            .position(|((slot, backing), owed)| {
+                slot.record.is_none() && backing.is_none() && owed.is_none()
+            })
             .ok_or(MemoryObjectError::Capacity)?;
         Ok((slot, rounded_byte_len))
     }
@@ -1272,6 +1294,94 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             return Err(MemoryObjectError::ProtectionCeiling);
         }
         object_range(record, offset, byte_len)
+    }
+
+    /// Whether any finalization is owed (DW2 §10.12).
+    pub(crate) fn finalization_owed(&self) -> bool {
+        self.owed_len != 0
+    }
+
+    /// Queues an on-demand object's finalization to be done in steps (DW2
+    /// §10.12 item 1), in a free slot (the one `take_finalization` just
+    /// emptied, at least, is free); any other kind is returned to be
+    /// completed at once.
+    pub(crate) fn defer_finalization(
+        &mut self,
+        finalization: MemoryObjectFinalization,
+    ) -> Option<MemoryObjectFinalization> {
+        if finalization.kind != MemoryObjectKind::OnDemand
+            || finalization.backing.kind() != ObjectBackingKind::OnDemand
+        {
+            return Some(finalization);
+        }
+        let slot = self
+            .objects
+            .iter()
+            .zip(self.backings.iter())
+            .zip(self.owed.iter())
+            .position(|((slot, backing), owed)| {
+                slot.record.is_none() && backing.is_none() && owed.is_none()
+            })
+            .expect("the slot a finalization was taken from is free");
+        self.owed[slot] = Some(OwedFinalization {
+            finalization,
+            cursor: 0,
+        });
+        assert!(self.owed_len < OBJECTS, "one owed entry per slot");
+        self.owed_order[(self.owed_head + self.owed_len) % OBJECTS] = slot;
+        self.owed_len += 1;
+        None
+    }
+
+    /// One step of the owed finalizations (DW2 §10.12 item 2), oldest
+    /// first: at most `budget` index entries are visited, the budget left
+    /// by an object that completes going on to the next (step-6 review R3).
+    /// Each step lowers the object's weight by the frames it freed; an
+    /// object whose index is empty is completed. `true` if any remain.
+    #[cfg(deepwyrm_integrated)]
+    pub(crate) fn finalize_owed_step<
+        const REGISTRY_OBJECTS: usize,
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        budget: u64,
+    ) -> bool {
+        let mut left = budget;
+        while left != 0 && self.owed_len != 0 {
+            let slot = self.owed_order[self.owed_head];
+            let owed = self.owed[slot]
+                .as_mut()
+                .expect("a queued owed slot holds its finalization");
+            let backing = owed.finalization.backing.identity();
+            let pages = owed.finalization.backing.byte_len() / PAGE_SIZE;
+            let (cursor, freed, visited) = roles
+                .release_index_step(backing, owed.cursor, left)
+                .unwrap_or_else(|error| panic!("an owed index did not free: {error:?}"));
+            owed.cursor = cursor;
+            if freed != 0 {
+                registry
+                    .lower_finalizing_charge_pages(owed.finalization.final_release.id(), freed)
+                    .unwrap_or_else(|error| {
+                        panic!("an owed object's weight did not fall: {error:?}")
+                    });
+            }
+            left = left.saturating_sub(visited.max(1));
+            if cursor < pages {
+                break;
+            }
+            let owed = self.owed[slot]
+                .take()
+                .expect("a queued owed slot holds its finalization");
+            self.owed_head = (self.owed_head + 1) % OBJECTS;
+            self.owed_len -= 1;
+            let parent = complete_memory_finalization(registry, roles, owed.finalization);
+            assert!(parent.is_none(), "an on-demand object has no parent");
+            left = left.saturating_sub(1);
+        }
+        self.owed_len != 0
     }
 
     pub(crate) fn take_finalization(

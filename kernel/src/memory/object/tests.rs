@@ -1325,3 +1325,241 @@ fn device_mmio_finalization_returns_the_bar_then_releases_the_resource() {
     assert!(registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).is_ok());
     let _ = parent_release;
 }
+
+/// DW2 §10.12: an on-demand object's finalization is owed and done in
+/// steps, its weight falling with each, its slot held until it completes.
+mod owed_finalization {
+    use super::*;
+    use crate::memory::frame_roles::{FrameRoleManager, IndexMemory, synthetic_frame_role_manager};
+    use crate::object::charge::ChargeTag;
+    use deepwyrm_abi::DW_OBJECT_TYPE_EVENT;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Model {
+        zeroed: Mutex<BTreeSet<u64>>,
+        entries: Mutex<BTreeMap<(u64, usize), u64>>,
+    }
+
+    impl IndexMemory for Model {
+        fn read(&self, node: u64, entry: usize) -> u64 {
+            let entries = self.entries.lock().unwrap();
+            match entries.get(&(node, entry)) {
+                Some(value) => *value,
+                None if self.zeroed.lock().unwrap().contains(&node) => 0,
+                None => panic!("an index node is read before it is zeroed"),
+            }
+        }
+
+        #[allow(
+            unsafe_code,
+            reason = "the model implements the trait's unsafe methods"
+        )]
+        unsafe fn write(&self, node: u64, entry: usize, value: u64) {
+            self.entries.lock().unwrap().insert((node, entry), value);
+        }
+
+        #[allow(
+            unsafe_code,
+            reason = "the model implements the trait's unsafe methods"
+        )]
+        unsafe fn zero(&self, page: u64) -> bool {
+            self.entries
+                .lock()
+                .unwrap()
+                .retain(|(node, _), _| *node != page);
+            self.zeroed.lock().unwrap().insert(page);
+            true
+        }
+    }
+
+    type Roles = FrameRoleManager<4, 128>;
+
+    fn roles() -> Roles {
+        let mut roles = synthetic_frame_role_manager::<4, 128>(0x1000, 96);
+        roles.set_index_memory(Box::leak(Box::<Model>::default()));
+        roles
+    }
+
+    /// An on-demand object of `pages` pages with `committed` committed,
+    /// charged to `group` for its frames, held by its returned owner.
+    fn on_demand<const OBJECTS: usize, const REGISTRY: usize>(
+        authority: &mut MemoryObjectAuthority<OBJECTS, 1>,
+        registry: &mut ObjectRegistry<REGISTRY>,
+        roles: &mut Roles,
+        group: crate::object::ObjectId,
+        pages: u64,
+        committed: &[u64],
+    ) -> Result<(InternalRef, u64), MemoryObjectError> {
+        let backing = roles.allocate_on_demand_backing(pages).unwrap();
+        for &page in committed {
+            roles
+                .commit_on_demand_page(backing.identity(), page)
+                .unwrap();
+        }
+        let frames = roles.on_demand_frames(backing.identity()).unwrap();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        if let Err(error) = authority.grant_backing(
+            &creation,
+            backing,
+            pages * PAGE_SIZE,
+            MemoryObjectKind::OnDemand,
+            MemoryProtection::READ_WRITE,
+        ) {
+            roles.cancel_object_backing(error.into_backing()).unwrap();
+            registry.cancel_creation(creation).unwrap();
+            return Err(MemoryObjectError::Capacity);
+        }
+        let owner = registry.creation_into_internal(creation).unwrap();
+        let mut tag = ChargeTag::EMPTY;
+        assert!(tag.push(group));
+        registry.set_charge_tag(owner.id(), tag).unwrap();
+        registry.set_charge_pages(owner.id(), frames).unwrap();
+        Ok((owner, frames))
+    }
+
+    /// Releases `owner`, the object's last reference, as the cleanup
+    /// drain's `finalize_one` does: the finalization is taken and owed.
+    fn finalize<const OBJECTS: usize, const REGISTRY: usize>(
+        authority: &mut MemoryObjectAuthority<OBJECTS, 1>,
+        registry: &mut ObjectRegistry<REGISTRY>,
+        owner: InternalRef,
+    ) {
+        let last = registry
+            .release_internal(owner)
+            .unwrap()
+            .expect("the last reference");
+        let finalization = authority.take_finalization(last).unwrap();
+        assert!(authority.defer_finalization(finalization).is_none());
+    }
+
+    #[test]
+    fn a_large_object_is_freed_in_steps_its_charge_falling_with_each() {
+        let mut roles = roles();
+        let initial = roles.available_frames();
+        let mut registry = ObjectRegistry::<3>::new();
+        let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap();
+        let group_id = group.id();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let committed: std::vec::Vec<u64> = (0..20).chain([1500, 2047]).collect();
+        let (owner, frames) = on_demand(
+            &mut authority,
+            &mut registry,
+            &mut roles,
+            group_id,
+            2048,
+            &committed,
+        )
+        .unwrap();
+        let object = owner.id();
+        assert_eq!(registry.charged_pages(group_id), frames as usize);
+        finalize(&mut authority, &mut registry, owner);
+        assert!(authority.finalization_owed());
+        // Still charged while its frames are held; unreachable meanwhile.
+        assert_eq!(registry.charged_pages(group_id), frames as usize);
+        assert!(registry.charge(object).is_err());
+        assert!(!authority.object_is_on_demand(object));
+        assert!(
+            authority
+                .object_info(MemoryObjectKey {
+                    object: Some(object)
+                })
+                .is_err()
+        );
+        let mut steps = 0;
+        let mut charged = frames as usize;
+        loop {
+            let held = roles.available_frames();
+            let owed = authority.finalize_owed_step(&mut registry, &mut roles, 5);
+            steps += 1;
+            roles.check_invariants().unwrap();
+            if !owed {
+                break;
+            }
+            let freed = usize::try_from(roles.available_frames() - held).unwrap();
+            assert!(freed != 0 || registry.charged_pages(group_id) == charged);
+            assert_eq!(registry.charged_pages(group_id), charged - freed);
+            charged -= freed;
+        }
+        assert!(steps > 3, "a large object takes several steps");
+        assert_eq!(registry.charged_pages(group_id), 0);
+        assert_eq!(roles.available_frames(), initial);
+        // Its registry slot is free again.
+        let reused = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        registry.cancel_creation(reused).unwrap();
+        let _ = group;
+    }
+
+    #[test]
+    fn a_releasing_slot_is_not_reused_until_its_object_completes() {
+        let mut roles = roles();
+        let mut registry = ObjectRegistry::<3>::new();
+        let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let (owner, _) = on_demand(
+            &mut authority,
+            &mut registry,
+            &mut roles,
+            group,
+            1024,
+            &[0, 700],
+        )
+        .unwrap();
+        finalize(&mut authority, &mut registry, owner);
+        assert_eq!(
+            on_demand(&mut authority, &mut registry, &mut roles, group, 1, &[]).err(),
+            Some(MemoryObjectError::Capacity)
+        );
+        while authority.finalize_owed_step(&mut registry, &mut roles, 2) {}
+        assert!(on_demand(&mut authority, &mut registry, &mut roles, group, 1, &[]).is_ok());
+    }
+
+    #[test]
+    fn owed_objects_complete_oldest_first_sharing_one_step() {
+        let mut roles = roles();
+        let mut registry = ObjectRegistry::<4>::new();
+        let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let mut authority = MemoryObjectAuthority::<2, 1>::new();
+        let (first, _) = on_demand(
+            &mut authority,
+            &mut registry,
+            &mut roles,
+            group,
+            600,
+            &[0, 599],
+        )
+        .unwrap();
+        let (second, _) =
+            on_demand(&mut authority, &mut registry, &mut roles, group, 8, &[3]).unwrap();
+        finalize(&mut authority, &mut registry, first);
+        finalize(&mut authority, &mut registry, second);
+        // A step too small for the first leaves the second untouched.
+        assert!(authority.finalize_owed_step(&mut registry, &mut roles, 1));
+        assert!(registry.charged_pages(group) >= 2);
+        // One step with room for both completes both.
+        assert!(!authority.finalize_owed_step(&mut registry, &mut roles, 1024));
+        assert_eq!(registry.charged_pages(group), 0);
+        roles.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn only_on_demand_objects_are_owed() {
+        let mut registry = ObjectRegistry::<1>::new();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let (_, owner) = grant(
+            &mut authority,
+            &mut registry,
+            PAGE_SIZE,
+            MemoryProtection::READ_WRITE,
+        );
+        let last = registry.release_internal(owner).unwrap().unwrap();
+        let finalization = authority.take_finalization(last).unwrap();
+        let finalization = authority
+            .defer_finalization(finalization)
+            .expect("a page-backed object completes at once");
+        assert!(!authority.finalization_owed());
+        let (cleanup, _backing) = into_page_backed_cancellation_parts(finalization);
+        let _ = registry.complete_payload_finalization(cleanup);
+    }
+}

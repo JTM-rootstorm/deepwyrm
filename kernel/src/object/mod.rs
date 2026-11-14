@@ -309,6 +309,11 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     /// Pops the oldest MemoryObject release notice: `None` when there is
     /// none, `Some(None)` when its slot no longer holds a live MemoryObject,
     /// else that object.
+    /// Whether any release-on-unmap notice is queued (DW2 §10.9 item 4).
+    pub(crate) fn memory_notices_pending(&self) -> bool {
+        self.notice_len != 0
+    }
+
     pub(crate) fn pop_memory_notice(&mut self) -> Option<Option<ObjectId>> {
         if self.notice_len == 0 {
             return None;
@@ -470,6 +475,30 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             return Err(ObjectRegistryError::StaleReference);
         }
         self.pages[slot] = pages;
+        Ok(())
+    }
+
+    /// Lowers a finalizing object's weight by `frames` as a stepped
+    /// finalization frees them (DW2 §10.12 item 3), so its groups' usage
+    /// falls step by step. Refuses a slot that is not finalizing that
+    /// object, or a weight smaller than `frames`.
+    pub(crate) fn lower_finalizing_charge_pages(
+        &mut self,
+        id: ObjectId,
+        frames: u64,
+    ) -> Result<(), ObjectRegistryError> {
+        let slot = self.reference_slot(id)?;
+        let generation = decode_object_id(id.raw)
+            .ok_or(ObjectRegistryError::StaleReference)?
+            .1;
+        if self.slots[slot].generation != generation
+            || !matches!(self.slots[slot].state, SlotState::Finalizing(_))
+        {
+            return Err(ObjectRegistryError::NotFinalizing);
+        }
+        self.pages[slot] = self.pages[slot]
+            .checked_sub(frames)
+            .ok_or(ObjectRegistryError::ReferenceCountUnderflow)?;
         Ok(())
     }
 

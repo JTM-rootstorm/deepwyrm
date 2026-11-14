@@ -785,6 +785,28 @@ From the coordinator's read of Deepwyrm `4b4dd5c`; paths are under `kernel/src/`
 7. **Timed.** `StepCall::Finalize` in the step report, so dev-boot's `[steps]` lines show the longest finalization step.
 8. **Tests (host).** A large on-demand object finalized over several drains: the frames, the weight and the group's usage fall by each step's frames and end at zero, with `check_indexes` whole after every step; a sparse index (one page per leaf node) frees its nodes as the cursor passes them; an object at the inline line finalizes in one drain; a releasing slot is absent to lookups and is not reused before completion; an owed object whose group is gone still completes.
 
+**Design review (2026-11-14).** Independent, read-only, Claude Opus 5.5 at low effort, against `a4cd8b4`; checked against the code by the coordinator.
+
+| # | Sev. | Finding | Disposition |
+|---|---|---|---|
+| D1 | Medium | The primordial terminal teardown (`finish_terminal_teardown`) drains and then proves every registry slot free (`prove_registry_capacity`); an object left owed there fails it | Fixed: that path completes every owed finalization before the proof |
+| D2 | Medium | A node's span can end past the object, so a cursor that stops at the object's end never "passes" the last node at each level: nodes leak or the object never completes | Fixed: a node ends at its span's end clamped to the object, so reaching the end frees the whole last path |
+| D3 | Low | A step whose budget runs out at a node's end must free that node in the same step, or a later step frees its parent with a child linked | Fixed: node frees cascade upward before the budget is checked; a step may visit up to three entries past its budget |
+| D4 | Low | The finalize step runs inside timed steps (family-G drains), and one timing slot per CPU would end the outer step early; `CALL_BITS` holds 8 calls | Fixed: a step already timed on its CPU counts it; `CALL_BITS` is 4 |
+| D5 | Low | Item 1 kept the backing grant in two places | Fixed: the queued finalization holds record and grant; the slot is held by the owed entry, which slot allocation checks |
+| R1 | Medium | A job that drops a large object and at once makes an eager create or commit in the same budget is refused until enough steps run (faults retry) | Accepted by Mike, 2026-11-14: syscalls refuse |
+| R2 | Low/Medium | The inline line (64 frames) did not bound a drain: many sparse objects of 64 frames each read about 24K entries | Fixed: no inline line; every on-demand finalization is owed and the step's budget bounds a drain |
+| R3 | Low | One object per drain would hold many slots | Fixed: a step's unspent budget goes on to the next owed object |
+| R4 | Low | The fault arm retries while any finalization is owed, though another job's: an over-budget job spins instead of ending | Accepted (Low): bounded by the queue, which every drain shortens; it spends the faulting job's own time |
+| R5 | Low | With the BSP running user code that makes no syscalls, steps come one per BSP tick, and init's 500 ms settle can end first | Measured below (`owed-longest-us`) |
+| R6 | Low | Without the whole-tree check before freeing, a corrupt index panics partway through instead of before | Accepted (Low): a panic either way |
+
+**As built (revision 2).**
+1. *Owed.* `finalize_one` takes the finalization and hands it to `MemoryObjectAuthority::defer_finalization`, which queues every on-demand one (FIFO, `OBJECTS` entries, one per slot) and returns any other kind for completion at once. The record is out of the authority's tables, so every lookup misses it; the owed entry holds a slot, which `validate_backing`'s slot search skips.
+2. *Step.* `FrameRoleManager::release_index_step` (D2, D3). `finalize_owed_step` spends `FINALIZE_STEP_ENTRIES` (512) over the queue oldest first, lowering each object's weight by its freed frames through `ObjectRegistry::lower_finalizing_charge_pages` and completing each whose cursor reached its end (`complete_memory_finalization`, which frees the empty root).
+3. *Where.* Last in every `drain_finalizers`, after the teardown step and its drain, so a teardown's finalizations share the drain's step. The idle BSP takes one on the kernel root (`idle_finalize_step`), and `idle_work_remains` counts owed finalizations. The fault arm fires for owed finalization too.
+4. *Report.* `[steps]` gains `release` and `finalize` calls; per call its longest step, its steps and their total (`call-longest-us`, `call-steps`, `call-total-us`); and `owed-longest-us`, the longest stretch teardown, and finalization, stayed owed without the queue emptying, sampled at each drain.
+
 **Measurements (the rest of step 6).** The step report gains a `Release` call for §10.9's release step (its lease-pool scans, item 8) and a `Finalize` call (item 7). Teardown latency (§10.10 item 8) is the time from a job's termination to its group's usage settling, read by dev-boot from `memory` samples. Probe 14's per-page cost is broken down by step call. Init's worst reply delay after a settle pause (step-5 review W R1) is measured with 16 sessions.
 
 ## 11. M9 direction (Mike, 2026-11-13)

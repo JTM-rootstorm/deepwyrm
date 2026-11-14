@@ -596,6 +596,102 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok((cursor.min(end.max(start)), freed, visited))
     }
 
+    /// One step of finalizing an on-demand backing (DW2 §10.12 item 2):
+    /// frees its committed pages and nodes in object-page order from
+    /// `cursor`, visiting at most `budget` entries. A committed page is
+    /// unlinked and freed; an absent entry skips its span; once the cursor
+    /// reaches the end of a node below the root (its span, clamped to the
+    /// object), that node is empty and is freed with its parent entry
+    /// cleared, cascading upward before the budget is checked again, so a
+    /// step may visit up to `INDEX_MAX_LEVELS - 1` entries past `budget`.
+    /// The root stays. Returns the new cursor, the frames freed and the
+    /// entries visited; the index below the root is empty once the cursor
+    /// reaches the object's end.
+    ///
+    /// The caller guarantees nothing can commit into the backing or reach
+    /// its pages: its object is finalizing.
+    pub(crate) fn release_index_step(
+        &mut self,
+        backing: BackingIdentity,
+        cursor: u64,
+        budget: u64,
+    ) -> Result<(u64, u64, u64), FrameRoleError> {
+        let head = backing.0;
+        let (_, root) = self.index_root(head)?;
+        let pages = root.pages;
+        let memory = self.memory()?;
+        let mut cursor = cursor.min(pages);
+        let mut freed = 0_u64;
+        let mut visited = 0_u64;
+        while cursor < pages && visited < budget {
+            let (steps, found) = self.index_walk(head, cursor)?;
+            let depth = steps
+                .iter()
+                .rposition(Option::is_some)
+                .ok_or(FrameRoleError::InvariantViolation)?;
+            let deepest = steps[depth].ok_or(FrameRoleError::InvariantViolation)?;
+            visited += 1;
+            match found {
+                Some((identity, _)) => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "the manager owns its index nodes exclusively under `&mut self`"
+                    )]
+                    // SAFETY: `deepest.node` is a node of this backing, which
+                    // the manager owns exclusively under `&mut self`.
+                    unsafe {
+                        memory.write(deepest.node, deepest.entry, 0)
+                    };
+                    let slot = self.slot(identity)?;
+                    self.free_index_slot(slot);
+                    freed += 1;
+                    cursor += 1;
+                }
+                None => {
+                    cursor = deepest
+                        .first_page
+                        .checked_add(entry_span(deepest.level))
+                        .ok_or(FrameRoleError::InvariantViolation)?
+                        .min(pages);
+                }
+            }
+            // The node at each depth below the root is the child its parent
+            // step's entry names; it ends where that entry's span ends.
+            for level in (1..=depth).rev() {
+                let parent = steps[level - 1].ok_or(FrameRoleError::InvariantViolation)?;
+                let end = parent
+                    .first_page
+                    .checked_add(entry_span(parent.level))
+                    .ok_or(FrameRoleError::InvariantViolation)?
+                    .min(pages);
+                if cursor < end {
+                    break;
+                }
+                let raw = memory.read(parent.node, parent.entry);
+                let (identity, _, _) = self.index_entry(
+                    head,
+                    raw,
+                    true,
+                    node_place(parent.first_page, parent.level - 1),
+                )?;
+                #[allow(
+                    unsafe_code,
+                    reason = "the manager owns its index nodes exclusively under `&mut self`"
+                )]
+                // SAFETY: `parent.node` is a node of this backing, which the
+                // manager owns exclusively under `&mut self`.
+                unsafe {
+                    memory.write(parent.node, parent.entry, 0)
+                };
+                let slot = self.slot(identity)?;
+                self.free_index_slot(slot);
+                freed += 1;
+                visited += 1;
+            }
+        }
+        Ok((cursor, freed, visited))
+    }
+
     /// Frees an on-demand backing whole, after checking every node and
     /// page.
     pub(super) fn release_index(&mut self, head: FrameRoleIdentity) -> Result<(), FrameRoleError> {
