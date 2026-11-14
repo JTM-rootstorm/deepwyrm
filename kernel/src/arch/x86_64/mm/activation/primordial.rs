@@ -5698,7 +5698,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Removes at most `limit` bytes of an exited, quiesced Process's
     /// mappings, lowest first, a mapping's front at a time: all of them for
-    /// `u64::MAX`, one queued-teardown step for 16 MiB (DW2 §10.10 item 3).
+    /// `u64::MAX`, one queued-teardown step for `FAMILY_G_STEP_BYTES` (DW2
+    /// §10.10 item 3).
     /// `true` if mappings remain.
     fn unmap_inactive_pieces(
         &mut self,
