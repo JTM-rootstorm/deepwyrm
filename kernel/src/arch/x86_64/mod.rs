@@ -48,6 +48,15 @@ pub(crate) mod power;
 )]
 pub(crate) mod rendezvous;
 pub(crate) mod smp;
+// Host builds use only its tests; the live kernel paints and reports.
+#[cfg(any(
+    test,
+    all(
+        not(feature = "test-support"),
+        target_os = "none",
+        target_arch = "x86_64"
+    )
+))]
 pub(crate) mod stack_watermark;
 pub(crate) mod syscall;
 pub mod tss;

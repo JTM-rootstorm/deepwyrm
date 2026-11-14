@@ -14,6 +14,9 @@ mod arch {
         pub(crate) mod io_port {
             pub(crate) struct X86PortIo;
         }
+        pub(crate) mod stack_watermark {
+            pub(crate) fn report() {}
+        }
         pub(crate) mod acpi {
             pub(crate) mod sleep {
                 pub(crate) struct S5SoftOff;
