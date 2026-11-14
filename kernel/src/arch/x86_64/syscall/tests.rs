@@ -225,7 +225,13 @@ impl SyscallMsrAccess for FakeMsr {
 
 #[test]
 fn e4_msr_plan_is_exact_and_preserves_efer() {
-    let plan = SyscallMsrPlan::new(0x500, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
+    let plan = SyscallMsrPlan::new(
+        0x500,
+        0xffff_ffff_8000_1000,
+        0xffff_ffff_8000_3000,
+        0xffff_ffff_8000_2000,
+    )
+    .unwrap();
     assert_eq!(plan.efer, 0x501);
     assert_eq!(plan.star, 0x0000_0008_0000_0000);
     assert_eq!(plan.lstar, 0xffff_ffff_8000_1000);
@@ -233,15 +239,26 @@ fn e4_msr_plan_is_exact_and_preserves_efer() {
     assert_eq!(plan.fs_base, 0);
     assert_eq!(plan.gs_base, 0xffff_ffff_8000_2000);
     assert_eq!(plan.kernel_gs_base, 0);
+    assert_eq!(plan.cstar, 0xffff_ffff_8000_3000);
+    assert_eq!(plan.sysenter_cs, 0);
 }
 
 #[test]
 fn e4_msr_programming_enables_sce_last_and_verifies_readback() {
-    let plan = SyscallMsrPlan::new(0x100, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
+    let plan = SyscallMsrPlan::new(
+        0x100,
+        0xffff_ffff_8000_1000,
+        0xffff_ffff_8000_3000,
+        0xffff_ffff_8000_2000,
+    )
+    .unwrap();
     let mut access = FakeMsr::default();
     program_and_verify(&mut access, plan).unwrap();
     assert_eq!(access.writes.last(), Some(&(IA32_EFER, plan.efer)));
-    assert_eq!(access.writes.len(), 7);
+    assert_eq!(access.writes.len(), 11);
+    for msr in [IA32_SYSENTER_CS, IA32_SYSENTER_ESP, IA32_SYSENTER_EIP] {
+        assert!(access.writes.contains(&(msr, 0)), "{msr:#x}");
+    }
     verify(&mut access, plan).unwrap();
 
     access.values.insert(IA32_FMASK, 0);
@@ -256,7 +273,13 @@ fn e4_msr_programming_enables_sce_last_and_verifies_readback() {
 
 #[test]
 fn e4_live_validation_requires_strict_kernel_gs_orientation() {
-    let plan = SyscallMsrPlan::new(0x100, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
+    let plan = SyscallMsrPlan::new(
+        0x100,
+        0xffff_ffff_8000_1000,
+        0xffff_ffff_8000_3000,
+        0xffff_ffff_8000_2000,
+    )
+    .unwrap();
     let mut access = FakeMsr::default();
     program_and_verify(&mut access, plan).unwrap();
 
@@ -274,7 +297,16 @@ fn e4_live_validation_requires_strict_kernel_gs_orientation() {
     access.values.insert(IA32_KERNEL_GS_BASE, 0);
     verify(&mut access, plan).unwrap();
 
-    for msr in [IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_EFER] {
+    for msr in [
+        IA32_STAR,
+        IA32_LSTAR,
+        IA32_FMASK,
+        IA32_EFER,
+        IA32_CSTAR,
+        IA32_SYSENTER_CS,
+        IA32_SYSENTER_ESP,
+        IA32_SYSENTER_EIP,
+    ] {
         let expected = plan.expected(msr).unwrap();
         access.values.insert(msr, expected ^ 1);
         assert!(matches!(
@@ -290,7 +322,13 @@ fn e4_live_validation_requires_strict_kernel_gs_orientation() {
 
 #[test]
 fn a_thread_fs_base_is_user_state_not_a_boundary_invariant() {
-    let plan = SyscallMsrPlan::new(0x100, 0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000).unwrap();
+    let plan = SyscallMsrPlan::new(
+        0x100,
+        0xffff_ffff_8000_1000,
+        0xffff_ffff_8000_3000,
+        0xffff_ffff_8000_2000,
+    )
+    .unwrap();
     let mut access = FakeMsr::default();
     program_and_verify(&mut access, plan).unwrap();
     assert!(access.writes.contains(&(IA32_FS_BASE, 0)));

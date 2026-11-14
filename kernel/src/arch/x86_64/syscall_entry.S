@@ -153,6 +153,23 @@ dw_x86_64_syscall_entry:
 .size dw_x86_64_syscall_entry, .-dw_x86_64_syscall_entry
 
 .p2align 4
+/*
+ * IA32_CSTAR's target: SYSCALL from compatibility mode (AMD). No user code
+ * segment can enter compatibility mode (no 32-bit DPL-3 code descriptor, a
+ * null LDT), so this is unreachable; if that ever stops holding before the
+ * i386 contract's entry exists, the CPU stops here on the user's stack rather
+ * than running the 64-bit entry with a compatibility-mode frame. It touches
+ * no memory and no GS.
+ */
+.globl dw_x86_64_compat_syscall_entry
+.type dw_x86_64_compat_syscall_entry,@function
+dw_x86_64_compat_syscall_entry:
+    cli
+1:
+    hlt
+    jmp 1b
+.size dw_x86_64_compat_syscall_entry, .-dw_x86_64_compat_syscall_entry
+
 .globl dw_x86_64_iret_to_user
 .type dw_x86_64_iret_to_user,@function
 dw_x86_64_iret_to_user:

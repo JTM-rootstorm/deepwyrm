@@ -106,6 +106,11 @@ pub unsafe fn activate(gdt: &'static GlobalDescriptorTable) {
             "mov gs, ax",
             "mov ax, {tss_selector}",
             "ltr ax",
+            // A null LDT: the BSP otherwise keeps whatever LDTR firmware left,
+            // whose descriptors (a compatibility-mode code segment, a call
+            // gate) would live in memory the kernel no longer owns.
+            "xor eax, eax",
+            "lldt ax",
             gdt_pointer = in(reg) &raw const pointer,
             code_selector = const KERNEL_CODE_SELECTOR.bits(),
             data_selector = const KERNEL_DATA_SELECTOR.bits(),

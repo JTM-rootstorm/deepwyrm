@@ -17,6 +17,10 @@ pub(crate) const IA32_FMASK: u32 = 0xc000_0084;
 pub(crate) const IA32_FS_BASE: u32 = 0xc000_0100;
 pub(crate) const IA32_GS_BASE: u32 = 0xc000_0101;
 pub(crate) const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
+pub(crate) const IA32_CSTAR: u32 = 0xc000_0083;
+pub(crate) const IA32_SYSENTER_CS: u32 = 0x174;
+pub(crate) const IA32_SYSENTER_ESP: u32 = 0x175;
+pub(crate) const IA32_SYSENTER_EIP: u32 = 0x176;
 
 pub(crate) const EFER_SCE: u64 = 1;
 pub(crate) const E4_FMASK: u64 = 0x001f_7700;
@@ -30,6 +34,15 @@ pub(crate) struct SyscallMsrPlan {
     pub(crate) fs_base: u64,
     pub(crate) gs_base: u64,
     pub(crate) kernel_gs_base: u64,
+    /// Compatibility-mode SYSCALL's target (AMD). No user code segment can
+    /// enter compatibility mode today, so it is a stub that halts; the i386
+    /// contract (root `I386_EXECUTION_MODE_CONTRACT.md`) replaces it before
+    /// one can.
+    pub(crate) cstar: u64,
+    /// Zero, with the SYSENTER stack and target: Intel's SYSENTER, which
+    /// works from 64-bit user mode too, then raises #GP(0), an ordinary user
+    /// fault, instead of entering ring 0 wherever firmware left these.
+    pub(crate) sysenter_cs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,12 +55,16 @@ impl SyscallMsrPlan {
     pub(crate) fn new(
         current_efer: u64,
         lstar: u64,
+        cstar: u64,
         entry_state_base: u64,
     ) -> Result<Self, SyscallMsrPlanError> {
-        if lstar == 0 || entry_state_base == 0 {
+        if lstar == 0 || cstar == 0 || entry_state_base == 0 {
             return Err(SyscallMsrPlanError::ZeroKernelAddress);
         }
-        if !is_upper_canonical(lstar) || !is_upper_canonical(entry_state_base) {
+        if !is_upper_canonical(lstar)
+            || !is_upper_canonical(cstar)
+            || !is_upper_canonical(entry_state_base)
+        {
             return Err(SyscallMsrPlanError::NonCanonicalKernelAddress);
         }
         Ok(Self {
@@ -61,6 +78,8 @@ impl SyscallMsrPlan {
             // Every later SYSCALL begins with SWAPGS before consuming GS.
             gs_base: entry_state_base,
             kernel_gs_base: 0,
+            cstar,
+            sysenter_cs: 0,
         })
     }
 
@@ -73,6 +92,9 @@ impl SyscallMsrPlan {
             IA32_FS_BASE => Some(self.fs_base),
             IA32_GS_BASE => Some(self.gs_base),
             IA32_KERNEL_GS_BASE => Some(self.kernel_gs_base),
+            IA32_CSTAR => Some(self.cstar),
+            IA32_SYSENTER_CS => Some(self.sysenter_cs),
+            IA32_SYSENTER_ESP | IA32_SYSENTER_EIP => Some(0),
             _ => None,
         }
     }
@@ -111,6 +133,10 @@ pub(crate) fn program_and_verify<A: SyscallMsrAccess>(
         (IA32_FS_BASE, plan.fs_base),
         (IA32_GS_BASE, plan.gs_base),
         (IA32_KERNEL_GS_BASE, plan.kernel_gs_base),
+        (IA32_CSTAR, plan.cstar),
+        (IA32_SYSENTER_CS, plan.sysenter_cs),
+        (IA32_SYSENTER_ESP, 0),
+        (IA32_SYSENTER_EIP, 0),
         (IA32_EFER, plan.efer),
     ] {
         access
@@ -132,6 +158,10 @@ pub(crate) fn verify<A: SyscallMsrAccess>(
         IA32_FMASK,
         IA32_GS_BASE,
         IA32_KERNEL_GS_BASE,
+        IA32_CSTAR,
+        IA32_SYSENTER_CS,
+        IA32_SYSENTER_ESP,
+        IA32_SYSENTER_EIP,
         IA32_EFER,
     ] {
         let observed = access.read(msr).map_err(SyscallMsrProgramError::Access)?;

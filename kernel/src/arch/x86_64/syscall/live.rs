@@ -745,6 +745,17 @@ fn syscall_entry_address() -> u64 {
     core::ptr::addr_of!(dw_x86_64_syscall_entry) as u64
 }
 
+#[allow(
+    unsafe_code,
+    reason = "fixed assembly symbol address is the IA32_CSTAR target"
+)]
+fn compat_syscall_entry_address() -> u64 {
+    unsafe extern "C" {
+        static dw_x86_64_compat_syscall_entry: u8;
+    }
+    core::ptr::addr_of!(dw_x86_64_compat_syscall_entry) as u64
+}
+
 fn cpu_index_for_entry_state_address(address: u64) -> Option<usize> {
     ENTRY_STATE
         .iter()
@@ -958,8 +969,13 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         };
         let entry_state_base =
             entry_state_address(cpu_index).ok_or(SyscallInstallError::DescriptorState)?;
-        let plan = SyscallMsrPlan::new(current_efer, syscall_entry_address(), entry_state_base)
-            .map_err(SyscallInstallError::InvalidMsrPlan)?;
+        let plan = SyscallMsrPlan::new(
+            current_efer,
+            syscall_entry_address(),
+            compat_syscall_entry_address(),
+            entry_state_base,
+        )
+        .map_err(SyscallInstallError::InvalidMsrPlan)?;
         program_and_verify(&mut access, plan).map_err(map_program_error)?;
         let expected = EXPECTED_PLAN
             .get(cpu_index)
