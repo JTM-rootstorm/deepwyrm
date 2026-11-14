@@ -20,6 +20,7 @@ const ELF_CURRENT_VERSION: u8 = 1;
 const ELF_TYPE_EXECUTABLE: u16 = 2;
 const ELF_MACHINE_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
 const PT_GNU_STACK: u32 = 0x6474_e551;
 const PF_X: u32 = 1;
@@ -365,6 +366,7 @@ pub fn parse_primordial_elf(bytes: &[u8]) -> Result<PrimordialElfLoadPlan, Primo
     let mut mapped_byte_len = 0_u64;
     let mut seen_phdr = false;
     let mut seen_gnu_stack = false;
+    let mut seen_note = false;
 
     for index in 0..program_header_count {
         let offset = program_header_offset + index * ELF_PROGRAM_HEADER_SIZE;
@@ -411,6 +413,18 @@ pub fn parse_primordial_elf(bytes: &[u8]) -> Result<PrimordialElfLoadPlan, Primo
                 if flags & !KNOWN_PROGRAM_FLAGS != 0 {
                     return Err(PrimordialElfError::UnsupportedSegmentPermissions);
                 }
+            }
+            // The ABI note every native binary carries (root
+            // `OS_STACK_ARCHITECTURE_PLAN.md` V1). The kernel loads nothing
+            // from it and only bounds it: init compares its own fingerprint
+            // with the kernel's at startup, and Wyrmroot's loader checks every
+            // image it loads.
+            PT_NOTE => {
+                if seen_note {
+                    return Err(PrimordialElfError::DuplicateMetadataHeader);
+                }
+                seen_note = true;
+                validate_metadata_file_range(header, bytes.len())?;
             }
             _ => return Err(PrimordialElfError::UnsupportedProgramHeader),
         }

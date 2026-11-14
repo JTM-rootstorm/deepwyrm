@@ -285,6 +285,24 @@ fn rejects_wx_executable_stack_unsupported_dynamic_and_bad_entry() {
         );
     }
 
+    // One in-bounds ABI note is accepted and loads nothing; a second note,
+    // or one past the file, is refused.
+    let mut noted = fixture();
+    put_u16(&mut noted, 56, 4);
+    program_header(&mut noted, 3, 4, PF_R, 0x2f00, 0, 56, 56, 4);
+    assert_eq!(parse_primordial_elf(&noted).unwrap().segment_count, 2);
+    let mut twice = noted.clone();
+    put_u16(&mut twice, 56, 5);
+    program_header(&mut twice, 4, 4, PF_R, 0x2f00, 0, 56, 56, 4);
+    assert_eq!(
+        parse_primordial_elf(&twice),
+        Err(PrimordialElfError::DuplicateMetadataHeader)
+    );
+    let mut outside = fixture();
+    put_u16(&mut outside, 56, 4);
+    program_header(&mut outside, 3, 4, PF_R, 0x2fe0, 0, 56, 56, 4);
+    assert!(parse_primordial_elf(&outside).is_err());
+
     let mut invalid_entry = fixture();
     put_u64(&mut invalid_entry, 24, 0x404000);
     assert_eq!(
