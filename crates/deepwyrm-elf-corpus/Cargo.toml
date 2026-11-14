@@ -1,0 +1,13 @@
+[package]
+name = "deepwyrm-elf-corpus"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+description = "Shared hostile-ELF corpus and parser limits table for host tests"
+
+[dependencies]
+deepwyrm-abi = { path = "../deepwyrm-abi" }
+
+[lib]
+path = "src/lib.rs"

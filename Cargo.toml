@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/deepwyrm-abi",
+    "crates/deepwyrm-elf-corpus",
     "crates/deepwyrm-syscall",
     "kernel",
     "tools/abi-gen",

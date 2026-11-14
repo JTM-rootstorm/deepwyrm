@@ -373,3 +373,22 @@ fn accepts_optional_program_header_metadata() {
     );
     assert!(parse_primordial_elf(&bytes).is_ok());
 }
+
+/// The shared corpus's verdicts for this parser (root
+/// `OS_STACK_ARCHITECTURE_PLAN.md` Z1); Wyrmroot's loader tests the same
+/// cases against its own column.
+#[test]
+fn the_shared_elf_corpus_gets_its_expected_verdicts() {
+    use deepwyrm_elf_corpus::{Verdict, cases};
+    let mut wrong = std::vec::Vec::new();
+    for case in cases() {
+        let verdict = match parse_primordial_elf(&case.bytes) {
+            Ok(_) => Verdict::Accept,
+            Err(_) => Verdict::Reject,
+        };
+        if verdict != case.primordial {
+            wrong.push((case.name, verdict, parse_primordial_elf(&case.bytes).err()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

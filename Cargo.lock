@@ -11,10 +11,18 @@ name = "deepwyrm-abi"
 version = "0.0.0"
 
 [[package]]
+name = "deepwyrm-elf-corpus"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-abi",
+]
+
+[[package]]
 name = "deepwyrm-kernel"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-abi",
+ "deepwyrm-elf-corpus",
 ]
 
 [[package]]

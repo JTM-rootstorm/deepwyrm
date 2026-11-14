@@ -20,3 +20,6 @@ bench = false
 
 [dependencies]
 deepwyrm-abi = { path = "../crates/deepwyrm-abi" }
+
+[dev-dependencies]
+deepwyrm-elf-corpus = { path = "../crates/deepwyrm-elf-corpus" }
