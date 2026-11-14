@@ -263,6 +263,22 @@ pub fn object_get_task_state_v1(
     )
 }
 
+/// Query a TaskGroup's MEMORY_PAGES limit, usage and headroom, and, on the
+/// root TaskGroup only, the free frame count (DW2 M5). Needs INSPECT.
+#[inline]
+pub fn object_get_task_group_memory_info_v1(
+    handle: DwHandle,
+    out_info: &mut DwTaskGroupMemoryInfoV1,
+    out_required_size: &mut u64,
+) -> DwStatus {
+    object_get_info_v1(
+        handle,
+        DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1,
+        out_info,
+        out_required_size,
+    )
+}
+
 /// Transactionally create a child Process and install its bootstrap Channel.
 #[inline]
 pub fn process_create(
