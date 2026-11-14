@@ -396,6 +396,14 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(ProcessKey(self.thread(key)?.parent.id()))
     }
 
+    /// Whether `key` has exited or no longer names a Thread: it will never
+    /// run again (DW2 §10.8 item 5).
+    pub(crate) fn thread_has_ended(&self, key: ThreadKey) -> bool {
+        !self
+            .thread(key)
+            .is_ok_and(|thread| thread.state.state != DW_TASK_STATE_EXITED)
+    }
+
     pub(crate) fn drain_exited_process_handles<const OBJECTS: usize>(
         &mut self,
         registry: &mut ObjectRegistry<OBJECTS>,

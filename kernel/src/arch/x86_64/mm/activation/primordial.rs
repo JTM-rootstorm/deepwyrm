@@ -917,38 +917,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         request: NativeSyscallRequest,
     ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
-        let handle = |address| [Some((address, 8, 8)), None, None];
-        let outputs: [Option<(deepwyrm_abi::DwUserAddress, usize, u64)>; 3] = match request {
-            NativeSyscallRequest::HandleDuplicate { out_handle, .. }
-            | NativeSyscallRequest::TaskGroupCreate { out_handle, .. } => handle(out_handle),
-            NativeSyscallRequest::ThreadCreate { out_thread, .. } => handle(out_thread),
-            NativeSyscallRequest::DeviceResourceClaim { out_resource, .. } => handle(out_resource),
-            NativeSyscallRequest::DevicePioRead { out_value, .. }
-            | NativeSyscallRequest::DevicePciConfigRead { out_value, .. } => {
-                [Some((out_value, 4, 4)), None, None]
-            }
-            NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => handle(out_interrupt),
-            NativeSyscallRequest::DeviceMmioObjectCreate {
-                out_memory_object, ..
-            } => handle(out_memory_object),
-            NativeSyscallRequest::DmaMap { out_iova, .. } => [Some((out_iova, 8, 8)), None, None],
-            NativeSyscallRequest::EventCreate { out_event, .. } => handle(out_event),
-            NativeSyscallRequest::TimerCreate { out_timer, .. } => handle(out_timer),
-            NativeSyscallRequest::ChannelCreate {
-                out_endpoint0,
-                out_endpoint1,
-                ..
-            } => [
-                Some((out_endpoint0, 8, 8)),
-                Some((out_endpoint1, 8, 8)),
-                None,
-            ],
-            NativeSyscallRequest::AtomicWake { out_woken, .. } => {
-                [Some((out_woken, 4, 4)), None, None]
-            }
-            NativeSyscallRequest::MemoryObjectCreate { out_handle, .. } => handle(out_handle),
-            _ => return None,
-        };
+        let outputs = deferred_outputs(request)?;
         // MemoryObjectCreate's backing, allocated with P alone before the
         // hold, when its size is one the adapter can reach its allocation
         // with (D1 commit 6c).
@@ -1002,16 +971,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         // Every range the adapter will preflight, or `None` if one cannot be
         // formed (the adapter then fails at that range, before any pin).
-        let mut ranges = [None, None, None];
-        let mut formed = true;
-        for (index, output) in outputs.into_iter().enumerate() {
-            if let Some((address, byte_len, alignment)) = output {
-                match crate::syscall::output_range(address, byte_len, alignment) {
-                    Ok(range) => ranges[index] = Some(range),
-                    Err(_) => formed = false,
-                }
-            }
-        }
+        let (ranges, formed) = deferred_output_ranges(outputs);
         let (atomic_pin, pinned, backing) = {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
@@ -1073,14 +1033,65 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             (atomic_pin, pinned, backing)
         };
-        let backing = backing.map(|early| {
-            early.and_then(|early| match early {
-                EarlyBacking::Ready(grant) => Ok(grant),
-                EarlyBacking::Unzeroed(allocation) => {
-                    self.zero_backing_in_steps(root, process, allocation)
+        // An eager backing is zeroed in steps, which may yield (DW2 §10.8).
+        let (phase, root, process, backing) = match backing {
+            Some(Ok(EarlyBacking::Unzeroed(allocation))) => {
+                match self.zero_backing_in_steps(phase, root, process, allocation, 0) {
+                    Zeroing::Done {
+                        phase,
+                        root,
+                        process,
+                        backing,
+                    } => (phase, root, process, Some(backing)),
+                    Zeroing::Yielded { allocation, first } => {
+                        self.discard_deferred_pins(root, process, pinned);
+                        return Some(Ok(self.park_call(ParkedCall::Create(ParkedCreate {
+                            request,
+                            allocation,
+                            first,
+                            backing_pages: backing_pages.unwrap_or(0),
+                        }))));
+                    }
+                    Zeroing::Stopped(allocation) => {
+                        self.discard_deferred_pins(root, process, pinned);
+                        self.abandon_create(allocation);
+                        return Some(Err(()));
+                    }
                 }
-            })
-        });
+            }
+            Some(Ok(EarlyBacking::Ready(grant))) => (phase, root, process, Some(Ok(grant))),
+            Some(Err(status)) => (phase, root, process, Some(Err(status))),
+            None => (phase, root, process, None),
+        };
+        Some(Ok(self.finish_deferred_output(
+            request,
+            phase,
+            (root, process),
+            atomic_pin,
+            pinned,
+            ranges,
+            backing_pages,
+            backing,
+        )))
+    }
+
+    /// The last hold of a family-B call, then its pins' settlement with P
+    /// alone (D1 commit 6): steps 3 and 4 of `handle_deferred_output`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the family-B state built before the last hold, in one place"
+    )]
+    fn finish_deferred_output(
+        &mut self,
+        request: NativeSyscallRequest,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        (root, process): (super::UserCopyRoot, ProcessKey),
+        atomic_pin: Option<Result<user_access::OwnedLiveAtomicU32, deepwyrm_abi::DwStatus>>,
+        pinned: Option<[Option<user_access::OwnedLiveUserOutput>; 3]>,
+        ranges: [Option<UserRange>; 3],
+        backing_pages: Option<u64>,
+        backing: Option<Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>>,
+    ) -> crate::syscall::native::ReturnReady {
         let pin_taken = matches!(atomic_pin, Some(Ok(_)));
         let mut deferred =
             crate::memory::usercopy::DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));
@@ -1163,7 +1174,38 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             }
         }
-        Some(Ok(ready))
+        ready
+    }
+
+    /// Lets a family-B call's output pins go, with P alone.
+    fn discard_deferred_pins(
+        &mut self,
+        root: super::UserCopyRoot,
+        process: ProcessKey,
+        pinned: Option<[Option<user_access::OwnedLiveUserOutput>; 3]>,
+    ) {
+        let Some(pinned) = pinned else {
+            return;
+        };
+        let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+        let mut paging = access.lock();
+        let mut user = paging
+            .guard_free_value()
+            .usercopy_process_address_space(root, process);
+        for output in pinned.into_iter().flatten() {
+            user.discard_owned_output(output)
+                .unwrap_or_else(|_| panic!("a parked create's output discard drifted"));
+        }
+    }
+
+    /// Ends a create that will not finish (stopped, or its output gone on
+    /// resume): under T, frees its unzeroed backing with P beneath and ends
+    /// its quota reservation.
+    fn abandon_create(&mut self, allocation: crate::memory::frame_roles::BackingAllocation) {
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        let thread = runtime.own.scheduled().thread;
+        runtime.settle_abandoned_call(thread, Some(allocation));
     }
 
     /// `ObjectGetInfoV1` (design §11.2.3 family B, D1 commit 6d). It is a
@@ -1862,35 +1904,57 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // DW2 M4b: a call larger than one step runs as a chain of steps,
         // each a complete transaction through the holds below, with a safe
         // point between them; `RegionSteps` plans the chain.
-        let mut steps = crate::syscall::RegionSteps::<MemoryProtection, REGION_SLOTS>::new(
-            request,
-            FAMILY_G_STEP_BYTES,
-        );
+        Some(self.run_region_steps(
+            crate::syscall::RegionSteps::new(request, FAMILY_G_STEP_BYTES),
+            false,
+        ))
+    }
+
+    /// Runs a family-G chain of steps until it returns, stops or yields
+    /// (DW2 M4b, §10.8). A call `resumed` after yielding pins a map's output
+    /// again before its next step; if it cannot, the map fails as a failed
+    /// step would, unmapping what it made, with `BAD_ADDRESS`. On Yield the
+    /// output pin is let go and the chain is parked; nothing else is held.
+    #[inline(never)]
+    fn run_region_steps(
+        &mut self,
+        mut steps: crate::syscall::RegionSteps<MemoryProtection, REGION_SLOTS>,
+        resumed: bool,
+    ) -> Result<crate::syscall::native::ReturnReady, ()> {
+        let request = steps.request();
         let mut output = None;
         let mut user = None;
         let mut previous = None;
+        let mut repin = resumed && steps.writes_map_output();
+        let mut stepped = false;
         loop {
             let cpu = self.cpu;
             let snapshot_range = steps.snapshot_range();
             let previous_phase = previous.take();
-            let Ok((phase, root, process, snapshot)) = self
-                .with_synchronized_runtime_at_safe_point(|runtime| {
-                    if let Some(phase) = previous_phase {
-                        runtime.commit_runtime_phase(phase);
-                    }
-                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                        runtime.service_pending_timer_expiries_on_bootstrap();
-                    }
-                    let snapshot = snapshot_range
-                        .map(|(region, start, end)| runtime.region_snapshot(region, start, end));
-                    let (phase, root, process) = runtime.prepare_guard_free_usercopy();
-                    (phase, root, process, snapshot)
-                })
-            else {
+            let Ok(prepared) = self.at_step_safe_point(stepped, |runtime, yielding| {
+                if let Some(phase) = previous_phase {
+                    runtime.commit_runtime_phase(phase);
+                }
+                if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                    runtime.service_pending_timer_expiries_on_bootstrap();
+                }
+                if yielding {
+                    return None;
+                }
+                let snapshot = snapshot_range
+                    .map(|(region, start, end)| runtime.region_snapshot(region, start, end));
+                let (phase, root, process) = runtime.prepare_guard_free_usercopy();
+                Some((phase, root, process, snapshot))
+            }) else {
                 // Stopped at a safe point. A call in steps keeps the steps
                 // it made; a pinned map output is let go.
                 self.settle_map_output(output.take(), user, None);
-                return Some(Err(()));
+                return Err(());
+            };
+            let Some((phase, root, process, snapshot)) = prepared else {
+                // The quantum expired: let the output pin go and park.
+                self.settle_map_output(output.take(), user, None);
+                return Ok(self.park_call(ParkedCall::Region(steps)));
             };
             let (root, process) = *user.get_or_insert((root, process));
             if let Some(snapshot) = snapshot {
@@ -1901,7 +1965,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let mut runtime = guard.on(&mut self.owned);
                         runtime.return_from_steps(phase, status)
                     };
-                    return Some(Ok(ready));
+                    return Ok(ready);
+                }
+            }
+            // A resumed map takes its output pin again (§10.8 item 2).
+            if core::mem::take(&mut repin) {
+                let NativeSyscallRequest::AddressRegionMap { out_address, .. } = request else {
+                    unreachable!("only a map writes an output")
+                };
+                let pinned = {
+                    let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+                    let mut paging = access.lock();
+                    let mut space = paging
+                        .guard_free_value()
+                        .usercopy_process_address_space(root, process);
+                    pin_map_output(&mut space, out_address)
+                };
+                match pinned {
+                    Ok(pinned) => output = Some(pinned),
+                    Err(status) => {
+                        if let Some(status) = steps.abandon(status) {
+                            let ready = {
+                                let mut guard = self.runtime.lock();
+                                let mut runtime = guard.on(&mut self.owned);
+                                runtime.return_from_steps(phase, status)
+                            };
+                            return Ok(ready);
+                        }
+                    }
                 }
             }
             // Map's arguments and output pin, with P alone (D1 commit 9).
@@ -1970,11 +2061,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             match finished {
                 FamilyGBegun::Returned(ready) => {
                     self.settle_map_output(output.take(), user, address);
-                    return Some(Ok(ready));
+                    return Ok(ready);
                 }
                 FamilyGBegun::Stepped { phase, status } => {
                     let Some(status) = steps.advance(status, address) else {
                         previous = Some(phase);
+                        stepped = true;
                         continue;
                     };
                     let ready = {
@@ -1988,7 +2080,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         None
                     };
                     self.settle_map_output(output.take(), user, address);
-                    return Some(Ok(ready));
+                    return Ok(ready);
                 }
                 FamilyGBegun::Published { .. } => {
                     unreachable!("a published step finishes in its last hold")
@@ -2006,36 +2098,79 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         request: NativeSyscallRequest,
     ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        self.run_fill_in(
+            request,
+            FillCursor::Buffer {
+                index: 0,
+                next: None,
+            },
+        )
+    }
+
+    /// The fill-in from `cursor` (DW2 M6 §8.6), yielding between steps when
+    /// the quantum expires (§10.8): the cursor is parked, and the resumed
+    /// call goes on from it and then to the syscall.
+    #[inline(never)]
+    fn run_fill_in(
+        &mut self,
+        request: NativeSyscallRequest,
+        cursor: FillCursor,
+    ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
         if crate::memory::object::LIVE_ON_DEMAND_OBJECTS.load(core::sync::atomic::Ordering::Acquire)
             == 0
         {
             return None;
         }
-        for buffer in request.user_buffers().into_iter().flatten() {
-            if buffer.byte_len == 0 {
-                continue;
-            }
-            // A buffer the copy cannot use is the copy's to refuse.
-            let Some(end) = buffer
-                .address
-                .checked_add(buffer.byte_len)
-                .and_then(|end| end.checked_add(PAGE_SIZE - 1))
-                .map(|end| end & !(PAGE_SIZE - 1))
-            else {
-                continue;
-            };
-            let cpu = self.cpu;
-            let mut next = buffer.address & !(PAGE_SIZE - 1);
-            while next < end {
-                match self.with_synchronized_runtime_at_safe_point(|runtime| {
-                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                        runtime.service_pending_timer_expiries_on_bootstrap();
+        let mut stepped = false;
+        if let FillCursor::Buffer {
+            index: first,
+            next: resume_at,
+        } = cursor
+        {
+            for (index, buffer) in request.user_buffers().into_iter().enumerate().skip(first) {
+                let Some(buffer) = buffer else {
+                    continue;
+                };
+                if buffer.byte_len == 0 {
+                    continue;
+                }
+                // A buffer the copy cannot use is the copy's to refuse.
+                let Some(end) = buffer
+                    .address
+                    .checked_add(buffer.byte_len)
+                    .and_then(|end| end.checked_add(PAGE_SIZE - 1))
+                    .map(|end| end & !(PAGE_SIZE - 1))
+                else {
+                    continue;
+                };
+                let cpu = self.cpu;
+                let mut next = match resume_at {
+                    Some(next) if index == first => next,
+                    _ => buffer.address & !(PAGE_SIZE - 1),
+                };
+                while next < end {
+                    match self.at_step_safe_point(stepped, |runtime, yielding| {
+                        if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                            runtime.service_pending_timer_expiries_on_bootstrap();
+                        }
+                        if yielding {
+                            return None;
+                        }
+                        Some(runtime.fill_in_user_range(&mut next, end, buffer.write))
+                    }) {
+                        Err(()) => return Some(Err(())),
+                        Ok(None) => {
+                            let cursor = FillCursor::Buffer {
+                                index,
+                                next: Some(next),
+                            };
+                            return Some(
+                                Ok(self.park_call(ParkedCall::FillIn { request, cursor })),
+                            );
+                        }
+                        Ok(Some(Err(status))) => return Some(self.return_status(status)),
+                        Ok(Some(Ok(()))) => stepped = true,
                     }
-                    runtime.fill_in_user_range(&mut next, end, buffer.write)
-                }) {
-                    Err(()) => return Some(Err(())),
-                    Ok(Err(status)) => return Some(self.return_status(status)),
-                    Ok(Ok(())) => {}
                 }
             }
         }
@@ -2052,11 +2187,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } = request
         {
             let cpu = self.cpu;
-            let mut next = offset;
+            let mut next = match cursor {
+                FillCursor::Dma { next: Some(next) } => next,
+                FillCursor::Dma { next: None } | FillCursor::Buffer { .. } => offset,
+            };
             loop {
-                match self.with_synchronized_runtime_at_safe_point(|runtime| {
+                match self.at_step_safe_point(stepped, |runtime, yielding| {
                     if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                         runtime.service_pending_timer_expiries_on_bootstrap();
+                    }
+                    if yielding {
+                        return None;
                     }
                     let process = runtime.own.scheduled().process;
                     let Some(required) = crate::syscall::dma_map_commit_rights(
@@ -2067,25 +2208,29 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         resource,
                         access,
                     ) else {
-                        return Ok(true);
+                        return Some(Ok(true));
                     };
-                    runtime.commit_on_demand_step(
+                    Some(runtime.commit_on_demand_step(
                         memory_object,
                         offset,
                         byte_len,
                         required,
                         &mut next,
-                    )
+                    ))
                 }) {
                     Err(()) => return Some(Err(())),
-                    Ok(Ok(true)) => break,
-                    Ok(Ok(false)) => {}
-                    Ok(Err(
+                    Ok(None) => {
+                        let cursor = FillCursor::Dma { next: Some(next) };
+                        return Some(Ok(self.park_call(ParkedCall::FillIn { request, cursor })));
+                    }
+                    Ok(Some(Ok(true))) => break,
+                    Ok(Some(Ok(false))) => stepped = true,
+                    Ok(Some(Err(
                         status @ (deepwyrm_abi::DW_STATUS_NO_RESOURCES
                         | deepwyrm_abi::DW_STATUS_NO_MEMORY),
-                    )) => return Some(self.return_status(status)),
+                    ))) => return Some(self.return_status(status)),
                     // The syscall reports a bad range or handle itself.
-                    Ok(Err(_)) => break,
+                    Ok(Some(Err(_))) => break,
                 }
             }
         }
@@ -2110,20 +2255,37 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         request: NativeSyscallRequest,
     ) -> Option<Result<crate::syscall::native::ReturnReady, ()>> {
+        let NativeSyscallRequest::MemoryObjectCommit { offset, .. } = request else {
+            return None;
+        };
+        Some(self.run_commit(request, offset))
+    }
+
+    /// `memory_object_commit`'s steps from offset `next`, yielding between
+    /// them when the quantum expires (DW2 §10.8).
+    #[inline(never)]
+    fn run_commit(
+        &mut self,
+        request: NativeSyscallRequest,
+        mut next: u64,
+    ) -> Result<crate::syscall::native::ReturnReady, ()> {
         let NativeSyscallRequest::MemoryObjectCommit {
             memory_object,
             offset,
             byte_len,
         } = request
         else {
-            return None;
+            unreachable!("a commit's steps run only for a commit")
         };
         let cpu = self.cpu;
-        let mut next = offset;
+        let mut stepped = false;
         loop {
-            let step = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            let step = self.at_step_safe_point(stepped, |runtime, yielding| {
                 if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                     runtime.service_pending_timer_expiries_on_bootstrap();
+                }
+                if yielding {
+                    return None;
                 }
                 let result = runtime.commit_on_demand_step(
                     memory_object,
@@ -2132,7 +2294,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     deepwyrm_abi::DW_RIGHT_MAP,
                     &mut next,
                 );
-                match result {
+                Some(match result {
                     Ok(false) => None,
                     Ok(true) => Some(
                         runtime.ready_to_return(NativeSyscallResult::returning(DW_STATUS_SUCCESS)),
@@ -2140,35 +2302,67 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     Err(status) => {
                         Some(runtime.ready_to_return(NativeSyscallResult::returning(status)))
                     }
-                }
+                })
             });
             match step {
-                Err(()) => return Some(Err(())),
-                Ok(Some(ready)) => return Some(Ok(ready)),
-                Ok(None) => {}
+                Err(()) => return Err(()),
+                Ok(None) => return Ok(self.park_call(ParkedCall::Commit { request, next })),
+                Ok(Some(Some(ready))) => return Ok(ready),
+                Ok(Some(None)) => stepped = true,
             }
         }
     }
 
-    /// Zeroes a new MemoryObject's backing one step at a time, taking P for
-    /// each step and releasing it between them, then makes it the object's
-    /// backing (DW2 M4b). Its frames are reachable only through
-    /// `allocation`, held in this frame, so nothing touches them between
-    /// steps. A page that fails frees the whole allocation.
+    /// Zeroes a new MemoryObject's backing one step at a time from page
+    /// `first`, taking P for each step and releasing it between them, then
+    /// makes it the object's backing (DW2 M4b). Its frames are reachable
+    /// only through `allocation`, held in this frame or a parked record, so
+    /// nothing touches them between steps. A page that fails frees the
+    /// whole allocation. Between steps is a safe point (DW2 §10.8): a Stop
+    /// returns the allocation for the caller to free, and an expired
+    /// quantum returns it with the pages left, to park. Each safe point
+    /// commits the phase held so far and takes a fresh one and a fresh user
+    /// root; the first step runs on the caller's.
     #[allow(
         unsafe_code,
         reason = "every page was zeroed by the steps before the allocation becomes a backing"
     )]
+    #[inline(never)]
     fn zero_backing_in_steps(
         &mut self,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
         root: super::UserCopyRoot,
         process: ProcessKey,
         allocation: crate::memory::frame_roles::BackingAllocation,
-    ) -> Result<ObjectBackingGrant, deepwyrm_abi::DwStatus> {
+        mut first: u64,
+    ) -> Zeroing {
         let step_pages = PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64;
-        let mut first = 0;
+        let mut phase = Some(phase);
+        let (mut root, mut process) = (root, process);
         let mut zeroed = true;
+        let mut stepped = false;
+        let cpu = self.cpu;
         while zeroed && first < allocation.pages() {
+            if stepped {
+                let previous = phase.take();
+                match self.at_step_safe_point(true, |runtime, yielding| {
+                    if let Some(phase) = previous {
+                        runtime.commit_runtime_phase(phase);
+                    }
+                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                        runtime.service_pending_timer_expiries_on_bootstrap();
+                    }
+                    (!yielding).then(|| runtime.prepare_guard_free_usercopy())
+                }) {
+                    Err(()) => return Zeroing::Stopped(allocation),
+                    Ok(None) => return Zeroing::Yielded { allocation, first },
+                    Ok(Some((fresh, fresh_root, fresh_process))) => {
+                        phase = Some(fresh);
+                        root = fresh_root;
+                        process = fresh_process;
+                    }
+                }
+            }
             let count = step_pages.min(allocation.pages() - first);
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
@@ -2177,18 +2371,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .usercopy_process_address_space(root, process);
             zeroed = user.zero_backing_pages(&allocation, first, count);
             first += count;
+            stepped = true;
         }
+        let phase = phase.expect("every safe point that ran took a fresh phase");
         let mut access = self.paging.guard_free_access(self.runtime.guard_free());
         let mut paging = access.lock();
         let mut user = paging
             .guard_free_value()
             .usercopy_process_address_space(root, process);
-        if zeroed {
+        let backing = if zeroed {
             // SAFETY: the loop zeroed every page of the allocation.
             Ok(unsafe { user.finish_zeroed_backing(allocation) })
         } else {
             user.cancel_backing(allocation);
             Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+        };
+        Zeroing::Done {
+            phase,
+            root,
+            process,
+            backing,
         }
     }
 
@@ -2285,6 +2487,46 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
         }
         Ok(operation(&mut runtime))
+    }
+
+    /// A safe point between two steps of a call in steps (DW2 §10.8 item 1).
+    /// When `may_yield`, the quantum deadline is serviced first, before the
+    /// runtime guard (it takes the time and scheduler locks); then, as at
+    /// every safe point, a Stop ends the call (`Err`). `operation` runs
+    /// under the guard and is told whether this CPU has a reschedule
+    /// request: if so it must not take a step but finish what the call's
+    /// phase needs, and the caller parks the call. A call passes
+    /// `may_yield` only once it has taken a step since it last started or
+    /// resumed, so a resumed call always makes progress before it yields
+    /// again (review R2).
+    #[inline(always)]
+    fn at_step_safe_point<T>(
+        &mut self,
+        may_yield: bool,
+        operation: impl FnOnce(
+            &mut PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+            bool,
+        ) -> T,
+    ) -> Result<T, ()> {
+        if may_yield {
+            crate::time::service_current_scheduler_quantum_deadline()
+                .unwrap_or_else(|_| panic!("a step safe point could not service its quantum"));
+        }
+        self.with_synchronized_runtime_at_safe_point(|runtime| {
+            let yielding = may_yield && runtime.has_reschedule_request();
+            operation(runtime, yielding)
+        })
+    }
+
+    /// Parks the running Thread's call under T (DW2 §10.8 item 5), for the
+    /// trampoline to yield. The caller has let every pin go and committed
+    /// its phase.
+    fn park_call(&mut self, call: ParkedCall) -> crate::syscall::native::ReturnReady {
+        let mut guard = self.runtime.lock();
+        let runtime = guard.on(&mut self.owned);
+        let thread = runtime.own.scheduled().thread;
+        runtime.core.parked.park(thread, call);
+        crate::syscall::native::ReturnReady::yield_current()
     }
 
     #[cfg(deepwyrm_dw1e_platform)]
@@ -3516,6 +3758,9 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     // They are drained only by a post-ack kernel-root continuation, the last
     // one outstanding when several CPUs are stopped at once.
     rendezvous_cleanup: StagedStopCleanup<REGISTRY_OBJECTS>,
+    /// Calls parked between steps while their Threads yield the CPU (DW2
+    /// §10.8). A record moves in and out only under T.
+    parked: crate::syscall::ParkedCalls<ParkedCall, { crate::syscall::PARKED_CALL_THREADS }>,
 }
 
 /// Everything the runtime authority guards: the core authorities and every
@@ -5728,8 +5973,54 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             self.core.cleanup.push(parent_release);
         }
+        self.settle_ended_parked_calls();
         self.release_unmapped_step();
         Ok(())
+    }
+
+    /// Settles the resources of `thread`'s call that will not finish (DW2
+    /// §10.8 item 5): its create's quota reservation ends and its unzeroed
+    /// backing, if it had one, is freed with P beneath T.
+    fn settle_abandoned_call(
+        &mut self,
+        thread: crate::task::ThreadKey,
+        allocation: Option<crate::memory::frame_roles::BackingAllocation>,
+    ) {
+        self.core
+            .registry
+            .release_reserved_pages(thread.object_id());
+        if let Some(allocation) = allocation {
+            let mut paging = self.paging.lock();
+            paging
+                .target
+                .roles
+                .cancel_backing_allocation(allocation)
+                .unwrap_or_else(|_| panic!("an abandoned create's backing did not free"));
+        }
+    }
+
+    /// Settles every call parked by a Thread that has since ended (DW2
+    /// §10.8 item 5). Such a Thread never runs again, so it never takes its
+    /// record back; this runs in each finalizer drain, so the termination
+    /// that ended it settles the record before it returns.
+    fn settle_ended_parked_calls(&mut self) {
+        loop {
+            let tasks = &self.core.tasks;
+            let Some((thread, call)) = self
+                .core
+                .parked
+                .take_ended(|thread| tasks.thread_has_ended(thread))
+            else {
+                return;
+            };
+            let allocation = match call {
+                ParkedCall::Create(create) => Some(create.allocation),
+                ParkedCall::Region(_) | ParkedCall::Commit { .. } | ParkedCall::FillIn { .. } => {
+                    None
+                }
+            };
+            self.settle_abandoned_call(thread, allocation);
+        }
     }
 
     /// One step of releasing a handle-less on-demand object's unmapped
@@ -6589,42 +6880,205 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                     break 'handled crate::syscall::native::ReturnReady::complete_remote_stop();
                 }
             }
-            let handled = match self
-                .fill_in_user_buffers(request)
-                .or_else(|| self.handle_guard_free_usercopy(request))
-                .or_else(|| self.handle_deferred_output(request))
-                .or_else(|| self.handle_object_info(request))
-                .or_else(|| self.handle_channel_send(request))
-                .or_else(|| self.handle_channel_receive(request))
-                .or_else(|| self.handle_process_create(request))
-                .or_else(|| self.handle_wait(request))
-                .or_else(|| self.handle_atomic_wait(request))
-                .or_else(|| self.handle_address_region_mutation(request))
-                .or_else(|| self.handle_memory_object_commit(request))
-                .or_else(|| self.handle_thread_start(request))
-            {
+            let handled = match self.fill_in_user_buffers(request) {
                 Some(handled) => handled,
-                None => {
-                    let cpu = self.cpu;
-                    self.with_synchronized_runtime_at_safe_point(|runtime| {
-                        if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                            runtime.service_pending_timer_expiries_on_bootstrap();
-                        }
-                        runtime.handle(request)
-                    })
-                }
+                None => self.serve_request(request),
             };
-            let ready = match handled {
-                Ok(ready) => ready,
-                Err(()) => {
-                    break 'handled crate::syscall::native::ReturnReady::service_rendezvous();
-                }
-            };
-            crate::task::drain_runnable_work_notifications();
-            self.drain_quantum_cancellation_detached();
-            ready
+            self.end_dispatch(handled)
         };
         ready.into_result()
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    /// Serves `request` after its fill-in.
+    #[inline(always)]
+    fn serve_request(
+        &mut self,
+        request: NativeSyscallRequest,
+    ) -> Result<crate::syscall::native::ReturnReady, ()> {
+        match self
+            .handle_guard_free_usercopy(request)
+            .or_else(|| self.handle_deferred_output(request))
+            .or_else(|| self.handle_object_info(request))
+            .or_else(|| self.handle_channel_send(request))
+            .or_else(|| self.handle_channel_receive(request))
+            .or_else(|| self.handle_process_create(request))
+            .or_else(|| self.handle_wait(request))
+            .or_else(|| self.handle_atomic_wait(request))
+            .or_else(|| self.handle_address_region_mutation(request))
+            .or_else(|| self.handle_memory_object_commit(request))
+            .or_else(|| self.handle_thread_start(request))
+        {
+            Some(handled) => handled,
+            None => {
+                let cpu = self.cpu;
+                self.with_synchronized_runtime_at_safe_point(|runtime| {
+                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                        runtime.service_pending_timer_expiries_on_bootstrap();
+                    }
+                    runtime.handle(request)
+                })
+            }
+        }
+    }
+
+    /// The end of a dispatch, or of a continuation: a stopped call services
+    /// the rendezvous; any other, a yielding one included, delivers the
+    /// runnable-work notifications and drains a quantum cancellation.
+    #[inline(always)]
+    fn end_dispatch(
+        &mut self,
+        handled: Result<crate::syscall::native::ReturnReady, ()>,
+    ) -> crate::syscall::native::ReturnReady {
+        let Ok(ready) = handled else {
+            return crate::syscall::native::ReturnReady::service_rendezvous();
+        };
+        crate::task::drain_runnable_work_notifications();
+        self.drain_quantum_cancellation_detached();
+        ready
+    }
+
+    /// Takes back this Thread's parked call under T, at the safe point a
+    /// resumed call starts with, and continues it (DW2 §10.8 item 4). A Stop
+    /// there leaves the record parked: the Thread is ending, and its
+    /// termination's finalizer drain settles it.
+    #[inline(never)]
+    fn resume_parked_call(&mut self) -> Result<crate::syscall::native::ReturnReady, ()> {
+        let call = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            let thread = runtime.own.scheduled().thread;
+            runtime
+                .core
+                .parked
+                .take(thread)
+                .unwrap_or_else(|| panic!("a yielded Thread has no parked call"))
+        })?;
+        match call {
+            ParkedCall::Region(steps) => self.run_region_steps(steps, true),
+            ParkedCall::Commit { request, next } => self.run_commit(request, next),
+            ParkedCall::FillIn { request, cursor } => match self.run_fill_in(request, cursor) {
+                Some(handled) => handled,
+                None => self.serve_request(request),
+            },
+            ParkedCall::Create(create) => self.resume_create(create),
+        }
+    }
+
+    /// Continues a create parked while zeroing (DW2 §10.8): takes a fresh
+    /// phase and user root, pins its outputs again, zeroes on from its next
+    /// page and finishes as `handle_deferred_output` does. If an output can
+    /// no longer be pinned, the create fails as its first preflight would
+    /// have, with `BAD_ADDRESS`, its backing freed and reservation ended.
+    #[inline(never)]
+    fn resume_create(
+        &mut self,
+        create: ParkedCreate,
+    ) -> Result<crate::syscall::native::ReturnReady, ()> {
+        let ParkedCreate {
+            request,
+            allocation,
+            first,
+            backing_pages,
+        } = create;
+        let cpu = self.cpu;
+        let prepared = self.with_synchronized_runtime_at_safe_point(|runtime| {
+            if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime.service_pending_timer_expiries_on_bootstrap();
+            }
+            runtime.prepare_guard_free_usercopy()
+        });
+        let Ok((phase, root, process)) = prepared else {
+            // Stopped before it took a step: free what the create holds.
+            self.abandon_create(allocation);
+            return Err(());
+        };
+        let outputs = deferred_outputs(request).expect("a parked create has outputs");
+        let (ranges, formed) = deferred_output_ranges(outputs);
+        assert!(
+            formed,
+            "a parked create's outputs were formed before it allocated"
+        );
+        let pinned = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
+            let mut owned = [None, None, None];
+            let mut complete = true;
+            for (index, range) in ranges.into_iter().enumerate() {
+                let Some(range) = range else {
+                    continue;
+                };
+                match user.preflight_owned_output(range) {
+                    Ok(output) => owned[index] = Some(output),
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if !complete {
+                for output in owned.into_iter().flatten() {
+                    user.discard_owned_output(output)
+                        .unwrap_or_else(|_| panic!("partial resumed output discard drifted"));
+                }
+                None
+            } else {
+                Some(owned)
+            }
+        };
+        let Some(pinned) = pinned else {
+            self.abandon_create(allocation);
+            return Ok(self.return_status_with_phase(phase, deepwyrm_abi::DW_STATUS_BAD_ADDRESS));
+        };
+        let (phase, root, process, backing) =
+            match self.zero_backing_in_steps(phase, root, process, allocation, first) {
+                Zeroing::Done {
+                    phase,
+                    root,
+                    process,
+                    backing,
+                } => (phase, root, process, backing),
+                Zeroing::Yielded { allocation, first } => {
+                    self.discard_deferred_pins(root, process, Some(pinned));
+                    return Ok(self.park_call(ParkedCall::Create(ParkedCreate {
+                        request,
+                        allocation,
+                        first,
+                        backing_pages,
+                    })));
+                }
+                Zeroing::Stopped(allocation) => {
+                    self.discard_deferred_pins(root, process, Some(pinned));
+                    self.abandon_create(allocation);
+                    return Err(());
+                }
+            };
+        Ok(self.finish_deferred_output(
+            request,
+            phase,
+            (root, process),
+            None,
+            Some(pinned),
+            ranges,
+            Some(backing_pages),
+            Some(backing),
+        ))
+    }
+
+    /// Commits `phase` and ends the syscall with `status`.
+    fn return_status_with_phase(
+        &mut self,
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        status: deepwyrm_abi::DwStatus,
+    ) -> crate::syscall::native::ReturnReady {
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on(&mut self.owned);
+        runtime.commit_runtime_phase(phase);
+        runtime.ready_to_return(NativeSyscallResult::returning(status))
     }
 }
 
@@ -6831,6 +7285,27 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let current_binding_generation = crate::arch::x86_64::syscall::current_binding_generation();
         frame.rebind_after_kernel_resume(current_binding_generation)?;
         runtime.authorize_return(frame, current_binding_generation)
+    }
+
+    fn resume_yielded_call(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        if !self.synchronize_scheduler_current_at_safe_point_detached() {
+            return Ok(());
+        }
+        let publication = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            runtime.complete_physical_switch_handoff()
+        };
+        crate::task::notify_completed_switch_runnable(publication);
+        frame.rebind_after_kernel_resume(crate::arch::x86_64::syscall::current_binding_generation())
+    }
+
+    fn continue_parked_call(&mut self) -> NativeSyscallResult {
+        let handled = self.resume_parked_call();
+        self.end_dispatch(handled).into_result()
     }
 
     fn complete_remote_stop(
@@ -7554,6 +8029,15 @@ fn map_input<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         }
         Err(_) => return Err(deepwyrm_abi::DW_STATUS_INVALID_ARGUMENT),
     };
+    let output = pin_map_output(user, out_address)?;
+    Ok((args, protection, output))
+}
+
+/// Pins a map's 8-byte address output, or `BAD_ADDRESS`.
+fn pin_map_output<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    user: &mut user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    out_address: deepwyrm_abi::DwUserAddress,
+) -> Result<user_access::OwnedLiveUserOutput, deepwyrm_abi::DwStatus> {
     let output_range = UserRange::new(
         UserAddressSpace::x86_64_four_level(PAGE_SIZE)
             .unwrap_or_else(|_| panic!("x86_64 userspace model unavailable")),
@@ -7564,10 +8048,8 @@ fn map_input<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         EmptyAddressRule::Reject,
     )
     .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)?;
-    let output = user
-        .preflight_owned_output(output_range)
-        .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)?;
-    Ok((args, protection, output))
+    user.preflight_owned_output(output_range)
+        .map_err(|_| deepwyrm_abi::DW_STATUS_BAD_ADDRESS)
 }
 
 const fn invalid_user_return_detail(error: crate::arch::x86_64::syscall::UserReturnError) -> u32 {
@@ -7814,6 +8296,7 @@ pub(super) fn enter(
                                 root_owner: (Some(root_owner)),
                                 cleanup: (CleanupQueue::new()),
                                 rendezvous_cleanup: (StagedStopCleanup::new()),
+                                parked: (crate::syscall::ParkedCalls::new()),
                             }
                         );
                         init_fields!(
@@ -10534,6 +11017,120 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.absorb_service_cleanup();
     }
+}
+
+/// A call in steps parked between steps while its Thread yields the CPU
+/// (DW2 §10.8 item 2). Data only, apart from a create's backing allocation:
+/// no pin, phase, user root, CPU or shootdown outlives a step.
+enum ParkedCall {
+    /// A map, unmap or protect: its chain's plan. A map's output pin was let
+    /// go and is taken again on resume.
+    Region(crate::syscall::RegionSteps<MemoryProtection, REGION_SLOTS>),
+    /// `memory_object_commit`, from offset `next`.
+    Commit {
+        request: NativeSyscallRequest,
+        next: u64,
+    },
+    /// A syscall's fill-in, from `cursor`; the syscall runs after it.
+    FillIn {
+        request: NativeSyscallRequest,
+        cursor: FillCursor,
+    },
+    /// `MemoryObjectCreate` zeroing its eager backing.
+    Create(ParkedCreate),
+}
+
+/// Where a fill-in continues (DW2 M6 §8.6).
+#[derive(Clone, Copy)]
+enum FillCursor {
+    /// User buffer `index`, from page `next` (`None`: its start).
+    Buffer { index: usize, next: Option<u64> },
+    /// The `dma_map` commit, from offset `next` (`None`: its start).
+    Dma { next: Option<u64> },
+}
+
+/// A create parked while zeroing: the pages from `first` on are still to
+/// be zeroed. Its quota reservation stays in the registry under its
+/// Thread; its output pins were let go and are taken again on resume.
+struct ParkedCreate {
+    request: NativeSyscallRequest,
+    allocation: crate::memory::frame_roles::BackingAllocation,
+    first: u64,
+    backing_pages: u64,
+}
+
+/// How a create's zeroing in steps ended (DW2 M4b, §10.8).
+enum Zeroing {
+    /// Every step ran: the backing, or the status that failed it, with the
+    /// phase and user root of the last safe point.
+    Done {
+        phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
+        root: super::UserCopyRoot,
+        process: ProcessKey,
+        backing: Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>,
+    },
+    /// The quantum expired: the pages from `first` on are left.
+    Yielded {
+        allocation: crate::memory::frame_roles::BackingAllocation,
+        first: u64,
+    },
+    /// A Stop landed at a safe point.
+    Stopped(crate::memory::frame_roles::BackingAllocation),
+}
+
+/// A family-B call's outputs, as (address, length, alignment), or `None` for
+/// a request that is not one.
+type DeferredOutputs = [Option<(deepwyrm_abi::DwUserAddress, usize, u64)>; 3];
+
+/// The outputs `handle_deferred_output` pins for `request`.
+fn deferred_outputs(request: NativeSyscallRequest) -> Option<DeferredOutputs> {
+    let handle = |address| [Some((address, 8, 8)), None, None];
+    let outputs: DeferredOutputs = match request {
+        NativeSyscallRequest::HandleDuplicate { out_handle, .. }
+        | NativeSyscallRequest::TaskGroupCreate { out_handle, .. } => handle(out_handle),
+        NativeSyscallRequest::ThreadCreate { out_thread, .. } => handle(out_thread),
+        NativeSyscallRequest::DeviceResourceClaim { out_resource, .. } => handle(out_resource),
+        NativeSyscallRequest::DevicePioRead { out_value, .. }
+        | NativeSyscallRequest::DevicePciConfigRead { out_value, .. } => {
+            [Some((out_value, 4, 4)), None, None]
+        }
+        NativeSyscallRequest::InterruptCreate { out_interrupt, .. } => handle(out_interrupt),
+        NativeSyscallRequest::DeviceMmioObjectCreate {
+            out_memory_object, ..
+        } => handle(out_memory_object),
+        NativeSyscallRequest::DmaMap { out_iova, .. } => [Some((out_iova, 8, 8)), None, None],
+        NativeSyscallRequest::EventCreate { out_event, .. } => handle(out_event),
+        NativeSyscallRequest::TimerCreate { out_timer, .. } => handle(out_timer),
+        NativeSyscallRequest::ChannelCreate {
+            out_endpoint0,
+            out_endpoint1,
+            ..
+        } => [
+            Some((out_endpoint0, 8, 8)),
+            Some((out_endpoint1, 8, 8)),
+            None,
+        ],
+        NativeSyscallRequest::AtomicWake { out_woken, .. } => [Some((out_woken, 4, 4)), None, None],
+        NativeSyscallRequest::MemoryObjectCreate { out_handle, .. } => handle(out_handle),
+        _ => return None,
+    };
+    Some(outputs)
+}
+
+/// The ranges of `outputs`, and whether every one could be formed (if not,
+/// the adapter fails at that range, before any pin).
+fn deferred_output_ranges(outputs: DeferredOutputs) -> ([Option<UserRange>; 3], bool) {
+    let mut ranges = [None, None, None];
+    let mut formed = true;
+    for (index, output) in outputs.into_iter().enumerate() {
+        if let Some((address, byte_len, alignment)) = output {
+            match crate::syscall::output_range(address, byte_len, alignment) {
+                Ok(range) => ranges[index] = Some(range),
+                Err(_) => formed = false,
+            }
+        }
+    }
+    (ranges, formed)
 }
 
 /// A MemoryObjectCreate backing taken before the runtime hold: an eager

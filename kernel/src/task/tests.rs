@@ -89,8 +89,16 @@ fn child_to_parent_lifetime_chain_finalizes_without_cycles() {
         DW_TASK_STATE_CREATED
     );
     assert_eq!(tasks.start_thread(thread), Err(TaskError::BadState));
+    assert!(
+        !tasks.thread_has_ended(thread),
+        "a created Thread has not ended"
+    );
     prepare_thread(&mut tasks, thread, 1);
     tasks.start_thread(thread).unwrap();
+    assert!(
+        !tasks.thread_has_ended(thread),
+        "a running Thread has not ended"
+    );
     assert_eq!(
         tasks.process_info(process).unwrap().state,
         DW_TASK_STATE_RUNNING
@@ -113,6 +121,8 @@ fn child_to_parent_lifetime_chain_finalizes_without_cycles() {
     assert_eq!(thread_info.state, DW_TASK_STATE_EXITED);
     assert_eq!(thread_info.reason, DW_TERMINATION_NORMAL_EXIT);
     assert_eq!(thread_info.application_code, 0x1234_5678);
+    // DW2 §10.8: an exited Thread will never take back a parked call.
+    assert!(tasks.thread_has_ended(thread));
     let process_info = tasks.process_info(process).unwrap();
     assert_eq!(process_info.state, DW_TASK_STATE_EXITED);
     assert_eq!(process_info.reason, DW_TERMINATION_NORMAL_EXIT);
@@ -120,6 +130,8 @@ fn child_to_parent_lifetime_chain_finalizes_without_cycles() {
 
     let thread_final = registry.release_handle(thread_handle).unwrap().unwrap();
     finish_task_release(&mut tasks, &mut registry, thread_final);
+    // A key that no longer names a Thread has ended too.
+    assert!(tasks.thread_has_ended(thread));
     let process_final = registry.release_handle(process_handle).unwrap().unwrap();
     finish_task_release(&mut tasks, &mut registry, process_final);
     let root_final = registry.release_internal(root_owner).unwrap().unwrap();

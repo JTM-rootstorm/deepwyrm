@@ -1,7 +1,7 @@
 use super::*;
 use deepwyrm_abi::{
-    DW_STATUS_BAD_STATE, DW_STATUS_INVALID_ARGUMENT, DwAddressRegionMapFlags, DwHandle, DwOffset,
-    DwSize,
+    DW_STATUS_BAD_ADDRESS, DW_STATUS_BAD_STATE, DW_STATUS_INVALID_ARGUMENT,
+    DwAddressRegionMapFlags, DwHandle, DwOffset, DwSize,
 };
 
 const MIB: u64 = 1 << 20;
@@ -247,5 +247,59 @@ fn a_failed_unmap_step_is_retried_then_left_partial() {
     assert_eq!(
         steps.advance(DW_STATUS_SUCCESS, None),
         Some(DW_STATUS_SUCCESS)
+    );
+}
+
+/// DW2 §10.8 item 2: a map resumed after yielding whose output can no
+/// longer be pinned fails as a failed step would, unmapping what it made.
+#[test]
+fn an_abandoned_map_unmaps_the_steps_it_made() {
+    let base = 0x8000_0000;
+    let mut steps = Steps::new(map_request(), STEP);
+    assert!(!steps.writes_map_output(), "no arguments copied in yet");
+    steps.set_map_input(Ok((map_args(3 * STEP, 0, Some(base)), 0)));
+    assert!(steps.writes_map_output());
+    assert_eq!(steps.advance(DW_STATUS_SUCCESS, Some(base)), None);
+    assert_eq!(steps.advance(DW_STATUS_SUCCESS, Some(base + STEP)), None);
+    assert_eq!(steps.abandon(DW_STATUS_BAD_ADDRESS), None);
+    assert!(
+        !steps.writes_map_output(),
+        "an undoing map writes no address"
+    );
+    assert_eq!(range_step(&steps.step()), (base, STEP, None));
+    // Abandoning again while undoing changes nothing.
+    assert_eq!(steps.abandon(DW_STATUS_BAD_STATE), None);
+    assert_eq!(steps.advance(DW_STATUS_SUCCESS, None), None);
+    assert_eq!(range_step(&steps.step()), (base + STEP, STEP, None));
+    assert_eq!(
+        steps.advance(DW_STATUS_SUCCESS, None),
+        Some(DW_STATUS_BAD_ADDRESS)
+    );
+
+    // Before any step there is nothing to undo: it returns at once.
+    let mut steps = Steps::new(map_request(), STEP);
+    steps.set_map_input(Ok((map_args(3 * STEP, 0, Some(base)), 0)));
+    assert_eq!(
+        steps.abandon(DW_STATUS_BAD_ADDRESS),
+        Some(DW_STATUS_BAD_ADDRESS)
+    );
+}
+
+/// An abandoned unmap keeps the steps it made and returns, whatever retries
+/// it had left.
+#[test]
+fn an_abandoned_unmap_returns_with_its_steps_made() {
+    let base = 0x8000_0000;
+    let request = NativeSyscallRequest::AddressRegionUnmap {
+        address_region: REGION,
+        address: DwUserAddress(base),
+        byte_len: 2 * STEP,
+    };
+    let mut steps = Steps::new(request, STEP);
+    assert!(!steps.writes_map_output());
+    assert_eq!(steps.advance(DW_STATUS_SUCCESS, None), None);
+    assert_eq!(
+        steps.abandon(DW_STATUS_BAD_STATE),
+        Some(DW_STATUS_BAD_STATE)
     );
 }

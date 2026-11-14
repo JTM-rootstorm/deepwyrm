@@ -22,6 +22,13 @@ mod f_services;
 mod region_steps;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use region_steps::{MapStep, RegionSteps};
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live facade parks calls between steps")
+)]
+mod parked_calls;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use parked_calls::{PARKED_CALL_THREADS, ParkedCalls};
 
 #[allow(
     unused_imports,

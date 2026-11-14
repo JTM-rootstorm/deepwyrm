@@ -415,6 +415,134 @@ fn suspended_dispatch_returns_control_without_authorizing_the_user_frame() {
     assert_eq!(frame.test_return_authorized(), 0);
 }
 
+/// A runtime whose call yields twice between steps and then returns
+/// (DW2 §10.8): the frame is authorized only by the continuation that
+/// finishes the call.
+struct YieldingRuntime {
+    handled: usize,
+    yields_left: usize,
+    continued: usize,
+}
+
+impl NativeSyscallHandler for YieldingRuntime {
+    fn handle(&mut self, _request: NativeSyscallRequest) -> NativeSyscallResult {
+        self.handled += 1;
+        ReturnReady::yield_current().into_result()
+    }
+}
+
+impl crate::arch::x86_64::syscall::UserReturnMappingValidation for YieldingRuntime {
+    fn executable_at(&mut self, _instruction_pointer: u64) -> bool {
+        true
+    }
+
+    fn writable_byte_below(&mut self, _stack_pointer: u64) -> bool {
+        true
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
+)]
+impl NativeSyscallFrameRuntime for YieldingRuntime {
+    type QuantumExpiry = super::NoQuantumExpiry;
+
+    fn authorize_return(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        assert_eq!(self.yields_left, 0, "a parked call authorized a return");
+        frame.authorize_return(current_binding_generation, self)
+    }
+
+    fn continue_parked_call(&mut self) -> NativeSyscallResult {
+        self.continued += 1;
+        if self.yields_left > 0 {
+            self.yields_left -= 1;
+        }
+        if self.yields_left > 0 {
+            return ReturnReady::yield_current().into_result();
+        }
+        NativeSyscallResult::returning(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+    }
+
+    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+        panic!("unexpected invalid return: {error:?}")
+    }
+
+    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+        panic!("unexpected user exception")
+    }
+
+    fn terminate_current(_this: DivergentCarrier<'_, Self>) -> ! {
+        panic!("a yielding call does not terminate")
+    }
+
+    fn enter_scheduled_fresh_thread(_this: DivergentCarrier<'_, Self>) -> ! {
+        panic!("direct dispatch test never launches a fresh Thread")
+    }
+
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeSuspendPlan<'owner> {
+        panic!("a yielding call does not suspend")
+    }
+
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeIdleSuspendPoll<'owner> {
+        panic!("a yielding call does not idle")
+    }
+
+    fn resume_suspended(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeResumeOutcome {
+        panic!("a yielding call is not a suspended one")
+    }
+}
+
+#[test]
+fn a_yielded_call_is_authorized_only_when_its_continuation_finishes() {
+    let mut runtime = YieldingRuntime {
+        handled: 0,
+        yields_left: 2,
+        continued: 0,
+    };
+    let mut frame = crate::arch::x86_64::syscall::RawSyscallFrame::synthetic(
+        u64::from(DwKnownSyscall::HandleClose.id().0),
+        [0x55, 0, 0, 0, 0, 0],
+        0x4000,
+        0x8000,
+        0x202,
+        3,
+    );
+    assert_eq!(
+        dispatch_frame(&mut runtime, &mut frame, 3),
+        SyscallControl::YieldCurrent
+    );
+    assert_eq!(frame.test_return_authorized(), 0);
+    assert_eq!(
+        continue_frame(&mut runtime, &mut frame, 3),
+        SyscallControl::YieldCurrent
+    );
+    assert_eq!(frame.test_return_authorized(), 0);
+    assert_eq!(
+        continue_frame(&mut runtime, &mut frame, 3),
+        SyscallControl::ReturnToCaller
+    );
+    assert_eq!((runtime.handled, runtime.continued), (1, 2));
+    assert_eq!(
+        frame.test_status_bits(),
+        i64::from(deepwyrm_abi::DW_STATUS_NO_RESOURCES.0) as u64
+    );
+    assert_eq!(frame.test_return_authorized(), 1);
+}
+
 /// DW2 M6 §8.6: the fill-in phase covers exactly the buffers a syscall
 /// copies, with the lengths its arguments give and the direction it copies.
 #[test]

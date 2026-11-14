@@ -698,6 +698,11 @@ pub(crate) enum SyscallControl {
     CompleteRemoteStop,
     ServiceRendezvous,
     SuspendCurrent,
+    /// A call in steps parked its state at a safe point because its quantum
+    /// expired (DW2 §10.8). The trampoline gives the CPU to the next
+    /// runnable Thread and, when this one runs again, continues the call
+    /// through `NativeSyscallFrameRuntime::continue_parked_call`.
+    YieldCurrent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -784,6 +789,17 @@ impl ReturnReady {
             result: NativeSyscallResult {
                 status: DW_STATUS_SUCCESS,
                 control: SyscallControl::CompleteRemoteStop,
+            },
+        }
+    }
+
+    /// A call in steps parked its state to yield the CPU (DW2 §10.8): it
+    /// returns nothing yet, so it owes no proof.
+    pub(crate) const fn yield_current() -> Self {
+        Self {
+            result: NativeSyscallResult {
+                status: DW_STATUS_SUCCESS,
+                control: SyscallControl::YieldCurrent,
             },
         }
     }
@@ -1636,6 +1652,24 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         panic!("native runtime has no pending remote stop")
     }
 
+    /// After a `YieldCurrent` switch, acknowledges this Thread's arrival on
+    /// the CPU it now runs on and rebinds its frame there, without
+    /// authorizing a return: the call is not finished (DW2 §10.8 item 4).
+    /// A published Stop leaves the frame as it is; the trampoline's next
+    /// safe point takes it.
+    fn resume_yielded_call(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        panic!("native runtime parks no call")
+    }
+
+    /// Takes back this Thread's parked call and continues it, as
+    /// `dispatch_frame` runs a new one (DW2 §10.8 item 4).
+    fn continue_parked_call(&mut self) -> NativeSyscallResult {
+        panic!("native runtime parks no call")
+    }
+
     /// Returns a plan branded by the stationary execution owner borrowed from
     /// this runtime. The raw trampoline must consume it immediately.
     ///
@@ -1700,6 +1734,27 @@ pub(crate) fn dispatch_frame<R: NativeSyscallFrameRuntime>(
         Some((id, arguments)) => dispatch_native(runtime, id, arguments),
         None => NativeSyscallResult::returning(DW_STATUS_INVALID_ARGUMENT),
     };
+    finish_frame(runtime, frame, current_binding_generation, result)
+}
+
+/// Continues a call parked by `YieldCurrent` on `frame`, whose request it
+/// already decoded (DW2 §10.8), and finishes it as `dispatch_frame` does.
+pub(crate) fn continue_frame<R: NativeSyscallFrameRuntime>(
+    runtime: &mut R,
+    frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    current_binding_generation: u64,
+) -> SyscallControl {
+    let result = runtime.continue_parked_call();
+    crate::task::drain_runnable_work_notifications();
+    finish_frame(runtime, frame, current_binding_generation, result)
+}
+
+fn finish_frame<R: NativeSyscallFrameRuntime>(
+    runtime: &mut R,
+    frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    current_binding_generation: u64,
+    result: NativeSyscallResult,
+) -> SyscallControl {
     frame.set_status(result.status);
     if result.control == SyscallControl::ReturnToCaller
         && let Err(error) = runtime.authorize_return(frame, current_binding_generation)

@@ -124,6 +124,11 @@ impl<P: Copy, const SLOTS: usize> RegionSteps<P, SLOTS> {
         }
     }
 
+    /// The call's own request.
+    pub(crate) fn request(&self) -> NativeSyscallRequest {
+        self.request
+    }
+
     /// Whether the map's arguments are still to be copied in.
     pub(crate) fn needs_map_input(&self) -> bool {
         matches!(self.kind, Kind::MapPending)
@@ -199,6 +204,31 @@ impl<P: Copy, const SLOTS: usize> RegionSteps<P, SLOTS> {
     /// A map's address: where its first step placed it.
     pub(crate) fn address(&self) -> Option<u64> {
         self.placed
+    }
+
+    /// Whether the call is a map going forward, so its address will be
+    /// written to its output: a call resumed after yielding pins that
+    /// output again (DW2 §10.8 item 2).
+    pub(crate) fn writes_map_output(&self) -> bool {
+        matches!(self.kind, Kind::Map { .. }) && matches!(self.progress, Progress::Forward)
+    }
+
+    /// Fails the call with `status` between steps, as a failed forward
+    /// step would: a map unmaps the steps it made and a protect restores
+    /// what it changed. `Some(status)` when nothing is left to undo and the
+    /// call returns now. A call already undoing keeps undoing, returning
+    /// its first failure. Used when a resumed map's output can no longer be
+    /// pinned (DW2 §10.8 item 2).
+    pub(crate) fn abandon(&mut self, status: DwStatus) -> Option<DwStatus> {
+        match self.progress {
+            Progress::Forward => {
+                // An unmap has nothing to undo, so it stops with the steps
+                // it made, as when its retries run out.
+                self.retries = 0;
+                self.forward_failed(status)
+            }
+            Progress::Undo { .. } => None,
+        }
     }
 
     /// The step to run next.

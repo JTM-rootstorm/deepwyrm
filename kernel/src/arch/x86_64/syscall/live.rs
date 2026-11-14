@@ -2039,47 +2039,31 @@ unsafe fn native_runtime_trampoline<
     // returned to it yet. Dropping this guard makes that authorization
     // revocable by the following e1 safe point.
     drop(usercopy_window);
-    // Recheck the authoritative mailbox after the guarded syscall/return
-    // transaction. The initiator may have published terminal state and Stop
-    // while this CPU was waiting to reacquire the shared runtime authority for
-    // return authorization, before e1 could run with IF clear.
-    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
-        crate::arch::x86_64::rendezvous::MailboxNotification::None
-        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
-        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
-        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
-            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
-            handoff_to_rendezvous_reaper(context);
-        }
-    }
-    match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
-        crate::arch::x86_64::rendezvous::MailboxNotification::None
-        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
-        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
-            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
-            handoff_to_rendezvous_reaper(context);
-        }
-        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
-    }
-    if control == crate::syscall::native::SyscallControl::ServiceRendezvous {
-        match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+    let mut control = settle_dispatched_control::<R>(context, frame, control);
+    // DW2 §10.8: a call in steps whose quantum expired parked its state.
+    // Give the CPU away as the return path does, then continue the call,
+    // possibly on another CPU, after a fresh entry safe point.
+    while control == crate::syscall::native::SyscallControl::YieldCurrent {
+        yield_parked_call::<R>(&mut context, frame);
+        let safe_point = match poll_entry_safe_point() {
+            Ok(clear) => clear,
+            Err(request) => {
                 stage_rendezvous_action(RendezvousAction(request))
                     .unwrap_or_else(|_| halt_forever());
                 handoff_to_rendezvous_reaper(context);
             }
-            crate::arch::x86_64::rendezvous::MailboxNotification::None
-            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
-            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => halt_forever(),
-        }
+        };
+        let usercopy_window =
+            NativeUsercopyWindow::enter_current(safe_point).unwrap_or_else(|_| halt_forever());
+        let continued = {
+            // SAFETY: [CARRIER] scoped reborrow, re-read after any switch; the previous one has
+            // ended.
+            let runtime = unsafe { &mut *context.cast::<R>() };
+            crate::syscall::native::continue_frame(runtime, frame, current_binding_generation())
+        };
+        drop(usercopy_window);
+        control = settle_dispatched_control::<R>(context, frame, continued);
     }
-    let control = if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
-        // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
-        let runtime = unsafe { &mut *context.cast::<R>() };
-        runtime.complete_remote_stop(frame, current_binding_generation())
-    } else {
-        control
-    };
     match control {
         crate::syscall::native::SyscallControl::ReturnToCaller => {}
         crate::syscall::native::SyscallControl::TerminateCurrent => {
@@ -2262,8 +2246,119 @@ unsafe fn native_runtime_trampoline<
         }
         crate::syscall::native::SyscallControl::CompleteRemoteStop => halt_forever(),
         crate::syscall::native::SyscallControl::ServiceRendezvous => halt_forever(),
+        crate::syscall::native::SyscallControl::YieldCurrent => halt_forever(),
     }
     service_syscall_return_preemption::<R>(&mut context, frame);
+}
+
+/// The checks after a dispatched or continued call, before its control is
+/// acted on: the authoritative mailbox and rendezvous latch are polled for a
+/// Stop published while the call held the runtime, a Stop-serviced call goes
+/// to the rendezvous reaper, and a termination that published remote Stops
+/// completes them.
+#[allow(
+    unsafe_code,
+    reason = "the current CPU's unique carrier is reborrowed only in a bounded region that does not span a kernel-context switch"
+)]
+fn settle_dispatched_control<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    context: *mut (),
+    frame: &mut RawSyscallFrame,
+    control: crate::syscall::native::SyscallControl,
+) -> crate::syscall::native::SyscallControl {
+    // Recheck the authoritative mailbox after the guarded syscall/return
+    // transaction. The initiator may have published terminal state and Stop
+    // while this CPU was waiting to reacquire the shared runtime authority for
+    // return authorization, before e1 could run with IF clear.
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context);
+        }
+    }
+    match crate::time::service_current_rendezvous_latch().unwrap_or_else(|_| halt_forever()) {
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake => {}
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context);
+        }
+        crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
+    }
+    if control == crate::syscall::native::SyscallControl::ServiceRendezvous {
+        match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+                stage_rendezvous_action(RendezvousAction(request))
+                    .unwrap_or_else(|_| halt_forever());
+                handoff_to_rendezvous_reaper(context);
+            }
+            crate::arch::x86_64::rendezvous::MailboxNotification::None
+            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => halt_forever(),
+        }
+    }
+    if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
+        // SAFETY: [CARRIER] scoped reborrow; the trampoline holds no other one.
+        let runtime = unsafe { &mut *context.cast::<R>() };
+        runtime.complete_remote_stop(frame, current_binding_generation())
+    } else {
+        control
+    }
+}
+
+/// Gives the CPU to the next runnable Thread for a call parked between
+/// steps (DW2 §10.8 item 4), as the syscall return path does, but with no
+/// return authorized: when this Thread runs again, possibly on another CPU,
+/// its arrival is acknowledged and its frame rebound there, and a fresh
+/// quantum is armed. A Stop at any of these safe points goes to the
+/// rendezvous reaper, leaving the call parked for termination to settle.
+#[allow(
+    unsafe_code,
+    reason = "the parked call's raw syscall frame stays on its Thread-owned stack while a lifetime-branded preemption plan is consumed"
+)]
+fn yield_parked_call<
+    R: crate::syscall::native::NativeSyscallFrameRuntime
+        + crate::syscall::native::NativeRendezvousRuntime,
+>(
+    context: &mut *mut (),
+    frame: &mut RawSyscallFrame,
+) {
+    poll_timer_return_stop(*context);
+    crate::time::service_current_scheduler_quantum_deadline().unwrap_or_else(|_| halt_forever());
+    let has_request = {
+        // SAFETY: [CARRIER] scoped reborrow; the trampoline holds no other one.
+        let runtime = unsafe { &mut *(*context).cast::<R>() };
+        runtime.has_reschedule_request()
+    };
+    if has_request {
+        let plan = {
+            // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
+            let runtime = unsafe { &mut *(*context).cast::<R>() };
+            // SAFETY: this is the syscall safe-boundary trampoline on the current Thread's
+            // bound kernel stack, which is the trait method's `# Safety`; the plan is consumed
+            // immediately below.
+            unsafe { runtime.prepare_preemption() }
+        };
+        if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
+            switch_kernel_context(plan);
+            *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
+            // SAFETY: [CARRIER] `*context` was just re-read from the destination CPU's binding
+            // after the switch.
+            let runtime = unsafe { &mut *(*context).cast::<R>() };
+            if let Err(error) = runtime.resume_yielded_call(frame) {
+                invalid_bound_return::<R>(*context, error);
+            }
+        }
+    }
+    poll_timer_return_stop(*context);
+    // The call's next safe point sees an expiry during the arm.
+    let _expired_during_arm = arm_current_normal_quantum();
+    poll_timer_return_stop(*context);
 }
 
 #[allow(
