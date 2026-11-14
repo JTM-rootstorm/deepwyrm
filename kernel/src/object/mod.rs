@@ -317,17 +317,20 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             SlotState::Live(live) if live.object_type == DW_OBJECT_TYPE_MEMORY_OBJECT => {
                 encode_object_id(slot, entry.generation).map(|raw| ObjectId::new(self.domain, raw))
             }
-            _ => None,
+            SlotState::Vacant
+            | SlotState::Live(_)
+            | SlotState::Finalizing(_)
+            | SlotState::Retired => None,
         })
     }
 
     /// Queues `id` again, for a release that needs more steps. Does nothing
     /// for a stale identity.
     pub(crate) fn requeue_memory_notice(&mut self, id: ObjectId) {
-        if self.live_reference_counts(id).is_some() {
-            if let Ok(slot) = self.reference_slot(id) {
-                self.push_notice(slot);
-            }
+        if self.live_reference_counts(id).is_some()
+            && let Ok(slot) = self.reference_slot(id)
+        {
+            self.push_notice(slot);
         }
     }
 
@@ -342,7 +345,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         }
         match entry.state {
             SlotState::Live(live) => Some((live.handle_refs, live.internal_refs)),
-            _ => None,
+            SlotState::Vacant | SlotState::Finalizing(_) | SlotState::Retired => None,
         }
     }
 

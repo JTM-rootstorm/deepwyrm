@@ -384,11 +384,16 @@ fn dispatch(action: Action) -> io::Result<u8> {
     }
 }
 
-/// `tools/pinned-cargo host`, run from the workspace root.
+/// `tools/pinned-cargo host`, run from the workspace root. `CARGO_HOME` is
+/// cleared, as for the target lane: the lane selects its own and refuses one
+/// supplied, which it is when xtask itself runs under `pinned-cargo host`.
 pub(crate) fn pinned_host_cargo() -> Command {
     let workspace = workspace_root();
     let mut command = Command::new(workspace.join("tools/pinned-cargo"));
-    command.current_dir(&workspace).arg("host");
+    command
+        .current_dir(&workspace)
+        .env_remove("CARGO_HOME")
+        .arg("host");
     command
 }
 

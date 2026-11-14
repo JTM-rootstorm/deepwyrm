@@ -99,8 +99,11 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let coverage = self
             .plan_removed(plan, released.len(), removed)
             .and_then(|()| {
-                for index in 0..plan.removed_len {
-                    let (object_slot, _, _) = plan.removed[index].expect("planned removal");
+                for (removal, coverage) in plan.removed[..plan.removed_len]
+                    .iter()
+                    .zip(coverage_pins.iter_mut())
+                {
+                    let (object_slot, _, _) = removal.expect("planned removal");
                     let Some(source) = self.unreused_or_any_released_pin(plan, object_slot) else {
                         return Err(MemoryObjectError::ObjectReference);
                     };
@@ -110,7 +113,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                     let pin = registry
                         .retain_internal(source)
                         .map_err(|_| MemoryObjectError::ObjectReference)?;
-                    coverage_pins[index] = Some(pin);
+                    *coverage = Some(pin);
                 }
                 Ok(())
             });

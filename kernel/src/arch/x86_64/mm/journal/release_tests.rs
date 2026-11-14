@@ -39,7 +39,7 @@ impl Fixture {
     /// of these tests releases an object's last reference.
     fn settle(&mut self, releases: MappingFinalReleases) {
         assert!(
-            releases.settle_locally(&mut self.registry).len() == 0,
+            releases.settle_locally(&mut self.registry).is_empty(),
             "no release in these tests is final"
         );
     }
