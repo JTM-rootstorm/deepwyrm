@@ -482,6 +482,9 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 | Every first touch takes the global T, and usage is a linear scan | §8.9 | M8 |
 | The fault gate, fill-in and commit step have no host tests (spurious fault, table refusal, BSP expiries during a long fill-in) | §8.11 | M8 (its lock work makes them host-testable units) |
 | Global frame exhaustion kills whichever process touches next | §8.9 | M9 |
+| Finalizing a large on-demand object frees every page in one hold (`release_index`), unmeasured (step-5 review R-1) | §10.11 | M5 step 6 |
+| The first kernel pass (low effort) did not cover stack depth beyond the recorded `kernel-check`, APs idling in place and their Stop path, child AddressRegions under a root, or timing | §10.11 | M5 step 6 (second pass) |
+| The arena bookkeeping has no lock (step-5 review R4) | §10.11 | Root `TOOLCHAIN_PLAN.md` step 3, with threads |
 | Review D-1's two-thread probe: a map parked mid-call whose output page another thread unmaps returns `BAD_ADDRESS` with its steps unmapped (jobs cannot start threads; Mike, 2026-11-14) | §10.8 | Root `TOOLCHAIN_PLAN.md` step 3, once jobs can start threads |
 
 **Accepted by Mike (2026-11-13)**, as recommended; §5.3a R1 is instead superseded by M7, which carves the role table from buddy blocks:
@@ -532,7 +535,8 @@ M5 lets a job use what M2–M6 made possible. Today a job gets 16 MiB, 4 MemoryO
 2. Wyrmroot and SDK repinned; the platform config entry and builder; init's reserve, jobs group, run-time budget and limit table, and the startup-record field; `status`.
 3. SDK: `mmap` by size over on-demand objects, scalable arenas and `ENOMEM`; its host tests replace the arena tests.
 4. Probes 12–16 in dev-boot, with §10.8's yield coverage (review D-1).
-5. Independent security review of the stage; fixes; §9 ledger and an as-built record.
+5. Independent security review of the stage; fixes; §9 ledger and an as-built record. *Review done and its batch fixed, 2026-11-14 (§10.11); the as-built record waits for step 6.*
+6. *Added by step 5 (§10.11):* step the finalization of an on-demand backing (kernel R-1), designed and reviewed first; measure the holds the step report does not see (that finalization, §10.9 item 8's release cost, §10.10 item 8's teardown latency); close probe 14's per-page cost; then a second kernel security pass at default effort over what the first did not cover. M5 does not close before this step.
 
 **Step 2 as built (2026-11-14).** Wyrmroot `505198a` and SDK `d62590a`, pinning Deepwyrm `23972de` (the typed `object_get_task_group_memory_info_v1` in `deepwyrm-syscall`). Items 6–8 as designed, with these as-built facts and changes:
 - *The record is 48 bytes,* not 32 (the generated `DwTaskGroupMemoryInfoV1`). Bootstrap passes init the root TaskGroup, so init's read carries the free count.
@@ -738,6 +742,32 @@ Mike's decision of §10.6's step-4 findings. From a read-only survey (Claude Opu
 | Q1 | — | Does a mutation session accept an exited current Process? | Moot: item 2 steps only on a live Process's root |
 | Q2 | — | Does the drain loop run the stage again; must the retirement split? | Item 4 |
 | Q3 | — | Which revalidation failures can occur? | Item 3 |
+
+### 10.11 Step 5: security review of the stage (2026-11-14)
+
+Two independent, read-only reviews by Claude Opus 5.5, each reporting **low** effort, 2026-11-14; findings checked against the code by the coordinator. Kernel: Deepwyrm `e764e51..2604bf5` (`2604bf56bb8b52312a83b0b9c93b4828d470f745`), centred on §10.10 as built. Userspace: Wyrmroot `7986275..e46264e` and wyrmroot-sdk `93de274..56eb579`. No Critical, High or Medium defect was confirmed in either.
+
+| # | Sev. | Finding | Disposition |
+|---|---|---|---|
+| K D-1 | Low | The teardown allowance stayed set when a drain found nothing to step, and an AP's timer gate granted one no drain there used; a later syscall (init's terminate) then stepped, against item 2 | Fixed: Deepwyrm `556601a`. The stage spends the allowance first; a syscall entry ends a leftover one; only the BSP's timer gate grants |
+| K D-2 | Low | A step's 2 MiB bounded bytes, not transactions: 64 small mappings made one step 64 transactions in one hold | Fixed: `556601a`, one transaction per step |
+| K R-1 | Medium candidate | Finalizing a large on-demand object (`memory/frame_roles/index.rs` `release_index`) frees every committed page in one hold during the cleanup drain; a job that commits its budget through a handle, never maps it and exits causes it. The step report does not time it | Scheduled: step 6 (§10.6), §9 |
+| K R-2 | Low | While an entry cannot be stepped the idle BSP polls instead of halting (two root switches and T per pass). No unprivileged way to hold that state was found: queueing needs zero residents | Waiting on Mike [accept; step 6's second pass traces APs idling in place] |
+| K R-3 | Low | With D-1, steps could run on the reaper stack or a successor's root (checked safe) | Closed by D-1's fix |
+| W R1 | Medium if reachable | Each reap began a fresh 500 ms settle pause, so reaps one after another could hold requests past wyrmsh's deadline | Fixed: Wyrmroot `2f2329f`, a pause begun during one keeps its end. With 16 sessions polled one per tick, a client's turn can still come about 400 ms after a pause ends: step 6's latency measurement |
+| W D2 | Low | The probes' module comment claimed a Stop must be shown inside a create and a commit; only a map is required | Fixed: `2f2329f` (comment). Stops inside creates and commits are shown by the yield-everywhere runs (§10.8) and were seen in both boots below |
+| W D3 | Low | Probe 12 checked init's arithmetic against init's own numbers | Fixed: `2f2329f`, WRLJ MEMORY's jobs limit is read from the jobs group. A job group's own limit is still shown only through the over-budget probes |
+| S D1 | — | `MAP_FIXED` over a split that finds no slot was reported to return `EEXIST` | Not a defect: a full region refuses for capacity before overlap (`memory/address_region/region.rs`), so the answer is already `ENOMEM`; a test written for it passed without a fix. Its older half stands: `MAP_FIXED` over a partly mapped range fails with `EEXIST`. Waiting on Mike [schedule with the `MAP_FIXED` row of root `TOOLCHAIN_POSIX_LAYER_DESIGN.md` §11, step 3] |
+| W R2 | Low | Another job's allocations end a pause early, or its releases keep it to the limit | Waiting on Mike [accept: bounded per pause] |
+| S R3 | Low | An arena run handed out, never touched, freed and reused is zeroed, which commits it | Waiting on Mike [accept, or track touched runs with the threads rework] |
+| S R4 | Low | The arena bookkeeping has no lock | Scheduled: §9, with threads |
+| S R5 | Low | An arena's first map gives up on `BAD_ADDRESS` instead of trying a smaller size | Waiting on Mike [fix with the next SDK change] |
+
+Questions for Mike, each with the reviewer's point: the fallback jobs limit is a fixed 64 MiB, which can exceed free − reserve on a small machine [cap it at free − reserve when free is known]; when the jobs group cannot be made, jobs go under init's own group, though item 7 says "still under the jobs group" [accept and correct item 7's wording]; `bin/hello`'s probe modes ship in the production image [accept until dev-boot has its own image]; whether the SDK run checks `memory-test slots`' exit status is unchecked [check in step 6].
+
+The reviewer's answers on teardown cost: a teardown takes one step per 2 MiB of mapped range whether or not its pages were touched, but making that range costs the job as many map steps of its own; others pay for the teardown one step per entry; the Process, TaskGroup, region and object slots stay held meanwhile.
+
+Checked (development tier): kernel host tests, `xtask clippy`, `kernel-check` on Deepwyrm `556601a`; host tests of system-init, launch-proto and xtask, `xtask test fmt` and `clippy` on Wyrmroot `2f2329f`; `dev-boot --check` on one CPU (longest step 7.3 ms, a commit) and `--smp` (35.9 ms, a fill-in) on that pair, run with Wyrmroot's fixes uncommitted. `--sdk` was not run: the SDK did not change. The two kernel fixes have no host test, as the live facade has no host harness (§10.10 item 11).
 
 ## 11. M9 direction (Mike, 2026-11-13)
 
