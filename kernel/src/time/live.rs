@@ -1018,13 +1018,31 @@ unsafe impl Sync for TimeStorage {}
 
 struct LiveClockState {
     pm: PmTimerState,
+    /// Set when the boot cross-check selected the invariant TSC (L1); the PM
+    /// timer is then no longer sampled.
+    tsc: Option<super::tsc::TscClock>,
     last_sample: MonotonicSample,
 }
 
 impl LiveClockState {
     fn sample_now(&mut self) -> Result<MonotonicSample, LiveTimeError> {
-        let raw = read_pm_timer(self.pm.descriptor());
-        let sample = self.pm.sample(raw).map_err(|_| LiveTimeError::Clock)?;
+        let sample = match &mut self.tsc {
+            Some(tsc) => {
+                let nanoseconds = tsc.sample(read_tsc()).map_err(|_| LiveTimeError::Clock)?;
+                let maintenance_deadline = nanoseconds
+                    .checked_add(super::tsc::TSC_MAINTENANCE_NANOSECONDS)
+                    .filter(|value| *value < deepwyrm_abi::DW_DEADLINE_INFINITE.0)
+                    .ok_or(LiveTimeError::Clock)?;
+                MonotonicSample {
+                    nanoseconds,
+                    maintenance_deadline,
+                }
+            }
+            None => {
+                let raw = read_pm_timer(self.pm.descriptor());
+                self.pm.sample(raw).map_err(|_| LiveTimeError::Clock)?
+            }
+        };
         self.last_sample = sample;
         Ok(sample)
     }
@@ -1177,13 +1195,21 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let initial_raw = read_pm_timer(pm_descriptor);
     let mut pm = PmTimerState::new(pm_descriptor, initial_raw);
     let initial_sample = pm.sample(initial_raw).map_err(|_| LiveTimeError::Clock)?;
-    let apic_timer_hz = calibrate_apic_timer(&mut apic, &mut registers, &mut pm)?;
+    let (apic_timer_hz, tsc_calibration) =
+        calibrate_apic_timer(&mut apic, &mut registers, &mut pm)?;
+    let tsc_check = measure_tsc_window(&mut pm)?;
+    let verdict = super::tsc::TscVerdict::new(invariant_tsc_reported(), tsc_calibration, tsc_check);
+    report_clock_choice(verdict);
+    let final_tsc = read_tsc();
     let final_sample = pm
         .sample(read_pm_timer(pm_descriptor))
         .map_err(|_| LiveTimeError::Clock)?;
     if final_sample.nanoseconds <= initial_sample.nanoseconds {
         return Err(LiveTimeError::AcpiTimerDidNotAdvance);
     }
+    let tsc = verdict
+        .selected_hz()
+        .map(|hz| super::tsc::TscClock::new(final_tsc, final_sample.nanoseconds, hz));
     let state = LiveTimeState {
         apic_timer_hz,
         deadlines: DeadlineQueue::new(),
@@ -1200,6 +1226,7 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     Ok(CommittedLiveTimeState {
         clock: LiveClockState {
             pm,
+            tsc,
             last_sample: final_sample,
         },
         time: state,
@@ -1210,13 +1237,16 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     })
 }
 
+/// Calibrates the local APIC timer against the PM timer, and measures the TSC
+/// over the same window: `(apic_hz, (tsc_delta, ns_delta))`.
 fn calibrate_apic_timer(
     apic: &mut LocalApic,
     registers: &mut LiveXApicMmio,
     pm: &mut PmTimerState,
-) -> Result<u64, LiveTimeError> {
+) -> Result<(u64, (u64, u64)), LiveTimeError> {
     apic.start_timer_calibration(registers, u32::MAX)
         .map_err(|_| LiveTimeError::ApicAccess)?;
+    let start_tsc = read_tsc();
     let start = pm
         .sample(read_pm_timer(pm.descriptor()))
         .map_err(|_| LiveTimeError::Clock)?;
@@ -1232,6 +1262,7 @@ fn calibrate_apic_timer(
         }
         core::hint::spin_loop();
     }
+    let end_tsc = read_tsc();
     let end = end.ok_or(LiveTimeError::AcpiTimerDidNotAdvance)?;
     let current = apic
         .timer_current_count(registers)
@@ -1251,7 +1282,91 @@ fn calibrate_apic_timer(
     if !(1_000..=10_000_000_000).contains(&frequency) {
         return Err(LiveTimeError::Calibration);
     }
-    Ok(frequency)
+    Ok((frequency, (end_tsc.wrapping_sub(start_tsc), elapsed_ns)))
+}
+
+/// A second window of TSC ticks against PM-timer nanoseconds, the check the
+/// calibration must agree with before the TSC is trusted.
+fn measure_tsc_window(pm: &mut PmTimerState) -> Result<(u64, u64), LiveTimeError> {
+    let start_tsc = read_tsc();
+    let start = pm
+        .sample(read_pm_timer(pm.descriptor()))
+        .map_err(|_| LiveTimeError::Clock)?;
+    for _ in 0..10_000_000_u32 {
+        let sample = pm
+            .sample(read_pm_timer(pm.descriptor()))
+            .map_err(|_| LiveTimeError::Clock)?;
+        let elapsed = sample.nanoseconds.saturating_sub(start.nanoseconds);
+        if elapsed >= CALIBRATION_NANOSECONDS {
+            return Ok((read_tsc().wrapping_sub(start_tsc), elapsed));
+        }
+        core::hint::spin_loop();
+    }
+    Err(LiveTimeError::AcpiTimerDidNotAdvance)
+}
+
+fn invariant_tsc_reported() -> bool {
+    let max_extended = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    let power = if max_extended >= 0x8000_0007 {
+        core::arch::x86_64::__cpuid(0x8000_0007).edx
+    } else {
+        0
+    };
+    super::tsc::reports_invariant_tsc(max_extended, power)
+}
+
+fn read_tsc() -> u64 {
+    #[allow(
+        unsafe_code,
+        reason = "RDTSC reads a counter and has no memory or privilege effect"
+    )]
+    // SAFETY: RDTSC is available on every x86_64 CPU and only reads the
+    // time-stamp counter.
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+}
+
+/// Logs the clock source and the cross-check, every boot: on a CPU without an
+/// invariant TSC the measurement still runs, so the VM exercises it.
+fn report_clock_choice(verdict: super::tsc::TscVerdict) {
+    use core::fmt::Write;
+
+    struct Line {
+        bytes: [u8; 96],
+        len: usize,
+    }
+    impl Write for Line {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.len + text.len();
+            let slot = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+            slot.copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    let mut line = Line {
+        bytes: [0; 96],
+        len: 0,
+    };
+    let source = if verdict.selected_hz().is_some() {
+        "tsc"
+    } else {
+        "pm"
+    };
+    let _ = write!(
+        line,
+        "clock={source} invariant-tsc={} tsc-hz={} check-ppm={}",
+        if verdict.invariant { "yes" } else { "no" },
+        verdict.hz.unwrap_or(0),
+        verdict.disagreement_ppm.map_or(-1, |ppm| ppm as i64),
+    );
+    // Guest-test builds keep their serial records exact.
+    #[cfg(not(feature = "test-support"))]
+    if let Ok(message) = core::str::from_utf8(&line.bytes[..line.len]) {
+        let _ =
+            crate::debug::emit_early_record(crate::debug::DiagnosticLevel::Info, "time", message);
+    }
 }
 
 fn map_timer_queue_error(error: super::DeadlineQueueError) -> TimerDeadlineError {

@@ -22,6 +22,14 @@ mod live;
 mod pm_timer;
 mod service;
 mod timer;
+#[cfg_attr(
+    not(all(target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "the live clock is target-only; host tests cover the model"
+    )
+)]
+mod tsc;
 
 #[allow(
     unused_imports,
