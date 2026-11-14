@@ -239,6 +239,8 @@ Every requested_rights value is nonzero, known, and compatible with the target o
 | `DW_ATOMIC_WAKE_ALL` | `u32` | `4294967295` | Wake every waiter eligible for atomic_wake. |
 | `DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT` | `u64` | `1` | Discovery identity for the complete DeviceResource and Interrupt runtime; kernels report this bit only after the DW1-D runtime gate is reached. |
 | `DW_HANDLE_TRANSFER_MOVE` | `DwHandleTransferOperation` | `1` | Move a handle on commit; no duplicate transfer operation exists in ABI 0. |
+| `DW_EXECUTION_MODE_X86_64` | `DwExecutionMode` | `1` | 64-bit long mode; every native thread starts in it. |
+| `DW_EXECUTION_MODE_X86_COMPAT32` | `DwExecutionMode` | `2` | 32-bit compatibility mode; named for the i386 contract, refused with NOT_SUPPORTED until it is built. |
 | `DW_WAIT_MODE_ANY` | `u32` | `0` | Return the lowest-index ready item. |
 | `DW_WAIT_MODE_ALL` | `u32` | `1` | Reserved in ABI 0; operations return NOT_SUPPORTED. |
 | `DW_CLOCK_MONOTONIC_ACTIVE` | `DwClockId` | `0` | Monotonic active-time clock used by ABI-0 deadlines. |
@@ -629,7 +631,9 @@ Initial user register state for starting a created thread. Size 80, alignment 8.
 | 32 | `startup_argument0` | `u64` | First Wyrmroot-owned initial argument value. |
 | 40 | `startup_argument1` | `u64` | Second Wyrmroot-owned initial argument value. |
 | 48 | `flags` | `u64` | Must be zero in ABI 0. |
-| 56 | `reserved` | `[u64; 3]` | Reserved; all elements must be zero. |
+| 56 | `execution_mode` | `DwExecutionMode` | Mode the thread starts in; must be X86_64. |
+| 60 | `reserved0` | `u32` | Reserved; must be zero. |
+| 64 | `reserved` | `[u64; 2]` | Reserved; all elements must be zero. |
 
 ### `DwHandleTransferV1`
 

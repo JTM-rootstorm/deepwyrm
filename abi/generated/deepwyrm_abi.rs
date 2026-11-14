@@ -8,10 +8,10 @@ pub const DW_ABI_VERSION: u32 = 0;
 /// the descriptor of the `.note.deepwyrm.abi` ELF note every native binary
 /// carries, and `abi_get_info` reports the running kernel's in
 /// `DwAbiInfoV1::abi_fingerprint`.
-pub const DW_ABI_FINGERPRINT: [u8; 32] = [90, 160, 69, 208, 231, 50, 139, 21, 169, 226, 90, 253, 108, 58, 169, 195, 129, 228, 129, 34, 11, 224, 80, 184, 249, 244, 66, 34, 148, 209, 252, 68];
+pub const DW_ABI_FINGERPRINT: [u8; 32] = [131, 210, 61, 228, 56, 5, 48, 223, 22, 84, 46, 130, 108, 54, 127, 120, 132, 185, 189, 121, 158, 127, 170, 55, 194, 21, 180, 175, 186, 253, 45, 93];
 
 /// `DW_ABI_FINGERPRINT` as four little-endian words, for assemblers.
-pub const DW_ABI_FINGERPRINT_WORDS: [u64; 4] = [0x158b32e7d045a05a, 0xc3a93a6cfd5ae2a9, 0xb850e00b2281e481, 0x44fcd1942242f4f9];
+pub const DW_ABI_FINGERPRINT_WORDS: [u64; 4] = [0xdf300538e43dd283, 0x787f366c822e5416, 0x37aa7f9e79bdb984, 0x5d2dfdbaafb415c2];
 
 /// Owner name of the ABI note, NUL-terminated as ELF requires.
 pub const DW_ABI_NOTE_NAME: [u8; 9] = *b"Deepwyrm\0";
@@ -58,6 +58,11 @@ pub struct DwDeadline(pub u64);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DwHandleTransferOperation(pub u32);
+
+/// Open numeric namespace for the CPU execution mode a user thread runs in; zero is invalid.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DwExecutionMode(pub u32);
 
 /// Explicit native syscall identifier; zero is invalid.
 #[repr(transparent)]
@@ -650,6 +655,12 @@ pub const DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT: u64 = 1;
 
 /// Move a handle on commit; no duplicate transfer operation exists in ABI 0.
 pub const DW_HANDLE_TRANSFER_MOVE: DwHandleTransferOperation = DwHandleTransferOperation(1);
+
+/// 64-bit long mode; every native thread starts in it.
+pub const DW_EXECUTION_MODE_X86_64: DwExecutionMode = DwExecutionMode(1);
+
+/// 32-bit compatibility mode; named for the i386 contract, refused with NOT_SUPPORTED until it is built.
+pub const DW_EXECUTION_MODE_X86_COMPAT32: DwExecutionMode = DwExecutionMode(2);
 
 /// Return the lowest-index ready item.
 pub const DW_WAIT_MODE_ANY: u32 = 0;
@@ -1482,8 +1493,12 @@ pub struct DwThreadStartArgsV1 {
     pub startup_argument1: u64,
     /// Must be zero in ABI 0.
     pub flags: u64,
+    /// Mode the thread starts in; must be X86_64.
+    pub execution_mode: DwExecutionMode,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
     /// Reserved; all elements must be zero.
-    pub reserved: [u64; 3],
+    pub reserved: [u64; 2],
 }
 
 pub const DW_THREAD_START_ARGS_V1_SIZE: u32 = 80;
@@ -1601,6 +1616,8 @@ mod generated_layout_tests {
         assert_eq!(align_of::<DwDeadline>(), 8);
         assert_eq!(size_of::<DwHandleTransferOperation>(), 4);
         assert_eq!(align_of::<DwHandleTransferOperation>(), 4);
+        assert_eq!(size_of::<DwExecutionMode>(), 4);
+        assert_eq!(align_of::<DwExecutionMode>(), 4);
         assert_eq!(size_of::<DwSyscallId>(), 4);
         assert_eq!(align_of::<DwSyscallId>(), 4);
         assert_eq!(size_of::<DwSize>(), 8);
@@ -1890,7 +1907,9 @@ mod generated_layout_tests {
         assert_eq!(offset_of!(DwThreadStartArgsV1, startup_argument0), 32);
         assert_eq!(offset_of!(DwThreadStartArgsV1, startup_argument1), 40);
         assert_eq!(offset_of!(DwThreadStartArgsV1, flags), 48);
-        assert_eq!(offset_of!(DwThreadStartArgsV1, reserved), 56);
+        assert_eq!(offset_of!(DwThreadStartArgsV1, execution_mode), 56);
+        assert_eq!(offset_of!(DwThreadStartArgsV1, reserved0), 60);
+        assert_eq!(offset_of!(DwThreadStartArgsV1, reserved), 64);
         assert_eq!(size_of::<DwHandleTransferV1>(), 40);
         assert_eq!(align_of::<DwHandleTransferV1>(), 8);
         assert_eq!(offset_of!(DwHandleTransferV1, handle), 0);
@@ -2102,6 +2121,8 @@ mod generated_layout_tests {
         assert_eq!(DW_ATOMIC_WAKE_ALL, 4294967295);
         assert_eq!(DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT, 1);
         assert_eq!(DW_HANDLE_TRANSFER_MOVE.0, 1);
+        assert_eq!(DW_EXECUTION_MODE_X86_64.0, 1);
+        assert_eq!(DW_EXECUTION_MODE_X86_COMPAT32.0, 2);
         assert_eq!(DW_WAIT_MODE_ANY, 0);
         assert_eq!(DW_WAIT_MODE_ALL, 1);
         assert_eq!(DW_CLOCK_MONOTONIC_ACTIVE.0, 0);

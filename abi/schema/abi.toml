@@ -52,6 +52,11 @@ base = "u32"
 doc = "Open numeric namespace for channel handle-transfer behavior."
 
 [[newtype]]
+name = "DwExecutionMode"
+base = "u32"
+doc = "Open numeric namespace for the CPU execution mode a user thread runs in; zero is invalid."
+
+[[newtype]]
 name = "DwSyscallId"
 base = "u32"
 doc = "Explicit native syscall identifier; zero is invalid."

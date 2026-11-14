@@ -187,12 +187,18 @@ fn thread_start_decoder_follows_generated_offsets() {
     thread[24..32].copy_from_slice(&0x8000_u64.to_le_bytes());
     thread[32..40].copy_from_slice(&3_u64.to_le_bytes());
     thread[40..48].copy_from_slice(&4_u64.to_le_bytes());
+    thread[56..60].copy_from_slice(&2_u32.to_le_bytes());
+    thread[60..64].copy_from_slice(&5_u32.to_le_bytes());
+    thread[72..80].copy_from_slice(&6_u64.to_le_bytes());
     let decoded = decode_thread_start(&thread);
     assert_eq!(decoded.thread, DwHandle(0x1122));
     assert_eq!(decoded.entry, DwUserAddress(0x4000));
     assert_eq!(decoded.stack_pointer, DwUserAddress(0x8000));
     assert_eq!(decoded.startup_argument0, 3);
     assert_eq!(decoded.startup_argument1, 4);
+    assert_eq!(decoded.execution_mode, deepwyrm_abi::DwExecutionMode(2));
+    assert_eq!(decoded.reserved0, 5);
+    assert_eq!(decoded.reserved, [0, 6]);
 }
 #[test]
 fn map_decoder_follows_generated_offsets() {

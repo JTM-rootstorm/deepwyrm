@@ -393,7 +393,9 @@ pub(crate) fn decode_thread_start(bytes: &[u8; THREAD_START_BYTES]) -> DwThreadS
         startup_argument0: get_u64(bytes, 32),
         startup_argument1: get_u64(bytes, 40),
         flags: get_u64(bytes, 48),
-        reserved: [get_u64(bytes, 56), get_u64(bytes, 64), get_u64(bytes, 72)],
+        execution_mode: deepwyrm_abi::DwExecutionMode(get_u32(bytes, 56)),
+        reserved0: get_u32(bytes, 60),
+        reserved: [get_u64(bytes, 64), get_u64(bytes, 72)],
     }
 }
 

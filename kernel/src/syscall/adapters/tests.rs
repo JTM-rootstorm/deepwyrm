@@ -5801,6 +5801,45 @@ fn write_thread_start_args(
     bytes[8..16].copy_from_slice(&thread.0.to_le_bytes());
     bytes[16..24].copy_from_slice(&entry.to_le_bytes());
     bytes[24..32].copy_from_slice(&stack_pointer.to_le_bytes());
+    bytes[56..60].copy_from_slice(&deepwyrm_abi::DW_EXECUTION_MODE_X86_64.0.to_le_bytes());
+}
+
+#[test]
+fn thread_start_input_admits_only_the_x86_64_execution_mode() {
+    let address = BASE + 0x280;
+    let offset = FakeUserMemory::offset(address, THREAD_START_BYTES);
+    let mut user = FakeUserMemory::new();
+    let cases = [
+        (deepwyrm_abi::DW_EXECUTION_MODE_X86_64.0, None),
+        (
+            deepwyrm_abi::DW_EXECUTION_MODE_X86_COMPAT32.0,
+            Some(DW_STATUS_NOT_SUPPORTED),
+        ),
+        (0, Some(DW_STATUS_INVALID_ARGUMENT)),
+        (3, Some(DW_STATUS_INVALID_ARGUMENT)),
+        (u32::MAX, Some(DW_STATUS_INVALID_ARGUMENT)),
+    ];
+    for (mode, refusal) in cases {
+        write_thread_start_args(&mut user, address, DwHandle(0x55), 0x4000_1000, 0x5000_2000);
+        user.bytes[offset + 56..offset + 60].copy_from_slice(&mode.to_le_bytes());
+        let result =
+            thread_start_input(&mut user, DwUserAddress(address), THREAD_START_BYTES as u64);
+        match refusal {
+            None => assert_eq!(
+                result.map(|args| args.execution_mode),
+                Ok(deepwyrm_abi::DW_EXECUTION_MODE_X86_64)
+            ),
+            Some(status) => assert_eq!(result.map(|_| ()), Err(status), "mode {mode}"),
+        }
+    }
+    // The word after the mode stays reserved.
+    write_thread_start_args(&mut user, address, DwHandle(0x55), 0x4000_1000, 0x5000_2000);
+    user.bytes[offset + 60] = 1;
+    assert_eq!(
+        thread_start_input(&mut user, DwUserAddress(address), THREAD_START_BYTES as u64)
+            .map(|_| ()),
+        Err(DW_STATUS_INVALID_ARGUMENT)
+    );
 }
 
 #[test]

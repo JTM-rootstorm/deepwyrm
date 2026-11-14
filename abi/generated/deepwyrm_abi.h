@@ -19,11 +19,11 @@
 
 /* The semantic ABI fingerprint as the descriptor bytes of the
  * `.note.deepwyrm.abi` ELF note, and as four little-endian words. */
-#define DW_ABI_FINGERPRINT_BYTES 0x5a, 0xa0, 0x45, 0xd0, 0xe7, 0x32, 0x8b, 0x15, 0xa9, 0xe2, 0x5a, 0xfd, 0x6c, 0x3a, 0xa9, 0xc3, 0x81, 0xe4, 0x81, 0x22, 0x0b, 0xe0, 0x50, 0xb8, 0xf9, 0xf4, 0x42, 0x22, 0x94, 0xd1, 0xfc, 0x44
-#define DW_ABI_FINGERPRINT_WORD0 0x158b32e7d045a05a
-#define DW_ABI_FINGERPRINT_WORD1 0xc3a93a6cfd5ae2a9
-#define DW_ABI_FINGERPRINT_WORD2 0xb850e00b2281e481
-#define DW_ABI_FINGERPRINT_WORD3 0x44fcd1942242f4f9
+#define DW_ABI_FINGERPRINT_BYTES 0x83, 0xd2, 0x3d, 0xe4, 0x38, 0x05, 0x30, 0xdf, 0x16, 0x54, 0x2e, 0x82, 0x6c, 0x36, 0x7f, 0x78, 0x84, 0xb9, 0xbd, 0x79, 0x9e, 0x7f, 0xaa, 0x37, 0xc2, 0x15, 0xb4, 0xaf, 0xba, 0xfd, 0x2d, 0x5d
+#define DW_ABI_FINGERPRINT_WORD0 0xdf300538e43dd283
+#define DW_ABI_FINGERPRINT_WORD1 0x787f366c822e5416
+#define DW_ABI_FINGERPRINT_WORD2 0x37aa7f9e79bdb984
+#define DW_ABI_FINGERPRINT_WORD3 0x5d2dfdbaafb415c2
 #define DW_ABI_NOTE_NAME "Deepwyrm"
 #define DW_ABI_NOTE_TYPE_FINGERPRINT 1
 
@@ -74,6 +74,12 @@ typedef uint32_t DwHandleTransferOperation;
 
 DW_STATIC_ASSERT(sizeof(DwHandleTransferOperation) == 4, "DwHandleTransferOperation size");
 DW_STATIC_ASSERT(DW_ALIGNOF(DwHandleTransferOperation) == 4, "DwHandleTransferOperation alignment");
+
+/* Open numeric namespace for the CPU execution mode a user thread runs in; zero is invalid. */
+typedef uint32_t DwExecutionMode;
+
+DW_STATIC_ASSERT(sizeof(DwExecutionMode) == 4, "DwExecutionMode size");
+DW_STATIC_ASSERT(DW_ALIGNOF(DwExecutionMode) == 4, "DwExecutionMode alignment");
 
 /* Explicit native syscall identifier; zero is invalid. */
 typedef uint32_t DwSyscallId;
@@ -555,6 +561,10 @@ static inline int dw_signals_are_compatible(DwObjectType object_type, DwSignals 
 #define DW_ABI_FEATURE_DEVICE_RESOURCE_INTERRUPT ((uint64_t)(1))
 /* Move a handle on commit; no duplicate transfer operation exists in ABI 0. */
 #define DW_HANDLE_TRANSFER_MOVE ((DwHandleTransferOperation)(1))
+/* 64-bit long mode; every native thread starts in it. */
+#define DW_EXECUTION_MODE_X86_64 ((DwExecutionMode)(1))
+/* 32-bit compatibility mode; named for the i386 contract, refused with NOT_SUPPORTED until it is built. */
+#define DW_EXECUTION_MODE_X86_COMPAT32 ((DwExecutionMode)(2))
 /* Return the lowest-index ready item. */
 #define DW_WAIT_MODE_ANY ((uint32_t)(0))
 /* Reserved in ABI 0; operations return NOT_SUPPORTED. */
@@ -1469,8 +1479,12 @@ typedef struct DwThreadStartArgsV1 {
     uint64_t startup_argument1;
     /* Must be zero in ABI 0. */
     uint64_t flags;
+    /* Mode the thread starts in; must be X86_64. */
+    DwExecutionMode execution_mode;
+    /* Reserved; must be zero. */
+    uint32_t reserved0;
     /* Reserved; all elements must be zero. */
-    uint64_t reserved[3];
+    uint64_t reserved[2];
 } DwThreadStartArgsV1;
 #define DW_THREAD_START_ARGS_V1_SIZE ((uint32_t)(80))
 DW_STATIC_ASSERT(sizeof(DwThreadStartArgsV1) == 80, "DwThreadStartArgsV1 size");
@@ -1483,7 +1497,9 @@ DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, stack_pointer) == 24, "DwThreadSt
 DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, startup_argument0) == 32, "DwThreadStartArgsV1.startup_argument0 offset");
 DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, startup_argument1) == 40, "DwThreadStartArgsV1.startup_argument1 offset");
 DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, flags) == 48, "DwThreadStartArgsV1.flags offset");
-DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, reserved) == 56, "DwThreadStartArgsV1.reserved offset");
+DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, execution_mode) == 56, "DwThreadStartArgsV1.execution_mode offset");
+DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, reserved0) == 60, "DwThreadStartArgsV1.reserved0 offset");
+DW_STATIC_ASSERT(offsetof(DwThreadStartArgsV1, reserved) == 64, "DwThreadStartArgsV1.reserved offset");
 
 /* One handle transaction descriptor for channel_send. */
 typedef struct DwHandleTransferV1 {

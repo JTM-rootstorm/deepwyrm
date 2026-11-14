@@ -8573,12 +8573,8 @@ pub(crate) fn thread_start<
         Err(status) => return status,
     };
     let args = decode_thread_start(&bytes);
-    if args.size != THREAD_START_BYTES as u32
-        || args.version != 1
-        || args.flags != 0
-        || args.reserved != [0; 3]
-    {
-        return DW_STATUS_INVALID_ARGUMENT;
+    if let Err(status) = validate_thread_start(&args) {
+        return status;
     }
     let pin = match resolve_current_handle(
         tasks,
@@ -8657,14 +8653,27 @@ pub(crate) fn thread_start_input<U: UserPageAccess>(
     }
     let bytes = copy_input::<U, THREAD_START_BYTES>(user, args_address, 8)?;
     let args = decode_thread_start(&bytes);
+    validate_thread_start(&args)?;
+    Ok(args)
+}
+
+/// The fixed fields of `DwThreadStartArgsV1`, then its execution mode: only
+/// `X86_64` starts until compatibility mode is built (i386 contract E3);
+/// `X86_COMPAT32` is named but not supported, and any other value is invalid.
+fn validate_thread_start(args: &deepwyrm_abi::DwThreadStartArgsV1) -> Result<(), DwStatus> {
     if args.size != THREAD_START_BYTES as u32
         || args.version != 1
         || args.flags != 0
-        || args.reserved != [0; 3]
+        || args.reserved0 != 0
+        || args.reserved != [0; 2]
     {
         return Err(DW_STATUS_INVALID_ARGUMENT);
     }
-    Ok(args)
+    match args.execution_mode {
+        deepwyrm_abi::DW_EXECUTION_MODE_X86_64 => Ok(()),
+        deepwyrm_abi::DW_EXECUTION_MODE_X86_COMPAT32 => Err(DW_STATUS_NOT_SUPPORTED),
+        _ => Err(DW_STATUS_INVALID_ARGUMENT),
+    }
 }
 
 /// ThreadStart over copied arguments (D1 commit 9): resolve the Thread,

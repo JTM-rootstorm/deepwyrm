@@ -127,6 +127,18 @@ value = 1
 doc = "Move a handle on commit; no duplicate transfer operation exists in ABI 0."
 
 [[constant]]
+name = "DW_EXECUTION_MODE_X86_64"
+type = "DwExecutionMode"
+value = 1
+doc = "64-bit long mode; every native thread starts in it."
+
+[[constant]]
+name = "DW_EXECUTION_MODE_X86_COMPAT32"
+type = "DwExecutionMode"
+value = 2
+doc = "32-bit compatibility mode; named for the i386 contract, refused with NOT_SUPPORTED until it is built."
+
+[[constant]]
 name = "DW_WAIT_MODE_ANY"
 type = "u32"
 value = 0
@@ -544,7 +556,9 @@ field4 = "stack_pointer|DwUserAddress|Initial stack pointer."
 field5 = "startup_argument0|u64|First Wyrmroot-owned initial argument value."
 field6 = "startup_argument1|u64|Second Wyrmroot-owned initial argument value."
 field7 = "flags|u64|Must be zero in ABI 0."
-field8 = "reserved|[u64;3]|Reserved; all elements must be zero."
+field8 = "execution_mode|DwExecutionMode|Mode the thread starts in; must be X86_64."
+field9 = "reserved0|u32|Reserved; must be zero."
+field10 = "reserved|[u64;2]|Reserved; all elements must be zero."
 
 [[record]]
 name = "DwHandleTransferV1"
