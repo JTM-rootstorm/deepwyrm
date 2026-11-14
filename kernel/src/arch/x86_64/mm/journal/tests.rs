@@ -215,6 +215,90 @@ fn reused_storage_starts_an_empty_journal() {
     assert!(target.applied.is_empty());
 }
 
+/// The staged-entry index (DW2 §10.6, probe 14): with three buckets, many
+/// entries share each chain; lookups must still find exactly the staged
+/// value, a failed plan's entries must leave the chains, and entries added
+/// after a rollback must be found.
+#[test]
+fn indexed_entries_are_found_through_shared_buckets_and_rollbacks() {
+    let mut target = FakeTarget::default();
+    let page = VirtualPage::new(0x4000).unwrap();
+    let mut journal = PageTableJournal::<_, 3, 1>::new(&mut target, storage());
+    let mut first = MutationPlan::empty(FrameAddress(0x1000), page);
+    first.push_mutation(mutation(0x1000, 0, 0, 0x11));
+    first.push_mutation(mutation(0x1000, 1, 0, 0x12));
+    journal.commit(&first).unwrap();
+    // A plan that fits one more entry, then fails on the next.
+    let mut failing = MutationPlan::empty(FrameAddress(0x1000), page);
+    failing.push_mutation(mutation(0x1000, 0, 0x11, 0x99));
+    failing.push_mutation(mutation(0x2000, 7, 0, 0x21));
+    failing.push_mutation(mutation(0x3000, 7, 0, 0x31));
+    assert_eq!(
+        journal.commit(&failing),
+        Err(CommitError::TableClaimRejected)
+    );
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 0), Ok(0x11));
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 1), Ok(0x12));
+    assert_eq!(journal.read_entry(FrameAddress(0x2000), 7), Ok(0));
+    // The failed plan's slot is reused by a different entry.
+    let mut third = MutationPlan::empty(FrameAddress(0x1000), page);
+    third.push_mutation(mutation(0x3000, 7, 0, 0x31));
+    journal.commit(&third).unwrap();
+    assert_eq!(journal.read_entry(FrameAddress(0x3000), 7), Ok(0x31));
+    assert_eq!(journal.read_entry(FrameAddress(0x2000), 7), Ok(0));
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 0), Ok(0x11));
+    journal.publish().unwrap();
+    assert_eq!(target.entries.get(&(0x1000, 0)), Some(&0x11));
+    assert_eq!(target.entries.get(&(0x1000, 1)), Some(&0x12));
+    assert_eq!(target.entries.get(&(0x3000, 7)), Some(&0x31));
+    assert_eq!(target.entries.get(&(0x2000, 7)), None);
+}
+
+#[test]
+fn a_full_batch_of_entries_is_each_found_once() {
+    // Thousands of entries across many tables, as a 16 MiB batch stages.
+    const COUNT: usize = 4096;
+    let mut target = FakeTarget::default();
+    let page = VirtualPage::new(0x4000).unwrap();
+    let mut journal = PageTableJournal::<_, COUNT, 1>::new(&mut target, storage());
+    for entry in 0..COUNT {
+        let table = 0x10_0000 + (entry / 512) as u64 * 0x1000;
+        let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
+        plan.push_mutation(mutation(table, entry % 512, 0, entry as u64 + 1));
+        journal.commit(&plan).unwrap();
+    }
+    for entry in 0..COUNT {
+        let table = 0x10_0000 + (entry / 512) as u64 * 0x1000;
+        assert_eq!(
+            journal.read_entry(FrameAddress(table), entry % 512),
+            Ok(entry as u64 + 1)
+        );
+    }
+    let mut extra = MutationPlan::empty(FrameAddress(0x1000), page);
+    extra.push_mutation(mutation(0x1, 0, 0, 1));
+    assert_eq!(journal.commit(&extra), Err(CommitError::TableClaimRejected));
+}
+
+#[test]
+fn a_wrapped_generation_still_starts_an_empty_journal() {
+    let mut target = FakeTarget::default();
+    let page = VirtualPage::new(0x4000).unwrap();
+    let storage = storage::<2, 1>();
+    // The last generation before the counter wraps stages an entry.
+    storage.generation = u32::MAX - 1;
+    let mut journal = PageTableJournal::new(&mut target, &mut *storage);
+    let mut plan = MutationPlan::empty(FrameAddress(0x1000), page);
+    plan.push_mutation(mutation(0x1000, 0, 0, 0x2003));
+    journal.commit(&plan).unwrap();
+    assert_eq!(storage.generation, u32::MAX);
+    // The next journal wraps to generation one and sees nothing staged.
+    let mut journal = PageTableJournal::new(&mut target, &mut *storage);
+    assert_eq!(journal.read_entry(FrameAddress(0x1000), 0), Ok(0));
+    journal.publish().unwrap();
+    assert_eq!(storage.generation, 1);
+    assert!(target.entries.is_empty());
+}
+
 #[test]
 fn capacity_failure_rolls_back_the_entire_plan_overlay() {
     let mut target = FakeTarget::default();

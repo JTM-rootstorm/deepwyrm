@@ -186,6 +186,16 @@ pub(crate) struct JournalStorage<const ENTRY_CAPACITY: usize, const INVALIDATION
     actual: [u64; ENTRY_CAPACITY],
     /// `publish`'s write batch.
     writes: [JournalWrite; ENTRY_CAPACITY],
+    /// Staged entries by (table, index): each bucket holds the journal
+    /// generation that wrote it in its high half and one more than the slot
+    /// of its newest entry in its low half (zero for none), and `next`
+    /// chains each entry to the one staged before it in the same bucket. A
+    /// bucket from another generation is empty, so a new journal clears
+    /// nothing. Lookups walk a chain instead of every staged entry, which
+    /// made a full batch quadratic (DW2 §10.6, probe 14).
+    buckets: [u64; ENTRY_CAPACITY],
+    next: [u32; ENTRY_CAPACITY],
+    generation: u32,
 }
 
 #[allow(
@@ -201,7 +211,71 @@ impl<const ENTRY_CAPACITY: usize, const INVALIDATION_CAPACITY: usize>
             invalidations: [EMPTY_PAGE; INVALIDATION_CAPACITY],
             actual: [0; ENTRY_CAPACITY],
             writes: [EMPTY_WRITE; ENTRY_CAPACITY],
+            buckets: [0; ENTRY_CAPACITY],
+            next: [0; ENTRY_CAPACITY],
+            generation: 0,
         }
+    }
+
+    /// Starts a new journal's generation; every bucket is then empty.
+    fn begin(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Wrapped: buckets of the generation about to be reused go.
+            self.buckets.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    fn head(&self, bucket: usize) -> u32 {
+        let value = self.buckets[bucket];
+        if (value >> 32) as u32 == self.generation {
+            value as u32
+        } else {
+            0
+        }
+    }
+
+    fn set_head(&mut self, bucket: usize, link: u32) {
+        self.buckets[bucket] = (u64::from(self.generation) << 32) | u64::from(link);
+    }
+
+    fn bucket(table: FrameAddress, index: usize) -> usize {
+        // Table frames are page aligned, so their low bits carry nothing.
+        let key = (table.0 >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ index as u64;
+        (key % ENTRY_CAPACITY as u64) as usize
+    }
+
+    /// The slot of the staged entry for (`table`, `index`) among the first
+    /// `count`, if there is one.
+    fn find(&self, count: usize, table: FrameAddress, index: usize) -> Option<usize> {
+        if ENTRY_CAPACITY == 0 {
+            return None;
+        }
+        let mut link = self.head(Self::bucket(table, index));
+        while link != 0 {
+            let slot = link as usize - 1;
+            let entry = &self.entries[slot];
+            if slot < count && entry.table == table && entry.index == index {
+                return Some(slot);
+            }
+            link = self.next[slot];
+        }
+        None
+    }
+
+    /// Links a newly staged `slot` into its bucket.
+    fn link(&mut self, slot: usize) {
+        let bucket = Self::bucket(self.entries[slot].table, self.entries[slot].index);
+        self.next[slot] = self.head(bucket);
+        self.set_head(bucket, slot as u32 + 1);
+    }
+
+    /// Unlinks the newest staged `slot`, which heads its bucket.
+    fn unlink(&mut self, slot: usize) {
+        let bucket = Self::bucket(self.entries[slot].table, self.entries[slot].index);
+        debug_assert_eq!(self.head(bucket), slot as u32 + 1);
+        self.set_head(bucket, self.next[slot]);
     }
 
     /// Initializes storage in place, so no whole-value temporary exists on
@@ -917,6 +991,8 @@ where
         target: &'a mut T,
         storage: &'a mut JournalStorage<ENTRY_CAPACITY, INVALIDATION_CAPACITY>,
     ) -> Self {
+        // Entries left by an earlier journal are not this one's.
+        storage.begin();
         Self {
             target,
             storage,
@@ -973,11 +1049,8 @@ where
         if index >= ENTRY_COUNT {
             return Err(PageTableJournalError::InvalidIndex);
         }
-        if let Some(entry) = self.storage.entries[..self.entry_count]
-            .iter()
-            .find(|entry| entry.table == table && entry.index == index)
-        {
-            return Ok(entry.logical);
+        if let Some(slot) = self.storage.find(self.entry_count, table, index) {
+            return Ok(self.storage.entries[slot].logical);
         }
         self.target
             .read_entry(table, index)
@@ -999,6 +1072,11 @@ where
                 self.undo_count -= 1;
                 let (slot, entry) = self.undo[self.undo_count];
                 self.storage.entries[slot] = entry;
+            }
+            // The plan's own entries head their buckets: unlink them newest
+            // first.
+            for slot in (original_entry_count..self.entry_count).rev() {
+                self.storage.unlink(slot);
             }
             self.entry_count = original_entry_count;
             self.invalidation_count = original_invalidation_count;
@@ -1103,10 +1181,7 @@ where
         compare_mask: u64,
         logical: u64,
     ) -> Result<usize, PageTableJournalError<T::Error>> {
-        if let Some(slot) = self.storage.entries[..self.entry_count]
-            .iter()
-            .position(|entry| entry.table == table && entry.index == index)
-        {
+        if let Some(slot) = self.storage.find(self.entry_count, table, index) {
             let entry = self.storage.entries[slot];
             if !entry.written {
                 let overlap = entry.compare_mask & compare_mask;
@@ -1134,6 +1209,7 @@ where
             logical,
             written: false,
         };
+        self.storage.link(slot);
         self.entry_count += 1;
         Ok(slot)
     }
