@@ -299,6 +299,11 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     if let Err(error) = unsafe { arch::x86_64::install_early_descriptors() } {
         panic!("failed to install early x86_64 descriptors: {error:?}");
     }
+    // SAFETY: the BSP runs on the boot stack; no painted stack is in use yet.
+    #[cfg(not(feature = "test-support"))]
+    unsafe {
+        arch::x86_64::stack_watermark::paint_all();
+    }
 
     let reader = IdentityMappedBootInfoReader;
     // The validated copy of the boot information is owned for the kernel's lifetime: the paging

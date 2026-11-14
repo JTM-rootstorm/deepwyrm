@@ -32,6 +32,7 @@ use crate::arch::x86_64::syscall::GuardFree;
     reason = "the terminal path has no runnable work; halting with interrupts enabled is the pre-existing production behaviour this extends"
 )]
 pub(crate) fn soft_off_then_halt(_guard_free: GuardFree<'_>) -> ! {
+    crate::arch::x86_64::stack_watermark::report();
     match sleep::authorized_soft_off() {
         Some(command) => sleep::request_soft_off(&mut X86PortIo, command),
         None => {

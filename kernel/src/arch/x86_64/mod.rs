@@ -48,6 +48,7 @@ pub(crate) mod power;
 )]
 pub(crate) mod rendezvous;
 pub(crate) mod smp;
+pub(crate) mod stack_watermark;
 pub(crate) mod syscall;
 pub mod tss;
 #[cfg_attr(
