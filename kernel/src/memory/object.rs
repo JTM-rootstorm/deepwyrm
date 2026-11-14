@@ -657,6 +657,15 @@ impl MemoryObjectRange {
         uncached: false,
     };
 
+    #[cfg(test)]
+    pub(super) const fn for_test(object_offset: u64, byte_len: u64) -> Self {
+        Self {
+            object_offset,
+            byte_len,
+            ..Self::EMPTY
+        }
+    }
+
     pub(crate) const fn backing_identity(self) -> BackingIdentity {
         self.backing
     }
@@ -1389,6 +1398,21 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
         object: ObjectId,
     ) -> ReleaseStep {
+        self.release_unmapped_step_within(registry, roles, object, RELEASE_STEP_ENTRIES)
+    }
+
+    /// [`Self::release_unmapped_step`] with an entry budget of `budget`.
+    pub(crate) fn release_unmapped_step_within<
+        const REGISTRY_OBJECTS: usize,
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        object: ObjectId,
+        budget: u64,
+    ) -> ReleaseStep {
         let Some(slot) = self
             .objects
             .iter()
@@ -1418,13 +1442,13 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         let mut cursor = first;
         let mut visited = 0_u64;
         let mut freed = 0_u64;
-        while cursor < end && visited < RELEASE_STEP_ENTRIES {
+        while cursor < end && visited < budget {
             let Some((low, high)) = self.next_uncovered(slot, cursor, end) else {
                 cursor = end;
                 break;
             };
             let (next, pages, entries) = roles
-                .decommit_on_demand_range(record.backing, low, high, RELEASE_STEP_ENTRIES - visited)
+                .decommit_on_demand_range(record.backing, low, high, budget - visited)
                 .unwrap_or_else(|error| {
                     panic!("a live on-demand object's index failed to release: {error:?}")
                 });

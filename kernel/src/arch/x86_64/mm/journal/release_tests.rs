@@ -57,14 +57,20 @@ impl Fixture {
     /// The live drain's release step: notices that cannot release are
     /// dropped, the first that can does one step.
     fn drain_step(&mut self) -> Option<ReleaseStep> {
+        self.drain_step_within(crate::memory::object::RELEASE_STEP_ENTRIES)
+    }
+
+    fn drain_step_within(&mut self, budget: u64) -> Option<ReleaseStep> {
         while let Some(notice) = self.registry.pop_memory_notice() {
             let Some(object) = notice else {
                 continue;
             };
-            match self
-                .objects
-                .release_unmapped_step(&mut self.registry, &mut self.roles, object)
-            {
+            match self.objects.release_unmapped_step_within(
+                &mut self.registry,
+                &mut self.roles,
+                object,
+                budget,
+            ) {
                 ReleaseStep::Idle => continue,
                 step @ ReleaseStep::Done { .. } => return Some(step),
                 step @ ReleaseStep::More { .. } => {
@@ -266,5 +272,106 @@ fn a_decommit_visits_at_most_its_budget_and_skips_absent_entries() {
         Ok((PAGES, 1, 3))
     );
     assert!(!fixture.committed(0) && !fixture.committed(3));
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_hull_larger_than_a_step_is_released_over_several_drains() {
+    let mut fixture = Fixture::new();
+    let object = fixture.object();
+    fixture.commit_charged(object, &[0, 1, 2, 3]);
+    let charged = fixture.weight(object);
+    fixture.drop_owner();
+    fixture.change(ALIAS, SPAN, None).unwrap();
+    fixture.change(START + PAGE, 3 * PAGE, None).unwrap();
+    // One entry per step: pages 1, 2 and 3 take three drains, the object
+    // queued again after each but the last, and page 0 stays mapped.
+    assert_eq!(
+        fixture.drain_step_within(1),
+        Some(ReleaseStep::More { freed: 1 })
+    );
+    assert_eq!(fixture.objects.released_hull(object), Some((2, PAGES)));
+    assert_eq!(
+        fixture.drain_step_within(1),
+        Some(ReleaseStep::More { freed: 1 })
+    );
+    assert_eq!(
+        fixture.drain_step_within(1),
+        Some(ReleaseStep::Done { freed: 1 })
+    );
+    assert_eq!(fixture.drain_step_within(1), None, "not queued again");
+    assert_eq!(
+        (0..PAGES)
+            .map(|page| fixture.committed(page))
+            .collect::<Vec<_>>(),
+        [true, false, false, false]
+    );
+    assert_eq!(fixture.weight(object), charged - 3);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn two_unmaps_of_the_same_pages_release_after_both_settle() {
+    let mut fixture = Fixture::new();
+    let object = fixture.object();
+    fixture.commit_charged(object, &[0, 1, 2, 3]);
+    fixture.drop_owner();
+    let alias = fixture.unmap_held(ALIAS, 2 * PAGE);
+    let start = fixture.unmap_held(START, 2 * PAGE);
+    fixture.settle(alias);
+    // The second unmap's removal is still unacknowledged.
+    assert_eq!(fixture.drain_step(), None);
+    assert!(fixture.committed(0) && fixture.committed(1));
+    fixture.settle(start);
+    assert_eq!(fixture.drain_step(), Some(ReleaseStep::Done { freed: 2 }));
+    assert_eq!(
+        (0..PAGES)
+            .map(|page| fixture.committed(page))
+            .collect::<Vec<_>>(),
+        [false, false, true, true]
+    );
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_protect_removes_no_translation_and_releases_nothing() {
+    let mut fixture = Fixture::new();
+    let object = fixture.object();
+    fixture.commit_charged(object, &[0, 1]);
+    let charged = fixture.weight(object);
+    fixture.drop_owner();
+    // The region has two slots: the alias goes first (its pages stay
+    // covered by START), then START splits in two.
+    fixture.change(ALIAS, SPAN, None).unwrap();
+    assert_eq!(fixture.drain_step(), Some(ReleaseStep::Done { freed: 0 }));
+    let before = fixture.registry.live_reference_counts(object);
+    fixture.change(START, PAGE, Some(Protection::READ)).unwrap();
+    assert_eq!(fixture.objects.released_hull(object), None);
+    assert_eq!(fixture.drain_step(), None);
+    assert!(fixture.committed(0) && fixture.committed(1));
+    assert_eq!(fixture.weight(object), charged);
+    // The split's extra lease holds one more pin, and nothing else.
+    let after = fixture.registry.live_reference_counts(object);
+    assert_eq!(
+        after.map(|(handles, internal)| (handles, internal - 1)),
+        before
+    );
+}
+
+#[test]
+fn a_decommit_skips_an_absent_node_whole() {
+    let mut fixture = Fixture::new();
+    // Two levels: the root's entries each cover 512 pages.
+    let grant = fixture.roles.allocate_on_demand_backing(1024).unwrap();
+    let backing = grant.identity();
+    fixture.roles.commit_on_demand_page(backing, 513).unwrap();
+    // Page 0's node is absent (one visit skips 512 pages), page 512 is
+    // absent under a present node, page 513 is freed.
+    assert_eq!(
+        fixture.roles.decommit_on_demand_range(backing, 0, 1024, 3),
+        Ok((514, 1, 3))
+    );
+    assert_eq!(fixture.roles.on_demand_commit_cost(backing, 513), Ok(1));
+    assert!(fixture.roles.cancel_object_backing(grant).is_ok());
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }

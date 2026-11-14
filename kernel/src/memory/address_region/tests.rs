@@ -1800,3 +1800,49 @@ fn whole_range_checks_capacity_order_and_ceilings() {
     .unwrap();
     assert_eq!(region.mappings().iter().flatten().count(), 2);
 }
+
+#[test]
+fn removed_translations_follow_the_offset_even_above_the_address() {
+    // Code review L1: an object offset above the virtual address made the
+    // address-to-offset delta wrap, and the page arithmetic overflowed.
+    let page = PAGE_SIZE;
+    let mapping = Mapping {
+        virtual_start: page,
+        byte_len: 4 * page,
+        backing: MemoryObjectRange::for_test(16 * page, 4 * page),
+        ..EMPTY_MAPPING
+    };
+    let removed = |specs: &[Option<MappingSpec>]| {
+        let (ranges, len) = region::removed_translations::<4>(&[mapping], specs);
+        ranges[..len]
+            .iter()
+            .map(|range| (range.first_page, range.end_page))
+            .collect::<Vec<_>>()
+    };
+    // The whole mapping goes.
+    assert_eq!(removed(&[]), [(16, 20)]);
+    // The same translations again remove nothing.
+    assert_eq!(removed(&[Some(mapping.spec())]), []);
+    // Its first and last pages stay at the same delta; a piece at another
+    // delta reproduces nothing.
+    let keep_low = MappingSpec {
+        byte_len: page,
+        ..mapping.spec()
+    };
+    let keep_high = MappingSpec {
+        virtual_start: 4 * page,
+        byte_len: page,
+        object_offset: 19 * page,
+        ..mapping.spec()
+    };
+    let moved = MappingSpec {
+        virtual_start: 2 * page,
+        byte_len: page,
+        object_offset: 16 * page,
+        ..mapping.spec()
+    };
+    assert_eq!(
+        removed(&[Some(keep_low), Some(keep_high), Some(moved)]),
+        [(17, 19)]
+    );
+}

@@ -648,7 +648,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
 /// the same address-to-offset delta over that address. Pages another lease
 /// still covers through a different address count as removed: the release
 /// judges coverage separately.
-fn removed_translations<const SLOTS: usize>(
+pub(super) fn removed_translations<const SLOTS: usize>(
     old: &[Mapping],
     specs: &[Option<MappingSpec>],
 ) -> ([RemovedRange; SLOTS], usize) {
@@ -680,11 +680,15 @@ fn removed_translations<const SLOTS: usize>(
         {
             high = spec.virtual_start;
         }
-        removed[len] = RemovedRange::new(
-            mapping.object,
-            (low - delta) / PAGE_SIZE,
-            (high - delta) / PAGE_SIZE,
-        );
+        // `start <= low < high <= end`: the pages follow from the mapping's
+        // own offset, with no wrapping arithmetic (code review L1).
+        let page_at = |address: u64| {
+            offset
+                .checked_add(address - start)
+                .expect("a validated mapping's object range does not overflow")
+                / PAGE_SIZE
+        };
+        removed[len] = RemovedRange::new(mapping.object, page_at(low), page_at(high));
         len += 1;
     }
     (removed, len)
