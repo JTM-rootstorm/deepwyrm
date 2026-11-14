@@ -533,6 +533,17 @@ M5 lets a job use what M2–M6 made possible. Today a job gets 16 MiB, 4 MemoryO
 4. Probes 12–16 in dev-boot, with §10.8's yield coverage (review D-1).
 5. Independent security review of the stage; fixes; §9 ledger and an as-built record.
 
+**Step 2 as built (2026-11-14).** Wyrmroot `505198a` and SDK `d62590a`, pinning Deepwyrm `23972de` (the typed `object_get_task_group_memory_info_v1` in `deepwyrm-syscall`). Items 6–8 as designed, with these as-built facts and changes:
+- *The record is 48 bytes,* not 32 (the generated `DwTaskGroupMemoryInfoV1`). Bootstrap passes init the root TaskGroup, so init's read carries the free count.
+- *Init has no log stream,* so "init logs" (item 7, probe 12) is init's plan held for the boot and reported on request. WRLJ minor 3 adds `QUERY_MEMORY`/`MEMORY`: the plan (budget, jobs limit, reserve, cap, free when planned, source, fallback cause) with live reads of the jobs group's usage and the free count. Probes 12, 13 and 15 read it.
+- *The shell's `memory` command, not `status`, prints it* (item 7): `status` is one query to consoled's snapshot, and joining a second query to init into it would give one command two failure paths. Mike to confirm.
+- *Startup record:* a job's INIT gains a `u64` budget after its role records, as WRLP 1.14 (`JobV2`) and 1.15 (`JobV2Namespace`), replacing 1.12 and 1.13. The SDK keeps it in `Process::memory_budget` for step 3.
+- *Config:* WRPC v1 is 64 bytes; byte counts must be whole pages. `xtask product` sets no cap; dev-boot caps a job at 512 MiB, which binds in the 2 GiB guest (planned free about 1.86 GiB, reserve 256 MiB, jobs limit about 1.61 GiB). Init reads the config from the bootfs it already maps, so it needs no further MemoryObject (§10.7 risk). The kernel demand ledger counts the jobs group (one more TaskGroup and handle).
+- *`hello on-demand-exhaust`* now spends the quota after READY, committing an object four times the budget. Committing a whole 512 MiB budget, or mapping a 2 GiB object with the CPU hogs running, takes longer than init's one-second READY timeout, which first showed as `loader-failure`.
+Checked: host tests of every changed crate, `xtask test clippy`, `xtask test fmt`, the SDK's host tests; `dev-boot --check` on one CPU, `--smp` and `--sdk` on Deepwyrm `23972de`, Wyrmroot `505198a`, SDK `d62590a`.
+
+**Scheduled for step 4 (observed 2026-11-14).** In one development boot, init's READY timeout ended a job partway through committing about 512 MiB while two CPU hogs ran. The shell's reply then stalled for the check's whole 180 s. Nine deliberate repeats (a job committing toward its quota before READY, ended by the same timeout, three without the hogs and six with them) did not stall, and each returned the jobs group's usage and the free count to their earlier values. Probe 15 (a job stopped while a large commit, map and create are in their steps, on the product and the yield-everywhere kernels) must cover this case and show no stall; a reproduction is diagnosed and fixed in step 4.
+
 ### 10.7 Design review
 
 Claude Opus 5.5 (default effort), 2026-11-13, at Deepwyrm `988540f`, read-only. It confirmed the pool arithmetic and found six Medium and seven Low items, all taken into the design above:
