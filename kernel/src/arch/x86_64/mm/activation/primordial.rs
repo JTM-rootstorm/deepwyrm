@@ -612,9 +612,14 @@ type MapInput = Result<
 /// protection and the room its placement must find, or the status.
 type MapStep = crate::syscall::MapStep<MemoryProtection>;
 
-/// The largest step of a family-G call made in steps (DW2 M4b): one
-/// journal batch, so a step holds the global locks for one batch.
-const FAMILY_G_STEP_BYTES: u64 = PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE;
+/// The largest step of a family-G call made in steps (DW2 M4b), and of an
+/// owed teardown (§10.10). A step holds T and P throughout, so its size
+/// bounds how long every other CPU can wait for T: 2 MiB, an eighth of a
+/// journal batch. A 16 MiB step held T for about 30 ms under QEMU TCG, and a
+/// job mapping in a loop then kept init from answering the shell within its
+/// one-second deadline on four CPUs (DW2 M5 step 4).
+const FAMILY_G_STEP_BYTES: u64 = 2 * 1024 * 1024;
+const _: () = assert!(FAMILY_G_STEP_BYTES <= PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE);
 /// One hold of an on-demand commit (DW2 M6 §8.2, §8.11 R1): it zeroes every
 /// frame it takes, so it is kept well below a family-G step.
 const ON_DEMAND_COMMIT_STEP_BYTES: u64 = 2 * 1024 * 1024;
@@ -668,6 +673,60 @@ impl crate::syscall::native::NativeQuantumExpiry for QuantumExpiryPublisher {
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    /// The idle BSP's teardown visit (DW2 §10.10 item 5): with nothing to
+    /// run, teardown owed and the bootstrap's own root retired, it switches
+    /// from the kernel root to the primordial publisher root (the terminal
+    /// reaper's switch), takes one queued teardown step, and switches back.
+    /// `true` if teardown is still owed afterwards.
+    fn idle_teardown_visit(&mut self) -> bool {
+        let prepared = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            let primordial = runtime.core.primordial_process;
+            let bootstrap_retired = runtime
+                .core
+                .tasks
+                .root_region(primordial)
+                .map_or(true, |root| root.is_none());
+            if runtime.core.owed_teardown.is_empty() || !bootstrap_retired {
+                return false;
+            }
+            runtime.prepare_terminal_primordial_root_switch()
+        };
+        let executed = match prepared.execute(self.runtime.guard_free()) {
+            Ok(executed) => executed,
+            Err(failure) => {
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                let error = runtime.cancel_terminal_primordial_root_switch(failure);
+                panic!("idle teardown publisher-root switch failed before CR3: {error:?}")
+            }
+        };
+        let prepared = {
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+            runtime.commit_terminal_primordial_root_switch(executed);
+            step_report::allow_teardown_step(runtime.cpu().index());
+            if runtime.owed_teardown_step() {
+                runtime.drain_cleanup_queue();
+            }
+            runtime.prepare_terminal_kernel_root_switch()
+        };
+        let executed = match prepared.execute(self.runtime.guard_free()) {
+            Ok(executed) => executed,
+            Err(failure) => {
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+                let error = runtime.cancel_terminal_kernel_root_switch(failure);
+                panic!("idle teardown kernel-root switch failed before CR3: {error:?}")
+            }
+        };
+        let mut guard = self.runtime.lock();
+        let mut runtime = guard.on_root_switch_flight(&mut self.owned);
+        runtime.commit_terminal_kernel_root_switch(executed);
+        !runtime.core.owed_teardown.is_empty()
+    }
+
     fn drain_quantum_cancellation_detached(&mut self) {
         let ticket = {
             let mut guard = self.runtime.lock();
@@ -3003,6 +3062,21 @@ fn cancel_scheduler_quantum_guard_free(
         .unwrap_or_else(|error| panic!("scheduler quantum cancellation failed: {error:?}"));
 }
 
+/// Opens one interrupt window on the idle CPU without halting: an interrupt
+/// pending on entry, or arriving during the window, is taken; otherwise the
+/// window closes at once. The idle BSP uses it while teardown is owed (DW2
+/// §10.10 item 5): it keeps polling instead of sleeping until the next timer.
+/// As for `halt_for_interrupt`, the `GuardFree` token proves no runtime lock
+/// is held.
+fn interrupt_window(_guard_free: GuardFree<'_>) {
+    // SAFETY: CPL0 with IF clear. STI's one-instruction shadow covers the NOP, so interrupts are
+    // recognized after it and before CLI, which restores IF clear. As in `halt_for_interrupt`,
+    // handlers write memory read after the window, so the block omits `nomem`.
+    unsafe {
+        core::arch::asm!("sti", "nop", "cli", options(nostack));
+    }
+}
+
 /// Halts the idle CPU until an interrupt, with IF set only inside the
 /// window. No runtime lock may be held across `sti; hlt` (DW0-H §12.8):
 /// the `GuardFree` token proves the caller holds none.
@@ -3787,6 +3861,9 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     /// Calls parked between steps while their Threads yield the CPU (DW2
     /// §10.8). A record moves in and out only under T.
     parked: crate::syscall::ParkedCalls<ParkedCall, { crate::syscall::PARKED_CALL_THREADS }>,
+    /// Exited Processes whose roots are owed teardown, by registry slot
+    /// (DW2 §10.10 item 1); stepped by drains on a live Process's root.
+    owed_teardown: crate::object::slot_queue::SlotQueue<ProcessKey, REGISTRY_OBJECTS>,
 }
 
 /// Everything the runtime authority guards: the core authorities and every
@@ -5615,6 +5692,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         root_key: crate::memory::address_region::AddressRegionObjectKey,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
+        self.unmap_inactive_pieces(process, root_key, proof, u64::MAX)
+            .map(|_| ())
+    }
+
+    /// Removes at most `limit` bytes of an exited, quiesced Process's
+    /// mappings, lowest first, a mapping's front at a time: all of them for
+    /// `u64::MAX`, one queued-teardown step for 16 MiB (DW2 §10.10 item 3).
+    /// `true` if mappings remain.
+    fn unmap_inactive_pieces(
+        &mut self,
+        process: ProcessKey,
+        root_key: crate::memory::address_region::AddressRegionObjectKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+        limit: u64,
+    ) -> Result<bool, ()> {
         let current_process = self.own.active_root.as_ref().ok_or(())?.process();
         if process == current_process {
             return Err(());
@@ -5638,7 +5730,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             !user.pins_hold_any(address_space),
             "an exited Process's address space still holds a user pin at teardown"
         );
-        loop {
+        let mut left = limit;
+        let remain = loop {
             let mapping = self
                 .core
                 .regions
@@ -5650,8 +5743,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .next()
                 .copied();
             let Some(mapping) = mapping else {
-                break;
+                break false;
             };
+            if left == 0 {
+                break true;
+            }
+            let length = mapping.byte_len().min(left);
+            left -= length;
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
                 let region = self
@@ -5672,7 +5770,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut self.core.registry,
                         &mut publisher,
                         mapping.virtual_start(),
-                        mapping.byte_len(),
+                        length,
                     )
                     .unwrap_or_else(|failure| {
                         panic!(
@@ -5691,10 +5789,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             for release in releases.into_items().into_iter().flatten() {
                 self.core.cleanup.push(release);
             }
-        }
+        };
         user.select_process_for_return_validation(current_process)
             .map_err(|_| ())?;
-        Ok(())
+        Ok(remain)
     }
 
     /// Design §11.2.12 rule 3: tears an exited Process's root down if this
@@ -5753,12 +5851,154 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let decision =
             crate::task::exited_root_teardown(exited, quiescent, bound.is_some(), residents);
         if decision == crate::task::ExitedRootTeardown::TearDown {
-            let (root_key, address_space) =
-                bound.unwrap_or_else(|| panic!("an exited root teardown is owed only while bound"));
-            self.finish_inactive_process_teardown(process, root_key, address_space)
-                .unwrap_or_else(|_| panic!("exited Process root teardown drifted"));
+            if process == self.core.primordial_process {
+                // Never queued (DW2 §10.10 item 1): only boot images are
+                // mapped, and its root is the idle publisher root.
+                let (root_key, address_space) = bound
+                    .unwrap_or_else(|| panic!("an exited root teardown is owed only while bound"));
+                self.finish_inactive_process_teardown(process, root_key, address_space)
+                    .unwrap_or_else(|_| panic!("exited Process root teardown drifted"));
+            } else {
+                // Owed, not done (DW2 §10.10 item 1): drains step it.
+                self.queue_owed_teardown(process);
+            }
         }
         decision
+    }
+
+    fn queue_owed_teardown(&mut self, process: ProcessKey) {
+        let slot = self
+            .core
+            .registry
+            .slot_of(process.object_id())
+            .unwrap_or_else(|| panic!("an exited Process has no registry slot"));
+        self.core.owed_teardown.push(slot, process);
+    }
+
+    /// One step of the oldest owed teardown (DW2 §10.10 items 2 and 3), on
+    /// this CPU's active root, which must be a live Process's; otherwise
+    /// nothing is done and the queue is kept. `true` if the step pushed
+    /// releases for the caller's drain to finalize.
+    #[inline(never)]
+    fn owed_teardown_step(&mut self) -> bool {
+        if self.core.owed_teardown.is_empty() {
+            return false;
+        }
+        let Some(current) = self.own.active_root.as_ref().map(|root| root.process()) else {
+            return false;
+        };
+        // A live Process's root, or the publisher root once the bootstrap's
+        // own root is retired (§10.10 item 2).
+        let publisher = current == self.core.primordial_process
+            && self
+                .core
+                .tasks
+                .root_region(current)
+                .map_or(true, |root| root.is_none());
+        if !publisher
+            && self
+                .core
+                .tasks
+                .process_info(current)
+                .map_or(true, |info| info.state == DW_TASK_STATE_EXITED)
+        {
+            return false;
+        }
+        // One step per entry from user mode (§10.10 item 7).
+        if !step_report::take_teardown_step(self.cpu().index()) {
+            return false;
+        }
+        let Some((slot, process)) = self.core.owed_teardown.pop() else {
+            return false;
+        };
+        // A finalized or reused slot, or a root retired already: nothing is
+        // owed (§10.10 item 3).
+        let Some(root_object) = self.core.tasks.root_region(process).ok().flatten() else {
+            return false;
+        };
+        // A queued Process has exited; the current one has not.
+        assert!(process != current, "the running Process was owed teardown");
+        let root_key =
+            crate::memory::address_region::AddressRegionObjectKey::from_object_id(root_object);
+        let address_space = self
+            .core
+            .regions
+            .region(root_key)
+            .unwrap_or_else(|error| panic!("an owed root disappeared: {error:?}"))
+            .address_space_key();
+        let residents = self
+            .paging
+            .lock()
+            .child_root_resident_count(process, address_space)
+            .unwrap_or_else(|error| panic!("an owed root's residency query failed: {error:?}"));
+        if residents != 0 {
+            // Its resident queues it again when it leaves.
+            self.core.owed_teardown.push(slot, process);
+            return false;
+        }
+        assert!(
+            self.core
+                .tasks
+                .process_info(process)
+                .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED),
+            "an owed teardown's Process has not exited"
+        );
+        let proof = self
+            .core
+            .tasks
+            .process_quiescence_proof(process)
+            .unwrap_or_else(|_| panic!("an owed teardown's Process is not quiescent"));
+        let cpu = self.cpu().index();
+        step_report::timed(cpu, StepCall::Teardown, || {
+            let remain = self
+                .unmap_inactive_pieces(process, root_key, &proof, FAMILY_G_STEP_BYTES)
+                .unwrap_or_else(|()| panic!("an owed teardown step drifted"));
+            if remain {
+                self.core.owed_teardown.push(slot, process);
+            } else {
+                let drained = self
+                    .core
+                    .shared
+                    .execution
+                    .blocked_operations_drained(&self.core.tasks, &proof)
+                    .unwrap_or_else(|_| panic!("an owed root's blocked operations remain"));
+                self.retire_owed_root(process, address_space, &proof, drained)
+                    .unwrap_or_else(|()| panic!("an owed root's retirement drifted"));
+            }
+        });
+        true
+    }
+
+    /// `finish_quiesced_process_root_retirement` without its drain: the
+    /// releases go to the cleanup queue for the drain that ran this step
+    /// (DW2 §10.10 item 4), so no drain calls itself.
+    fn retire_owed_root(
+        &mut self,
+        process: ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+        drained: crate::task::BlockedOperationsDrained,
+    ) -> Result<(), ()> {
+        self.teardown_child_root_under_initiator(process, address_space)
+            .map_err(|_| ())?;
+        let root_pin = self
+            .core
+            .regions
+            .retire_quiesced_root(
+                &mut self.core.tasks,
+                process,
+                proof,
+                self.core.shared.execution.blocked_operations(),
+                drained,
+            )
+            .map_err(|_| ())?;
+        self.core.cleanup.push_optional(
+            self.core
+                .registry
+                .release_internal(root_pin)
+                .map_err(|_| ())?,
+        );
+        Ok(())
     }
 
     #[inline(never)]
@@ -5931,6 +6171,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn drain_finalizers(&mut self) -> Result<(), ()> {
+        self.drain_cleanup_queue();
+        self.settle_ended_parked_calls();
+        self.release_unmapped_step();
+        if self.owed_teardown_step() {
+            self.drain_cleanup_queue();
+        }
+        Ok(())
+    }
+
+    /// Pops the cleanup queue until it is empty, cascading.
+    fn drain_cleanup_queue(&mut self) {
         loop {
             // Popping in place is what allows the cascade: finalizing one
             // release pushes its parents back onto this same queue, and they are
@@ -5999,9 +6250,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             self.core.cleanup.push(parent_release);
         }
-        self.settle_ended_parked_calls();
-        self.release_unmapped_step();
-        Ok(())
     }
 
     /// Settles the resources of `thread`'s call that will not finish (DW2
@@ -7455,7 +7703,20 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         error: u64,
     ) -> crate::syscall::native::UserPageFaultOutcome {
         self.with_synchronized_runtime_at_safe_point(|runtime| {
-            runtime.serve_user_page_fault(cr2, error)
+            let outcome = runtime.serve_user_page_fault(cr2, error);
+            // A touch refused while a dead job's teardown is owed frees
+            // owed memory first (§10.10 item 7): this entry's one step, in
+            // a whole drain, then the touch comes again.
+            if matches!(
+                outcome,
+                crate::syscall::native::UserPageFaultOutcome::Exhausted(_)
+            ) && !runtime.core.owed_teardown.is_empty()
+            {
+                step_report::allow_teardown_step(runtime.cpu().index());
+                let _ = runtime.drain_finalizers();
+                return crate::syscall::native::UserPageFaultOutcome::Released;
+            }
+            outcome
         })
         .unwrap_or(crate::syscall::native::UserPageFaultOutcome::Retry)
     }
@@ -7802,51 +8063,65 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                 }
                 None => {
-                    let idle = crate::arch::x86_64::idle::prepare_current_idle()
-                        .unwrap_or_else(|error| panic!("AP idle publication failed: {error:?}"));
-                    let notification = match crate::arch::x86_64::idle::commit_current_idle(idle) {
-                        Ok(halt) => {
-                            let started_at_ns =
-                                crate::time::monotonic_now().unwrap_or_else(|error| {
-                                    panic!("AP idle start sample failed: {error:?}")
-                                });
-                            let idle_accounting = this
-                                .publish_scheduler_idle(started_at_ns)
-                                .unwrap_or_else(|error| {
-                                    panic!("AP idle accounting publication failed: {error:?}")
-                                });
-                            halt_for_interrupt(this.runtime.guard_free());
-                            crate::arch::x86_64::idle::finish_current_idle(halt).unwrap_or_else(
-                                |error| panic!("AP idle completion failed: {error:?}"),
-                            );
-                            let finished_at_ns =
-                                crate::time::monotonic_now().unwrap_or_else(|error| {
-                                    panic!("AP idle finish sample failed: {error:?}")
-                                });
-                            this.finish_scheduler_idle(idle_accounting, finished_at_ns)
-                                .unwrap_or_else(|error| {
-                                    panic!("AP idle accounting completion failed: {error:?}")
-                                });
-                            crate::time::service_current_rendezvous_latch().unwrap_or_else(
-                                |error| panic!("AP idle rendezvous service failed: {error:?}"),
-                            )
-                        }
-                        Err(failure)
-                            if failure.error()
-                                == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
-                        {
-                            crate::arch::x86_64::idle::cancel_current_idle(
-                                failure.into_preparation(),
-                            )
+                    let teardown_owed =
+                        this.cpu == crate::cpu::CpuIndex::BOOTSTRAP && this.idle_teardown_visit();
+                    let notification = if teardown_owed {
+                        // Teardown remains: no halt. Take any pending
+                        // interrupt, then visit again (DW2 §10.10 item 5).
+                        interrupt_window(this.runtime.guard_free());
+                        crate::time::service_current_rendezvous_latch().unwrap_or_else(|error| {
+                            panic!("idle teardown rendezvous service failed: {error:?}")
+                        })
+                    } else {
+                        let idle = crate::arch::x86_64::idle::prepare_current_idle()
                             .unwrap_or_else(|error| {
-                                panic!("AP idle rescan cancellation failed: {error:?}")
+                                panic!("AP idle publication failed: {error:?}")
                             });
-                            crate::time::service_current_rendezvous_latch().unwrap_or_else(
-                                |error| panic!("AP idle rescan service failed: {error:?}"),
-                            )
-                        }
-                        Err(failure) => {
-                            panic!("AP idle commit failed: {:?}", failure.error())
+                        match crate::arch::x86_64::idle::commit_current_idle(idle) {
+                            Ok(halt) => {
+                                let started_at_ns =
+                                    crate::time::monotonic_now().unwrap_or_else(|error| {
+                                        panic!("AP idle start sample failed: {error:?}")
+                                    });
+                                let idle_accounting = this
+                                    .publish_scheduler_idle(started_at_ns)
+                                    .unwrap_or_else(|error| {
+                                        panic!("AP idle accounting publication failed: {error:?}")
+                                    });
+                                halt_for_interrupt(this.runtime.guard_free());
+                                crate::arch::x86_64::idle::finish_current_idle(halt)
+                                    .unwrap_or_else(|error| {
+                                        panic!("AP idle completion failed: {error:?}")
+                                    });
+                                let finished_at_ns =
+                                    crate::time::monotonic_now().unwrap_or_else(|error| {
+                                        panic!("AP idle finish sample failed: {error:?}")
+                                    });
+                                this.finish_scheduler_idle(idle_accounting, finished_at_ns)
+                                    .unwrap_or_else(|error| {
+                                        panic!("AP idle accounting completion failed: {error:?}")
+                                    });
+                                crate::time::service_current_rendezvous_latch().unwrap_or_else(
+                                    |error| panic!("AP idle rendezvous service failed: {error:?}"),
+                                )
+                            }
+                            Err(failure)
+                                if failure.error()
+                                    == crate::arch::x86_64::idle::IdleWakeError::RescanRequired =>
+                            {
+                                crate::arch::x86_64::idle::cancel_current_idle(
+                                    failure.into_preparation(),
+                                )
+                                .unwrap_or_else(|error| {
+                                    panic!("AP idle rescan cancellation failed: {error:?}")
+                                });
+                                crate::time::service_current_rendezvous_latch().unwrap_or_else(
+                                    |error| panic!("AP idle rescan service failed: {error:?}"),
+                                )
+                            }
+                            Err(failure) => {
+                                panic!("AP idle commit failed: {:?}", failure.error())
+                            }
                         }
                     };
                     match notification {
@@ -7887,6 +8162,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
             if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                // Idling on a blocked Thread's live root, this poll may take
+                // one queued teardown step (§10.10 item 5).
+                step_report::allow_teardown_step(self.cpu.index());
                 runtime.service_pending_timer_expiries_on_bootstrap();
                 #[cfg(deepwyrm_dw1e_platform)]
                 runtime
@@ -7899,6 +8177,15 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         crate::task::drain_runnable_work_notifications();
         poll
+    }
+
+    fn idle_work_remains(&mut self) -> bool {
+        if self.cpu != crate::cpu::CpuIndex::BOOTSTRAP {
+            return false;
+        }
+        let mut guard = self.runtime.lock();
+        let runtime = guard.on(&mut self.owned);
+        !runtime.core.owed_teardown.is_empty()
     }
 
     fn resume_suspended(
@@ -8330,6 +8617,7 @@ pub(super) fn enter(
                                 cleanup: (CleanupQueue::new()),
                                 rendezvous_cleanup: (StagedStopCleanup::new()),
                                 parked: (crate::syscall::ParkedCalls::new()),
+                                owed_teardown: (crate::object::slot_queue::SlotQueue::new()),
                             }
                         );
                         init_fields!(
@@ -9159,6 +9447,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         match crate::syscall::native::ReturnReady::without_return(result) {
             Ok(ready) => ready,
             Err(result) => {
+                // A syscall refused for memory frees owed memory first: one
+                // teardown step in this return's drain (§10.10 item 7).
+                if matches!(
+                    result.status,
+                    deepwyrm_abi::DW_STATUS_NO_RESOURCES | deepwyrm_abi::DW_STATUS_NO_MEMORY
+                ) {
+                    step_report::allow_teardown_step(self.cpu().index());
+                }
                 crate::syscall::native::ReturnReady::drained(result, self.publish_final_releases())
             }
         }

@@ -1506,6 +1506,9 @@ pub(crate) enum UserPageFaultOutcome {
     /// with `DW_TERMINATION_RESOURCE_POLICY`, and a syscall's fill-in fails
     /// with this status (`NO_RESOURCES` for quota, `NO_MEMORY` for frames).
     Exhausted(DwStatus),
+    /// Refused while an exited Process's teardown was owed: a teardown step
+    /// ran instead (DW2 §10.10 item 7). Return; the touch faults again.
+    Released,
     /// The runtime could not reach a safe point: poll for a stop and retry.
     Retry,
 }
@@ -1696,6 +1699,14 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         &'owner mut self,
         frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
     ) -> NativeIdleSuspendPoll<'owner>;
+
+    /// Whether this CPU has idle work that must not wait for a halt: after a
+    /// `Continue` poll the idle loop then opens an interrupt window and polls
+    /// again instead of halting. The BSP answers true while exited address
+    /// spaces are owed teardown (DW2 §10.10 item 5).
+    fn idle_work_remains(&mut self) -> bool {
+        false
+    }
 
     /// Resumes a logically selected suspended Thread while holding the
     /// runtime's scheduler authority. An already-published local terminal

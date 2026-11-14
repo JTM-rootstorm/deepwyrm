@@ -8,6 +8,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub(crate) mod charge;
 #[cfg(deepwyrm_integrated)]
 mod finalizer;
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live facade queues teardowns")
+)]
+pub(crate) mod slot_queue;
 #[cfg(deepwyrm_integrated)]
 #[allow(
     unused_imports,
@@ -955,6 +960,13 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             self.push_notice(slot);
         }
         Ok(None)
+    }
+
+    /// The pool slot `id` names, for tables indexed by slot; `None` for an
+    /// identity of another registry or out of range. Says nothing about
+    /// whether the slot still holds `id`.
+    pub(crate) fn slot_of(&self, id: ObjectId) -> Option<usize> {
+        self.reference_slot(id).ok()
     }
 
     fn reference_slot(&self, id: ObjectId) -> Result<usize, ObjectRegistryError> {

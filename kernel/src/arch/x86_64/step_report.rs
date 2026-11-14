@@ -26,10 +26,14 @@ pub(crate) enum StepCall {
     FillIn = 3,
     Commit = 4,
     Create = 5,
+    /// A step of an exited Process's queued teardown (DW2 §10.10).
+    Teardown = 6,
 }
 
-const CALLS: usize = 6;
-const NAMES: [&str; CALLS] = ["map", "unmap", "protect", "fill", "commit", "create"];
+const CALLS: usize = 7;
+const NAMES: [&str; CALLS] = [
+    "map", "unmap", "protect", "fill", "commit", "create", "teardown",
+];
 /// The low bits of the packed longest step hold the call.
 const CALL_BITS: u32 = 3;
 
@@ -109,11 +113,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
             }
             values
         };
-        let [map, unmap, protect, fill, commit, create] = counts(&self.stops);
+        let [map, unmap, protect, fill, commit, create, _] = counts(&self.stops);
         line(format_args!(
             "stops-between-steps map={map} unmap={unmap} protect={protect} fill={fill} commit={commit} create={create}"
         ));
-        let [map, unmap, protect, fill, commit, create] = counts(&self.ended);
+        let [map, unmap, protect, fill, commit, create, _] = counts(&self.ended);
         line(format_args!(
             "parked-ended map={map} unmap={unmap} protect={protect} fill={fill} commit={commit} create={create}"
         ));
@@ -126,6 +130,26 @@ mod live {
     use crate::cpu::CPU_CAPACITY;
 
     static TALLY: StepTally<CPU_CAPACITY> = StepTally::new();
+    /// Per CPU, whether a queued teardown step may still run since the
+    /// CPU last entered from user mode (DW2 §10.10 item 7): one step per
+    /// syscall, timer interrupt, page fault or idle poll.
+    static TEARDOWN_ALLOWED: [core::sync::atomic::AtomicBool; CPU_CAPACITY] =
+        [const { core::sync::atomic::AtomicBool::new(false) }; CPU_CAPACITY];
+
+    /// An entry from user mode (or an idle poll) on `cpu`: one teardown
+    /// step may run before the next.
+    pub(crate) fn allow_teardown_step(cpu: usize) {
+        if let Some(slot) = TEARDOWN_ALLOWED.get(cpu) {
+            slot.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Takes `cpu`'s one teardown step, if it has not been taken.
+    pub(crate) fn take_teardown_step(cpu: usize) -> bool {
+        TEARDOWN_ALLOWED
+            .get(cpu)
+            .is_some_and(|slot| slot.swap(false, core::sync::atomic::Ordering::Relaxed))
+    }
 
     fn now() -> Option<u64> {
         crate::time::monotonic_now().ok()
@@ -173,6 +197,16 @@ mod live {
         TALLY.parked_call_ended(call);
     }
 
+    /// Times `step` on `cpu` as one step of `call`.
+    pub(crate) fn timed<T>(cpu: usize, call: StepCall, step: impl FnOnce() -> T) -> T {
+        step_began(cpu);
+        let result = step();
+        if let Some(now) = now() {
+            TALLY.step_ended(cpu, call, now);
+        }
+        result
+    }
+
     pub(crate) fn report() {
         TALLY.write_lines(|arguments| {
             let mut line = Line::new();
@@ -217,7 +251,10 @@ mod live {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use live::{after_safe_point, at_safe_point, parked_call_ended, report, step_began};
+pub(crate) use live::{
+    after_safe_point, allow_teardown_step, at_safe_point, parked_call_ended, report, step_began,
+    take_teardown_step, timed,
+};
 
 #[cfg(test)]
 mod tests {
@@ -254,11 +291,14 @@ mod tests {
         tally.step_ended(0, StepCall::Map, 5_001_000);
         tally.step_ended(1, StepCall::Create, 9_000_000);
         assert_eq!(tally.longest(), Some((9_000_000, "create")));
+        tally.step_began(1, 0);
+        tally.step_ended(1, StepCall::Teardown, 9_500_000);
+        assert_eq!(tally.longest(), Some((9_500_000, "teardown")));
         // A shorter step later changes nothing.
         tally.step_began(0, 10_000_000);
         tally.step_ended(0, StepCall::Commit, 10_000_500);
-        assert_eq!(tally.longest(), Some((9_000_000, "create")));
-        assert_eq!(lines(&tally)[0], "longest-step-us=9000 call=create");
+        assert_eq!(tally.longest(), Some((9_500_000, "teardown")));
+        assert_eq!(lines(&tally)[0], "longest-step-us=9500 call=teardown");
     }
 
     #[test]

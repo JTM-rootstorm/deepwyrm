@@ -1593,6 +1593,7 @@ unsafe fn native_runtime_timer_pre_iret<
     mut context: *mut (),
     frame: &mut super::frame::RawCpl3TimerReturnFrame,
 ) {
+    allow_teardown_step_here();
     loop {
         poll_timer_return_stop(context);
         validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
@@ -1726,7 +1727,9 @@ unsafe fn native_runtime_user_page_fault<
         // leaf now grants the access. A served fault was a not-present one,
         // so the retry either succeeds or faults on a present leaf, which is
         // never served; it cannot loop here (DW2 M6 §8.5).
-        UserPageFaultOutcome::Served | UserPageFaultOutcome::AlreadyPresent => {}
+        UserPageFaultOutcome::Served
+        | UserPageFaultOutcome::AlreadyPresent
+        | UserPageFaultOutcome::Released => {}
         UserPageFaultOutcome::Unserved => {
             end_user_page_fault::<R>(context, TerminalAction::UserException(record));
         }
@@ -2100,6 +2103,32 @@ unsafe fn native_runtime_trampoline<
                         };
                         match poll {
                             crate::syscall::native::NativeIdleSuspendPoll::Continue => {
+                                let work_remains = {
+                                    // SAFETY: [CARRIER] scoped reborrow; no other reborrow is live.
+                                    let runtime = unsafe { &mut *context.cast::<R>() };
+                                    runtime.idle_work_remains()
+                                };
+                                if work_remains {
+                                    // Owed teardown (DW2 §10.10 item 5): no halt.
+                                    // Take any pending interrupt, then poll again.
+                                    crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                        .unwrap_or_else(|_| halt_forever());
+                                    interrupt_window();
+                                    match crate::time::service_current_rendezvous_latch()
+                                        .unwrap_or_else(|_| halt_forever())
+                                    {
+                                        crate::arch::x86_64::rendezvous::MailboxNotification::None
+                                        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+                                        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {
+                                            continue;
+                                        }
+                                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+                                            stage_rendezvous_action(RendezvousAction(request))
+                                                .unwrap_or_else(|_| halt_forever());
+                                            handoff_to_rendezvous_reaper(context);
+                                        }
+                                    }
+                                }
                                 // SYSCALL FMASK keeps IF clear from the final
                                 // scheduler rescan through this commit. The only
                                 // re-enable is the atomic sti; hlt sequence below,
@@ -2440,6 +2469,25 @@ fn switch_kernel_context(plan: crate::arch::x86_64::context::KernelSwitchPlan<'_
     // SAFETY: every CPU installed the same policy (`agree_on_fp_policy`), IF is clear on this
     // path, and `saved` is this Thread's own state, saved above.
     unsafe { crate::arch::x86_64::user_state::dw_x86_64_user_state_restore(&saved) };
+}
+
+/// A timer interrupt of user code on this CPU: one queued teardown step may
+/// run before the next (DW2 §10.10 items 2 and 7).
+fn allow_teardown_step_here() {
+    if let Some(cpu) = current_cpu_index() {
+        crate::arch::x86_64::step_report::allow_teardown_step(cpu);
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "STI;NOP;CLI opens exactly one interrupt window in the IF-clear syscall runtime"
+)]
+fn interrupt_window() {
+    // SAFETY: [ASM] CPL0 with IF clear. STI's shadow covers the NOP, so a pending interrupt is
+    // taken after it and before CLI restores IF clear. Handlers write memory read after the
+    // window, so the block omits `nomem`, as in `wait_for_suspend_interrupt`.
+    unsafe { core::arch::asm!("sti", "nop", "cli", options(nostack)) };
 }
 
 #[allow(

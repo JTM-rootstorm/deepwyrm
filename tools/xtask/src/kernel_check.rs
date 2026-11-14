@@ -104,10 +104,18 @@ const BUDGETS: &[StackBudget] = &[
 /// so it is named here: every instance of the generic reaper is a root.
 const TERMINAL_REAPER: &str = "30native_runtime_terminal_reaper";
 
-/// The one indirect call the bound resolves by name: the bound runtime's jump
-/// into its carrier's trampoline (`syscall/live.rs`).
-const RESOLVED_INDIRECT: &[(&str, &str)] =
-    &[("22dispatch_bound_runtime", "25native_runtime_trampoline")];
+/// The indirect calls the bound resolves by name (`syscall/live.rs`): the
+/// bound runtime's jump into its carrier's trampoline, and the idle entry's
+/// call through its binding's idle-scheduler handler.
+const RESOLVED_INDIRECT: &[(&str, &str)] = &[
+    ("22dispatch_bound_runtime", "25native_runtime_trampoline"),
+    // The terminal reaper's way into idle, whose drains may take a queued
+    // teardown step (DW2 §10.10 item 4).
+    (
+        "26enter_bound_idle_scheduler",
+        "29native_runtime_idle_scheduler",
+    ),
+];
 
 /// Functions that call themselves to a depth their arguments bound, and that
 /// depth. Any other recursion fails the check.
