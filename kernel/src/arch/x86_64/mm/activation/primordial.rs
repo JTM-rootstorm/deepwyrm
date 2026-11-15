@@ -3985,8 +3985,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// A safe point's decision for this hold, from this CPU's mailbox and
     /// its scheduler-current Thread's terminal state (§10.15 review Q3).
     fn safe_point_entry(&self) -> crate::task::SafePointEntry {
-        let stop_published = matches!(
+        self.safe_point_entry_after(
             crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+        )
+    }
+
+    /// As `safe_point_entry`, for a hold that has already taken its
+    /// mailbox notification.
+    fn safe_point_entry_after(
+        &self,
+        notification: crate::arch::x86_64::rendezvous::MailboxNotification,
+    ) -> crate::task::SafePointEntry {
+        let stop_published = matches!(
+            notification,
             crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
         );
         let terminal_current = !stop_published
@@ -7089,11 +7100,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                 loop {
                     let mut guard = self.runtime.lock();
                     let mut runtime = guard.on(&mut self.owned);
-                    if matches!(
-                        crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-                        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-                    ) {
-                        break 'handled crate::syscall::native::ReturnReady::service_rendezvous();
+                    match runtime.safe_point_entry() {
+                        crate::task::SafePointEntry::Stopped => {
+                            break 'handled crate::syscall::native::ReturnReady::service_rendezvous(
+                            );
+                        }
+                        // Another termination exited this Thread after the
+                        // synchronization; its Stop follows (§10.15 review Q3).
+                        crate::task::SafePointEntry::AwaitStopPublication => {
+                            drop(guard);
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        crate::task::SafePointEntry::Proceed => {}
                     }
                     let prepared = match request {
                         NativeSyscallRequest::ProcessExit { exit_code } => {
@@ -8326,11 +8345,23 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut guard = self.runtime.lock();
         let mut runtime = guard.on(&mut self.owned);
         let notification = crate::arch::x86_64::idle::take_current_notification_at_safe_point();
-        if matches!(
-            notification,
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        ) {
-            return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+        match runtime.safe_point_entry_after(notification) {
+            crate::task::SafePointEntry::Stopped => {
+                return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+            }
+            // A termination prepared since the synchronization exited this
+            // Thread and took its operation; its Stop follows, and the
+            // synchronization waits for it (§10.15 review Q3).
+            crate::task::SafePointEntry::AwaitStopPublication => {
+                drop(runtime);
+                drop(guard);
+                assert!(
+                    !self.synchronize_scheduler_current_at_safe_point_detached(),
+                    "a terminal resume's Stop was never published"
+                );
+                return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
+            }
+            crate::task::SafePointEntry::Proceed => {}
         }
         #[cfg(feature = "test-support")]
         let suspended_claim = runtime.core.shared.execution.suspended_claim_on(self.cpu);
