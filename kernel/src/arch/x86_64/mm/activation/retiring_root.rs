@@ -83,6 +83,22 @@ unsafe impl DetachedTeardown for RetiringRootPublisher<'_> {
     }
 }
 
+/// How an owed teardown step found its root (DW2 §10.14 revision 2 item 0,
+/// §10.17 B-1): retiring and free to work on, or not yet, with the reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TeardownStepStart {
+    /// The root is retiring with no CPU resident: the step does its work.
+    Retiring,
+    /// A CPU is still resident: the step does nothing; its leave queues the
+    /// root again.
+    Resident,
+    /// A mutation published on the root before it was queued has not
+    /// completed: the step does nothing and the root stays queued. The
+    /// mutation's initiator completes it on its own CPU, holding only the
+    /// shootdown-initiator lock S, so no hold of this CPU is needed for it.
+    MutationInFlight,
+}
+
 /// One table on the step's path down from the root.
 #[derive(Clone, Copy)]
 struct Level {
@@ -115,6 +131,25 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 RootBindingError::from(error)
             }
         })
+    }
+
+    /// The start of one owed teardown step (§10.17 B-1): moves the root
+    /// into retiring if it can, or names what holds it back, a CPU resident
+    /// or a mutation still in flight, in which case nothing changes. Any
+    /// other refusal is returned as an error.
+    pub(crate) fn begin_teardown_step(
+        &self,
+        process: ProcessKey,
+        address_space: AddressSpaceKey,
+    ) -> Result<TeardownStepStart, RootBindingError> {
+        let begun = self.begin_retiring(process, address_space);
+        if begun == Err(RootBindingError::Resident) {
+            Ok(TeardownStepStart::Resident)
+        } else if begun == Err(RootBindingError::MutationInFlight) {
+            Ok(TeardownStepStart::MutationInFlight)
+        } else {
+            begun.map(|()| TeardownStepStart::Retiring)
+        }
     }
 
     /// Whether `process`'s root is retiring.

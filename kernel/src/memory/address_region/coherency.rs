@@ -1259,6 +1259,55 @@ mod tests {
     /// CPU resident and nothing in flight; from then on, for good, no CPU
     /// may enter and no mutation may be prepared, while the final teardown
     /// still runs.
+    /// DW2 §10.17 B-1: a root whose last resident has left while a mutation
+    /// on it is still `Published` (or one still `Prepared`) cannot begin
+    /// retiring; nothing changes, and it can once the mutation completes.
+    #[test]
+    fn a_mutation_in_flight_holds_retiring_back_until_it_completes() {
+        let coherency = coherency::<2>();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
+        let scope = InvalidationScope::pages(0x1000, 0x1000).unwrap();
+
+        let prepared = coherency
+            .prepare_mutation(MappingMutation::Unmap, scope)
+            .unwrap();
+        assert_eq!(coherency.resident_cpus().count(), 0);
+        assert_eq!(
+            coherency.begin_retiring(),
+            Err(AddressSpaceCoherencyError::MutationInFlight)
+        );
+        assert!(!coherency.is_retiring());
+        drop(prepared);
+
+        let resident = coherency.enter(cpu1).unwrap();
+        let barrier = coherency
+            .prepare_mutation(MappingMutation::Protect, scope)
+            .unwrap()
+            .publish();
+        assert!(barrier.pending_targets().contains(cpu1));
+        // The target's leave acknowledges; the initiator has not completed.
+        coherency.leave_after_local_flush(resident).unwrap();
+        assert_eq!(coherency.resident_cpus().count(), 0);
+        assert_eq!(
+            coherency.begin_retiring(),
+            Err(AddressSpaceCoherencyError::MutationInFlight)
+        );
+        assert!(!coherency.is_retiring());
+        let generation = coherency.published_generation();
+        // Entry stays open: refusing to retire changed nothing.
+        let entered = coherency.enter(cpu0).unwrap();
+        coherency.leave_after_local_flush(entered).unwrap();
+
+        assert!(
+            barrier.try_complete().is_ok(),
+            "every target acknowledged by leaving"
+        );
+        coherency.begin_retiring().unwrap();
+        assert!(coherency.is_retiring());
+        assert_eq!(coherency.published_generation(), generation);
+    }
+
     #[test]
     fn a_retiring_root_refuses_entry_and_mutation_but_not_its_teardown() {
         let coherency = coherency::<2>();

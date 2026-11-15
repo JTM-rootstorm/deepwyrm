@@ -28,7 +28,7 @@ mod retiring_root;
 )]
 pub(crate) use retiring_root::{
     RetiringRootPublisher, TEARDOWN_FIRST_FREE_ENTRIES, TEARDOWN_STEP_ENTRIES,
-    TEARDOWN_STEP_TABLES, TableTeardownStep,
+    TEARDOWN_STEP_TABLES, TableTeardownStep, TeardownStepStart,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

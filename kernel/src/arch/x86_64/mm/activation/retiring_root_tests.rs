@@ -490,3 +490,80 @@ fn the_processs_weight_is_unchanged_by_the_table_steps() {
     assert_eq!(fixture.registry.charge(process).unwrap(), before);
     assert_eq!(before.1, 10);
 }
+
+/// §10.17 B-1: an owed root whose last resident left while a mutation on it
+/// is still published starts its first teardown step as `MutationInFlight`,
+/// with nothing changed (not retiring, its tables and frames as they were),
+/// instead of failing; a resident is reported as such and the primordial
+/// root is still an error. Once the mutation completes, the step begins
+/// retiring and the root is torn down by its steps.
+#[test]
+fn a_teardown_step_waits_out_a_mutation_in_flight() {
+    use crate::memory::address_region::{InvalidationScope, MappingMutation};
+    let mut fixture = Fixture::new();
+    let pdpt = fixture.table(TableLevel::Pdpt, fixture.root, 0);
+    let pd = fixture.table(TableLevel::Pd, pdpt, 0);
+    fixture.page_table(pd, 0, &[1]);
+    let (child, space) = (fixture.child, fixture.space);
+    let cpu1 = CpuIndex::new(1).unwrap();
+    let scope = InvalidationScope::pages(0x1000, 0x1000).unwrap();
+
+    assert_eq!(
+        fixture
+            .bindings
+            .begin_teardown_step(fixture.primordial, fixture.primordial_space),
+        Err(RootBindingError::RootMismatch)
+    );
+    let resident = fixture
+        .bindings
+        .prepare_selection(cpu1, child, space)
+        .unwrap();
+    assert_eq!(
+        fixture.bindings.begin_teardown_step(child, space),
+        Ok(TeardownStepStart::Resident)
+    );
+
+    // Another Process's unmap published while the child's CPU was resident.
+    let coherency = fixture.bindings.coherency_for(child, space).unwrap();
+    let barrier = coherency
+        .prepare_mutation(MappingMutation::Unmap, scope)
+        .unwrap()
+        .publish();
+    fixture.bindings.abandon_selection(resident).unwrap();
+    assert_eq!(fixture.bindings.resident_count(child, space), Ok(0));
+    let free = fixture.roles.available_frames();
+    for _ in 0..3 {
+        assert_eq!(
+            fixture.bindings.begin_teardown_step(child, space),
+            Ok(TeardownStepStart::MutationInFlight)
+        );
+    }
+    assert_eq!(fixture.bindings.is_retiring(child, space), Ok(false));
+    let reservation = fixture.pins.reserve_teardown(space).unwrap();
+    assert_eq!(
+        fixture.bindings.teardown_tables_step(
+            &mut fixture.roles,
+            &mut fixture.target,
+            child,
+            space,
+            &fixture.pins,
+            reservation,
+        ),
+        Err(RootBindingError::NotRetiring)
+    );
+    assert_eq!(fixture.table_count(), 3);
+    assert_eq!(fixture.roles.available_frames(), free);
+
+    assert!(
+        barrier.try_complete().is_ok(),
+        "the leave acknowledged the only target"
+    );
+    assert_eq!(
+        fixture.bindings.begin_teardown_step(child, space),
+        Ok(TeardownStepStart::Retiring)
+    );
+    assert_eq!(fixture.bindings.is_retiring(child, space), Ok(true));
+    fixture.steps_to_empty();
+    fixture.teardown_root().unwrap();
+    assert_eq!(fixture.roles.available_frames(), free + 4);
+}

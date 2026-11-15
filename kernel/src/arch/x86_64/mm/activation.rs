@@ -2325,15 +2325,17 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
-    /// Moves an exited child's root one way into retiring at its owed
-    /// teardown's first step (DW2 §10.14 revision 2 item 0); repeated on
-    /// every later step, it changes nothing.
-    pub(crate) fn begin_retiring_child_root(
+    /// Starts an owed teardown step on an exited child's root: moves it one
+    /// way into retiring (DW2 §10.14 revision 2 item 0; repeated on every
+    /// later step, it changes nothing), or reports the CPU resident or the
+    /// mutation in flight that holds it back (§10.17 B-1).
+    pub(crate) fn begin_child_root_teardown_step(
         &self,
         process: crate::task::ProcessKey,
         address_space: crate::memory::address_region::AddressSpaceKey,
-    ) -> Result<(), RootBindingError> {
-        self.root_bindings.begin_retiring(process, address_space)
+    ) -> Result<address_space::TeardownStepStart, RootBindingError> {
+        self.root_bindings
+            .begin_teardown_step(process, address_space)
     }
 
     /// Whether an exited child's root is retiring.

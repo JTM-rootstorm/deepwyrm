@@ -633,6 +633,9 @@ const ON_DEMAND_COMMIT_STEP_BYTES: u64 = 2 * 1024 * 1024;
 enum OwedTeardownStep {
     /// A CPU is resident on the root: nothing was done.
     Resident,
+    /// A mutation published on the root before it was queued is still in
+    /// flight (§10.17 B-1): nothing was done.
+    MutationInFlight,
     /// A mapping or tables were removed; the root stays owed.
     Remain,
     /// No mapping or table remains: the root is to be retired.
@@ -6018,8 +6021,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         step_report::timed(cpu, StepCall::Teardown, || {
             let step = self.retiring_teardown_step(process, root_key, address_space, &proof);
             match step {
-                // Its resident queues it again when it leaves.
-                OwedTeardownStep::Resident | OwedTeardownStep::Remain => {
+                // Its resident queues it again when it leaves; a mutation in
+                // flight completes on its initiator's CPU, and a later step
+                // finds the root free.
+                OwedTeardownStep::Resident
+                | OwedTeardownStep::MutationInFlight
+                | OwedTeardownStep::Remain => {
                     self.core.owed_teardown.push(slot, process);
                 }
                 OwedTeardownStep::Retire => {
@@ -6033,14 +6040,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .unwrap_or_else(|()| panic!("an owed root's retirement drifted"));
                 }
             }
-            step != OwedTeardownStep::Resident
+            step == OwedTeardownStep::Remain || step == OwedTeardownStep::Retire
         })
     }
 
     /// The work of one owed teardown step (DW2 §10.14 revision 2), in one
     /// paging lock hold that first re-reads the root's residents and
-    /// requires zero (item 0): with a CPU resident, nothing is done. At the
-    /// first step the root moves into retiring. Then, while mappings
+    /// requires zero (item 0): with a CPU resident, or a mutation published
+    /// before the root was queued still in flight (§10.17 B-1), nothing is
+    /// done. At the first step the root moves into retiring. Then, while mappings
     /// remain, one whole mapping's leases are released through the sealed
     /// teardown publisher, which touches no table (item 1); then up to a
     /// step's tables are freed (item 2). A step that finds neither leaves
@@ -6053,15 +6061,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> OwedTeardownStep {
         let mut paging = self.paging.lock();
-        let residents = paging
-            .child_root_resident_count(process, address_space)
-            .unwrap_or_else(|error| panic!("an owed root's residency query failed: {error:?}"));
-        if residents != 0 {
-            return OwedTeardownStep::Resident;
-        }
-        paging
-            .begin_retiring_child_root(process, address_space)
+        let start = paging
+            .begin_child_root_teardown_step(process, address_space)
             .unwrap_or_else(|error| panic!("an owed root did not become retiring: {error:?}"));
+        match start {
+            super::address_space::TeardownStepStart::Retiring => {}
+            super::address_space::TeardownStepStart::Resident => {
+                return OwedTeardownStep::Resident;
+            }
+            // A mutation published before the root was queued, which its
+            // initiator completes without this hold (§10.17 B-1).
+            super::address_space::TeardownStepStart::MutationInFlight => {
+                return OwedTeardownStep::MutationInFlight;
+            }
+        }
         // Reviewed safe (DW2 §7.1 R2, 2026-11-13): every owned pin is drained
         // with its blocked operation or held by a CPU resident on this root,
         // and none is.
