@@ -200,6 +200,115 @@ pub(crate) const fn owed_work_wake(cpu: usize, bsp: usize, facts: OwedHoldFacts)
     }
 }
 
+/// Something a hold did that may give an idle BSP owed work to step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BspOwedEvent {
+    /// Queued an owed finalization while none was owed.
+    FinalizationFromEmpty,
+    /// Queued an owed teardown while none was owed.
+    TeardownFromEmpty,
+    /// Retired the bootstrap's root.
+    BootstrapRetired,
+}
+
+/// One CPU's owed-work wake state (DW2 §10.19 revision 3), as one byte the
+/// carrier keeps per CPU: the events its current hold did, and a wake
+/// decided at a hold's end and not yet sent. A hold marks events; its end
+/// settles them into a wake or none; after the release the wake is taken
+/// and sent, and put back if it could not be.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OwedHoldState(u8);
+
+impl OwedHoldState {
+    const FINALIZATION_FROM_EMPTY: u8 = 1 << 0;
+    const TEARDOWN_FROM_EMPTY: u8 = 1 << 1;
+    const BOOTSTRAP_RETIRED: u8 = 1 << 2;
+    const EVENTS: u8 =
+        Self::FINALIZATION_FROM_EMPTY | Self::TEARDOWN_FROM_EMPTY | Self::BOOTSTRAP_RETIRED;
+    const WAKE_QUEUE: u8 = 1 << 3;
+    const WAKE_RETIREMENT: u8 = 1 << 4;
+    const WAKES: u8 = Self::WAKE_QUEUE | Self::WAKE_RETIREMENT;
+
+    pub(crate) const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+
+    const fn wake_bits(wake: OwedWake) -> u8 {
+        (if wake.queue { Self::WAKE_QUEUE } else { 0 })
+            | if wake.retirement {
+                Self::WAKE_RETIREMENT
+            } else {
+                0
+            }
+    }
+
+    /// The hold did `event`.
+    pub(crate) const fn marked(self, event: BspOwedEvent) -> Self {
+        let bit = match event {
+            BspOwedEvent::FinalizationFromEmpty => Self::FINALIZATION_FROM_EMPTY,
+            BspOwedEvent::TeardownFromEmpty => Self::TEARDOWN_FROM_EMPTY,
+            BspOwedEvent::BootstrapRetired => Self::BOOTSTRAP_RETIRED,
+        };
+        Self(self.0 | bit)
+    }
+
+    /// At the hold's end on `cpu`, with what is owed then: its events become
+    /// the wake to deliver ([`owed_work_wake`]), or none, and are cleared. A
+    /// wake still pending from before is kept. With no event, unchanged.
+    pub(crate) const fn settled(
+        self,
+        cpu: usize,
+        bsp: usize,
+        finalization_owed: bool,
+        teardown_owed: bool,
+    ) -> Self {
+        let events = self.0 & Self::EVENTS;
+        if events == 0 {
+            return self;
+        }
+        let facts = OwedHoldFacts {
+            finalization: OwedQueueChange {
+                queued_from_empty: events & Self::FINALIZATION_FROM_EMPTY != 0,
+                owed_at_end: finalization_owed,
+            },
+            teardown: OwedQueueChange {
+                queued_from_empty: events & Self::TEARDOWN_FROM_EMPTY != 0,
+                owed_at_end: teardown_owed,
+            },
+            bootstrap_retired_with_teardown_owed: events & Self::BOOTSTRAP_RETIRED != 0
+                && teardown_owed,
+        };
+        let wake = owed_work_wake(cpu, bsp, facts);
+        Self((self.0 & Self::WAKES) | Self::wake_bits(wake))
+    }
+
+    /// After the release: the wake to deliver, if any, and the state without
+    /// it.
+    pub(crate) const fn take_wake(self) -> (Self, Option<OwedWake>) {
+        let wakes = self.0 & Self::WAKES;
+        if wakes == 0 {
+            return (self, None);
+        }
+        (
+            Self(self.0 & !Self::WAKES),
+            Some(OwedWake {
+                queue: wakes & Self::WAKE_QUEUE != 0,
+                retirement: wakes & Self::WAKE_RETIREMENT != 0,
+            }),
+        )
+    }
+
+    /// `wake` could not be sent: it is pending again, so this CPU's next
+    /// hold end tries it again.
+    pub(crate) const fn with_unsent(self, wake: OwedWake) -> Self {
+        Self(self.0 | Self::wake_bits(wake))
+    }
+}
+
 #[cfg(test)]
 #[path = "hold_end/tests.rs"]
 mod tests;

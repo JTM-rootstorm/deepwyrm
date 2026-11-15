@@ -29,8 +29,8 @@ mod stop_handoff;
 mod stop_publication;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use hold_end::{
-    CleanupOutboxes, HoldEnd, OwedHoldFacts, OwedQueueChange, OwedWake, assert_hold_ended,
-    hold_end_for, owed_work_wake, settle_hold_queues,
+    BspOwedEvent, CleanupOutboxes, HoldEnd, OwedHoldState, OwedWake, assert_hold_ended,
+    hold_end_for, settle_hold_queues,
 };
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use stop_handoff::{

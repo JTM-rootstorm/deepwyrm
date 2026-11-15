@@ -324,3 +324,209 @@ fn a_hold_wakes_the_bsp_only_for_owed_work_it_newly_made_steppable() {
         assert_eq!(woken.any(), expected.queue || expected.retirement);
     }
 }
+
+const BSP: usize = 0;
+
+/// What is owed at a hold's end.
+#[derive(Clone, Copy)]
+struct OwedAtEnd {
+    finalization: bool,
+    teardown: bool,
+}
+
+const NOTHING_OWED: OwedAtEnd = OwedAtEnd {
+    finalization: false,
+    teardown: false,
+};
+const FINALIZATION_OWED: OwedAtEnd = OwedAtEnd {
+    finalization: true,
+    teardown: false,
+};
+const TEARDOWN_OWED: OwedAtEnd = OwedAtEnd {
+    finalization: false,
+    teardown: true,
+};
+
+/// One whole hold on `cpu`: it marks `events`, then its end settles them
+/// against what is owed then.
+fn hold(
+    state: OwedHoldState,
+    cpu: usize,
+    events: &[BspOwedEvent],
+    owed: OwedAtEnd,
+) -> OwedHoldState {
+    events
+        .iter()
+        .fold(state, |state, event| state.marked(*event))
+        .settled(cpu, BSP, owed.finalization, owed.teardown)
+}
+
+fn wake(queue: bool, retirement: bool) -> Option<OwedWake> {
+    Some(OwedWake { queue, retirement })
+}
+
+/// The carrier's byte through whole holds (DW2 §10.19 revision 3): mark,
+/// settle at the hold's end, take after the release. Each case starts from
+/// an empty state on a CPU off the BSP.
+#[test]
+fn a_hold_off_the_bsp_settles_into_the_wake_it_owes() {
+    use BspOwedEvent::{BootstrapRetired, FinalizationFromEmpty, TeardownFromEmpty};
+    for (events, owed, expected) in [
+        // The bootstrap's root retired: a wake only with teardown owed.
+        (&[BootstrapRetired][..], TEARDOWN_OWED, wake(false, true)),
+        (&[BootstrapRetired][..], NOTHING_OWED, None),
+        (&[BootstrapRetired][..], FINALIZATION_OWED, None),
+        // Each queue from empty and still owed at the end.
+        (
+            &[FinalizationFromEmpty][..],
+            FINALIZATION_OWED,
+            wake(true, false),
+        ),
+        (&[TeardownFromEmpty][..], TEARDOWN_OWED, wake(true, false)),
+        // Finished within the hold.
+        (&[FinalizationFromEmpty][..], NOTHING_OWED, None),
+        (&[TeardownFromEmpty][..], NOTHING_OWED, None),
+        // The other queue's being owed does not count.
+        (&[FinalizationFromEmpty][..], TEARDOWN_OWED, None),
+        // Both causes in one hold.
+        (
+            &[TeardownFromEmpty, BootstrapRetired][..],
+            TEARDOWN_OWED,
+            wake(true, true),
+        ),
+        // Nothing marked.
+        (&[][..], TEARDOWN_OWED, None),
+    ] {
+        for cpu in [1, 3] {
+            let settled = hold(OwedHoldState::default(), cpu, events, owed);
+            let (taken, woken) = settled.take_wake();
+            assert_eq!(woken, expected, "cpu {cpu}, {events:?}");
+            assert_eq!(taken, OwedHoldState::default(), "cpu {cpu}, {events:?}");
+            // Taking again yields nothing.
+            assert_eq!(taken.take_wake(), (taken, None));
+        }
+    }
+}
+
+/// The BSP's own holds never wake it, and their events do not outlive the
+/// hold.
+#[test]
+fn the_bsps_own_hold_settles_into_no_wake_and_forgets_its_events() {
+    use BspOwedEvent::{BootstrapRetired, FinalizationFromEmpty, TeardownFromEmpty};
+    let owed = OwedAtEnd {
+        finalization: true,
+        teardown: true,
+    };
+    let settled = hold(
+        OwedHoldState::default(),
+        BSP,
+        &[FinalizationFromEmpty, TeardownFromEmpty, BootstrapRetired],
+        owed,
+    );
+    assert_eq!(settled, OwedHoldState::default());
+    assert_eq!(settled.take_wake().1, None);
+    // A following hold that marks nothing yields nothing either.
+    let next = hold(settled, BSP, &[], owed);
+    assert_eq!(next.take_wake().1, None);
+}
+
+/// A hold's events are settled at its own end: a following hold that marks
+/// nothing settles into no new wake, whatever is owed then.
+#[test]
+fn events_do_not_leak_into_the_next_hold() {
+    use BspOwedEvent::{BootstrapRetired, FinalizationFromEmpty, TeardownFromEmpty};
+    // Settled into no wake: the events must not count at the next end,
+    // when the queues are owed.
+    for events in [
+        &[FinalizationFromEmpty][..],
+        &[TeardownFromEmpty][..],
+        &[BootstrapRetired][..],
+    ] {
+        let first = hold(OwedHoldState::default(), 1, events, NOTHING_OWED);
+        assert_eq!(first, OwedHoldState::default(), "{events:?}");
+        let owed = OwedAtEnd {
+            finalization: true,
+            teardown: true,
+        };
+        let second = hold(first, 1, &[], owed);
+        assert_eq!(second.take_wake().1, None, "{events:?}");
+    }
+    // Settled into a wake that was taken: the next hold adds nothing.
+    let first = hold(
+        OwedHoldState::default(),
+        2,
+        &[TeardownFromEmpty],
+        TEARDOWN_OWED,
+    );
+    let (taken, woken) = first.take_wake();
+    assert_eq!(woken, wake(true, false));
+    let second = hold(taken, 2, &[], TEARDOWN_OWED);
+    assert_eq!(second.take_wake().1, None);
+}
+
+/// A wake settled but not yet taken survives a later hold's end, with or
+/// without new events, and gains the new hold's cause.
+#[test]
+fn a_pending_wake_survives_a_later_settle() {
+    use BspOwedEvent::{BootstrapRetired, FinalizationFromEmpty};
+    let pending = hold(
+        OwedHoldState::default(),
+        1,
+        &[BootstrapRetired],
+        TEARDOWN_OWED,
+    );
+    // No new event: unchanged.
+    let quiet = hold(pending, 1, &[], NOTHING_OWED);
+    assert_eq!(quiet, pending);
+    assert_eq!(quiet.take_wake().1, wake(false, true));
+    // A new event that owes nothing at its end: the old wake is kept.
+    let finished = hold(pending, 1, &[FinalizationFromEmpty], NOTHING_OWED);
+    assert_eq!(finished.take_wake().1, wake(false, true));
+    // A new event that owes a wake: both causes.
+    let both = hold(pending, 1, &[FinalizationFromEmpty], FINALIZATION_OWED);
+    assert_eq!(both.take_wake().1, wake(true, true));
+    // Even a BSP-side settle (which decides no wake) keeps it.
+    assert_eq!(
+        pending
+            .marked(FinalizationFromEmpty)
+            .settled(BSP, BSP, true, true)
+            .take_wake()
+            .1,
+        wake(false, true)
+    );
+}
+
+/// A wake that could not be sent is put back: the next take returns it
+/// with its causes intact, and that take clears it.
+#[test]
+fn an_unsent_wake_is_taken_again_with_its_causes() {
+    use BspOwedEvent::{BootstrapRetired, TeardownFromEmpty};
+    for (events, expected) in [
+        (&[TeardownFromEmpty][..], wake(true, false)),
+        (&[BootstrapRetired][..], wake(false, true)),
+        (&[TeardownFromEmpty, BootstrapRetired][..], wake(true, true)),
+    ] {
+        let settled = hold(OwedHoldState::default(), 1, events, TEARDOWN_OWED);
+        let (taken, woken) = settled.take_wake();
+        assert_eq!(woken, expected, "{events:?}");
+        let unsent = taken.with_unsent(woken.unwrap());
+        // A later hold on the CPU that marks nothing keeps it pending.
+        let later = hold(unsent, 1, &[], TEARDOWN_OWED);
+        let (retaken, rewoken) = later.take_wake();
+        assert_eq!(rewoken, expected, "{events:?}");
+        assert_eq!(retaken, OwedHoldState::default(), "{events:?}");
+        assert_eq!(retaken.take_wake().1, None, "{events:?}");
+        // Put back straight after the take, too.
+        assert_eq!(unsent.take_wake().1, expected, "{events:?}");
+    }
+}
+
+/// The byte round-trips through the carrier's atomic.
+#[test]
+fn the_state_round_trips_through_its_bits() {
+    let state = OwedHoldState::default()
+        .marked(BspOwedEvent::TeardownFromEmpty)
+        .marked(BspOwedEvent::BootstrapRetired);
+    assert_eq!(OwedHoldState::from_bits(state.bits()), state);
+    assert_eq!(OwedHoldState::from_bits(0), OwedHoldState::default());
+}

@@ -612,46 +612,26 @@ pub(crate) fn complete_q35_bsp_retirement_check(
         .map_err(|_| LiveTimeError::Faulted)
 }
 
-/// Per CPU, what its current hold did that may wake the BSP for owed work
-/// (DW2 §10.19 revision 3), and the wake that hold's end decided. Written
+/// Per CPU, its [`OwedHoldState`](crate::syscall::OwedHoldState) (DW2
+/// §10.19 revision 3): what its current hold did that may wake the BSP for
+/// owed work, and a wake decided at a hold's end and not yet sent. Written
 /// and read only on its own CPU: the events and the decision under T, the
-/// delivery just after T is released.
+/// delivery just after T is released. An unsent wake stays here until a
+/// later hold end on this CPU sends it.
 static BSP_OWED_WAKE: [AtomicU8; CPU_CAPACITY] = [const { AtomicU8::new(0) }; CPU_CAPACITY];
 
-const OWED_FINALIZATION_FROM_EMPTY: u8 = 1 << 0;
-const OWED_TEARDOWN_FROM_EMPTY: u8 = 1 << 1;
-const OWED_BOOTSTRAP_RETIRED: u8 = 1 << 2;
-const OWED_EVENTS: u8 =
-    OWED_FINALIZATION_FROM_EMPTY | OWED_TEARDOWN_FROM_EMPTY | OWED_BOOTSTRAP_RETIRED;
-const OWED_WAKE_QUEUE: u8 = 1 << 3;
-const OWED_WAKE_RETIREMENT: u8 = 1 << 4;
-const OWED_WAKES: u8 = OWED_WAKE_QUEUE | OWED_WAKE_RETIREMENT;
-
-/// Something a hold did that may give an idle BSP owed work to step.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BspOwedEvent {
-    /// Queued an owed finalization while none was owed.
-    FinalizationFromEmpty,
-    /// Queued an owed teardown while none was owed.
-    TeardownFromEmpty,
-    /// Retired the bootstrap's root.
-    BootstrapRetired,
-}
-
 /// A hold on `cpu` did `event`; its end decides whether the BSP is woken.
-pub(crate) fn mark_bsp_owed_event(cpu: CpuIndex, event: BspOwedEvent) {
-    let bit = match event {
-        BspOwedEvent::FinalizationFromEmpty => OWED_FINALIZATION_FROM_EMPTY,
-        BspOwedEvent::TeardownFromEmpty => OWED_TEARDOWN_FROM_EMPTY,
-        BspOwedEvent::BootstrapRetired => OWED_BOOTSTRAP_RETIRED,
-    };
+pub(crate) fn mark_bsp_owed_event(cpu: CpuIndex, event: crate::syscall::BspOwedEvent) {
     if let Some(state) = BSP_OWED_WAKE.get(cpu.index()) {
-        state.store(state.load(Ordering::Relaxed) | bit, Ordering::Relaxed);
+        let marked =
+            crate::syscall::OwedHoldState::from_bits(state.load(Ordering::Relaxed)).marked(event);
+        state.store(marked.bits(), Ordering::Relaxed);
     }
 }
 
 /// At this CPU's hold end, under T, with what is owed then: turns the
-/// hold's events into the wake to deliver after the release, or none.
+/// hold's events into the wake to deliver after the release, or none,
+/// keeping one still pending. With no event, nothing is stored.
 pub(crate) fn settle_bsp_owed_events(finalization_owed: bool, teardown_owed: bool) {
     let Ok(cpu) = installed_current_cpu_index() else {
         return;
@@ -659,56 +639,43 @@ pub(crate) fn settle_bsp_owed_events(finalization_owed: bool, teardown_owed: boo
     let Some(state) = BSP_OWED_WAKE.get(cpu.index()) else {
         return;
     };
-    let events = state.load(Ordering::Relaxed);
-    if events & OWED_EVENTS == 0 {
-        return;
+    let bits = state.load(Ordering::Relaxed);
+    let settled = crate::syscall::OwedHoldState::from_bits(bits).settled(
+        cpu.index(),
+        CpuIndex::BOOTSTRAP.index(),
+        finalization_owed,
+        teardown_owed,
+    );
+    if settled.bits() != bits {
+        state.store(settled.bits(), Ordering::Relaxed);
     }
-    let facts = crate::syscall::OwedHoldFacts {
-        finalization: crate::syscall::OwedQueueChange {
-            queued_from_empty: events & OWED_FINALIZATION_FROM_EMPTY != 0,
-            owed_at_end: finalization_owed,
-        },
-        teardown: crate::syscall::OwedQueueChange {
-            queued_from_empty: events & OWED_TEARDOWN_FROM_EMPTY != 0,
-            owed_at_end: teardown_owed,
-        },
-        bootstrap_retired_with_teardown_owed: events & OWED_BOOTSTRAP_RETIRED != 0 && teardown_owed,
-    };
-    let wake = crate::syscall::owed_work_wake(cpu.index(), CpuIndex::BOOTSTRAP.index(), facts);
-    let pending = (events & OWED_WAKES)
-        | if wake.queue { OWED_WAKE_QUEUE } else { 0 }
-        | if wake.retirement {
-            OWED_WAKE_RETIREMENT
-        } else {
-            0
-        };
-    state.store(pending, Ordering::Relaxed);
 }
 
-/// After this CPU released T: if its hold decided a wake, wakes the BSP,
+/// After this CPU released T: if a hold end decided a wake, wakes the BSP,
 /// whatever it is doing, with a Wake in its mailbox and the rendezvous IPI.
 /// The IPI is what a halting BSP cannot miss: one taken before its idle
 /// commit leaves the latch that makes the commit rescan, and one still
 /// pending at `sti; hlt` ends the halt. A busy BSP only latches it.
 /// `None` if no wake was due (the common path is one load); otherwise the
-/// cause and whether it was sent. Unsent, the work stays owed and the BSP's
-/// next drain or visit steps it.
+/// cause and whether it was sent. Unsent, the wake is put back, so this
+/// CPU's next hold end tries it again: the queue it was for stays
+/// non-empty, so no later hold would take it from empty and mark it anew.
 pub(crate) fn deliver_bsp_owed_work_wake() -> Option<(crate::syscall::OwedWake, bool)> {
     let cpu = installed_current_cpu_index().ok()?;
     let state = BSP_OWED_WAKE.get(cpu.index())?;
-    let pending = state.load(Ordering::Relaxed);
-    if pending & OWED_WAKES == 0 {
-        return None;
-    }
-    state.store(pending & !OWED_WAKES, Ordering::Relaxed);
-    let cause = crate::syscall::OwedWake {
-        queue: pending & OWED_WAKE_QUEUE != 0,
-        retirement: pending & OWED_WAKE_RETIREMENT != 0,
-    };
+    let (taken, cause) =
+        crate::syscall::OwedHoldState::from_bits(state.load(Ordering::Relaxed)).take_wake();
+    let cause = cause?;
+    state.store(taken.bits(), Ordering::Relaxed);
     let sent = crate::arch::x86_64::idle::publish_bsp_service_wake().is_ok()
         && LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
             .identity()
             .is_some_and(|bsp| send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous).is_ok());
+    if !sent {
+        let unsent = crate::syscall::OwedHoldState::from_bits(state.load(Ordering::Relaxed))
+            .with_unsent(cause);
+        state.store(unsent.bits(), Ordering::Relaxed);
+    }
     Some((cause, sent))
 }
 

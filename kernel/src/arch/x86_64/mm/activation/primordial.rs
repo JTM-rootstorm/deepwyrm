@@ -6090,7 +6090,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // (DW2 §10.19 revision 3).
             crate::time::mark_bsp_owed_event(
                 self.cpu(),
-                crate::time::BspOwedEvent::TeardownFromEmpty,
+                crate::syscall::BspOwedEvent::TeardownFromEmpty,
             );
         }
         self.core.owed_teardown.push(slot, process);
@@ -6385,7 +6385,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // §10.19 revision 3): the hold's end wakes it if any is owed.
             crate::time::mark_bsp_owed_event(
                 self.cpu(),
-                crate::time::BspOwedEvent::BootstrapRetired,
+                crate::syscall::BspOwedEvent::BootstrapRetired,
             );
         }
         self.core.cleanup.push_optional(
@@ -6561,7 +6561,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // (DW2 §10.19 revision 3).
             crate::time::mark_bsp_owed_event(
                 self.cpu(),
-                crate::time::BspOwedEvent::FinalizationFromEmpty,
+                crate::syscall::BspOwedEvent::FinalizationFromEmpty,
             );
         }
         let Some(now) = step_report::now() else {
