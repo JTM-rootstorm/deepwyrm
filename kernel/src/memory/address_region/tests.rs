@@ -1846,3 +1846,108 @@ fn removed_translations_follow_the_offset_even_above_the_address() {
         [(17, 19)]
     );
 }
+
+/// Stands for a retiring root in the host model (DW2 §10.14 revision 2
+/// item 1).
+struct TestTeardown {
+    address_space: AddressSpaceKey,
+}
+
+impl detached_seal::Sealed for TestTeardown {}
+
+#[allow(
+    unsafe_code,
+    reason = "the host model has no CPU that could walk the region's root"
+)]
+// SAFETY: the host model has no CPU and no page tables, so nothing can walk
+// the region's root.
+unsafe impl DetachedTeardown for TestTeardown {
+    fn address_space_key(&self) -> AddressSpaceKey {
+        self.address_space
+    }
+}
+
+/// DW2 §10.14 revision 2 item 1: a retiring root's mapping is removed whole
+/// in one transaction, whatever its size, through the same lease
+/// replacement as an unmap: an alias of the same object keeps it alive, the
+/// last lease's pin is held until settled locally, and the object then
+/// finalizes once. A start that is not a mapping's, or a teardown for
+/// another root, changes nothing.
+#[test]
+fn a_retiring_roots_mapping_is_removed_whole_in_one_transaction() {
+    let mut objects = TestObjects::<2, 8>::new();
+    let object = object(&mut objects, Protection::READ_WRITE);
+    let mut region = region::<4>(PAGE_SIZE, PAGE_SIZE * 64);
+    let mut publisher = FakePublisher::for_region(&region);
+    for (start, length) in [(PAGE_SIZE, PAGE_SIZE * 8), (PAGE_SIZE * 32, PAGE_SIZE * 4)] {
+        let authorization = authorization(&mut objects, object, &region, Protection::READ_WRITE);
+        test_map(
+            &mut region,
+            &mut objects,
+            &mut publisher,
+            start,
+            authorization,
+            0,
+            length,
+            Protection::READ_WRITE,
+        )
+        .unwrap();
+    }
+    let publications = publisher.calls;
+    assert_eq!(objects.active_lease_count(), 2);
+    let owner = objects.owners[0].take().unwrap();
+    assert!(objects.registry.release_internal(owner).unwrap().is_none());
+
+    let teardown = TestTeardown {
+        address_space: region.address_space_key(),
+    };
+    let elsewhere = TestTeardown {
+        address_space: AddressSpaceKey::EMPTY,
+    };
+    let (authority, registry) = objects.split_mut();
+    for (refused, start, error) in [
+        (&teardown, PAGE_SIZE * 2, AddressRegionError::Unmapped),
+        (&elsewhere, PAGE_SIZE, AddressRegionError::PublisherIdentity),
+    ] {
+        let failure = region
+            .remove_mapping_detached(authority, registry, refused, start)
+            .unwrap_err();
+        assert!(matches!(
+            failure.error(),
+            AddressSpaceTransactionError::Model(found) if *found == error
+        ));
+        assert!(failure.into_final_releases().is_empty());
+        assert_eq!(region.mappings().iter().flatten().count(), 2);
+        assert_eq!(authority.active_lease_count(), 2);
+    }
+
+    // The 8-page mapping goes in one transaction; its alias keeps the
+    // object.
+    let releases = region
+        .remove_mapping_detached(authority, registry, &teardown, PAGE_SIZE)
+        .unwrap();
+    assert!(releases.settle_locally(registry).is_empty());
+    assert_eq!(authority.active_lease_count(), 1);
+    let left: Vec<_> = region
+        .mappings()
+        .iter()
+        .flatten()
+        .map(|mapping| (mapping.virtual_start(), mapping.byte_len()))
+        .collect();
+    assert_eq!(left, [(PAGE_SIZE * 32, PAGE_SIZE * 4)]);
+
+    // The last lease's pin is held until the caller settles it.
+    let releases = region
+        .remove_mapping_detached(authority, registry, &teardown, PAGE_SIZE * 32)
+        .unwrap();
+    assert_eq!(releases.len(), 0);
+    assert!(!releases.is_empty());
+    assert_eq!(authority.active_lease_count(), 0);
+    let releases = releases.settle_locally(registry);
+    assert_eq!(releases.len(), 1);
+    let release = releases.into_items().into_iter().flatten().next().unwrap();
+    assert!(objects.authority.take_finalization(release).is_ok());
+    assert!(region.mappings().iter().flatten().next().is_none());
+    // Nothing was published to the page tables.
+    assert_eq!(publisher.calls, publications);
+}

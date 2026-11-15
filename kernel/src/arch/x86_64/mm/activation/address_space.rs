@@ -20,6 +20,17 @@ use crate::memory::physical::PhysicalAddressLimit;
 use crate::memory::usercopy::{AddressSpaceTeardownReservation, UserPinTracker};
 use crate::task::ProcessKey;
 
+#[path = "retiring_root.rs"]
+mod retiring_root;
+#[allow(
+    unused_imports,
+    reason = "the integrated carrier steps retiring roots; host tests reach the rest"
+)]
+pub(crate) use retiring_root::{
+    RetiringRootPublisher, TEARDOWN_FIRST_FREE_ENTRIES, TEARDOWN_STEP_ENTRIES,
+    TEARDOWN_STEP_TABLES, TableTeardownStep,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootBindingError {
     Capacity,
@@ -34,6 +45,13 @@ pub(crate) enum RootBindingError {
     MutationInFlight,
     GenerationExhausted,
     FrameRole(FrameRoleError),
+    /// The root is retiring (DW2 §10.14 revision 2 item 0): it cannot be
+    /// entered, selected or torn down synchronously.
+    Retiring,
+    /// A retiring-root operation found a root that is not retiring.
+    NotRetiring,
+    /// A teardown met a large leaf where it expected a table.
+    LargeLeaf,
 }
 
 /// Lifetime-pinned borrow of the primordial root's supervisor-only PML4 half.
@@ -100,6 +118,7 @@ impl From<AddressSpaceCoherencyError> for RootBindingError {
         match error {
             AddressSpaceCoherencyError::AlreadyResident => Self::AlreadyActive,
             AddressSpaceCoherencyError::MutationInFlight => Self::MutationInFlight,
+            AddressSpaceCoherencyError::Retiring => Self::Retiring,
             _ => Self::RootMismatch,
         }
     }
@@ -509,6 +528,11 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
             .flatten()
             .find(|binding| binding.process == process)
             .ok_or(RootBindingError::Missing)?;
+        // A retiring root is reached only by its owed teardown's steps, never
+        // through a session (DW2 §10.14 revision 2 item 4).
+        if binding.coherency.is_retiring() {
+            return Err(RootBindingError::Retiring);
+        }
         let root = match &binding.storage {
             RootStorage::Primordial => primordial,
             RootStorage::Owned(root) => root,
@@ -969,6 +993,11 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 error => RootBindingError::from(error),
             })?;
 
+        // A retiring root's tables were freed by its steps, so its proof
+        // reads only the PML4's user entries and refuses any it finds
+        // (DW2 §10.14 revision 2 items 3 and 4): its leaves were never
+        // cleared, so no walk below it may run.
+        let retiring = binding.coherency.is_retiring();
         let mut hierarchy = roles
             .begin_empty_table_hierarchy(binding.identity)
             .map_err(RootBindingError::FrameRole)?;
@@ -985,6 +1014,9 @@ impl<const SPACES: usize, const CPUS: usize> AddressSpaceRootBindings<SPACES, CP
                 .map_err(|_| RootBindingError::RootMismatch)?;
             if entry == 0 {
                 continue;
+            }
+            if retiring {
+                return Err(RootBindingError::Retiring);
             }
             let child_frame = decode_intermediate(entry, true, root.physical_limit())
                 .map_err(|_| RootBindingError::RootMismatch)?;

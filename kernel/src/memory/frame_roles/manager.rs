@@ -438,15 +438,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let grant = staged.grant;
         // Every committed table below a root counts toward that root, which
         // is how an empty-hierarchy proof knows it saw them all.
+        // Every table below a PML4 also counts toward its parent, unless the
+        // parent is that PML4, so a table freed alone can prove it has no
+        // committed child left (DW2 §10.14 revision 2 item 2).
         if let Some(parent) = staged.parent {
             let root = self
                 .root_slot_of(parent)
                 .expect("a validated parent table leads to its root");
-            let root = &mut self.roles.as_mut_slice()[root];
-            root.tables = root
-                .tables
-                .checked_add(1)
-                .expect("a root's table count stays below the slot count");
+            let parent = self
+                .slot(parent)
+                .expect("a validated parent table has a live slot");
+            for counted in [Some(root), (parent != root).then_some(parent)]
+                .into_iter()
+                .flatten()
+            {
+                let counted = &mut self.roles.as_mut_slice()[counted];
+                counted.tables = counted
+                    .tables
+                    .checked_add(1)
+                    .expect("a table count stays below the slot count");
+            }
         }
         self.replace_record(
             staged.slot,
@@ -689,11 +700,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let root = self
             .slot(grant.root.role)
             .expect("the hierarchy root outlives its tables");
-        let root = &mut self.roles.as_mut_slice()[root];
-        root.tables = root
-            .tables
-            .checked_sub(1)
-            .expect("a root counts every table below it");
+        // The proof's tables go in any order, so a parent may be gone
+        // already, its count with it.
+        let parent_slot = self.slot(parent).ok();
+        self.uncount_table(root, parent_slot);
         self.cancel(
             table.role,
             range,
@@ -705,6 +715,102 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
         .unwrap_or_else(|error| panic!("preflighted table reclaim drifted: {error:?}"));
         grant.version = self.version;
+    }
+
+    /// Lowers the counts a child table added when it was committed: its
+    /// root's (slot `root`), and its parent's (slot `parent`, when given)
+    /// unless that is the root.
+    fn uncount_table(&mut self, root: usize, parent: Option<usize>) {
+        for counted in [Some(root), parent.filter(|parent| *parent != root)]
+            .into_iter()
+            .flatten()
+        {
+            let counted = &mut self.roles.as_mut_slice()[counted];
+            counted.tables = counted
+                .tables
+                .checked_sub(1)
+                .expect("a table count covers every committed child it counted");
+        }
+    }
+
+    /// How many committed tables below the PML4 `root` its owner has.
+    pub(crate) fn hierarchy_table_count(&self, root: TableIdentity) -> Result<u32, FrameRoleError> {
+        self.validate_table_identity(root)?;
+        if root.level != TableLevel::Pml4 {
+            return Err(FrameRoleError::WrongRole);
+        }
+        Ok(self.roles.as_slice()[self.slot(root.role)?].tables)
+    }
+
+    /// Checks that `table` may be freed alone from the retiring hierarchy
+    /// of the PML4 `root` (DW2 §10.14 revision 2 item 2): a committed child
+    /// table (never the PML4) of `root`'s owner, of the level below
+    /// `parent`, whose recorded parent is `parent`, which itself lies
+    /// below `root`; and no committed table names it as parent. Changes
+    /// nothing.
+    pub(crate) fn check_retiring_table(
+        &self,
+        root: TableIdentity,
+        parent: TableIdentity,
+        table: TableIdentity,
+    ) -> Result<(), FrameRoleError> {
+        self.validate_table_identity(root)?;
+        if root.level != TableLevel::Pml4 || table.level == TableLevel::Pml4 {
+            return Err(FrameRoleError::WrongRole);
+        }
+        if parent.owner != root.owner || table.owner != root.owner {
+            return Err(FrameRoleError::InvalidTableOwner);
+        }
+        self.validate_table_child(parent, table)?;
+        if self.root_slot_of(parent.role)? != self.slot(root.role)? {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        if self.roles.as_slice()[self.slot(table.role)?].tables != 0 {
+            return Err(FrameRoleError::InvalidTableParent);
+        }
+        Ok(())
+    }
+
+    /// Frees one user table of a retiring hierarchy, bottom-up, without
+    /// reading it (DW2 §10.14 revision 2 item 2), after
+    /// [`Self::check_retiring_table`]'s checks, which it repeats: on a
+    /// refusal nothing changes. It lowers the root's count of tables and
+    /// `parent`'s count of children. Charges are untouched.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the architecture binding of `root`, which must be
+    /// retiring: its residency gate closed for good with no CPU resident,
+    /// so no CPU can walk it or hold a translation or paging-structure entry
+    /// cached from it (no PCID, no global user pages). Before any later walk
+    /// of `parent`, the caller must clear `parent`'s entry naming `table`.
+    #[allow(
+        unsafe_code,
+        reason = "root retirement and residency are architecture facts the target-independent role manager cannot see"
+    )]
+    pub(crate) unsafe fn reclaim_retiring_table(
+        &mut self,
+        root: TableIdentity,
+        parent: TableIdentity,
+        table: TableIdentity,
+    ) -> Result<(), FrameRoleError> {
+        self.check_retiring_table(root, parent, table)?;
+        let parent_role = parent.role;
+        let root = self.slot(root.role)?;
+        let parent = self.slot(parent.role)?;
+        self.uncount_table(root, Some(parent));
+        let range = self.record(table.role)?.range;
+        self.cancel(
+            table.role,
+            range,
+            FrameRole::PageTable {
+                owner: table.owner,
+                level: table.level,
+                parent: Some(parent_role),
+            },
+        )
+        .unwrap_or_else(|error| panic!("a checked retiring table's reclaim drifted: {error:?}"));
+        Ok(())
     }
 
     /// Ends hierarchy reclaim once every observed table is reclaimed. The

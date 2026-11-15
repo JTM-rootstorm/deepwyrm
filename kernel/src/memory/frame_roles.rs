@@ -375,7 +375,10 @@ struct RoleSlot {
     record: Option<RoleRecord>,
     /// The epoch of the last empty-hierarchy proof that observed this table.
     mark: u64,
-    /// On a committed PML4: how many committed tables below it its owner has.
+    /// On a committed PML4: how many committed tables below it its owner
+    /// has. On any other committed table: how many committed child tables
+    /// name it as their parent (DW2 §10.14 revision 2 item 2), so a table
+    /// can be freed alone only once none does.
     tables: u32,
 }
 
