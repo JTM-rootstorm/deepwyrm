@@ -77,3 +77,17 @@ fn ended_threads_calls_are_settled_once_and_live_ones_kept() {
     assert_eq!(parked.take(first), None);
     assert_eq!(parked.take(second), Some(2));
 }
+
+/// A remote Stop's precommit names a parked call among its facts (DW2
+/// §10.15 revision 2 item 4).
+#[test]
+fn the_table_says_whether_a_thread_holds_a_parked_call() {
+    let [first, second] = thread_keys::<2>();
+    let mut parked = ParkedCalls::<u32, 2>::new();
+    assert!(!parked.holds(first));
+    parked.park(first, 1);
+    assert!(parked.holds(first));
+    assert!(!parked.holds(second));
+    assert_eq!(parked.take(first), Some(1));
+    assert!(!parked.holds(first));
+}

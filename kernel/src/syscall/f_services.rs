@@ -1185,6 +1185,66 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
         control.retire_idle_for_stop(thread, execution_generation)
     }
 
+    /// A remote Stop's actions on the stopped Thread's suspension handoff, as
+    /// its classified `plan` names them (DW2 §10.15 revision 2 item 4): the
+    /// wait control is retired when the plan says so, and the quantum
+    /// cancellation a pending suspension carries is returned for the stop
+    /// to stage; the Thread's own operation, if it has one, is cleaned up
+    /// into `cleanup`, its output discarded and its pin released through the
+    /// caller's consumers. The claim itself is retired at the commit, whose
+    /// quiescence check finds the operation gone.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the stop's cleanup keeps every source authority and owner explicit"
+    )]
+    #[cfg_attr(
+        not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live runtime takes remote Stops")
+    )]
+    pub(crate) fn retire_for_stop<
+        'a,
+        DISCARD: FnMut(OUTPUT),
+        RELEASE: FnMut(AtomicPin),
+        const WAITERS: usize,
+        const GROUPS: usize,
+        const PROCESSES: usize,
+        const THREADS: usize,
+        const HANDLES: usize,
+    >(
+        &'a mut self,
+        plan: super::stop_handoff::StopHandoffPlan,
+        control: &mut NativeWaitControl,
+        thread: ThreadKey,
+        execution_generation: u64,
+        wait_deadlines: Option<&'a mut dyn WaitDeadlineAuthority>,
+        discard_output: DISCARD,
+        release_atomic_pin: RELEASE,
+        registry: &mut ObjectRegistry<OBJECTS>,
+        tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+        waits: &WaitRegistry<WAITERS>,
+        execution: &ExecutionDomain<EXECUTION>,
+        cleanup: &mut CleanupQueue<OBJECTS>,
+    ) -> Option<crate::task::SchedulerQuantumTicket> {
+        let cancelled_quantum = if plan.retire_control {
+            control
+                .retire_idle_for_stop(thread, execution_generation)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "remote stop could not retire its {:?} handoff: {error:?}",
+                        plan.state
+                    )
+                })
+        } else {
+            None
+        };
+        if plan.transfer_service_cleanup {
+            let mut terminal =
+                self.terminal_cleanup(wait_deadlines, discard_output, release_atomic_pin);
+            terminal.cleanup_terminal_wait(registry, tasks, waits, execution, thread, cleanup);
+        }
+        cancelled_quantum
+    }
+
     /// The guarded half of `WaitOne` and `WaitMany` (D1 commit 8, design
     /// §11.2.3 family E): the wait begins over input copied, and an output
     /// pinned, before the runtime authority. A returning wait hands its

@@ -83,6 +83,14 @@ impl<C, const THREADS: usize> ParkedCalls<C, THREADS> {
         slot.take()
     }
 
+    /// Whether `thread` has a call parked.
+    pub(crate) fn holds(&self, thread: ThreadKey) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|(owner, _)| *owner == thread)
+    }
+
     pub(crate) const fn parked(&self) -> usize {
         self.parked
     }

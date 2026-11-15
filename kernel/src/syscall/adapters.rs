@@ -5244,6 +5244,22 @@ enum NativeWaitControlState {
     Resuming(WaitSuspendState),
 }
 
+/// A [`NativeWaitControl`]'s handoff, as a remote Stop's precommit reads it
+/// (DW2 §10.15 revision 2 item 4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitControlHandoff {
+    /// No suspension is in flight on this CPU, or a switch consumed it.
+    Clear,
+    /// A blocking call committed its block; `prepare_suspend` has not run.
+    /// `replacement` is whether the block chose a Thread to run instead.
+    Pending { replacement: bool },
+    /// The suspension idles this CPU.
+    Idle,
+    /// The idle poll found the suspension's winner; the resume has not
+    /// reached its physical handoff.
+    Resuming,
+}
+
 /// Ephemeral control-plane state between native wait dispatch and the raw
 /// suspension trampoline. Durable output/deadline/winner ownership remains in
 /// `WaitOperationRegistry`; this owner carries only the current control-flow
@@ -5424,6 +5440,19 @@ impl NativeWaitControl {
 
     pub(crate) const fn is_clear(&self) -> bool {
         matches!(self.state, NativeWaitControlState::Clear)
+    }
+
+    /// The handoff this control is in, for a remote Stop's precommit to
+    /// classify (DW2 §10.15 revision 2 item 4).
+    pub(crate) const fn handoff(&self) -> WaitControlHandoff {
+        match self.state {
+            NativeWaitControlState::Clear => WaitControlHandoff::Clear,
+            NativeWaitControlState::Pending(state) => WaitControlHandoff::Pending {
+                replacement: state.decision.current.is_some(),
+            },
+            NativeWaitControlState::Idle(_) => WaitControlHandoff::Idle,
+            NativeWaitControlState::Resuming(_) => WaitControlHandoff::Resuming,
+        }
     }
 
     /// Ends a live idle suspension's resume at its physical handoff: the

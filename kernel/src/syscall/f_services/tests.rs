@@ -1,6 +1,6 @@
 extern crate std;
 
-use super::super::adapters::{wait_many_input, wait_one_input};
+use super::super::adapters::{WaitControlHandoff, wait_many_input, wait_one_input};
 use super::*;
 use crate::atomic_wait::register_atomic_wait;
 use crate::handle::{AcceptedObjectTypes, HandleTableError};
@@ -2516,4 +2516,238 @@ fn an_idle_resume_ends_at_its_handoff() {
     let mut control = NativeWaitControl::new();
     control.finish_idle_resume();
     assert!(control.is_clear());
+}
+
+/// How far a blocking wait's handoff got before a remote Stop's precommit
+/// (DW2 §10.15 revision 2 item 4).
+#[derive(Clone, Copy, Debug)]
+enum HandoffReached {
+    /// Its block committed; `prepare_suspend` has not run.
+    Pending,
+    /// `prepare_suspend` idled the CPU.
+    Idle,
+    /// `prepare_suspend` prepared a switch to a runnable Thread.
+    Switch,
+    /// The idle poll found the winner, short of the resume's handoff.
+    Resuming,
+    /// The resume passed its handoff with its operation still present.
+    ResumedUnsettled,
+}
+
+/// Drives a `WaitOne` through the fixture to `reached`, then takes a remote
+/// Stop there as the live precommit and commit do: classify the facts, apply
+/// the plan's actions, retire the claim. Returns the classified state.
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for these suspension tests"
+)]
+fn stop_after(reached: HandoffReached) -> crate::syscall::stop_handoff::StopHandoffState {
+    use crate::syscall::stop_handoff::{StopHandoffFacts, classify_stop_handoff};
+    const ENTRY: u64 = 0xffff_8000_0012_3000;
+    let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
+    let mut fixture = match reached {
+        HandoffReached::Switch => Fixture::with_runnable_sender(),
+        _ => Fixture::new(),
+    };
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventCreate {
+                requested_rights: DW_RIGHT_WAIT,
+                out_event: DwUserAddress(BASE + 0x500),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let event = DwHandle(u64_at(&fixture.user, BASE + 0x500));
+    let wait = fixture.handled(NativeSyscallRequest::WaitOne {
+        handle: event,
+        signals: DW_SIGNAL_SIGNALED,
+        deadline: DwDeadline(50),
+        out_result: DwUserAddress(BASE + 0x580),
+    });
+    assert_eq!(
+        wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    assert_eq!(fixture.user.owned_outputs, 1, "the wait pinned its output");
+    let wake = fixture
+        .services
+        .wait_operations
+        .wake_key_for_thread(fixture.thread)
+        .unwrap();
+    let prepare = |fixture: &mut Fixture| {
+        // SAFETY: the fixture's running Thread is the physical carrier and
+        // the entry is a fixed synthetic address that this test never enters.
+        let plan = unsafe {
+            fixture.services.prepare_suspend(
+                &mut fixture.control,
+                &fixture.tasks,
+                &fixture.execution,
+                ENTRY,
+            )
+        }
+        .unwrap();
+        matches!(plan, NativeSuspendPlan::IdleCurrent)
+    };
+    match reached {
+        HandoffReached::Pending => {}
+        HandoffReached::Idle => assert!(prepare(&mut fixture)),
+        HandoffReached::Switch => assert!(!prepare(&mut fixture)),
+        HandoffReached::Resuming | HandoffReached::ResumedUnsettled => {
+            assert!(prepare(&mut fixture));
+            let mut expired = [None; 8];
+            assert_eq!(fixture.wait_deadlines.queue.expire(50, &mut expired), 1);
+            assert!(claim_timeout_and_wake(&fixture.execution, wake).unwrap());
+            assert!(matches!(
+                // SAFETY: as for `prepare_suspend`; the idle suspension is
+                // this fixture's own.
+                unsafe {
+                    fixture.services.poll_idle_suspend_on(
+                        &mut fixture.control,
+                        cpu,
+                        &fixture.tasks,
+                        &fixture.execution,
+                        ENTRY,
+                    )
+                }
+                .unwrap(),
+                NativeIdleSuspendPoll::ResumeCurrent
+            ));
+            if matches!(reached, HandoffReached::ResumedUnsettled) {
+                // The resume's handoff hold, as the live one: a suspended
+                // claim, if one remained, ends, and the control clears; the
+                // operation is still present.
+                if let Some(outgoing) = fixture.execution.suspended_claim_on(cpu) {
+                    fixture.execution.complete_switch_on(outgoing).unwrap();
+                }
+                fixture.control.finish_idle_resume();
+                assert!(fixture.services.operation_owner(fixture.thread).is_ok());
+            }
+        }
+    }
+
+    // The precommit's facts.
+    let thread = fixture.thread;
+    let suspended = fixture
+        .execution
+        .suspended_claim_on(cpu)
+        .filter(|claim| claim.thread() == thread);
+    let running_claim = fixture.execution.running_claim_on(cpu);
+    let running = running_claim.filter(|claim| claim.thread() == thread);
+    let claim = suspended
+        .or(running)
+        .expect("the Stop's Thread holds a claim");
+    if matches!(reached, HandoffReached::Resuming) {
+        // The shutdown panic's state (§10.13 failure 3): `ResumeCurrent`
+        // already made the claim Running, so the precommit meets the
+        // resuming control on its Running branch, which retired no control
+        // before: the commit then found the control not clear.
+        assert!(suspended.is_none() && running.is_some());
+        assert_eq!(fixture.control.handoff(), WaitControlHandoff::Resuming);
+    }
+    let plan = classify_stop_handoff(StopHandoffFacts {
+        suspended: suspended.is_some(),
+        running: suspended.is_none() && running.is_some(),
+        other_running: running_claim.is_some_and(|claim| claim.thread() != thread),
+        physically_executes: true,
+        terminal_owned: false,
+        parked_call: false,
+        outbox_staged: 0,
+        control: fixture.control.handoff(),
+        owner: fixture.services.operation_owner(thread),
+    });
+    assert!(plan.transfer_service_cleanup, "{reached:?}: {plan:?}");
+
+    // Its actions, then the commit's claim retirement.
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    let from_control = {
+        let user = &mut fixture.user;
+        let mut pins = 0;
+        let ticket = fixture.services.retire_for_stop(
+            plan,
+            &mut fixture.control,
+            thread,
+            claim.generation(),
+            Some(&mut fixture.wait_deadlines),
+            |output| user.discard_owned_output(output),
+            |_| pins += 1,
+            &mut fixture.registry,
+            &mut fixture.tasks,
+            &fixture.waits,
+            &fixture.execution,
+            &mut cleanup,
+        );
+        assert_eq!(pins, 0, "a generic wait owns no atomic pin");
+        ticket
+    };
+    let from_claim = if plan.suspended_claim {
+        fixture.execution.stop_suspended_claim_on(claim).unwrap();
+        None
+    } else {
+        fixture.execution.stop_running_claim_on(claim).unwrap()
+    };
+    // The post-acknowledgement continuation clears the retired slot.
+    fixture.execution.complete_switch_on(claim).unwrap();
+
+    // After the stop: no operation owner, a clear control, the deadline
+    // entry gone, the output ledger complete, at most one quantum ticket.
+    assert_eq!(
+        fixture.services.operation_owner(thread),
+        Err(FServiceOwnerError::Missing),
+        "{reached:?}"
+    );
+    assert!(fixture.services.is_quiescent(), "{reached:?}");
+    assert!(fixture.control.is_clear(), "{reached:?}");
+    let mut expired = [None; 8];
+    assert_eq!(
+        fixture.wait_deadlines.queue.expire(u64::MAX, &mut expired),
+        0,
+        "{reached:?}: the wait's deadline entry outlived the stop"
+    );
+    assert_eq!(fixture.user.owned_outputs, 0, "{reached:?}");
+    assert!(
+        !(from_control.is_some() && from_claim.is_some()),
+        "{reached:?}: the stop took two quantum tickets"
+    );
+    assert!(
+        fixture.execution.suspended_claim_on(cpu).is_none()
+            && fixture
+                .execution
+                .running_claim_on(cpu)
+                .is_none_or(|claim| claim.thread() != thread),
+        "{reached:?}: the stopped Thread kept a claim"
+    );
+    assert!(
+        cleanup.is_empty(),
+        "{reached:?}: a wait's cleanup releases nothing the event still holds"
+    );
+    close_event(&mut fixture, event);
+    plan.state
+}
+
+/// DW2 §10.15 revision 2 items 4–5: a remote Stop at every point of a
+/// wait's handoff into and out of its suspension leaves no operation, a
+/// clear control, the deadline entry removed, the ledger complete and at
+/// most one quantum ticket. The resumed-unsettled case is D-B: the
+/// transfer runs on the Running branch, by the Thread's own owner.
+#[test]
+fn a_remote_stop_settles_every_handoff_state() {
+    use crate::syscall::stop_handoff::StopHandoffState;
+    assert_eq!(
+        stop_after(HandoffReached::Pending),
+        StopHandoffState::Pending { replacement: false }
+    );
+    assert_eq!(stop_after(HandoffReached::Idle), StopHandoffState::Idle);
+    assert_eq!(
+        stop_after(HandoffReached::Switch),
+        StopHandoffState::SwitchPrepared
+    );
+    assert_eq!(
+        stop_after(HandoffReached::Resuming),
+        StopHandoffState::Resuming
+    );
+    assert_eq!(
+        stop_after(HandoffReached::ResumedUnsettled),
+        StopHandoffState::ResumedUnsettled
+    );
 }

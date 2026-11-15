@@ -53,7 +53,6 @@ use crate::syscall::native::{
 };
 use crate::syscall::{
     CleanupQueue, FServiceRoute, FServiceState, NativeWaitControl, StagedStopCleanup,
-    TerminalWaitCleanup,
 };
 use crate::task::{ExecutionDomain, ProcessKey, SchedulerThreadState, TaskAuthority, ThreadKey};
 use crate::time::TimerAuthority;
@@ -2678,8 +2677,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let pending = loop {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            // Every hold of an exception's termination stages: its releases
+            // finalize after the stops' acknowledgements, in the terminal
+            // handoff's first hold (§10.15 revision 2 item 2).
             match runtime.prepare_remote_process_exception(exception) {
                 ProcessTerminationPreparation::Retry => {
+                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
                     drop(guard);
                     for _ in 0..64 {
                         core::hint::spin_loop();
@@ -2687,6 +2690,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     continue;
                 }
                 ProcessTerminationPreparation::Immediate(result) => {
+                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
                     drop(guard);
                     self.drain_quantum_cancellation_detached();
                     assert_eq!(result.status, DW_STATUS_SUCCESS);
@@ -2694,6 +2698,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     return;
                 }
                 ProcessTerminationPreparation::Remote(prepared) => {
+                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
                     let mut deferred = core::array::from_fn(|_| None);
                     for (cpu_index, identity) in prepared.identities.into_iter().enumerate() {
                         let Some(identity) = identity else {
@@ -2721,7 +2726,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let result = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
-            runtime.complete_process_termination(pending.phase, pending.prepared, permits)
+            let result =
+                runtime.complete_process_termination(pending.phase, pending.prepared, permits);
+            runtime.end_hold(crate::syscall::hold_end_for(result.control));
+            result
         };
         self.drain_quantum_cancellation_detached();
         assert_eq!(result.status, DW_STATUS_SUCCESS);
@@ -3868,6 +3876,15 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     // They are drained only by a post-ack kernel-root continuation, the last
     // one outstanding when several CPUs are stopped at once.
     rendezvous_cleanup: StagedStopCleanup<REGISTRY_OBJECTS>,
+    /// Each CPU's releases from holds that must not finalize them yet
+    /// (DW2 §10.15 revision 2 item 2): a `TerminateCurrent` hold's, and a
+    /// remote termination's before its stops are acknowledged. Only the
+    /// owning CPU's terminal handoff or termination completion moves them
+    /// back into `cleanup`.
+    outboxes: crate::syscall::CleanupOutboxes<
+        REGISTRY_OBJECTS,
+        { crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT },
+    >,
     /// Calls parked between steps while their Threads yield the CPU (DW2
     /// §10.8). A record moves in and out only under T.
     parked: crate::syscall::ParkedCalls<ParkedCall, { crate::syscall::PARKED_CALL_THREADS }>,
@@ -3919,6 +3936,19 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             others,
             owned,
         }
+    }
+}
+
+/// The runtime guard's backstop (DW2 §10.15 revision 2 item 1): every hold
+/// ends with the shared cleanup queue and the F-service queue empty.
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_authority::HoldEndCheck
+    for PrimordialRuntimeState<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn check_hold_end(&self) {
+        crate::syscall::assert_hold_ended(
+            self.core.cleanup.is_empty(),
+            self.core.services.cleanup_is_empty(),
+        );
     }
 }
 
@@ -4639,9 +4669,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // shared queue empty (design §11.2.12 rule 4). The deferred reclaim
         // above can queue the Process's execution pin; the bound root region
         // still holds its parent reference, so the drain cannot finalize the
-        // Process before its root retires.
-        self.drain_finalizers()
-            .unwrap_or_else(|_| panic!("terminal handoff could not drain its releases"));
+        // Process before its root retires. This is the terminal handoff's
+        // first hold, so this CPU's outbox, staged by the holds that ended in
+        // `TerminateCurrent`, comes back and drains here (§10.15 revision 2
+        // item 2).
+        self.end_hold(crate::syscall::HoldEnd::Return);
         TerminalRetirementState {
             retired_process,
             retired_root_key,
@@ -5380,37 +5412,44 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         );
     }
 
-    /// Moves a suspended F-service operation out of the stopped carrier before
-    /// the Process root is released. e1 delivery after block commit has no
-    /// Running claim, but it still owns exact wait/output/atomic cleanup that
-    /// cannot be left to trip the post-commit quiescence check.
-    fn transfer_suspended_service_cleanup_for_stop(&mut self) {
-        if self.service_state_is_quiescent() {
-            return;
-        }
+    /// The stop's actions on the stopped Thread's handoff, as its classified
+    /// `plan` names them (DW2 §10.15 revision 2 item 4), before the Process
+    /// root is released: the wait control is retired when the plan says so
+    /// (staging the quantum cancellation a pending suspension carries), and
+    /// the Thread's own F-service operation, if it has one, is moved out on
+    /// either branch (D-B), its output and pin settled on the stopped root.
+    fn retire_stopped_handoff(
+        &mut self,
+        plan: crate::syscall::StopHandoffPlan,
+        claim: crate::task::SchedulerExecutionClaim,
+    ) {
+        let thread = self.own.scheduled().thread;
         let mut discarded = None;
         let mut atomic_pin = None;
         let mut wait_deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
-        {
-            let mut terminal = self.core.services.terminal_cleanup(
-                Some(&mut wait_deadlines),
-                |output| {
-                    assert!(discarded.replace(output).is_none());
-                },
-                |pin| {
-                    assert!(atomic_pin.replace(pin).is_none());
-                },
-            );
-            terminal.cleanup_terminal_wait(
-                &mut self.core.registry,
-                &mut self.core.tasks,
-                &self.core.shared.waits,
-                &self.core.shared.execution,
-                self.own.scheduled().thread,
-                &mut self.core.cleanup,
-            );
-        }
-        {
+        let cancelled_quantum = self.core.services.retire_for_stop(
+            plan,
+            &mut self.own.wait_control,
+            thread,
+            claim.generation(),
+            Some(&mut wait_deadlines),
+            |output| {
+                assert!(discarded.replace(output).is_none());
+            },
+            |pin| {
+                assert!(atomic_pin.replace(pin).is_none());
+            },
+            &mut self.core.registry,
+            &mut self.core.tasks,
+            &self.core.shared.waits,
+            &self.core.shared.execution,
+            &mut self.core.cleanup,
+        );
+        // A suspension still pending (its Stop taken before
+        // `prepare_suspend`) carries the quantum cancellation that call
+        // would have staged (step-6 review D-1).
+        self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
+        if discarded.is_some() || atomic_pin.is_some() {
             let mut paging = self.paging.lock();
             let mut user = paging.pin_settlement_session(
                 self.own.active_root.as_ref().expect("active Process root"),
@@ -5426,14 +5465,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         }
         self.absorb_service_cleanup();
-    }
-
-    fn service_state_is_quiescent(&self) -> bool {
-        self.core.services.is_quiescent()
-            && self
-                .others
-                .with_own(self.own)
-                .all(|cpu| cpu.wait_control.is_clear())
     }
 
     fn stopped_service_state_is_quiescent(&self) -> bool {
@@ -6261,6 +6292,35 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         owed
     }
 
+    /// The one way a hold that pushed ends (DW2 §10.15 revision 2 items
+    /// 1–2): the F-service queue is absorbed, then `Drain` pops the shared
+    /// queue (its cascade and deferred-interrupt retry only: no teardown,
+    /// release or finalize step), `Stage` moves it into this CPU's outbox,
+    /// and `Return` moves this CPU's outbox back and drains fully, as a
+    /// syscall return does. Both queues are then empty, which the guard
+    /// checks again as it releases T.
+    fn end_hold(&mut self, end: crate::syscall::HoldEnd) {
+        self.absorb_service_cleanup();
+        let drain = crate::syscall::settle_hold_queues(
+            end,
+            self.cpu().index(),
+            &mut self.core.cleanup,
+            &mut self.core.outboxes,
+        );
+        if drain {
+            if end == crate::syscall::HoldEnd::Return {
+                self.drain_finalizers()
+                    .unwrap_or_else(|_| panic!("a returning hold could not drain its releases"));
+            } else {
+                self.drain_cleanup_queue();
+            }
+        }
+        crate::syscall::assert_hold_ended(
+            self.core.cleanup.is_empty(),
+            self.core.services.cleanup_is_empty(),
+        );
+    }
+
     /// Pops the cleanup queue until it is empty, cascading.
     fn drain_cleanup_queue(&mut self) {
         loop {
@@ -6783,26 +6843,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 user_return_prevented: true,
             },
         )?;
-        // All rejectable identity/safe-point checks have passed. Move any
-        // completed syscall releases out of the stopped carrier before the
-        // reaper witness is consumed; only the post-ack continuation may
-        // finalize them.
-        if was_suspended {
-            let thread = self.own.scheduled().thread;
-            let control = &mut self.own.wait_control;
-            let cancelled_quantum = self
-                .core
-                .services
-                .retire_idle_control_for_stop(control, thread, claim.generation())
-                .unwrap_or_else(|_| {
-                    panic!("remote stop suspended idle control drifted before precommit")
-                });
-            // A suspension still pending (its Stop taken before
-            // `prepare_suspend`) carries the quantum cancellation that call
-            // would have staged (step-6 review D-1).
-            self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
-            self.transfer_suspended_service_cleanup_for_stop();
-        }
+        // All rejectable identity/safe-point checks have passed. Classify the
+        // handoff once and act on its state (DW2 §10.15 revision 2 items
+        // 3–4), then move this hold's releases out of the stopped carrier
+        // before the reaper witness is consumed; only the post-ack
+        // continuation may finalize them. Every earlier hold ended with the
+        // shared queue empty, so they are this CPU's own pushes.
+        let thread = self.own.scheduled().thread;
+        let plan = crate::syscall::classify_stop_handoff(crate::syscall::StopHandoffFacts {
+            suspended: was_suspended,
+            running: !was_suspended,
+            other_running: running.is_some_and(|running| running.thread() != thread),
+            physically_executes: self.owned.physically_executing.physically_executes(thread),
+            terminal_owned: self.own.deferred_current.is_some(),
+            parked_call: self.core.parked.holds(thread),
+            outbox_staged: self.core.outboxes.staged(self.cpu().index()),
+            control: self.own.wait_control.handoff(),
+            owner: self.core.services.operation_owner(thread),
+        });
+        assert_eq!(plan.suspended_claim, was_suspended);
+        self.retire_stopped_handoff(plan, claim);
         self.stage_rendezvous_cleanup();
         let reaper = self
             .core
@@ -7118,6 +7178,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                         NativeSyscallRequest::ProcessExit { exit_code } => {
                             match runtime.prepare_remote_process_exit(exit_code) {
                                 ProcessTerminationPreparation::Retry => {
+                                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
                                     drop(guard);
                                     for _ in 0..64 {
                                         core::hint::spin_loop();
@@ -7255,6 +7316,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             }
                         }
                     }
+                    // The initiator's prepare hold: the target's releases
+                    // finalize only after its stops are acknowledged, at the
+                    // completion hold (§10.15 revision 2 item 2).
+                    runtime.end_hold(crate::syscall::hold_end_for(
+                        crate::syscall::native::SyscallControl::CompleteRemoteStop,
+                    ));
                     self.pending_remote_termination = Some(pending);
                     break 'handled crate::syscall::native::ReturnReady::complete_remote_stop();
                 }
@@ -8438,6 +8505,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
         }
         let settlement = runtime.resume_suspended(frame);
+        // The resumed wait's releases are drained before the Thread returns
+        // to user mode (§10.15 review C1).
+        runtime.end_hold(crate::syscall::HoldEnd::Drain);
         drop(runtime);
         drop(guard);
         self.apply_resume_settlement(settlement);
@@ -8728,6 +8798,7 @@ pub(super) fn enter(
                                 root_owner: (Some(root_owner)),
                                 cleanup: (CleanupQueue::new()),
                                 rendezvous_cleanup: (StagedStopCleanup::new()),
+                                outboxes: (crate::syscall::CleanupOutboxes::new()),
                                 parked: (crate::syscall::ParkedCalls::new()),
                                 owed_teardown: (crate::object::slot_queue::SlotQueue::new()),
                             }
@@ -9556,8 +9627,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         result: NativeSyscallResult,
     ) -> crate::syscall::native::ReturnReady {
+        // Every result ends its hold through `end_hold` (DW2 §10.15 revision
+        // 2): one that does not return drains or stages by its control.
+        let end = crate::syscall::hold_end_for(result.control);
         match crate::syscall::native::ReturnReady::without_return(result) {
-            Ok(ready) => ready,
+            Ok(ready) => {
+                self.end_hold(end);
+                ready
+            }
             Err(result) => {
                 // A syscall refused for memory frees owed memory first: one
                 // teardown step in this return's drain (§10.10 item 7).
@@ -9578,10 +9655,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         reason = "the drain proof is minted only after the drain completed"
     )]
     fn publish_final_releases(&mut self) -> crate::syscall::native::FinalizersDrained {
-        self.drain_finalizers()
-            .unwrap_or_else(|_| panic!("normal syscall return could not drain finalizers"));
-        // SAFETY: `drain_finalizers` returns `Ok` only after its loop emptied the cleanup queue
-        // and found no deferred parent release to push.
+        // A termination's completion returns here: its outbox comes back
+        // first, now that its stops are acknowledged.
+        self.end_hold(crate::syscall::HoldEnd::Return);
+        // SAFETY: `end_hold(Return)` runs `drain_finalizers`, which returns `Ok` only after its
+        // loop emptied the cleanup queue and found no deferred parent release to push, and then
+        // asserts both queues empty.
         unsafe { crate::syscall::native::FinalizersDrained::assume() }
     }
 }

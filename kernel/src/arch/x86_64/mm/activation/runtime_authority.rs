@@ -48,6 +48,15 @@ const _: () = assert!(
      published for GDB no longer locates it"
 );
 
+/// What the runtime guard checks of the value it guards as it releases T
+/// (DW2 §10.15 revision 2 item 1): the backstop that makes a hold that ends
+/// without draining or staging its releases fail at that hold, not at a
+/// later remote Stop's commit. It runs before the release, so no other CPU
+/// sees the state that broke the rule.
+pub(super) trait HoldEndCheck {
+    fn check_hold_end(&self);
+}
+
 /// Coarse DW0-H transaction boundary for the still-monolithic live authority
 /// set. Per-CPU carrier state remains outside this lock; shared mutations are
 /// serialized until the individual authorities grow narrower SMP adapters.
@@ -137,7 +146,10 @@ impl<T> RuntimeAuthorityLock<T> {
         core::array::from_fn(|_| RuntimeAuthorityHandle { lock: self })
     }
 
-    fn lock(&self) -> RuntimeAuthorityGuard<'_, T> {
+    fn lock(&self) -> RuntimeAuthorityGuard<'_, T>
+    where
+        T: HoldEndCheck,
+    {
         let mut observed = self.tickets.next_ticket.load(Ordering::Relaxed);
         let ticket = loop {
             if observed == u64::MAX {
@@ -176,7 +188,10 @@ pub(super) struct RuntimeAuthorityHandle<'a, T> {
 impl<T> RuntimeAuthorityHandle<'_, T> {
     /// Acquires the runtime authority. The guard mutably borrows this
     /// handle until it drops.
-    pub(super) fn lock(&mut self) -> RuntimeAuthorityGuard<'_, T> {
+    pub(super) fn lock(&mut self) -> RuntimeAuthorityGuard<'_, T>
+    where
+        T: HoldEndCheck,
+    {
         self.lock.lock()
     }
 
@@ -191,14 +206,14 @@ impl<T> RuntimeAuthorityHandle<'_, T> {
     }
 }
 
-pub(super) struct RuntimeAuthorityGuard<'a, T> {
+pub(super) struct RuntimeAuthorityGuard<'a, T: HoldEndCheck> {
     lock: &'a RuntimeAuthorityLock<T>,
     ticket: u64,
     owns_lock: bool,
     _handle: PhantomData<&'a mut ()>,
 }
 
-impl<T> Deref for RuntimeAuthorityGuard<'_, T> {
+impl<T: HoldEndCheck> Deref for RuntimeAuthorityGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -209,7 +224,7 @@ impl<T> Deref for RuntimeAuthorityGuard<'_, T> {
     }
 }
 
-impl<T> DerefMut for RuntimeAuthorityGuard<'_, T> {
+impl<T: HoldEndCheck> DerefMut for RuntimeAuthorityGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: as in `deref`, the guard holds the ticket, and `&mut self` on the guard makes
         // this the only reference to the value for its lifetime.
@@ -217,9 +232,11 @@ impl<T> DerefMut for RuntimeAuthorityGuard<'_, T> {
     }
 }
 
-impl<T> Drop for RuntimeAuthorityGuard<'_, T> {
+impl<T: HoldEndCheck> Drop for RuntimeAuthorityGuard<'_, T> {
     fn drop(&mut self) {
         if self.owns_lock {
+            // SAFETY: as in `deref`; the ticket is still held here.
+            unsafe { &*self.lock.value.get() }.check_hold_end();
             self.lock
                 .tickets
                 .serving
@@ -304,7 +321,7 @@ impl<P> PagingLock<P> {
     }
 }
 
-impl<'g, T> RuntimeAuthorityGuard<'g, T> {
+impl<'g, T: HoldEndCheck> RuntimeAuthorityGuard<'g, T> {
     /// Splits this T guard into its value and access to `paging` beneath it.
     /// The access mutably borrows the guard, so P is reached only while T is
     /// held, and only after it.
@@ -501,6 +518,74 @@ mod tests {
     use super::*;
 
     fn no_service() {}
+
+    impl HoldEndCheck for () {
+        fn check_hold_end(&self) {}
+    }
+    impl HoldEndCheck for u32 {
+        fn check_hold_end(&self) {}
+    }
+    impl<const N: usize> HoldEndCheck for [u8; N] {
+        fn check_hold_end(&self) {}
+    }
+    impl<const N: usize> HoldEndCheck for [u32; N] {
+        fn check_hold_end(&self) {}
+    }
+
+    /// A guarded value with the live runtime's two queues, checked as the
+    /// live one is.
+    struct Queues {
+        shared: crate::syscall::CleanupQueue<4>,
+        services: crate::syscall::CleanupQueue<4>,
+    }
+
+    impl HoldEndCheck for Queues {
+        fn check_hold_end(&self) {
+            crate::syscall::assert_hold_ended(self.shared.is_empty(), self.services.is_empty());
+        }
+    }
+
+    /// DW2 §10.15 revision 2 item 1: the guard's backstop fires on a hold
+    /// that ends with a release in a queue, and only then.
+    #[test]
+    fn the_guard_backstop_fires_on_an_undrained_hold() {
+        let lock = RuntimeAuthorityLock::new(
+            Queues {
+                shared: crate::syscall::CleanupQueue::new(),
+                services: crate::syscall::CleanupQueue::new(),
+            },
+            no_service,
+        );
+        let [mut handle] = lock.handles::<1>();
+        let mut registry = crate::object::ObjectRegistry::<4>::new();
+        let creation = registry.create(deepwyrm_abi::DW_OBJECT_TYPE_EVENT).unwrap();
+        let reference = registry.creation_into_handle(creation).unwrap();
+        let release = registry.release_handle(reference).unwrap().unwrap();
+        // A drained hold ends quietly.
+        {
+            let mut guard = handle.lock();
+            guard.services.push(release);
+            let release = guard.services.pop().unwrap();
+            registry.complete_finalization(release).unwrap();
+        }
+        let creation = registry.create(deepwyrm_abi::DW_OBJECT_TYPE_EVENT).unwrap();
+        let reference = registry.creation_into_handle(creation).unwrap();
+        let release = registry.release_handle(reference).unwrap().unwrap();
+        let undrained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = handle.lock();
+            guard.shared.push(release);
+        }));
+        let message = undrained.expect_err("an undrained hold must fail at its end");
+        assert_eq!(
+            message
+                .downcast_ref::<std::string::String>()
+                .map(std::string::String::as_str),
+            Some(
+                "a runtime hold ended with cleanup undrained (shared queue empty: false, \
+                 F-service queue empty: true)"
+            )
+        );
+    }
 
     /// A host model of addendum §11.2.2's deadlock (D1 commit 4). An
     /// initiator holds a lock and waits, for a bounded number of steps, for

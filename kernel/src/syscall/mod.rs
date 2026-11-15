@@ -14,6 +14,25 @@ mod adapters;
 mod f_services;
 #[cfg_attr(
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live carrier ends runtime holds")
+)]
+mod hold_end;
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live carrier takes remote Stops")
+)]
+mod stop_handoff;
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+pub(crate) use hold_end::assert_hold_ended;
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use hold_end::{CleanupOutboxes, HoldEnd, hold_end_for, settle_hold_queues};
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use stop_handoff::{StopHandoffFacts, StopHandoffPlan, classify_stop_handoff};
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
     allow(
         dead_code,
         reason = "only the live family-G facade runs calls in steps"
@@ -53,7 +72,7 @@ pub(crate) use adapters::atomic_wake_with;
 )]
 pub(crate) use adapters::{
     CleanupQueue, HeldReleases, NativeWaitControl, StagedStopCleanup, TerminalWaitCleanup,
-    WaitSuspendError, WaitSuspendState, WaitSyscallAction, WaitTerminalCleanup,
+    WaitControlHandoff, WaitSuspendError, WaitSuspendState, WaitSyscallAction, WaitTerminalCleanup,
     resume_wait_thread_syscall, timer_cancel, timer_create, timer_set, wait_many_syscall,
     wait_one_syscall,
 };
