@@ -54,7 +54,8 @@ const _: () = assert!(
 /// later remote Stop's commit. It runs before the release, so no other CPU
 /// sees the state that broke the rule.
 pub(super) trait HoldEndCheck {
-    fn check_hold_end(&self);
+    /// `taken` is where the hold's guard was acquired, for the panic.
+    fn check_hold_end(&self, taken: &'static core::panic::Location<'static>);
 }
 
 /// Coarse DW0-H transaction boundary for the still-monolithic live authority
@@ -146,10 +147,12 @@ impl<T> RuntimeAuthorityLock<T> {
         core::array::from_fn(|_| RuntimeAuthorityHandle { lock: self })
     }
 
+    #[track_caller]
     fn lock(&self) -> RuntimeAuthorityGuard<'_, T>
     where
         T: HoldEndCheck,
     {
+        let taken = core::panic::Location::caller();
         let mut observed = self.tickets.next_ticket.load(Ordering::Relaxed);
         let ticket = loop {
             if observed == u64::MAX {
@@ -173,6 +176,7 @@ impl<T> RuntimeAuthorityLock<T> {
             lock: self,
             ticket,
             owns_lock: true,
+            taken,
             _handle: PhantomData,
         }
     }
@@ -188,6 +192,7 @@ pub(super) struct RuntimeAuthorityHandle<'a, T> {
 impl<T> RuntimeAuthorityHandle<'_, T> {
     /// Acquires the runtime authority. The guard mutably borrows this
     /// handle until it drops.
+    #[track_caller]
     pub(super) fn lock(&mut self) -> RuntimeAuthorityGuard<'_, T>
     where
         T: HoldEndCheck,
@@ -210,6 +215,8 @@ pub(super) struct RuntimeAuthorityGuard<'a, T: HoldEndCheck> {
     lock: &'a RuntimeAuthorityLock<T>,
     ticket: u64,
     owns_lock: bool,
+    /// Where this hold began, named if it ends breaking the hold-end rule.
+    taken: &'static core::panic::Location<'static>,
     _handle: PhantomData<&'a mut ()>,
 }
 
@@ -236,7 +243,7 @@ impl<T: HoldEndCheck> Drop for RuntimeAuthorityGuard<'_, T> {
     fn drop(&mut self) {
         if self.owns_lock {
             // SAFETY: as in `deref`; the ticket is still held here.
-            unsafe { &*self.lock.value.get() }.check_hold_end();
+            unsafe { &*self.lock.value.get() }.check_hold_end(self.taken);
             self.lock
                 .tickets
                 .serving
@@ -520,16 +527,16 @@ mod tests {
     fn no_service() {}
 
     impl HoldEndCheck for () {
-        fn check_hold_end(&self) {}
+        fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
     }
     impl HoldEndCheck for u32 {
-        fn check_hold_end(&self) {}
+        fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
     }
     impl<const N: usize> HoldEndCheck for [u8; N] {
-        fn check_hold_end(&self) {}
+        fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
     }
     impl<const N: usize> HoldEndCheck for [u32; N] {
-        fn check_hold_end(&self) {}
+        fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
     }
 
     /// A guarded value with the live runtime's two queues, checked as the
@@ -540,8 +547,10 @@ mod tests {
     }
 
     impl HoldEndCheck for Queues {
-        fn check_hold_end(&self) {
-            crate::syscall::assert_hold_ended(self.shared.is_empty(), self.services.is_empty());
+        fn check_hold_end(&self, taken: &'static core::panic::Location<'static>) {
+            if !(self.shared.is_empty() && self.services.is_empty()) {
+                panic!("hold taken at {}:{}", taken.file(), taken.line());
+            }
         }
     }
 
@@ -571,19 +580,19 @@ mod tests {
         let creation = registry.create(deepwyrm_abi::DW_OBJECT_TYPE_EVENT).unwrap();
         let reference = registry.creation_into_handle(creation).unwrap();
         let release = registry.release_handle(reference).unwrap().unwrap();
+        let mut taken_line = 0;
         let undrained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            taken_line = line!() + 1;
             let mut guard = handle.lock();
             guard.shared.push(release);
         }));
         let message = undrained.expect_err("an undrained hold must fail at its end");
+        // The backstop names the hold by where its guard was taken.
         assert_eq!(
             message
                 .downcast_ref::<std::string::String>()
                 .map(std::string::String::as_str),
-            Some(
-                "a runtime hold ended with cleanup undrained (shared queue empty: false, \
-                 F-service queue empty: true)"
-            )
+            Some(std::format!("hold taken at {}:{taken_line}", file!()).as_str())
         );
     }
 

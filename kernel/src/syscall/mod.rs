@@ -22,13 +22,10 @@ mod hold_end;
     allow(dead_code, reason = "only the live carrier takes remote Stops")
 )]
 mod stop_handoff;
-#[cfg(any(
-    test,
-    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
-))]
-pub(crate) use hold_end::assert_hold_ended;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use hold_end::{CleanupOutboxes, HoldEnd, hold_end_for, settle_hold_queues};
+pub(crate) use hold_end::{
+    CleanupOutboxes, HoldEnd, assert_hold_ended, hold_end_for, settle_hold_queues,
+};
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use stop_handoff::{StopHandoffFacts, StopHandoffPlan, classify_stop_handoff};
 #[cfg_attr(

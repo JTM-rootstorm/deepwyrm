@@ -3945,11 +3945,17 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_authority::HoldEndCheck
     for PrimordialRuntimeState<'_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    fn check_hold_end(&self) {
-        crate::syscall::assert_hold_ended(
+    fn check_hold_end(&self, taken: &'static core::panic::Location<'static>) {
+        let (shared, services) = (
             self.core.cleanup.is_empty(),
             self.core.services.cleanup_is_empty(),
         );
+        if !(shared && services) {
+            panic!(
+                "a runtime hold taken at {taken} ended with cleanup undrained (shared queue \
+                 empty: {shared}, F-service queue empty: {services})"
+            );
+        }
     }
 }
 

@@ -19,8 +19,8 @@ mod runtime_authority;
 // The runtime guard checks the value it guards as it releases T (DW2 §10.15
 // revision 2 item 1). The fixtures guard plain values with nothing to check.
 impl runtime_authority::HoldEndCheck for u32 {
-    fn check_hold_end(&self) {}
+    fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
 }
 impl runtime_authority::HoldEndCheck for () {
-    fn check_hold_end(&self) {}
+    fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
 }
