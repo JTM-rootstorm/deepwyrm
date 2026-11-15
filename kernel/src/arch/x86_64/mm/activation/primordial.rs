@@ -7863,7 +7863,12 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut step = {
             let mut guard = this.runtime.lock();
             let mut runtime = guard.on(&mut this.owned);
-            runtime.prepare_terminal_handoff_detached()
+            let step = runtime.prepare_terminal_handoff_detached();
+            // The terminal handoff's first hold drained this CPU's outbox;
+            // what it pushed after that (a root teardown's releases) ends
+            // drained too (DW2 §10.15 revision 2 item 1).
+            runtime.end_hold(crate::syscall::HoldEnd::Drain);
+            step
         };
         loop {
             step = match step {
@@ -7880,7 +7885,10 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     let mut guard = this.runtime.lock();
                     let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     runtime.commit_scheduler_root_switch(executed);
-                    PreparedTerminalStep::Final(runtime.finish_terminal_successor(state))
+                    let step =
+                        PreparedTerminalStep::Final(runtime.finish_terminal_successor(state));
+                    runtime.end_hold(crate::syscall::HoldEnd::Drain);
+                    step
                 }
                 PreparedTerminalStep::KernelRoot {
                     prepared,
@@ -7898,7 +7906,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     let mut guard = this.runtime.lock();
                     let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     runtime.commit_terminal_kernel_root_switch(executed);
-                    runtime.continue_terminal_after_kernel_root(continuation)
+                    let step = runtime.continue_terminal_after_kernel_root(continuation);
+                    runtime.end_hold(crate::syscall::HoldEnd::Drain);
+                    step
                 }
                 PreparedTerminalStep::PrimordialRoot {
                     prepared,
@@ -7916,7 +7926,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     let mut guard = this.runtime.lock();
                     let mut runtime = guard.on_root_switch_flight(&mut this.owned);
                     runtime.commit_terminal_primordial_root_switch(executed);
-                    runtime.continue_terminal_after_primordial_root(retirement)
+                    let step = runtime.continue_terminal_after_primordial_root(retirement);
+                    runtime.end_hold(crate::syscall::HoldEnd::Drain);
+                    step
                 }
                 PreparedTerminalStep::Final(handoff) => match handoff {
                     // SAFETY: [P-HANDOFF] `prepare_terminal_handoff` bound the next Thread's stack
