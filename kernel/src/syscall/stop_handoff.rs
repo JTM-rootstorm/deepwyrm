@@ -3,6 +3,14 @@
 //! named and refused: it is a prepared switch whose destination already runs
 //! on this CPU, and stopping there is not sound (audit R2).
 //!
+//! The panics below are invariants, not cases a Stop may meet (DW2 §10.16
+//! revision 2 item 5). Publication refuses a CPU in any of those states
+//! (`stop_publication`), and every hold that moves a CPU into one looks for
+//! a Stop first and takes it instead (preemption and yield, `prepare_suspend`,
+//! the idle poll, a termination's prepare hold on the syscall and the
+//! exception path). So a Stop is published before the transition, and that
+//! hold finds it, or after, and publication refuses it.
+//!
 //! The stopped CPU's precommit reads the facts a Thread's handoff into and
 //! out of a suspension leaves behind (its suspended and Running claims, what
 //! physically executes, its wait control, the stopped Thread's own F-service
@@ -99,9 +107,14 @@ pub(crate) fn classify_stop_handoff(facts: StopHandoffFacts) -> StopHandoffPlan 
     let unclassified = |why: &str| -> ! {
         panic!("remote stop precommit cannot classify its handoff ({why}): {facts:?}")
     };
+    // Upheld by publication's deferred-current refusal.
     if facts.terminal_owned {
         unclassified("a terminal handoff owns the continuation");
     }
+    // An outbox is staged only between a termination's prepare hold and its
+    // completion hold, or by a Retry hold that pushed nothing. Publication
+    // refuses a CPU that owns a pending termination (audit D1), and both
+    // prepare holds look for a Stop before preparing.
     if facts.outbox_staged != 0 {
         unclassified("the stopped CPU's cleanup outbox is not empty");
     }
@@ -126,7 +139,9 @@ pub(crate) fn classify_stop_handoff(facts: StopHandoffFacts) -> StopHandoffPlan 
             // already runs on this CPU, and the reaper would resume it from
             // the continuation it saved when it last switched out, which its
             // run since has overwritten. Not sound to stop here (DW2 §10.15
-            // audit R2); refused until a design says what the stop does.
+            // audit R2). Unreachable: publication refuses this state, and
+            // each of those four holds takes a Stop published before it
+            // instead of preparing the switch (DW2 §10.16 revision 2).
             WaitControlHandoff::Clear => {
                 unclassified("a prepared switch's outgoing Thread, its destination already running")
             }

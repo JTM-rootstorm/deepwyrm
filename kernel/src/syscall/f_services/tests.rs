@@ -2778,3 +2778,225 @@ fn a_remote_stop_settles_every_handoff_state() {
         Some(StopHandoffState::ResumedUnsettled)
     );
 }
+
+/// The publication facts of the fixture's CPU, its claims and wait control
+/// read as `terminal_stop_plan` reads them, with the fixture's Thread
+/// terminal and last made current there, and every other fact stoppable.
+fn publication_facts(
+    fixture: &Fixture,
+) -> crate::syscall::stop_publication::StopTargetFacts<ThreadKey, ProcessKey> {
+    let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
+    let (suspended, running) = crate::syscall::stop_publication::claim_facts(
+        &fixture.execution,
+        cpu,
+        &[Some(fixture.thread)],
+    );
+    crate::syscall::stop_publication::StopTargetFacts {
+        suspended,
+        running,
+        control: fixture.control.handoff(),
+        last_scheduled: Some(fixture.thread),
+        root_switch_flight: false,
+        active_root: Some(fixture.process),
+        mailbox_idle: true,
+        deferred_current: false,
+        pending_termination: false,
+    }
+}
+
+fn publication(
+    fixture: &Fixture,
+) -> Result<
+    crate::syscall::stop_publication::StopPublication,
+    crate::syscall::stop_publication::StopRefusal,
+> {
+    let process = fixture.process;
+    crate::syscall::stop_publication::decide_stop_publication(publication_facts(fixture), |_| {
+        process
+    })
+}
+
+/// Blocks the fixture's Thread in a `WaitOne` and returns its event.
+fn block_in_wait(fixture: &mut Fixture) -> DwHandle {
+    assert_eq!(
+        fixture
+            .handled(NativeSyscallRequest::EventCreate {
+                requested_rights: DW_RIGHT_WAIT,
+                out_event: DwUserAddress(BASE + 0x500),
+            })
+            .status,
+        DW_STATUS_SUCCESS
+    );
+    let event = DwHandle(u64_at(&fixture.user, BASE + 0x500));
+    let wait = fixture.handled(NativeSyscallRequest::WaitOne {
+        handle: event,
+        signals: DW_SIGNAL_SIGNALED,
+        deadline: DwDeadline(50),
+        out_result: DwUserAddress(BASE + 0x580),
+    });
+    assert_eq!(
+        wait.control,
+        super::super::native::SyscallControl::SuspendCurrent
+    );
+    event
+}
+
+/// Ends a fixture's blocked wait as a Stop's cleanup does, so it drops whole.
+fn retire_wait_for_stop(
+    fixture: &mut Fixture,
+    event: DwHandle,
+    plan: crate::syscall::stop_handoff::StopHandoffPlan,
+    generation: u64,
+) {
+    let mut cleanup = CleanupQueue::<OBJECTS>::new();
+    let thread = fixture.thread;
+    let user = &mut fixture.user;
+    let _ticket = fixture.services.retire_for_stop(
+        plan,
+        &mut fixture.control,
+        thread,
+        generation,
+        Some(&mut fixture.wait_deadlines),
+        |output| user.discard_owned_output(output),
+        |_| {},
+        &mut fixture.registry,
+        &mut fixture.tasks,
+        &fixture.waits,
+        &fixture.execution,
+        &mut cleanup,
+    );
+    assert!(cleanup.is_empty());
+    assert!(fixture.services.is_quiescent());
+    close_event(fixture, event);
+}
+
+/// DW2 §10.16 revision 2 items 1 and 6, audit R2: a Stop is published to a
+/// CPU whose terminal Thread is running, has committed its block, or idles
+/// in it, and is refused once that Thread's `prepare_suspend` has prepared
+/// a switch to another Thread, whose destination may already execute. The
+/// refusal ends at the destination's handoff, after which the blocked
+/// Thread holds no claim there and nothing is published.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for these suspension tests"
+)]
+fn a_stop_is_refused_across_a_wait_switch_and_published_otherwise() {
+    use crate::syscall::stop_handoff::{StopHandoffPlan, StopHandoffState};
+    use crate::syscall::stop_publication::{StopPublication, StopRefusal, StopTarget};
+    const ENTRY: u64 = 0xffff_8000_0012_3000;
+    let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
+
+    // Running.
+    let mut fixture = Fixture::with_runnable_sender();
+    assert_eq!(
+        publication(&fixture),
+        Ok(StopPublication::Publish {
+            claim: StopTarget::Running,
+            retire_unentered: false,
+        })
+    );
+
+    // Pending, then a switch prepared to the sender.
+    let event = block_in_wait(&mut fixture);
+    assert_eq!(
+        publication(&fixture),
+        Ok(StopPublication::Publish {
+            claim: StopTarget::Suspended,
+            retire_unentered: false,
+        })
+    );
+    // SAFETY: the fixture's running Thread is the physical carrier and the
+    // entry is a fixed synthetic address that this test never enters.
+    let plan = unsafe {
+        fixture.services.prepare_suspend(
+            &mut fixture.control,
+            &fixture.tasks,
+            &fixture.execution,
+            ENTRY,
+        )
+    }
+    .unwrap();
+    assert!(matches!(plan, NativeSuspendPlan::Switch(_)));
+    drop(plan);
+    assert_eq!(fixture.control.handoff(), WaitControlHandoff::Clear);
+    assert_eq!(
+        fixture
+            .execution
+            .running_claim_on(cpu)
+            .map(|claim| claim.thread()),
+        fixture.sender,
+        "the destination is not terminal: the R2 test reads it unfiltered"
+    );
+    assert_eq!(publication(&fixture), Err(StopRefusal::PreparedSwitch));
+
+    // The destination's handoff ends the state.
+    let outgoing = fixture.execution.suspended_claim_on(cpu).unwrap();
+    fixture.execution.complete_switch_on(outgoing).unwrap();
+    assert_eq!(publication(&fixture), Ok(StopPublication::Nothing));
+    retire_wait_for_stop(
+        &mut fixture,
+        event,
+        StopHandoffPlan {
+            state: StopHandoffState::Running,
+            suspended_claim: true,
+            retire_control: false,
+            transfer_service_cleanup: true,
+        },
+        outgoing.generation(),
+    );
+
+    // Idle: a Thread that blocks with nothing else to run.
+    let mut idle = Fixture::new();
+    let idle_event = block_in_wait(&mut idle);
+    // SAFETY: as above.
+    let plan = unsafe {
+        idle.services
+            .prepare_suspend(&mut idle.control, &idle.tasks, &idle.execution, ENTRY)
+    }
+    .unwrap();
+    assert!(matches!(plan, NativeSuspendPlan::IdleCurrent));
+    assert_eq!(
+        publication(&idle),
+        Ok(StopPublication::Publish {
+            claim: StopTarget::Suspended,
+            retire_unentered: false,
+        })
+    );
+    let claim = idle.execution.suspended_claim_on(cpu).unwrap();
+    retire_wait_for_stop(
+        &mut idle,
+        idle_event,
+        StopHandoffPlan {
+            state: StopHandoffState::Idle,
+            suspended_claim: true,
+            retire_control: true,
+            transfer_service_cleanup: true,
+        },
+        claim.generation(),
+    );
+    idle.execution.stop_suspended_claim_on(claim).unwrap();
+    idle.execution.complete_switch_on(claim).unwrap();
+}
+
+/// DW2 §10.16 revision 2 items 1 and 6 for a yield, which prepares its
+/// switch as a preemption does: the outgoing Thread keeps the suspended
+/// claim with a Clear control and the destination the Running claim, and a
+/// Stop for the outgoing Thread is refused until the destination's handoff.
+#[test]
+fn a_stop_is_refused_across_a_yield_switch() {
+    use crate::syscall::stop_publication::{StopPublication, StopRefusal};
+    let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
+    let fixture = Fixture::with_runnable_sender();
+    let decision = fixture
+        .execution
+        .yield_current_on(cpu, fixture.thread)
+        .unwrap();
+    assert_eq!(decision.previous, Some(fixture.thread));
+    assert_eq!(decision.current, fixture.sender);
+    let outgoing = fixture.execution.suspended_claim_on(cpu).unwrap();
+    assert_eq!(outgoing.thread(), fixture.thread);
+    assert_eq!(publication(&fixture), Err(StopRefusal::PreparedSwitch));
+    fixture.execution.complete_switch_on(outgoing).unwrap();
+    assert_eq!(publication(&fixture), Ok(StopPublication::Nothing));
+}

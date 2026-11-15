@@ -616,6 +616,14 @@ pub(crate) fn take_current_notification_at_safe_point() -> MailboxNotification {
         .unwrap_or_else(|_| fail_transport_and_halt())
 }
 
+/// Whether `cpu`'s rendezvous mailbox could take a Stop now (DW2 §10.16
+/// revision 2 item 1). A publisher reads it under the runtime authority, in
+/// the hold that publishes.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn remote_stop_mailbox_is_idle(cpu: CpuIndex) -> bool {
+    LIVE_IDLE_WAKE.mailboxes[cpu.index()].stop_is_idle()
+}
+
 /// Completes an exact Stop/HoldSafe only from the current CPU's reaper/safe
 /// point.  The mailbox remains stationary; the carrier supplies the unique
 /// mutable transition authority after the hard IRQ has returned.

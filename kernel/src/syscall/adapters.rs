@@ -5334,6 +5334,9 @@ impl NativeWaitControl {
         self.state = match &plan {
             NativeSuspendPlan::IdleCurrent => NativeWaitControlState::Idle(state),
             NativeSuspendPlan::Switch(_) => NativeWaitControlState::Clear,
+            NativeSuspendPlan::ServiceRendezvous => {
+                unreachable!("the wait engine never diverts a suspension to a Stop")
+            }
         };
         Ok(plan)
     }
@@ -5365,6 +5368,9 @@ impl NativeWaitControl {
         self.state = match &plan {
             NativeSuspendPlan::IdleCurrent => NativeWaitControlState::Idle(state),
             NativeSuspendPlan::Switch(_) => NativeWaitControlState::Clear,
+            NativeSuspendPlan::ServiceRendezvous => {
+                unreachable!("the wait engine never diverts a suspension to a Stop")
+            }
         };
         Ok(plan)
     }

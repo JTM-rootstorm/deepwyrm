@@ -241,11 +241,18 @@ impl NativeSyscallFrameRuntime for FrameRuntime {
         frame.authorize_return(current_binding_generation, self)
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+    fn invalid_return(
+        &mut self,
+        error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> crate::syscall::native::ExceptionTermination {
         assert!(self.invalid_return.replace(error).is_none());
+        crate::syscall::native::ExceptionTermination::Terminated
     }
 
-    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+    fn user_exception(
+        &mut self,
+        _record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> crate::syscall::native::ExceptionTermination {
         panic!("unexpected synthetic user exception")
     }
 
@@ -358,11 +365,17 @@ impl NativeSyscallFrameRuntime for SuspendingRuntime {
         panic!("suspended dispatch must not authorize before resume")
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+    fn invalid_return(
+        &mut self,
+        error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> crate::syscall::native::ExceptionTermination {
         panic!("unexpected invalid suspended return: {error:?}")
     }
 
-    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+    fn user_exception(
+        &mut self,
+        _record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> crate::syscall::native::ExceptionTermination {
         panic!("unexpected suspended user exception")
     }
 
@@ -468,11 +481,17 @@ impl NativeSyscallFrameRuntime for YieldingRuntime {
         NativeSyscallResult::returning(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+    fn invalid_return(
+        &mut self,
+        error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> crate::syscall::native::ExceptionTermination {
         panic!("unexpected invalid return: {error:?}")
     }
 
-    fn user_exception(&mut self, _record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+    fn user_exception(
+        &mut self,
+        _record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> crate::syscall::native::ExceptionTermination {
         panic!("unexpected user exception")
     }
 

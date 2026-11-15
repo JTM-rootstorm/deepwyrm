@@ -1570,6 +1570,21 @@ fn arm_current_normal_quantum() -> bool {
     false
 }
 
+/// Goes to the rendezvous reaper for the Stop a runtime hold found in this
+/// CPU's mailbox. The mailbox keeps a requested Stop until its precommit, so
+/// it is still there; anything else is a broken invariant.
+fn service_published_stop(context: *mut ()) -> ! {
+    match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
+        crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
+            stage_rendezvous_action(RendezvousAction(request)).unwrap_or_else(|_| halt_forever());
+            handoff_to_rendezvous_reaper(context)
+        }
+        crate::arch::x86_64::rendezvous::MailboxNotification::None
+        | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
+        | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => halt_forever(),
+    }
+}
+
 fn poll_timer_return_stop(context: *mut ()) {
     match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
         crate::arch::x86_64::rendezvous::MailboxNotification::None
@@ -1955,19 +1970,21 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
     // SAFETY: [DIVERGENT] `context` is this CPU's binding, passed through the reaper handoff, which
     // abandoned the deferred Thread stack and every reborrow on it.
     let mut carrier = unsafe { DivergentCarrier::published(carrier) };
-    match action {
-        TerminalAction::CompleteCurrent => {}
-        TerminalAction::InvalidReturn(error) => {
-            carrier.get().invalid_return(error);
-        }
-        TerminalAction::UserException(record) => {
-            carrier.get().user_exception(record);
-        }
-        TerminalAction::UserResourceFault(record) => {
-            carrier.get().user_resource_fault(record);
+    let ended = match action {
+        TerminalAction::CompleteCurrent => crate::syscall::native::ExceptionTermination::Terminated,
+        TerminalAction::InvalidReturn(error) => carrier.get().invalid_return(error),
+        TerminalAction::UserException(record) => carrier.get().user_exception(record),
+        TerminalAction::UserResourceFault(record) => carrier.get().user_resource_fault(record),
+    };
+    match ended {
+        crate::syscall::native::ExceptionTermination::Terminated => R::terminate_current(carrier),
+        // Another termination's Stop came first: the exception's own
+        // termination was dropped and the Thread ends at the rendezvous
+        // reaper (DW2 §10.16 revision 2 item 4).
+        crate::syscall::native::ExceptionTermination::Stopped => {
+            R::service_current_rendezvous(carrier)
         }
     }
-    R::terminate_current(carrier)
 }
 
 #[allow(
@@ -2088,6 +2105,11 @@ unsafe fn native_runtime_trampoline<
             match plan {
                 crate::syscall::native::NativeSuspendPlan::Switch(plan) => {
                     switch_kernel_context(plan);
+                }
+                // DW2 §10.16 revision 2 item 2: a Stop came before the
+                // suspension; its precommit retires the pending control.
+                crate::syscall::native::NativeSuspendPlan::ServiceRendezvous => {
+                    service_published_stop(context)
                 }
                 crate::syscall::native::NativeSuspendPlan::IdleCurrent => {
                     loop {
@@ -2228,6 +2250,14 @@ unsafe fn native_runtime_trampoline<
                                 switch_kernel_context(plan);
                                 break;
                             }
+                            // DW2 §10.16 revision 2 item 2: the poll's hold
+                            // found a Stop; its precommit retires the idle
+                            // suspension.
+                            crate::syscall::native::NativeIdleSuspendPoll::ServiceRendezvous => {
+                                crate::arch::x86_64::idle::cancel_current_idle(idle)
+                                    .unwrap_or_else(|_| halt_forever());
+                                service_published_stop(context)
+                            }
                         }
                     }
                 }
@@ -2320,25 +2350,20 @@ fn settle_dispatched_control<
         }
         crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => {}
     }
-    if control == crate::syscall::native::SyscallControl::ServiceRendezvous {
-        match crate::arch::x86_64::idle::take_current_notification_at_safe_point() {
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(request) => {
-                stage_rendezvous_action(RendezvousAction(request))
-                    .unwrap_or_else(|_| halt_forever());
-                handoff_to_rendezvous_reaper(context);
-            }
-            crate::arch::x86_64::rendezvous::MailboxNotification::None
-            | crate::arch::x86_64::rendezvous::MailboxNotification::Wake
-            | crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_) => halt_forever(),
-        }
-    }
-    if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
+    let control = if control == crate::syscall::native::SyscallControl::CompleteRemoteStop {
         // SAFETY: [CARRIER] scoped reborrow; the trampoline holds no other one.
         let runtime = unsafe { &mut *context.cast::<R>() };
         runtime.complete_remote_stop(frame, current_binding_generation())
     } else {
         control
+    };
+    // A Stop-serviced call, or a completed termination whose return was
+    // refused and whose exception then found a Stop (DW2 §10.16 revision 2
+    // item 4).
+    if control == crate::syscall::native::SyscallControl::ServiceRendezvous {
+        service_published_stop(context);
     }
+    control
 }
 
 /// Gives the CPU to the next runnable Thread for a call parked between

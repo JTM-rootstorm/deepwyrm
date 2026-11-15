@@ -8376,7 +8376,8 @@ fn wait_suspend_plan_switches_to_fresh_runnable_sibling() {
         .unwrap()
     {
         crate::syscall::native::NativeSuspendPlan::Switch(plan) => plan,
-        crate::syscall::native::NativeSuspendPlan::IdleCurrent => {
+        crate::syscall::native::NativeSuspendPlan::IdleCurrent
+        | crate::syscall::native::NativeSuspendPlan::ServiceRendezvous => {
             panic!("fresh runnable sibling must be selected instead of idle")
         }
     };

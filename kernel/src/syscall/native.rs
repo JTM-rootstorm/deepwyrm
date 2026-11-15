@@ -1370,6 +1370,12 @@ impl<T: NativeSyscallServices> NativeSyscallHandler for T {
 pub(crate) enum NativeSuspendPlan<'owner> {
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
     IdleCurrent,
+    /// A Stop was published to this CPU before its suspension was prepared:
+    /// the wait control stays `Pending`, which the Stop's precommit retires,
+    /// and the trampoline goes to the rendezvous reaper (DW2 §10.16
+    /// revision 2 item 2). Only a runtime that publishes remote Stops
+    /// returns it; the wait engine never does.
+    ServiceRendezvous,
 }
 
 #[must_use = "idle suspension polls must either continue idling, resume the waiter, or switch to newly runnable work"]
@@ -1377,6 +1383,12 @@ pub(crate) enum NativeIdleSuspendPoll<'owner> {
     Continue,
     ResumeCurrent,
     Switch(crate::arch::x86_64::context::KernelSwitchPlan<'owner>),
+    /// A Stop was published to this CPU before the poll: the suspension
+    /// stays `Idle`, which the Stop's precommit retires, and the idle loop
+    /// goes to the rendezvous reaper without relying on the IPI's latch
+    /// (DW2 §10.16 revision 2 item 2). Only a runtime that publishes remote
+    /// Stops returns it; the wait engine never does.
+    ServiceRendezvous,
 }
 
 #[must_use = "a resumed syscall either owns a live current Thread or must service the published rendezvous"]
@@ -1385,6 +1397,31 @@ pub(crate) enum NativeResumeOutcome {
     Resumed,
     ServiceRendezvous,
     TerminateCurrent,
+}
+
+/// How a terminal exception (an unhandled CPL3 exception, a resource fault
+/// or a rejected user return) ended the current Thread (DW2 §10.16 revision
+/// 2 item 4).
+#[must_use = "a Stopped exception must go to the rendezvous reaper, not the terminal handoff"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExceptionTermination {
+    /// The exception's own termination completed: the terminal handoff
+    /// follows.
+    Terminated,
+    /// A Stop from another termination was found first: the exception's own
+    /// termination is dropped, having changed nothing, and the Thread goes to
+    /// the rendezvous reaper.
+    Stopped,
+}
+
+impl ExceptionTermination {
+    /// The control a syscall that ended in this exception returns.
+    pub(crate) const fn control(self) -> SyscallControl {
+        match self {
+            Self::Terminated => SyscallControl::TerminateCurrent,
+            Self::Stopped => SyscallControl::ServiceRendezvous,
+        }
+    }
 }
 
 #[must_use = "a DW1-B safe-boundary decision must return or immediately consume its switch plan"]
@@ -1577,12 +1614,18 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     /// Converts a rejected user return into terminal state for the current
     /// Process. The raw trampoline performs the divergent reaper-stack handoff
     /// after this method returns.
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError);
+    fn invalid_return(
+        &mut self,
+        error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> ExceptionTermination;
 
     /// Converts a structured CPL3 exception into terminal state for the
     /// current Process. The exception trampoline performs the divergent
     /// reaper-stack handoff after this method returns.
-    fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord);
+    fn user_exception(
+        &mut self,
+        record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> ExceptionTermination;
 
     /// Ends the current Process for a fault on an on-demand page that could
     /// not be given a frame, with `DW_TERMINATION_RESOURCE_POLICY` (DW2 M6
@@ -1590,8 +1633,8 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn user_resource_fault(
         &mut self,
         record: crate::arch::x86_64::exceptions::UserExceptionRecord,
-    ) {
-        self.user_exception(record);
+    ) -> ExceptionTermination {
+        self.user_exception(record)
     }
 
     /// Serves a CPL3 page fault at `cr2` with error code `error` if it lies
@@ -1604,6 +1647,17 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> !
     where
         Self: Sized;
+
+    /// Ends the current Thread at the rendezvous reaper, for a terminal
+    /// exception that found a Stop (`ExceptionTermination::Stopped`, DW2
+    /// §10.16 revision 2 item 4). A runtime that publishes no remote Stop
+    /// never reports one.
+    fn service_current_rendezvous(_this: DivergentCarrier<'_, Self>) -> !
+    where
+        Self: Sized,
+    {
+        panic!("native runtime publishes no remote Stop")
+    }
 
     /// Enters userspace for the scheduler-selected Thread whose kernel
     /// continuation slot is still zero. Called only from the fixed trusted
@@ -1770,8 +1824,7 @@ fn finish_frame<R: NativeSyscallFrameRuntime>(
     if result.control == SyscallControl::ReturnToCaller
         && let Err(error) = runtime.authorize_return(frame, current_binding_generation)
     {
-        runtime.invalid_return(error);
-        return SyscallControl::TerminateCurrent;
+        return runtime.invalid_return(error).control();
     }
     result.control
 }

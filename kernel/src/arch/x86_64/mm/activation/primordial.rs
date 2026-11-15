@@ -59,8 +59,8 @@ use crate::time::TimerAuthority;
 use crate::wait::{EventAuthority, WaitRegistry};
 use deepwyrm_abi::{
     DW_CHANNEL_MAX_PAYLOAD, DW_EXCEPTION_GENERAL_PROTECTION, DW_STATUS_BAD_STATE,
-    DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_STATUS_WOULD_BLOCK,
-    DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT,
+    DW_STATUS_NO_RESOURCES, DW_STATUS_NOT_SUPPORTED, DW_STATUS_SUCCESS, DW_TASK_STATE_EXITED,
+    DW_TERMINATION_NORMAL_EXIT,
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
@@ -503,11 +503,13 @@ enum ProcessTerminationPreparation {
 }
 
 enum TaskGroupTerminationPreparation {
+    Retry,
     Immediate(NativeSyscallResult),
     Remote(PreparedRemoteTaskGroupTermination),
 }
 
 enum ThreadTerminationPreparation {
+    Retry,
     Immediate(NativeSyscallResult),
     Remote(PreparedRemoteThreadTermination),
 }
@@ -2676,16 +2678,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         runtime.commit_ap_kernel_root_entry(executed)
     }
 
+    /// Ends the current Process for a terminal exception, publishing Stops
+    /// to its Threads on other CPUs, or finds a Stop from another
+    /// termination first and reports it: the exception's own termination is
+    /// then dropped, having changed nothing, and the caller goes to the
+    /// rendezvous reaper (DW2 §10.16 revision 2 item 4; review DD2, DD3).
+    /// A Stop is looked for at the first synchronization and in every
+    /// preparation hold before the preparation, so no hold of this path
+    /// crosses one, and this CPU owns a pending remote termination from the
+    /// hold that publishes to its completion hold.
     fn terminate_exception_with_remote_stops(
         &mut self,
         exception: crate::task::TaskExceptionRecord,
-    ) {
+    ) -> crate::syscall::native::ExceptionTermination {
         assert!(
             self.pending_remote_termination.is_none(),
             "terminal exception crossed a pending remote termination"
         );
         if !self.synchronize_scheduler_current_at_safe_point_detached() {
-            return;
+            return crate::syscall::native::ExceptionTermination::Stopped;
         }
         let published = {
             let mut guard = self.runtime.lock();
@@ -2696,6 +2707,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let pending = loop {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            // Another termination's Stop: take it, and drop this one (R3,
+            // DD3). Nothing has been prepared yet, so nothing is undone.
+            if runtime.stop_published() {
+                return crate::syscall::native::ExceptionTermination::Stopped;
+            }
             // Every hold of an exception's termination stages: its releases
             // finalize after the stops' acknowledgements, in the terminal
             // handoff's first hold (§10.15 revision 2 item 2).
@@ -2714,7 +2730,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.drain_quantum_cancellation_detached();
                     assert_eq!(result.status, DW_STATUS_SUCCESS);
                     assert_eq!(result.control, SyscallControl::TerminateCurrent);
-                    return;
+                    return crate::syscall::native::ExceptionTermination::Terminated;
                 }
                 ProcessTerminationPreparation::Remote(prepared) => {
                     runtime.end_hold(crate::syscall::HoldEnd::Stage);
@@ -2732,6 +2748,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 }),
                         );
                     }
+                    runtime.begin_pending_remote_termination();
                     break PendingRemoteProcessTermination {
                         phase: prepared.phase,
                         prepared: prepared.prepared,
@@ -2745,6 +2762,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let result = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            runtime.end_pending_remote_termination();
             let result =
                 runtime.complete_process_termination(pending.phase, pending.prepared, permits);
             runtime.end_hold(crate::syscall::hold_end_for(result.control));
@@ -2753,6 +2771,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.drain_quantum_cancellation_detached();
         assert_eq!(result.status, DW_STATUS_SUCCESS);
         assert_eq!(result.control, SyscallControl::TerminateCurrent);
+        crate::syscall::native::ExceptionTermination::Terminated
     }
 }
 
@@ -3757,6 +3776,11 @@ struct CpuSharedState {
     /// one termination can stop several CPUs, each across two runtime holds.
     stopping_claim: Option<crate::task::SchedulerExecutionClaim>,
     stopping_claim_was_suspended: bool,
+    /// This CPU owns a remote termination between the prepare hold that
+    /// published its Stops and its completion hold, on the syscall or the
+    /// exception path. No Stop is published to it meanwhile (DW2 §10.16
+    /// revision 2 item 1; §10.15 audit D1).
+    pending_remote_termination: bool,
 }
 
 impl CpuSharedState {
@@ -3770,6 +3794,7 @@ impl CpuSharedState {
             pending_quantum_cancellation: None,
             stopping_claim: None,
             stopping_claim_was_suspended: false,
+            pending_remote_termination: false,
         }
     }
 
@@ -4454,6 +4479,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Some(ticket),
             "scheduler still owns the physically cancelled exact quantum"
         );
+    }
+
+    /// Marks this CPU as owning a pending remote termination, in the prepare
+    /// hold that publishes its Stops (DW2 §10.16 revision 2 item 1).
+    fn begin_pending_remote_termination(&mut self) {
+        assert!(
+            !core::mem::replace(&mut self.own.pending_remote_termination, true),
+            "CPU began a second pending remote termination"
+        );
+    }
+
+    /// Ends this CPU's pending remote termination, in its completion hold.
+    fn end_pending_remote_termination(&mut self) {
+        assert!(
+            core::mem::replace(&mut self.own.pending_remote_termination, false),
+            "CPU completed a remote termination it did not own"
+        );
+    }
+
+    /// Whether this CPU's mailbox holds a Stop, read under T at the start of
+    /// a hold that would move the CPU into a state no Stop may be published
+    /// to (DW2 §10.16 revision 2 item 2). The mailbox stays authoritative:
+    /// the caller services the Stop from it after the hold.
+    fn stop_published(&self) -> bool {
+        matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        )
     }
 
     fn install_deferred_current(
@@ -5568,7 +5621,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|_| panic!("exception Process lost its Thread topology"));
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
-            Err(()) => return ProcessTerminationPreparation::Retry,
+            Err(_refusal) => return ProcessTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
         let mut prepared = match self.prepare_process_exception_with_wait_cleanup(exception) {
@@ -7294,9 +7347,12 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             match runtime.prepare_remote_process_termination(process, reason, code)
                             {
                                 ProcessTerminationPreparation::Retry => {
-                                    unreachable!(
-                                        "external Process termination uses an ordinary retry status"
-                                    )
+                                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
+                                    drop(guard);
+                                    for _ in 0..64 {
+                                        core::hint::spin_loop();
+                                    }
+                                    continue;
                                 }
                                 ProcessTerminationPreparation::Immediate(result) => {
                                     let ready = runtime.ready_to_return(result);
@@ -7321,6 +7377,14 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                         NativeSyscallRequest::TaskGroupTerminate { task_group, reason } => {
                             match runtime.prepare_remote_task_group_termination(task_group, reason)
                             {
+                                TaskGroupTerminationPreparation::Retry => {
+                                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
+                                    drop(guard);
+                                    for _ in 0..64 {
+                                        core::hint::spin_loop();
+                                    }
+                                    continue;
+                                }
                                 TaskGroupTerminationPreparation::Immediate(result) => {
                                     let ready = runtime.ready_to_return(result);
                                     drop(guard);
@@ -7347,6 +7411,14 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             code,
                         } => {
                             match runtime.prepare_remote_thread_termination(thread, reason, code) {
+                                ThreadTerminationPreparation::Retry => {
+                                    runtime.end_hold(crate::syscall::HoldEnd::Stage);
+                                    drop(guard);
+                                    for _ in 0..64 {
+                                        core::hint::spin_loop();
+                                    }
+                                    continue;
+                                }
                                 ThreadTerminationPreparation::Immediate(result) => {
                                     let ready = runtime.ready_to_return(result);
                                     drop(guard);
@@ -7397,6 +7469,9 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             }
                         }
                     }
+                    // No Stop is published to this CPU until its completion
+                    // hold clears this (DW2 §10.16 revision 2 item 1).
+                    runtime.begin_pending_remote_termination();
                     // The initiator's prepare hold: the target's releases
                     // finalize only after its stops are acknowledged, at the
                     // completion hold (§10.15 revision 2 item 2).
@@ -7771,6 +7846,13 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::NativePreemptionPlan<'owner> {
         let mut guard = self.runtime.lock();
         let mut runtime = guard.on(&mut self.owned);
+        // A Stop published before this hold is taken instead of crossed by a
+        // switch (DW2 §10.16 revision 2 item 2): every caller polls the
+        // mailbox next and goes to the rendezvous reaper. One published
+        // after it finds the prepared switch and is refused at publication.
+        if runtime.stop_published() {
+            return crate::syscall::native::NativePreemptionPlan::Return;
+        }
         // SAFETY: forwards this trait method's `# Safety` to `prepare_preemption_stationary`;
         // the carrier was built for this facade's own CPU.
         unsafe { runtime.prepare_preemption_stationary() }
@@ -7852,6 +7934,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 {
                     let mut guard = self.runtime.lock();
                     let mut runtime = guard.on(&mut self.owned);
+                    runtime.end_pending_remote_termination();
                     let result = runtime.complete_process_termination(
                         pending.phase,
                         pending.prepared,
@@ -7867,6 +7950,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 {
                     let mut guard = self.runtime.lock();
                     let mut runtime = guard.on(&mut self.owned);
+                    runtime.end_pending_remote_termination();
                     let result = runtime.complete_task_group_termination(
                         pending.phase,
                         pending.prepared,
@@ -7882,6 +7966,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 {
                     let mut guard = self.runtime.lock();
                     let mut runtime = guard.on(&mut self.owned);
+                    runtime.end_pending_remote_termination();
                     let result = runtime.complete_thread_termination(
                         pending.phase,
                         pending.prepared,
@@ -7897,8 +7982,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if result.control == SyscallControl::ReturnToCaller
             && let Err(error) = self.authorize_return(frame, current_binding_generation)
         {
-            self.invalid_return(error);
-            return SyscallControl::TerminateCurrent;
+            return self.invalid_return(error).control();
         }
         result.control
     }
@@ -7924,23 +8008,29 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or(Ok(()))
     }
 
-    fn invalid_return(&mut self, error: crate::arch::x86_64::syscall::UserReturnError) {
+    fn invalid_return(
+        &mut self,
+        error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> crate::syscall::native::ExceptionTermination {
         self.terminate_exception_with_remote_stops(crate::task::TaskExceptionRecord::new(
             DW_EXCEPTION_GENERAL_PROTECTION,
             invalid_user_return_detail(error),
             0,
-        ));
+        ))
     }
 
-    fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
-        self.terminate_exception_with_remote_stops(record.task_exception());
+    fn user_exception(
+        &mut self,
+        record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> crate::syscall::native::ExceptionTermination {
+        self.terminate_exception_with_remote_stops(record.task_exception())
     }
 
     fn user_resource_fault(
         &mut self,
         record: crate::arch::x86_64::exceptions::UserExceptionRecord,
-    ) {
-        self.terminate_exception_with_remote_stops(record.task_exception().resource_policy());
+    ) -> crate::syscall::native::ExceptionTermination {
+        self.terminate_exception_with_remote_stops(record.task_exception().resource_policy())
     }
 
     fn serve_user_page_fault(
@@ -8063,6 +8153,10 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 },
             };
         }
+    }
+
+    fn service_current_rendezvous(this: DivergentCarrier<'_, Self>) -> ! {
+        crate::arch::x86_64::syscall::handoff_current_rendezvous_from_carrier(this.release())
     }
 
     fn enter_scheduled_fresh_thread(this: DivergentCarrier<'_, Self>) -> ! {
@@ -8406,6 +8500,13 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let plan = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            // A Stop published before this hold leaves the control `Pending`,
+            // which its precommit retires with the quantum cancellation it
+            // carries; nothing here stages that cancellation (DW2 §10.16
+            // revision 2 item 2).
+            if runtime.stop_published() {
+                return crate::syscall::native::NativeSuspendPlan::ServiceRendezvous;
+            }
             // SAFETY: forwards this trait method's `# Safety` to `prepare_suspend_stationary`;
             // the carrier was built for this facade's own CPU.
             unsafe { runtime.prepare_suspend_stationary() }
@@ -8421,6 +8522,12 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let poll = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            // A Stop published before this hold leaves the suspension `Idle`
+            // for its precommit; the poll neither resumes nor switches (DW2
+            // §10.16 revision 2 item 2).
+            if runtime.stop_published() {
+                return crate::syscall::native::NativeIdleSuspendPoll::ServiceRendezvous;
+            }
             if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                 // Idling on a blocked Thread's live root, this poll may take
                 // one queued teardown step (§10.10 item 5).
@@ -10791,7 +10898,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or_else(|_| panic!("exiting Process lost its Thread topology"));
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
-            Err(()) => return ProcessTerminationPreparation::Retry,
+            Err(_refusal) => return ProcessTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
         let mut prepared = match self.prepare_process_exit_with_wait_cleanup(exit_code) {
@@ -10923,16 +11030,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
-            Err(()) => {
-                // A scheduler claim can name the next logical continuation
-                // while its CPU still runs a prior rendezvous reaper under a
-                // Kernel root. The ordinary retry boundary releases runtime
-                // authority so that handoff can finish before we re-resolve
-                // and reauthenticate the complete terminal operation.
-                return ProcessTerminationPreparation::Immediate(NativeSyscallResult::returning(
-                    DW_STATUS_WOULD_BLOCK,
-                ));
-            }
+            // A target CPU cannot take a Stop now. Nothing has changed: the
+            // dispatch releases T, polls its own mailbox and tries again from
+            // the handle (DW2 §10.16 revision 2 item 3).
+            Err(_refusal) => return ProcessTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
         let mut prepared =
@@ -10973,15 +11074,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
-    /// Classifies every remote scheduler claim against the carrier state that
-    /// can actually accept an exact e1 Stop. A Running claim alone is only a
-    /// logical scheduler choice: until the same Thread owns the physical
-    /// carrier under a stable Process root, terminal preparation must retry
-    /// without mutating task state.
+    /// Decides, for every other CPU, whether a Stop for one of
+    /// `terminal_threads` may be published to it now, and names the claim it
+    /// would carry (DW2 §10.16 revision 2 item 1). The decision is one pure
+    /// function over the CPU's facts, all read in this hold; a refusal for
+    /// any CPU refuses the whole plan before anything has changed, and the
+    /// caller retries in a later hold.
     fn terminal_stop_plan<const TERMINAL_THREADS: usize>(
         &self,
         terminal_threads: &[Option<ThreadKey>; TERMINAL_THREADS],
-    ) -> Result<TerminalStopPlan, ()> {
+    ) -> Result<TerminalStopPlan, crate::syscall::StopRefusal> {
         let mut identities = core::array::from_fn(|_| None);
         let mut unentered = core::array::from_fn(|_| None);
         for (cpu_index, identity) in identities.iter_mut().enumerate() {
@@ -10994,53 +11096,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .others
                 .get(cpu)
                 .unwrap_or_else(|| panic!("remote-stop CPU has no runtime slot"));
-            let suspended = self
-                .core
-                .shared
-                .execution
-                .suspended_claim_on(cpu)
-                .filter(|claim| terminal_threads.contains(&Some(claim.thread())));
-            let running = self
-                .core
-                .shared
-                .execution
-                .running_claim_on(cpu)
-                .filter(|claim| terminal_threads.contains(&Some(claim.thread())));
-            let claim = match (suspended, running) {
-                (None, None) => continue,
-                (Some(claim), None) | (None, Some(claim)) => claim,
-                (Some(physical), Some(logical)) => {
-                    // A committed switch can expose the old suspended carrier
-                    // and its not-yet-entered logical replacement at once. The
-                    // e1 request authenticates only the physical generation;
-                    // successful terminal preparation retires the replacement
-                    // transactionally before publishing that Stop.
-                    if physical.thread() == logical.thread()
-                        || remote.last_scheduled.map(|identity| identity.thread)
-                            != Some(physical.thread())
-                    {
-                        return Err(());
+            let (suspended, running) =
+                crate::syscall::claim_facts(&self.core.shared.execution, cpu, terminal_threads);
+            let facts = crate::syscall::StopTargetFacts {
+                suspended,
+                running,
+                control: remote.wait_control.handoff(),
+                last_scheduled: remote.last_scheduled.map(|identity| identity.thread),
+                root_switch_flight: remote.root_switch_flight.is_some(),
+                active_root: remote.active_root.as_ref().map(|root| root.process()),
+                mailbox_idle: crate::arch::x86_64::idle::remote_stop_mailbox_is_idle(cpu),
+                deferred_current: remote.deferred_current.is_some(),
+                pending_termination: remote.pending_remote_termination,
+            };
+            let decision = crate::syscall::decide_stop_publication(facts, |thread| {
+                self.core
+                    .tasks
+                    .thread_process(thread)
+                    .unwrap_or_else(|_| panic!("terminal Thread lost its Process owner"))
+            })?;
+            let claim = match decision {
+                crate::syscall::StopPublication::Nothing => continue,
+                crate::syscall::StopPublication::Publish {
+                    claim,
+                    retire_unentered,
+                } => {
+                    let suspended = self.core.shared.execution.suspended_claim_on(cpu);
+                    let running = self.core.shared.execution.running_claim_on(cpu);
+                    if retire_unentered {
+                        // The e1 request authenticates only the physical
+                        // generation; successful terminal preparation
+                        // retires the unentered replacement before it
+                        // publishes the Stop.
+                        unentered[cpu_index] = running;
                     }
-                    unentered[cpu_index] = Some(logical);
-                    physical
+                    match claim {
+                        crate::syscall::StopTarget::Suspended => suspended,
+                        crate::syscall::StopTarget::Running => running,
+                    }
+                    .unwrap_or_else(|| panic!("remote-stop claim vanished under T"))
                 }
             };
-            if remote.root_switch_flight.is_some()
-                || remote.last_scheduled.map(|identity| identity.thread) != Some(claim.thread())
-            {
-                return Err(());
-            }
-            let Some(root) = remote.active_root.as_ref() else {
-                return Err(());
-            };
-            let owner = self
-                .core
-                .tasks
-                .thread_process(claim.thread())
-                .unwrap_or_else(|_| panic!("terminal Thread lost its Process owner"));
-            if root.process() != owner {
-                return Err(());
-            }
+            let root = remote
+                .active_root
+                .as_ref()
+                .unwrap_or_else(|| panic!("remote-stop root vanished under T"));
             let snapshot = crate::arch::x86_64::smp::live_cpu_registry()
                 .snapshot(cpu_index)
                 .unwrap_or_else(|_| panic!("remote terminal owner is not online"));
@@ -11092,7 +11192,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) {
         let observed = self
             .terminal_stop_plan(terminal_threads)
-            .unwrap_or_else(|()| panic!("terminal carrier plan changed during preparation"));
+            .unwrap_or_else(|refusal| {
+                panic!("terminal carrier plan changed during preparation: {refusal:?}")
+            });
         assert_eq!(
             &observed.identities, expected,
             "terminal Stop identity changed during preparation"
@@ -11179,11 +11281,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
-            Err(()) => {
-                return TaskGroupTerminationPreparation::Immediate(NativeSyscallResult::returning(
-                    DW_STATUS_WOULD_BLOCK,
-                ));
-            }
+            // As for a Process: retried in the kernel (§10.16 revision 2 item 3).
+            Err(_refusal) => return TaskGroupTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
         let mut prepared =
@@ -11455,11 +11554,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let plan = match self.terminal_stop_plan(&inspected_threads) {
             Ok(plan) => plan,
-            Err(()) => {
-                return ThreadTerminationPreparation::Immediate(NativeSyscallResult::returning(
-                    DW_STATUS_WOULD_BLOCK,
-                ));
-            }
+            // As for a Process: retried in the kernel (§10.16 revision 2 item 3).
+            Err(_refusal) => return ThreadTerminationPreparation::Retry,
         };
         let phase = self.reserve_runtime_phase();
         let mut prepared =

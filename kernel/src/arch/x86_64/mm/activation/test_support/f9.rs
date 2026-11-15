@@ -950,11 +950,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallFrame
         frame.authorize_return(current_binding_generation, &mut mappings)
     }
 
-    fn invalid_return(&mut self, _error: crate::arch::x86_64::syscall::UserReturnError) {
+    fn invalid_return(
+        &mut self,
+        _error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> crate::syscall::native::ExceptionTermination {
         fail(0xb0)
     }
 
-    fn user_exception(&mut self, record: crate::arch::x86_64::exceptions::UserExceptionRecord) {
+    fn user_exception(
+        &mut self,
+        record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> crate::syscall::native::ExceptionTermination {
         fail(0x100 | (record.vector & 0x0f))
     }
 

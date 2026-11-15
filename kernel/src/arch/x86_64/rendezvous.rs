@@ -537,6 +537,16 @@ impl RendezvousMailbox {
         })
     }
 
+    /// Whether a Stop published now would find this mailbox free: no Stop is
+    /// requested, none is acknowledged and awaiting its initiator's reclaim,
+    /// and no reclaim is in flight (DW2 §10.16 review DD4). Read under the
+    /// runtime authority by a publisher, the answer stays true until that
+    /// publisher publishes: the state leaves Idle only by a publication, and
+    /// every publication runs under that authority.
+    pub(crate) fn stop_is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == MAILBOX_IDLE
+    }
+
     /// Coalesces a wake without modifying the stop state or request payload.
     pub(crate) fn publish_wake(&self) {
         self.wake_pending.store(true, Ordering::Release);
@@ -986,6 +996,35 @@ mod tests {
             MailboxNotification::HoldSafe(deferred.request())
         );
         assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 41);
+    }
+
+    /// DW2 §10.16 review DD4: a stopped CPU moves on to its next Thread
+    /// before the initiator reclaims its mailbox, so a second Stop for that
+    /// Thread found the mailbox acknowledged and its publication failed
+    /// `Busy`, which the kernel panics on. `stop_is_idle`, which the stop
+    /// plan reads, is false for exactly as long as publication would fail.
+    #[test]
+    fn a_mailbox_is_idle_for_publication_only_after_its_reclaim() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let thread = thread_key(&mut objects);
+        let next = thread_key(&mut objects);
+        let mailbox = RendezvousMailbox::new(2).unwrap();
+        assert!(mailbox.stop_is_idle());
+        mailbox.publish_wake();
+        assert!(mailbox.stop_is_idle(), "a wake does not occupy the mailbox");
+        let deferred = mailbox.publish_stop(identity(thread), 1_u64).unwrap();
+        assert!(!mailbox.stop_is_idle());
+        acknowledge(&mailbox, identity(thread));
+        // Acknowledged, not reclaimed: the stopped CPU already runs `next`.
+        assert!(!mailbox.stop_is_idle());
+        let busy = mailbox.publish_stop(identity(next), 2_u64).unwrap_err();
+        assert_eq!(busy.error(), StopPublishError::Busy);
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 1);
+        assert!(mailbox.stop_is_idle());
+        let deferred = mailbox.publish_stop(identity(next), 3_u64).unwrap();
+        acknowledge(&mailbox, identity(next));
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 3);
+        assert!(mailbox.stop_is_idle());
     }
 
     #[test]

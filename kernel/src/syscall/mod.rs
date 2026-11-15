@@ -22,6 +22,11 @@ mod hold_end;
     allow(dead_code, reason = "only the live carrier takes remote Stops")
 )]
 mod stop_handoff;
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live carrier publishes remote Stops")
+)]
+mod stop_publication;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use hold_end::{
     CleanupOutboxes, HoldEnd, assert_hold_ended, hold_end_for, settle_hold_queues,
@@ -29,6 +34,10 @@ pub(crate) use hold_end::{
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use stop_handoff::{
     RunningClaim, StopClaim, StopHandoffFacts, StopHandoffPlan, classify_stop_handoff,
+};
+#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+pub(crate) use stop_publication::{
+    StopPublication, StopRefusal, StopTarget, StopTargetFacts, claim_facts, decide_stop_publication,
 };
 #[cfg_attr(
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
