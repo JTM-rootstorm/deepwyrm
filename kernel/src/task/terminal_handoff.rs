@@ -71,80 +71,9 @@ pub(crate) const fn exited_root_teardown(
     }
 }
 
-/// What a syscall safe point does with the hold it has just taken (DW2
-/// §10.15 review Q3).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SafePointEntry {
-    /// A Stop is published for this CPU: the call ends at the trampoline.
-    Stopped,
-    /// This CPU's scheduler-current Thread is terminal but its Stop is not
-    /// yet published: a termination's preparation and its publication
-    /// straddle T. Release T and wait for the Stop.
-    AwaitStopPublication,
-    /// Neither: the hold's operation may run.
-    Proceed,
-}
-
-/// Decides a safe point's hold from the two facts read under T in that same
-/// hold. Every hold that runs a syscall's operation decides with both: a
-/// hold that checked only for a Stop let an exited Thread whose Stop was not
-/// yet published run its operation, and a resumed parked call then found its
-/// record already settled by another CPU's drain (Q3).
-pub(crate) const fn safe_point_entry(
-    stop_published: bool,
-    terminal_current: bool,
-) -> SafePointEntry {
-    if stop_published {
-        SafePointEntry::Stopped
-    } else if terminal_current {
-        SafePointEntry::AwaitStopPublication
-    } else {
-        SafePointEntry::Proceed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_safe_point_proceeds_only_when_its_thread_is_neither_stopped_nor_terminal() {
-        assert_eq!(safe_point_entry(true, true), SafePointEntry::Stopped);
-        assert_eq!(safe_point_entry(true, false), SafePointEntry::Stopped);
-        assert_eq!(
-            safe_point_entry(false, true),
-            SafePointEntry::AwaitStopPublication
-        );
-        assert_eq!(safe_point_entry(false, false), SafePointEntry::Proceed);
-    }
-
-    /// Q3's interleaving over the real parked-call table. CPU A's Thread
-    /// parked a call and is resuming it; between A's root-synchronization
-    /// hold and the hold that takes the record back, an initiator prepares
-    /// the Thread's termination (the Thread is now ended, its Stop not yet
-    /// published), and a third CPU's drain settles ended records. A's take
-    /// hold must not proceed: under the old rule (a Stop check alone) it
-    /// did, and found no record.
-    #[test]
-    fn a_resumed_parked_call_never_takes_a_record_a_drain_settled() {
-        use crate::syscall::ParkedCalls;
-        let mut objects = crate::object::ObjectRegistry::<2>::new();
-        let creation = objects.create(deepwyrm_abi::DW_OBJECT_TYPE_THREAD).unwrap();
-        let thread = crate::task::ThreadKey::from_object_id(creation.id());
-        let mut parked = ParkedCalls::<u8, 4>::new();
-        parked.park(thread, 1);
-        // The initiator's preparation: ended, Stop unpublished.
-        let ended = true;
-        let stop_published = false;
-        // Another CPU's drain settles the record.
-        assert_eq!(parked.take_ended(|_| ended), Some((thread, 1)));
-        // A's hold decides before it takes the record.
-        let entry = safe_point_entry(stop_published, ended);
-        assert_ne!(entry, SafePointEntry::Proceed);
-        // What the old rule would have done:
-        let old_rule_proceeds = !stop_published;
-        assert!(old_rule_proceeds && parked.take(thread).is_none());
-    }
 
     /// Model (c): the decision table.
     #[test]

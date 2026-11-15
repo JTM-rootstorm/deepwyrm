@@ -65,8 +65,6 @@ pub(crate) use scheduler::{
 pub(crate) use terminal_handoff::{
     ExitedRootTeardown, TerminalHandoffRoute, exited_root_teardown, terminal_handoff_route,
 };
-#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use terminal_handoff::{SafePointEntry, safe_point_entry};
 
 #[cfg(test)]
 #[allow(unused_imports)]
