@@ -1220,7 +1220,7 @@ Then one boot on one CPU and twenty `--smp`, each reporting the new lines beside
 - *The check catches a kernel without the wake.* One `--smp` boot on the diagnostic branch (`fe2b9c9`: `fac8f86` plus the diagnostic commits) failed with "the kernel reports no owed-work wakes" (`…3565921421391`).
 - *Seen in passing.* While finalization is owed, one syscall of a thread on the BSP passes several BSP safe points and each takes a finalize step: about seven steps a syscall, 2.3 ms here, and up to four at each timer gate. That is how the queue empties in 90 ms, and it is paid by whichever thread runs on the BSP. Each step is still one bounded hold (§10.12).
 - *Not shown.* That each counted wake belongs to a probe run: the count is for the whole boot (28 to 48), so a kernel that skipped the wake for one run would pass. That nothing else holds a periodic BSP deadline shorter than 25 ms. The retirement wake and the retry of an unsent wake still rest on host tests only. The 2.9 s boot is unexplained, and this case, bounded at 25 ms while init ticks, does not explain it.
-- *Left over.* The diagnostic lane `lane/m5s8-no-wake-baseline` (`fe2b9c9`) and the branch `diag/m5s8-with-wake` (`44323c2`) hold unmerged diagnostic commits that are never to be integrated. Deleting them waits for Mike's word.
+- *Left over.* The diagnostic lane `lane/m5s8-no-wake-baseline` (`fe2b9c9`) and the branch `diag/m5s8-with-wake` (`44323c2`) held unmerged diagnostic commits that were never to be integrated. *Mike, 2026-11-15: delete them. Both branches are deleted and the lane retired; the audit shows no lane. The diagnostic boots' logs stay under `.tmp/dev-boot/`.*
 
 ## 11. M9 direction (Mike, 2026-11-13)
 
