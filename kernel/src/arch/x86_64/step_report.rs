@@ -159,6 +159,8 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// zero while nothing is owed. And the longest such gap, in ns.
     finalize_gap_since: AtomicU64,
     finalize_gap_longest: AtomicU64,
+    /// The longest finalize step, nested in a timed step or not, in ns.
+    finalize_step_longest: AtomicU64,
     /// Finalize steps by what drained, counted whether or not they were
     /// nested in a timed step.
     finalize_steps: [AtomicU64; SOURCES],
@@ -180,6 +182,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
             finalize_wait_pages: AtomicU64::new(0),
             finalize_gap_since: AtomicU64::new(0),
             finalize_gap_longest: AtomicU64::new(0),
+            finalize_step_longest: AtomicU64::new(0),
             finalize_steps: [const { AtomicU64::new(0) }; SOURCES],
         }
     }
@@ -202,6 +205,8 @@ impl<const CPUS: usize> StepTally<CPUS> {
     /// it, the next gap begins at its end.
     pub(crate) fn finalize_stepped(&self, source: DrainSource, began: u64, ended: u64, owed: bool) {
         self.finalize_steps[source as usize].fetch_add(1, Ordering::Relaxed);
+        self.finalize_step_longest
+            .fetch_max(ended.saturating_sub(began), Ordering::Relaxed);
         let next = if owed { ended.saturating_add(1) } else { 0 };
         let since = self.finalize_gap_since.swap(next, Ordering::Relaxed);
         if since != 0 {
@@ -239,6 +244,10 @@ impl<const CPUS: usize> StepTally<CPUS> {
         };
         let gap = self.finalize_gap_longest.load(Ordering::Relaxed).max(open);
         line(format_args!("finalize-gap-longest-us={}", gap / 1000));
+        line(format_args!(
+            "finalize-step-longest-us={}",
+            self.finalize_step_longest.load(Ordering::Relaxed) / 1000
+        ));
         let [gate, syscall, fault, idle, other] = [0, 1, 2, 3, 4]
             .map(|source: usize| self.finalize_steps[source].load(Ordering::Relaxed));
         line(format_args!(
@@ -282,6 +291,44 @@ impl<const CPUS: usize> StepTally<CPUS> {
 
     /// The step `cpu` was timing ends at `now`, at a safe point of `call`.
     /// Nothing is recorded if no step was being timed there.
+    /// A call in steps ended on `cpu` at `now` (every exit of its loop):
+    /// the step being timed there, if any, is recorded as `last`'s last
+    /// step when `last` names one, and the CPU times nothing afterwards
+    /// either way, so no slot stays open past the call (§10.19 revision 2).
+    pub(crate) fn call_ended(&self, cpu: usize, last: Option<StepCall>, now: u64) {
+        match last {
+            Some(call) => self.step_ended(cpu, call, now),
+            None => {
+                if let Some(slot) = self.started.get(cpu) {
+                    slot.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Runs `step` as one step of `call` on `cpu`, timed with `now`, unless
+    /// a step is being timed there already: then it is part of that step's
+    /// hold and is counted in it (step-6 review D4).
+    pub(crate) fn timed_nested<T>(
+        &self,
+        cpu: usize,
+        call: StepCall,
+        mut now: impl FnMut() -> Option<u64>,
+        step: impl FnOnce() -> T,
+    ) -> T {
+        if self.timing(cpu) {
+            return step();
+        }
+        if let Some(began) = now() {
+            self.step_began(cpu, began);
+        }
+        let result = step();
+        if let Some(ended) = now() {
+            self.step_ended(cpu, call, ended);
+        }
+        result
+    }
+
     pub(crate) fn step_ended(&self, cpu: usize, call: StepCall, now: u64) {
         let Some(slot) = self.started.get(cpu) else {
             return;
@@ -486,10 +533,14 @@ mod live {
     /// timed there already: then it is part of that step's hold and is
     /// counted in it (step-6 review D4).
     pub(crate) fn timed_nested<T>(cpu: usize, call: StepCall, step: impl FnOnce() -> T) -> T {
-        if TALLY.timing(cpu) {
-            step()
-        } else {
-            timed(cpu, call, step)
+        TALLY.timed_nested(cpu, call, now, step)
+    }
+
+    /// A call in steps ended on `cpu` (see [`StepTally::call_ended`]).
+    pub(crate) fn call_ended(cpu: usize, last: Option<StepCall>) {
+        match now() {
+            Some(now) => TALLY.call_ended(cpu, last, now),
+            None => TALLY.call_ended(cpu, None, 0),
         }
     }
 
@@ -557,9 +608,9 @@ mod live {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
-    after_safe_point, allow_teardown_step, at_safe_point, finalize_queued, finalize_stepped,
-    finalize_waited, now, owed, parked_call_ended, report, set_drain_source, step_began,
-    take_teardown_step, timed, timed_nested,
+    after_safe_point, allow_teardown_step, at_safe_point, call_ended, finalize_queued,
+    finalize_stepped, finalize_waited, now, owed, parked_call_ended, report, set_drain_source,
+    step_began, take_teardown_step, timed, timed_nested,
 };
 
 #[cfg(test)]
@@ -757,6 +808,7 @@ mod tests {
             [
                 "finalize-wait-longest-us=0 pages=0",
                 "finalize-gap-longest-us=0",
+                "finalize-step-longest-us=0",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=0",
             ]
         );
@@ -775,6 +827,7 @@ mod tests {
                 "finalize-wait-longest-us=5000 pages=612",
                 // 3 ms before the first step; 0.5 ms between the steps.
                 "finalize-gap-longest-us=3000",
+                "finalize-step-longest-us=1000",
                 "finalize-steps gate=2 syscall=0 fault=0 idle=0 other=0",
             ]
         );
@@ -793,6 +846,7 @@ mod tests {
             [
                 "finalize-wait-longest-us=2100 pages=9",
                 "finalize-gap-longest-us=2000",
+                "finalize-step-longest-us=100",
                 "finalize-steps gate=0 syscall=1 fault=0 idle=1 other=0",
             ]
         );
@@ -818,6 +872,7 @@ mod tests {
                 // Slot 1 waited 4.3 ms for 552 frames; slot 3, 28 ms for 500.
                 "finalize-wait-longest-us=28000 pages=500",
                 "finalize-gap-longest-us=3000",
+                "finalize-step-longest-us=25500",
                 "finalize-steps gate=2 syscall=0 fault=1 idle=0 other=0",
             ]
         );
@@ -834,6 +889,7 @@ mod tests {
             [
                 "finalize-wait-longest-us=0 pages=0",
                 "finalize-gap-longest-us=898000",
+                "finalize-step-longest-us=1000",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=1",
             ]
         );
@@ -858,6 +914,105 @@ mod tests {
         waits.queued(7, 10);
         waits.freed(7, 3);
         assert_eq!(waits.completed(7), None);
+    }
+
+    /// A clock for `timed_nested` that reads `times` in turn, in ms.
+    fn clock(times: &[u64]) -> impl FnMut() -> Option<u64> + '_ {
+        let mut times = times.iter();
+        move || times.next().map(|ms| ms * 1_000_000)
+    }
+
+    #[test]
+    fn a_call_that_ended_no_longer_swallows_a_later_finalize_step() {
+        let tally = StepTally::<2>::new();
+        // A map's last step began at a safe point at 0 and the call
+        // returned at 3 ms.
+        tally.step_began(0, 0);
+        tally.call_ended(0, Some(StepCall::Map), 3_000_000);
+        assert!(!tally.timing(0));
+        // A finalize step on that CPU later, from 4 to 6 ms, is its own.
+        let ran = tally.timed_nested(0, StepCall::Finalize, clock(&[4, 6]), || true);
+        assert!(ran);
+        let lines = lines(&tally);
+        assert_eq!(
+            lines[3],
+            "call-longest-us map=3000 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=2000"
+        );
+        assert_eq!(
+            lines[4],
+            "call-steps map=1 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=1"
+        );
+    }
+
+    #[test]
+    fn a_finalize_step_inside_a_timed_step_is_part_of_it() {
+        let tally = StepTally::<2>::new();
+        tally.step_began(0, 0);
+        let ran = tally.timed_nested(0, StepCall::Finalize, clock(&[1, 2]), || 7);
+        assert_eq!(ran, 7);
+        tally.step_ended(0, StepCall::Commit, 5_000_000);
+        assert_eq!(
+            lines(&tally)[4],
+            "call-steps map=0 unmap=0 protect=0 fill=0 commit=1 create=0 teardown=0 release=0 finalize=0"
+        );
+    }
+
+    #[test]
+    fn the_last_step_of_a_call_is_counted_and_timed() {
+        let tally = StepTally::<2>::new();
+        // Safe points at 0 and 2 ms each begin a step; the call returns
+        // after the second at 7 ms.
+        tally.step_began(1, 0);
+        tally.step_ended(1, StepCall::Unmap, 2_000_000);
+        tally.step_began(1, 2_000_000);
+        tally.call_ended(1, Some(StepCall::Unmap), 7_000_000);
+        assert!(!tally.timing(1));
+        let lines = lines(&tally);
+        assert_eq!(lines[0], "longest-step-us=5000 call=unmap");
+        assert_eq!(
+            lines[4],
+            "call-steps map=0 unmap=2 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0"
+        );
+        assert_eq!(
+            lines[5],
+            "call-total-us map=0 unmap=7000 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0"
+        );
+    }
+
+    #[test]
+    fn a_parked_call_resumed_on_another_cpu_counts_each_step_once() {
+        let tally = StepTally::<2>::new();
+        // On CPU 0: a step from 0 to 3 ms, then the quantum expires at that
+        // safe point, which ends the step and begins none; the call parks.
+        tally.step_began(0, 0);
+        tally.step_ended(0, StepCall::Map, 3_000_000);
+        tally.call_ended(0, None, 3_000_000);
+        // Resumed on CPU 1: its first safe point ends nothing and begins a
+        // step at 10 ms; the call returns after it at 12 ms.
+        tally.step_began(1, 10_000_000);
+        tally.call_ended(1, Some(StepCall::Map), 12_000_000);
+        assert!(!tally.timing(0) && !tally.timing(1));
+        let lines = lines(&tally);
+        assert_eq!(
+            lines[4],
+            "call-steps map=2 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0"
+        );
+        assert_eq!(
+            lines[5],
+            "call-total-us map=5000 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0"
+        );
+    }
+
+    #[test]
+    fn a_call_ended_before_any_step_records_nothing() {
+        let tally = StepTally::<2>::new();
+        tally.step_began(0, 0);
+        tally.call_ended(0, None, 9_000_000);
+        assert!(!tally.timing(0));
+        assert_eq!(tally.longest(), None);
+        // Ending a call on a CPU past the table changes nothing.
+        tally.call_ended(7, Some(StepCall::Map), 1);
+        assert_eq!(tally.longest(), None);
     }
 
     #[test]

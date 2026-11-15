@@ -2060,11 +2060,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }) else {
                 // Stopped at a safe point. A call in steps keeps the steps
                 // it made; a pinned map output is let go.
+                step_report::call_ended(cpu.index(), None);
                 self.settle_map_output(output.take(), user, None);
                 return Err(());
             };
             let Some((phase, root, process, snapshot)) = prepared else {
                 // The quantum expired: let the output pin go and park.
+                step_report::call_ended(cpu.index(), None);
                 self.settle_map_output(output.take(), user, None);
                 return Ok(self.park_call(ParkedCall::Region(steps)));
             };
@@ -2072,6 +2074,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if let Some(snapshot) = snapshot {
                 if let Err(status) = steps.set_snapshot(snapshot) {
                     // Refused as one call would be, before any step.
+                    step_report::call_ended(cpu.index(), None);
                     let ready = {
                         let mut guard = self.runtime.lock();
                         let mut runtime = guard.on(&mut self.owned);
@@ -2097,6 +2100,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     Ok(pinned) => output = Some(pinned),
                     Err(status) => {
                         if let Some(status) = steps.abandon(status) {
+                            // Ended before this run's first step.
+                            step_report::call_ended(cpu.index(), None);
                             let ready = {
                                 let mut guard = self.runtime.lock();
                                 let mut runtime = guard.on(&mut self.owned);
@@ -2172,6 +2177,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             match finished {
                 FamilyGBegun::Returned(ready) => {
+                    // The step just taken was the call's last.
+                    step_report::call_ended(cpu.index(), Some(call));
                     self.settle_map_output(output.take(), user, address);
                     return Ok(ready);
                 }
@@ -2181,6 +2188,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         stepped = true;
                         continue;
                     };
+                    step_report::call_ended(cpu.index(), Some(call));
                     let ready = {
                         let mut guard = self.runtime.lock();
                         let mut runtime = guard.on(&mut self.owned);
@@ -2270,8 +2278,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         }
                         Some(runtime.fill_in_user_range(&mut next, end, buffer.write))
                     }) {
-                        Err(()) => return Some(Err(())),
+                        Err(()) => {
+                            step_report::call_ended(cpu.index(), None);
+                            return Some(Err(()));
+                        }
                         Ok(None) => {
+                            step_report::call_ended(cpu.index(), None);
                             let cursor = FillCursor::Buffer {
                                 index,
                                 next: Some(next),
@@ -2280,11 +2292,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 Ok(self.park_call(ParkedCall::FillIn { request, cursor })),
                             );
                         }
-                        Ok(Some(Err(status))) => return Some(self.return_status(status)),
+                        Ok(Some(Err(status))) => {
+                            // The fill that failed was its last step.
+                            step_report::call_ended(cpu.index(), Some(StepCall::FillIn));
+                            return Some(self.return_status(status));
+                        }
                         Ok(Some(Ok(()))) => stepped = true,
                     }
                 }
             }
+            // The buffers' last fill, if any, is the fill-in's last step.
+            step_report::call_ended(self.cpu.index(), stepped.then_some(StepCall::FillIn));
         }
         // `dma_map` maps frames, not leaves: commit its range first (§8.6),
         // but only for a caller whose resource `dma_map` would accept and
@@ -2304,6 +2322,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 FillCursor::Dma { next: None } | FillCursor::Buffer { .. } => offset,
             };
             loop {
+                // Whether this safe point's hold took a commit step.
+                let mut committed = false;
                 match self.at_step_safe_point(stepped, StepCall::Commit, |runtime, yielding| {
                     if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                         runtime.service_pending_timer_expiries_on_bootstrap();
@@ -2322,6 +2342,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     ) else {
                         return Some(Ok(true));
                     };
+                    committed = true;
                     Some(runtime.commit_on_demand_step(
                         memory_object,
                         offset,
@@ -2330,19 +2351,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut next,
                     ))
                 }) {
-                    Err(()) => return Some(Err(())),
+                    Err(()) => {
+                        step_report::call_ended(cpu.index(), None);
+                        return Some(Err(()));
+                    }
                     Ok(None) => {
+                        step_report::call_ended(cpu.index(), None);
                         let cursor = FillCursor::Dma { next: Some(next) };
                         return Some(Ok(self.park_call(ParkedCall::FillIn { request, cursor })));
                     }
-                    Ok(Some(Ok(true))) => break,
+                    Ok(Some(Ok(true))) => {
+                        step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
+                        break;
+                    }
                     Ok(Some(Ok(false))) => stepped = true,
                     Ok(Some(Err(
                         status @ (deepwyrm_abi::DW_STATUS_NO_RESOURCES
                         | deepwyrm_abi::DW_STATUS_NO_MEMORY),
-                    ))) => return Some(self.return_status(status)),
+                    ))) => {
+                        step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
+                        return Some(self.return_status(status));
+                    }
                     // The syscall reports a bad range or handle itself.
-                    Ok(Some(Err(_))) => break,
+                    Ok(Some(Err(_))) => {
+                        step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
+                        break;
+                    }
                 }
             }
         }
@@ -2417,9 +2451,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 })
             });
             match step {
-                Err(()) => return Err(()),
-                Ok(None) => return Ok(self.park_call(ParkedCall::Commit { request, next })),
-                Ok(Some(Some(ready))) => return Ok(ready),
+                Err(()) => {
+                    step_report::call_ended(cpu.index(), None);
+                    return Err(());
+                }
+                Ok(None) => {
+                    step_report::call_ended(cpu.index(), None);
+                    return Ok(self.park_call(ParkedCall::Commit { request, next }));
+                }
+                Ok(Some(Some(ready))) => {
+                    // This safe point's hold took the call's last step.
+                    step_report::call_ended(cpu.index(), Some(StepCall::Commit));
+                    return Ok(ready);
+                }
                 Ok(Some(None)) => stepped = true,
             }
         }
@@ -2468,8 +2512,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                     (!yielding).then(|| runtime.prepare_guard_free_usercopy())
                 }) {
-                    Err(()) => return Zeroing::Stopped(allocation),
-                    Ok(None) => return Zeroing::Yielded { allocation, first },
+                    Err(()) => {
+                        step_report::call_ended(cpu.index(), None);
+                        return Zeroing::Stopped(allocation);
+                    }
+                    Ok(None) => {
+                        step_report::call_ended(cpu.index(), None);
+                        return Zeroing::Yielded { allocation, first };
+                    }
                     Ok(Some((fresh, fresh_root, fresh_process))) => {
                         phase = Some(fresh);
                         root = fresh_root;
@@ -2487,6 +2537,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             first += count;
             stepped = true;
         }
+        // The last zeroing step, if any, ends here; with none, the timing
+        // begun above ends untaken.
+        step_report::call_ended(cpu.index(), stepped.then_some(StepCall::Create));
         let phase = phase.expect("every safe point that ran took a fresh phase");
         let mut access = self.paging.guard_free_access(self.runtime.guard_free());
         let mut paging = access.lock();
