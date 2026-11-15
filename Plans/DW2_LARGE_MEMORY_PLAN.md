@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11). M5's seven steps are built and checked at the development tier (§10.18), and so is step 8, which Mike added on 2026-11-15: the wake that bounds how long owed finalization waits for its next step (§10.19, revision 3 as built). Mike had the probe for the wake built the same day (§10.19, the probe): it shows the wake sent and the gap at about 5 ms against 14 to 22 ms without it. **M5 is done at the development tier: closed by Mike, 2026-11-15** (§10.18), with the check's one-second deadline left as it is and the steps a BSP syscall takes accepted (§9).
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11). M5's seven steps are built and checked at the development tier (§10.18), and so is step 8, which Mike added on 2026-11-15: the wake that bounds how long owed finalization waits for its next step (§10.19, revision 3 as built). Mike had the probe for the wake built the same day (§10.19, the probe): it shows the wake sent and the gap at about 5 ms against 14 to 22 ms without it. **M5 is done at the development tier: closed by Mike, 2026-11-15** (§10.18), with the check's one-second deadline left as it is and the steps a BSP syscall takes accepted (§9). **M7 is started** (Mike, 2026-11-15): its first step, the buddy allocator, is designed in §12 and waits for his approval; nothing of it is built.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -1239,3 +1239,99 @@ Mike: overcommit is handled the way Linux handles it, tailored to this architect
 
 Questions for M9's design, not decided here: what the kernel reserves so the OOM service can always run; whether a parked fault counts against the stop and preemption rules of §8.5; how the per-job score is carried; and whether kernel-internal allocations (page tables, index nodes) wait or fail.
 
+## 12. M7: fragmentation that stays fast (started 2026-11-15)
+
+Mike, 2026-11-15: start M7 with the buddy allocator's design; the coordinator reads and designs, and an Opus worker gets a plan to implement, not design work. §6.8 is the direction this follows.
+
+### 12.1 Steps
+
+Each step is designed here by the coordinator before it is built, approved by Mike, built by an Opus worker, then reviewed by the coordinator (the security review included, since the allocator and the boot path change) and booted with `dev-boot --check --smp --sdk`.
+
+1. **The buddy allocator** (§12.2). Closes §9's R4 (allocation costs runs × free ranges) and §5.3a's R5 (the start index's position lookup scans the initial ranges).
+2. **The role table** (§6.8 item 4, §9's R1): a smaller `RoleSlot`, and storage that is not one contiguous run. Not designed yet.
+3. **The object index for fragmented eager backings** (§6.8 item 1, §9's R2). Not designed yet.
+4. **Compaction** (§6.8 item 3). Not designed yet.
+
+### 12.2 Step 1: the buddy allocator: design (2026-11-15; waits for Mike's approval)
+
+Read for this design, at Deepwyrm `eb5f17e`: `kernel/src/memory/physical.rs` (all), `memory/growable.rs`, `memory/frame_roles.rs` (the slot, record and manager types), `memory/frame_roles/manager.rs` (construction, `allocate`, `allocate_below`, `grown_layout`, `adopt_storage`, `check_invariants`, `cancel`, the start index), `memory/frame_roles/chain.rs` (`take_run`, `free_chain`), `memory/frame_roles/index.rs` (the frame takes and frees), the test helpers in `frame_roles/test_support.rs`, `chain_tests.rs`, `index_tests.rs` and `tests.rs` (growth), `arch/x86_64/mm/activation.rs` (`grow_frame_roles`, `allocate_zeroed_architecture_frame`), `activation/build.rs` (the ceilings), `arch/x86_64/vtd.rs` (its ceiling), and `lib.rs` (the boot order). Not read: the rest of `manager.rs`, the publisher, and the boot map's sanitizer; nothing below depends on them.
+
+**What the code does today.**
+- `PhysicalFrameAllocator` keeps the ranges it may ever hand out (`initial`) and a free list sorted by address. `allocate_run` takes the lowest range that fits (first fit); `free_run` inserts and merges. Allocation, the free's overlap check, `largest_free_pages` and `available_frames` are all linear in the free ranges. `available_frames` is on a syscall path (the TaskGroup memory query).
+- The free list starts inline (4,503 entries) and, at `grow_frame_roles` right after activation, moves into the grown role table's run, sized by `free_range_bound` at one `PageRange` (16 bytes) per allocator page.
+- Who allocates what, by grep over the production tree: single pages (`allocate(1)`: tables, roots, index nodes and on-demand pages through `take_run(1)`); single pages below a ceiling (`allocate_below(1, …)`: the AP trampoline below 1 MiB and the boot root below 4 GiB, both while the root is built, before activation; VT-d's table pool below the units' address width, after growth, at boot only); the grown table's own run (`allocate(layout.page_count())`, before the table is adopted); and scattered backings (`take_run(wanted.min(largest))`, any length). So after growth nothing asks for a contiguous run of a given length except `take_run`, which accepts whatever the largest free piece is.
+
+**Decisions.**
+
+1. *Two phases.* The range list stays as the boot allocator, unchanged, until the role table grows; the buddy allocator takes over at that moment and serves for the rest of the kernel's life. Reason: buddy metadata is per page and has to live in RAM reached through the direct map, which does not exist before activation. The boot phase makes a bounded number of allocations (the inline list already bounds it at 4,096 live runs). A side effect that matters for testing: every existing host test that does not grow the table sees the same allocator as before.
+2. *Metadata outside the frames.* Free-list links live in a per-page array in the grown table's run, not inside the free frames. A kernel bug that left a mapping to a freed frame then cannot corrupt the allocator, and nothing reads a freed frame's contents. Cost: 9 bytes per allocator page (a 1-byte tag and two 4-byte links), against the 16 bytes per page of the range list it replaces. The grown table goes from 104 to 97 bytes per page.
+3. *Runs keep their exact length.* A request for `n` pages takes the smallest free block that holds it, keeps the first `n` pages as the run and returns the rest to the free lists at once. A run is therefore still an arbitrary range freed whole (M1's rule at the role level is untouched), and a backing gets as few runs as the free blocks allow. Freeing a run splits it into aligned blocks, which merge with their neighbours.
+4. *Blocks are aligned by absolute page number*, and a block lies inside one initial range. Two buddies merge only when the merged block still lies inside that range. Orders run from 0 to 40 (a block of 2^40 pages is the 52-bit physical limit), so the per-order state is 41 list heads and one 64-bit mask.
+
+**Data** (in `physical.rs`).
+
+```rust
+/// Links of a free block's first page; positions are stored plus one, 0 = none.
+#[derive(Clone, Copy)] #[repr(C)]
+pub(super) struct FreeLink { next: u32, prev: u32 }
+
+const BUDDY_ORDERS: usize = 41;
+
+struct Buddy {
+    /// Per allocator page (by page position): 0, or 1 + the order of the
+    /// free block that starts at this page.
+    tags: &'static mut [u8],
+    /// Per allocator page; meaningful only where `tags` is non-zero.
+    links: &'static mut [FreeLink],
+    /// Per initial range: the allocator pages before it.
+    bases: &'static mut [u64],
+    /// Per order: position + 1 of the first free block, 0 = empty.
+    heads: [u32; BUDDY_ORDERS],
+    /// Bit k is set iff `heads[k] != 0`.
+    nonempty: u64,
+    free_pages: u64,
+}
+```
+
+`PhysicalFrameAllocator` gains `buddy: Option<Buddy>`; its `free` becomes a plain inline array (it is never adopted any more), so `adopt_free_list`, `free_list_capacity_for` and the allocator's use of `GrowableStore` go. A *page position* is a page's index in the concatenation of the initial ranges, as the start index already defines it. New `page_position(physical_start) -> Option<usize>`: a linear scan before adoption (today's `start_position`), a binary search over the initial ranges plus `bases` after it. The manager's `start_position` calls it and loses its own scan.
+
+**Invariants** (checked by a new `check_buddy`, called from `check_invariants`).
+- I1. A non-zero tag `k + 1` sits only on a page whose page number is a multiple of 2^k, and the block of 2^k pages starting there lies inside one initial range.
+- I2. Free blocks are pairwise disjoint, and no page inside a free block other than its first has a non-zero tag.
+- I3. Every free block is on the list of its order exactly once; each list is a consistent doubly linked list; `nonempty` matches the heads.
+- I4. No two free blocks are buddies of the same order whose union lies inside one initial range.
+- I5. `free_pages` is the sum of the free blocks' pages.
+
+**Operations after adoption.** `pfn` is a physical address divided by the page size. All arithmetic is checked and every refusal is decided before anything is changed, as today.
+
+- `insert_range(start, pages)` (private; used by seeding, by the tail return and by `free_run`): find the initial range `r` holding `start` once. While pages remain: `k = min(trailing_zeros(pfn), ilog2(remaining))`; insert the block `(pfn, k)`; advance by 2^k. To insert a block: while `k < 40`, let `b = pfn ^ (1 << k)` and `m = min(pfn, b)`; stop unless the block `(m, k + 1)` lies inside `r` and `tags[pos(b)] == k + 1`; otherwise unlink `b` from list `k`, clear its tag, and continue with `(m, k + 1)`. Then set `tags[pos(pfn)] = k + 1` and push the block on the head of list `k`. Inside the loop a position is `bases[r] + (pfn - start_pfn(r))`, so each level is O(1).
+- `allocate_run(n)`: `k = ceil(log2(n))`. If `nonempty >> k` is zero, `NoFramesAvailable`. Otherwise take the head of the lowest non-empty order `j >= k` (unlink, clear the tag), `insert_range` the tail `[start + n, start + 2^j)` if there is one, and subtract `n` from `free_pages`. Return `[start, start + n)`. `insert_range` itself never touches `free_pages`; its callers do.
+- `allocate_run_below(n, ceiling)`: the same, for a block whose first `n` pages end at or below `min(ceiling, limit)`. First try the head of each non-empty order `j >= k`. If none qualifies, scan the tags upward from the lowest allocator page, one initial range after another: at a free block of order at least `k` that qualifies, take it; at a smaller free block skip its pages; otherwise step one page; stop at the ceiling. The scan is linear in the allocator pages below the ceiling. Its callers after growth are VT-d's pool at boot, whose ceiling is normally above all of RAM, so the first try answers.
+- `free_run(range)`: `InvalidPageRange` and `OutsidePhysicalLimit` as today; `InvalidFrame` unless the range lies inside one initial range; `DoubleFree` if any page of it is free, which is decided exactly by two checks: no tag in `[pos(start), pos(end))` is non-zero (read eight tags at a time where aligned), and for each order `k` from 1 to 40 the aligned page `h = pfn & !((1 << k) - 1)`, when `h < pfn` and `h` is inside the range's initial range, does not carry tag `k + 1`. Then `insert_range`, and add the pages to `free_pages`.
+- `largest_free_pages()`: 0 if `nonempty` is 0, else `1 << (63 - nonempty.leading_zeros())`. `available_frames()`: `free_pages`. `overlaps_free(range)`: the two `DoubleFree` checks.
+- `adopt_buddy(tags, links, bases) -> Result<(), (…)>` replaces `adopt_free_list`: it refuses (returning the slices) unless this is the first adoption, `tags.len() == links.len() ==` the initial frames, that count is below `u32::MAX`, and `bases.len() ==` the number of initial ranges. It fills `bases`, then calls `insert_range` for each range of the boot free list in order, sets `free_pages` to their total, and sets `buddy`. Nothing in it can fail after the checks.
+
+Before adoption every one of these runs today's code, unchanged.
+
+**Costs.** Allocation and merging are bounded by the 41 orders, whatever the fragmentation: an allocation is one mask test, one unlink and at most 40 tail blocks; a free is at most 80 blocks of at most 40 merge steps, plus one byte read per page freed. `largest_free_pages` and `available_frames` are O(1). The M1 bound no longer limits anything after growth: a free cannot run out of list entries, because each page has its own.
+
+**The manager** (`frame_roles.rs`, `manager.rs`).
+- `RoleTableLayout` drops `ranges_offset` and `ranges` and gains `links_offset`, `bases_offset`, `bases` and `tags_offset` (tags last; every offset stays 8-aligned through the existing `after` helper). `grown_layout` sizes `links` and `tags` by `starts` and `bases` by the initial range count. The clause that kept the grown free list longer than the boot list (`.max(RANGE_CAPACITY + 1)`, §5.3a D1) and `adopt_storage`'s `layout.ranges > RANGE_CAPACITY` test go with the list.
+- `adopt_storage` carves the three new parts inside its existing unsafe block and calls `adopt_buddy` where it called `adopt_free_list`. Its rule stands: every check before any change, and on an error the grant comes back with the manager as it was. So `adopt_buddy`'s refusals must all be reachable before `roles.adopt` runs: check them first.
+- `take_run`, `free_chain`, the index's takes and frees, `allocate`, `allocate_below` and `cancel` do not change: they call the same allocator methods.
+- `lib.rs` logs one more boot line next to `frame-role slots=`: the free pages and the largest free order at adoption.
+
+**What changes in behaviour.** After growth, allocations no longer come lowest address first: they come from the most recently freed block of the smallest sufficient order. Nothing read for this design depends on low addresses without asking for a ceiling; the review checks that again (DMA without an IOMMU is the place to look). A backing in unfragmented memory may have a few runs where it had one, because a run cannot be longer than the largest aligned block; the count is bounded by about twice the number of orders involved, and step 3's index removes the cost. No ABI change.
+
+**Tests (host).** All behaviour tests; none reads source.
+1. *The buddy alone* (`physical/tests.rs`, storage from leaked vectors as `frame_roles/tests.rs` does). Seeding: a boot free list with unaligned ranges becomes the expected set of maximal aligned blocks (a test-only iterator over free blocks in address order). Allocation: exact length, tail returned, `available_frames` and `largest_free_pages` follow. Freeing everything in a different order restores the seeded block set. `DoubleFree` for the same block, for a page inside a free block and for a range containing a free block, each leaving the state unchanged; `InvalidFrame` for a range outside or across initial ranges. No merge across two initial ranges whose pages would pair as buddies. `allocate_run_below`: a block below the ceiling is found by the first try and by the scan; a refusal changes nothing. Exhaustion: single pages until `NoFramesAvailable`, the total equal to the initial frames. `page_position` gives the same answers before and after adoption.
+2. *A model test.* A fixed-seed generator (a small LCG written in the test; no new crate) drives a few thousand allocations and frees of mixed sizes over three initial ranges of a few thousand pages against a `Vec<bool>` model. After every operation: `check_buddy` holds, `available_frames` matches the model, no returned run overlaps a live one, and `largest_free_pages` equals the largest aligned free block the model computes.
+3. *The manager after growth* (`frame_roles/tests.rs`). The growth tests keep their meaning with the new layout. `the_grown_free_list_holds_more_holes_than_the_boot_list` becomes a test that a grown manager survives far more simultaneous holes than the inline list could hold (single pages allocated, every other one freed, `check_invariants` after each phase). `growth_succeeds_when_the_boot_free_list_is_longer_than_the_grown_bound` loses its premise and is replaced by growth on a small machine (the same sizes) simply succeeding.
+4. *Chains and indexes on the buddy allocator.* The existing chain and index tests assert first-fit addresses and stay as boot-phase tests, untouched. New grown-phase tests with assertions that hold for either allocator: a backing of `n` pages resolves every page through a cursor to distinct frames inside allocator RAM, and cancelling it restores `available_frames` and the free block set; a request larger than the largest free block succeeds in several runs whose lengths never increase along the chain; running out of memory mid-backing frees every run taken; an on-demand backing commits scattered pages and a stepped release returns every page and node; `check_invariants` holds throughout.
+5. Each new test is shown to fail against a real fault before it is trusted: at least the merge across initial ranges (drop the range check), the tail return (drop it), and the descendant double free (drop the tag scan).
+
+**Checks.** The four kernel commands (`host test -p deepwyrm-kernel --no-fail-fast`, `xtask clippy` with the ratchet unchanged, `xtask kernel-check`, `fmt --check`); then from Wyrmroot `dev-boot --check --smp --sdk` and one boot on one CPU against the lane. Production runs the buddy allocator for everything after growth, so those boots exercise it under every probe; the worker reports the new boot line and the step report's lines beside a boot of the base revision.
+
+**Not in this step.** The shape and size of `RoleSlot`, and the grown table still being one contiguous run found first-fit by the boot allocator (step 2, which also decides how a table in several pieces is carved). The object index (step 3). Compaction (step 4). Any minimum or preferred run alignment for 2 MiB pages (later, §2).
+
+**For the coordinator's review after the build.** Double and partial frees at the allocator; merges across ranges; position arithmetic and the `u32` position limit; `adopt_storage` staying all-or-nothing; the tail return; a consumer that assumed low addresses; and the cost of `free_run`'s tag scan for one very large run inside a stepped call.
