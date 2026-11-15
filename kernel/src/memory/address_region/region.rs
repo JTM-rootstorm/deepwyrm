@@ -198,7 +198,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         self.commit_specs(
             authority,
             registry,
-            publisher,
+            &mut Publishing(publisher),
             &staged,
             staged_len,
             Some(authorization),
@@ -379,7 +379,56 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             .checked_interval_end(start, byte_len)
             .map_err(model_failure)?;
         self.require_covered(start, end).map_err(model_failure)?;
-        self.rebuild(authority, registry, publisher, start, end, None)
+        self.rebuild(
+            authority,
+            registry,
+            &mut Publishing(publisher),
+            start,
+            end,
+            None,
+        )
+    }
+
+    /// Removes the whole mapping that starts at `start` from a retiring
+    /// root, through the same transaction as [`Self::unmap`] (the same lease
+    /// replacement, removed-translation hulls and coverage pins, and final
+    /// releases for the caller to settle locally), but publishing nothing:
+    /// `teardown` writes no leaf, allocates no table and reclaims none (DW2
+    /// §10.14 revision 2 item 1). Its cost does not depend on the mapping's
+    /// size.
+    #[allow(
+        clippy::result_large_err,
+        reason = "both sides carry one transaction's final-release batch; the kernel has no heap to box it into"
+    )]
+    pub(crate) fn remove_mapping_detached<
+        const OBJECTS: usize,
+        const LEASES: usize,
+        const REGISTRY_OBJECTS: usize,
+        D: DetachedTeardown,
+    >(
+        &mut self,
+        authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        teardown: &D,
+        start: u64,
+    ) -> Result<MappingFinalReleases, AddressSpaceTransactionFailure<core::convert::Infallible>>
+    {
+        let mapping = self
+            .mappings
+            .iter()
+            .flatten()
+            .find(|mapping| mapping.virtual_start == start)
+            .copied()
+            .ok_or_else(|| model_failure(AddressRegionError::Unmapped))?;
+        let end = mapping.spec().end();
+        self.rebuild(
+            authority,
+            registry,
+            &mut Detached(teardown),
+            start,
+            end,
+            None,
+        )
     }
 
     #[allow(
@@ -406,7 +455,14 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
             .checked_interval_end(start, byte_len)
             .map_err(model_failure)?;
         self.require_covered(start, end).map_err(model_failure)?;
-        self.rebuild(authority, registry, publisher, start, end, Some(protection))
+        self.rebuild(
+            authority,
+            registry,
+            &mut Publishing(publisher),
+            start,
+            end,
+            Some(protection),
+        )
     }
 
     #[allow(
@@ -417,7 +473,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         const OBJECTS: usize,
         const LEASES: usize,
         const REGISTRY_OBJECTS: usize,
-        P: AddressSpacePublisher,
+        P: Publication,
     >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
@@ -471,7 +527,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
         const OBJECTS: usize,
         const LEASES: usize,
         const REGISTRY_OBJECTS: usize,
-        P: AddressSpacePublisher,
+        P: Publication,
     >(
         &mut self,
         authority: &mut MemoryObjectAuthority<OBJECTS, LEASES>,
@@ -551,7 +607,7 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 final_releases,
             });
         }
-        if let Err(error) = publisher.publish_replace(
+        if let Err(error) = publisher.publish(
             self.address_space,
             self.region,
             &old[..old_len],
@@ -638,6 +694,65 @@ impl<const SLOTS: usize> AddressRegion<SLOTS> {
                 .ok_or(AddressRegionError::Unmapped)?;
             cursor = mapping.end().min(end);
         }
+        Ok(())
+    }
+}
+
+/// How one region transaction makes its replacement visible: through an
+/// [`AddressSpacePublisher`], or, for a retiring root, not at all.
+trait Publication {
+    type Error;
+
+    fn address_space_key(&self) -> AddressSpaceKey;
+
+    fn publish(
+        &mut self,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+        before: &[Mapping],
+        after: &[Mapping],
+    ) -> Result<(), Self::Error>;
+}
+
+/// The page-table publication every live mutation makes.
+struct Publishing<'a, P>(&'a mut P);
+
+impl<P: AddressSpacePublisher> Publication for Publishing<'_, P> {
+    type Error = P::Error;
+
+    fn address_space_key(&self) -> AddressSpaceKey {
+        self.0.address_space_key()
+    }
+
+    fn publish(
+        &mut self,
+        address_space: AddressSpaceKey,
+        region: RegionKey,
+        before: &[Mapping],
+        after: &[Mapping],
+    ) -> Result<(), Self::Error> {
+        self.0.publish_replace(address_space, region, before, after)
+    }
+}
+
+/// A retiring root's lease removal (DW2 §10.14 revision 2 item 1): the
+/// tables keep whatever they held until they are freed whole.
+struct Detached<'a, D>(&'a D);
+
+impl<D: DetachedTeardown> Publication for Detached<'_, D> {
+    type Error = core::convert::Infallible;
+
+    fn address_space_key(&self) -> AddressSpaceKey {
+        self.0.address_space_key()
+    }
+
+    fn publish(
+        &mut self,
+        _address_space: AddressSpaceKey,
+        _region: RegionKey,
+        _before: &[Mapping],
+        _after: &[Mapping],
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }

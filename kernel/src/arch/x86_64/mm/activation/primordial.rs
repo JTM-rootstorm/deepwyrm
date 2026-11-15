@@ -611,20 +611,33 @@ type MapInput = Result<
 /// protection and the room its placement must find, or the status.
 type MapStep = crate::syscall::MapStep<MemoryProtection>;
 
-/// The largest step of a family-G call made in steps (DW2 M4b), and of an
-/// owed teardown (§10.10). A step holds T and P throughout, so its size
-/// bounds how long every other CPU can wait for T: 2 MiB, an eighth of a
-/// journal batch. A 16 MiB step held T for about 30 ms under QEMU TCG, and a
-/// job mapping in a loop then kept init from answering the shell within its
-/// one-second deadline on four CPUs (DW2 M5 step 4).
+/// The largest step of a family-G call made in steps (DW2 M4b); an owed
+/// teardown's step was this size until DW2 §10.14 revision 2, which steps
+/// it by whole mappings and then by tables. A step holds T and P
+/// throughout, so its size bounds how long every other CPU can wait for T:
+/// 2 MiB, an eighth of a journal batch. A 16 MiB step held T for about 30 ms
+/// under QEMU TCG, and a job mapping in a loop then kept init from
+/// answering the shell within its one-second deadline on four CPUs (DW2 M5
+/// step 4).
 const FAMILY_G_STEP_BYTES: u64 = 2 * 1024 * 1024;
 /// Index entries one step of queued finalization visits (DW2 §10.12 item
-/// 2): 512, a 2 MiB step's pages, like a teardown step.
+/// 2): 512, a 2 MiB step's pages, like a teardown step's table entries.
 const FINALIZE_STEP_ENTRIES: u64 = 512;
 const _: () = assert!(FAMILY_G_STEP_BYTES <= PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE);
 /// One hold of an on-demand commit (DW2 M6 §8.2, §8.11 R1): it zeroes every
 /// frame it takes, so it is kept well below a family-G step.
 const ON_DEMAND_COMMIT_STEP_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What one owed teardown step's work found (DW2 §10.14 revision 2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwedTeardownStep {
+    /// A CPU is resident on the root: nothing was done.
+    Resident,
+    /// A mapping or tables were removed; the root stays owed.
+    Remain,
+    /// No mapping or table remains: the root is to be retired.
+    Retire,
+}
 
 /// The first hold of a family-G syscall (D1 option B3).
 #[must_use = "a family-G syscall leaves through ready_to_return, now or after its acknowledgement"]
@@ -5747,28 +5760,42 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         root_key: crate::memory::address_region::AddressRegionObjectKey,
         proof: &crate::task::ProcessQuiescenceProof,
     ) -> Result<(), ()> {
-        self.unmap_inactive_pieces(process, root_key, proof, None)
-            .map(|_| ())
+        self.unmap_inactive_pieces(process, root_key, proof)
     }
 
-    /// Removes an exited, quiesced Process's mappings, lowest first. With no
-    /// `step`, all of them, one transaction per mapping. With `step`, one
-    /// queued-teardown step (DW2 §10.10 item 3): a single transaction that
-    /// removes at most that many bytes from the front of the lowest mapping,
-    /// so a step's hold is one transaction however small the mappings are
-    /// (step-5 review D-2). `true` if mappings remain.
+    /// Removes every mapping of an exited, quiesced Process, lowest first,
+    /// one transaction per mapping, through the clearing publisher: the
+    /// synchronous teardown, which a queued root never takes (DW2 §10.14
+    /// revision 2 item 4).
     fn unmap_inactive_pieces(
         &mut self,
         process: ProcessKey,
         root_key: crate::memory::address_region::AddressRegionObjectKey,
         proof: &crate::task::ProcessQuiescenceProof,
-        step: Option<u64>,
-    ) -> Result<bool, ()> {
+    ) -> Result<(), ()> {
         let current_process = self.own.active_root.as_ref().ok_or(())?.process();
         if process == current_process {
             return Err(());
         }
+        let address_space = self
+            .core
+            .regions
+            .region(root_key)
+            .map_err(|_| ())?
+            .address_space_key();
         let mut paging = self.paging.lock();
+        // A queued root is torn down only by its steps, whose first made it
+        // retiring and left its leaves in place (DW2 §10.14 revision 2 item
+        // 4). The primordial root is never queued, so never retiring.
+        assert!(
+            process == self.core.primordial_process
+                || !paging
+                    .child_root_is_retiring(process, address_space)
+                    .unwrap_or_else(|error| {
+                        panic!("a synchronous teardown's root binding is missing: {error:?}")
+                    }),
+            "a synchronous teardown met a retiring root"
+        );
         let mut user = paging
             .page_table_mutation_session(self.own.active_root.as_ref().ok_or(())?, current_process);
         user.select_process_for_return_validation(process)
@@ -5777,18 +5804,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // with its blocked operation or held by a CPU still resident on this
         // root, which the caller has ruled out. Checked here, before any
         // change, rather than failing partway through the unmaps below.
-        let address_space = self
-            .core
-            .regions
-            .region(root_key)
-            .map_err(|_| ())?
-            .address_space_key();
         assert!(
             !user.pins_hold_any(address_space),
             "an exited Process's address space still holds a user pin at teardown"
         );
-        let mut stepped = false;
-        let remain = loop {
+        loop {
             let mapping = self
                 .core
                 .regions
@@ -5800,18 +5820,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .next()
                 .copied();
             let Some(mapping) = mapping else {
-                break false;
+                break;
             };
-            if stepped {
-                break true;
-            }
-            let length = match step {
-                Some(bytes) => {
-                    stepped = true;
-                    mapping.byte_len().min(bytes)
-                }
-                None => mapping.byte_len(),
-            };
+            let length = mapping.byte_len();
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
                 let region = self
@@ -5851,10 +5862,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             for release in releases.into_items().into_iter().flatten() {
                 self.core.cleanup.push(release);
             }
-        };
+        }
         user.select_process_for_return_validation(current_process)
             .map_err(|_| ())?;
-        Ok(remain)
+        Ok(())
     }
 
     /// Design §11.2.12 rule 3: tears an exited Process's root down if this
@@ -5991,16 +6002,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .region(root_key)
             .unwrap_or_else(|error| panic!("an owed root disappeared: {error:?}"))
             .address_space_key();
-        let residents = self
-            .paging
-            .lock()
-            .child_root_resident_count(process, address_space)
-            .unwrap_or_else(|error| panic!("an owed root's residency query failed: {error:?}"));
-        if residents != 0 {
-            // Its resident queues it again when it leaves.
-            self.core.owed_teardown.push(slot, process);
-            return false;
-        }
         assert!(
             self.core
                 .tasks
@@ -6015,23 +6016,105 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|_| panic!("an owed teardown's Process is not quiescent"));
         let cpu = self.cpu().index();
         step_report::timed(cpu, StepCall::Teardown, || {
-            let remain = self
-                .unmap_inactive_pieces(process, root_key, &proof, Some(FAMILY_G_STEP_BYTES))
-                .unwrap_or_else(|()| panic!("an owed teardown step drifted"));
-            if remain {
-                self.core.owed_teardown.push(slot, process);
-            } else {
-                let drained = self
-                    .core
-                    .shared
-                    .execution
-                    .blocked_operations_drained(&self.core.tasks, &proof)
-                    .unwrap_or_else(|_| panic!("an owed root's blocked operations remain"));
-                self.retire_owed_root(process, address_space, &proof, drained)
-                    .unwrap_or_else(|()| panic!("an owed root's retirement drifted"));
+            let step = self.retiring_teardown_step(process, root_key, address_space, &proof);
+            match step {
+                // Its resident queues it again when it leaves.
+                OwedTeardownStep::Resident | OwedTeardownStep::Remain => {
+                    self.core.owed_teardown.push(slot, process);
+                }
+                OwedTeardownStep::Retire => {
+                    let drained = self
+                        .core
+                        .shared
+                        .execution
+                        .blocked_operations_drained(&self.core.tasks, &proof)
+                        .unwrap_or_else(|_| panic!("an owed root's blocked operations remain"));
+                    self.retire_owed_root(process, address_space, &proof, drained)
+                        .unwrap_or_else(|()| panic!("an owed root's retirement drifted"));
+                }
             }
-        });
-        true
+            step != OwedTeardownStep::Resident
+        })
+    }
+
+    /// The work of one owed teardown step (DW2 §10.14 revision 2), in one
+    /// paging lock hold that first re-reads the root's residents and
+    /// requires zero (item 0): with a CPU resident, nothing is done. At the
+    /// first step the root moves into retiring. Then, while mappings
+    /// remain, one whole mapping's leases are released through the sealed
+    /// teardown publisher, which touches no table (item 1); then up to a
+    /// step's tables are freed (item 2). A step that finds neither leaves
+    /// the root for the caller to retire (item 3).
+    fn retiring_teardown_step(
+        &mut self,
+        process: ProcessKey,
+        root_key: crate::memory::address_region::AddressRegionObjectKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+    ) -> OwedTeardownStep {
+        let mut paging = self.paging.lock();
+        let residents = paging
+            .child_root_resident_count(process, address_space)
+            .unwrap_or_else(|error| panic!("an owed root's residency query failed: {error:?}"));
+        if residents != 0 {
+            return OwedTeardownStep::Resident;
+        }
+        paging
+            .begin_retiring_child_root(process, address_space)
+            .unwrap_or_else(|error| panic!("an owed root did not become retiring: {error:?}"));
+        // Reviewed safe (DW2 §7.1 R2, 2026-11-13): every owned pin is drained
+        // with its blocked operation or held by a CPU resident on this root,
+        // and none is.
+        assert!(
+            !paging.user_pins_hold_any(address_space),
+            "an exited Process's address space still holds a user pin at teardown"
+        );
+        let mapping = self
+            .core
+            .regions
+            .region(root_key)
+            .unwrap_or_else(|error| panic!("an owed root disappeared: {error:?}"))
+            .mappings()
+            .iter()
+            .flatten()
+            .next()
+            .copied();
+        if let Some(mapping) = mapping {
+            let publisher = paging
+                .retiring_teardown_publisher(process, address_space, proof)
+                .unwrap_or_else(|error| panic!("an owed root's teardown publisher: {error:?}"));
+            let region = self
+                .core
+                .regions
+                .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                .unwrap_or_else(|error| panic!("an owed root's region: {error:?}"));
+            let releases = region
+                .remove_mapping_detached(
+                    &mut self.core.memory,
+                    &mut self.core.registry,
+                    &publisher,
+                    mapping.virtual_start(),
+                )
+                .unwrap_or_else(|failure| {
+                    panic!("an owed mapping's removal diverged: {:?}", failure.error())
+                });
+            // The root is retiring with no CPU resident, so no TLB can hold
+            // the removed translations: the unmapped lease pins are
+            // released now.
+            let releases = releases.settle_locally(&mut self.core.registry);
+            for release in releases.into_items().into_iter().flatten() {
+                self.core.cleanup.push(release);
+            }
+            return OwedTeardownStep::Remain;
+        }
+        let tables = paging
+            .teardown_retiring_tables_step(process, address_space)
+            .unwrap_or_else(|error| panic!("an owed root's table step failed: {error:?}"));
+        if tables.freed() != 0 {
+            OwedTeardownStep::Remain
+        } else {
+            OwedTeardownStep::Retire
+        }
     }
 
     /// `finish_quiesced_process_root_retirement` without its drain: the

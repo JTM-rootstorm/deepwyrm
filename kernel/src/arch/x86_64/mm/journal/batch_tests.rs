@@ -506,3 +506,185 @@ fn a_batch_starting_inside_a_run_of_a_scattered_backing_maps_its_own_frames() {
     assert!(Fixture::pages().all(|page| fixture.leaf(&target, page).is_none()));
     assert_eq!(fixture.roles.check_invariants(), Ok(()));
 }
+
+/// Stands for a retiring root in the host model (DW2 §10.14 revision 2
+/// item 1).
+struct HostTeardown(crate::memory::address_region::AddressSpaceKey);
+
+impl crate::memory::address_region::detached_seal::Sealed for HostTeardown {}
+
+#[allow(
+    unsafe_code,
+    reason = "the host model has no CPU that could walk the fixture's root"
+)]
+// SAFETY: the host model has no CPU, so nothing walks the fixture's root.
+unsafe impl crate::memory::address_region::DetachedTeardown for HostTeardown {
+    fn address_space_key(&self) -> crate::memory::address_region::AddressSpaceKey {
+        self.0
+    }
+}
+
+/// DW2 §10.14 revision 2 item 2: a retiring root's page tables are freed
+/// with their leaves still in them. When those frames come back as tables,
+/// the publisher's candidate path zeroes them first, so a new mapping's
+/// tables hold only its own entries.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test stands in for the retiring-root teardown no CPU can observe"
+)]
+fn a_page_table_freed_with_its_leaves_is_zeroed_when_it_is_reused() {
+    let physical_mask = ((1_u64 << 40) - 1) & !(BASE_PAGE_SIZE - 1);
+    let mut fixture = Fixture::new(24);
+    let mut target = FakeTarget::default();
+    assert_eq!(fixture.map(&mut target).0, Ok(()));
+    let root = fixture.root;
+    let entry = |target: &FakeTarget, table: u64, index: usize| {
+        target.entries.get(&(table, index)).copied().unwrap_or(0) & physical_mask
+    };
+    let pdpt = entry(&target, root.physical_start(), 0);
+    let pd = entry(&target, pdpt, 0);
+    let page_tables = [entry(&target, pd, 0), entry(&target, pd, 1)];
+    let old = [pdpt, pd, page_tables[0], page_tables[1]];
+    // Each page table also holds a leaf (present, user) of some other,
+    // long gone mapping.
+    const STALE: u64 = 0x7700_0000 | 0b101;
+    for table in page_tables {
+        target.entries.insert((table, 300), STALE);
+    }
+
+    // The leases go without touching a leaf.
+    let releases = fixture
+        .region
+        .remove_mapping_detached(
+            &mut fixture.objects,
+            &mut fixture.registry,
+            &HostTeardown(fixture.region.address_space_key()),
+            START,
+        )
+        .unwrap();
+    drop(releases.settle_locally(&mut fixture.registry));
+    assert!(Fixture::pages().all(|page| fixture.leaf(&target, page).is_some()));
+
+    // The tables go bottom-up, page tables unread, each parent entry cleared.
+    let owner = root.owner();
+    let identity = |roles: &FrameRoleManager<4, 64>, level, frame| {
+        roles.table_identity(owner, level, frame).unwrap()
+    };
+    let pdpt = identity(&fixture.roles, TableLevel::Pdpt, pdpt);
+    let pd = identity(&fixture.roles, TableLevel::Pd, pd);
+    let freed = [
+        (
+            pd,
+            0,
+            identity(&fixture.roles, TableLevel::Pt, page_tables[0]),
+        ),
+        (
+            pd,
+            1,
+            identity(&fixture.roles, TableLevel::Pt, page_tables[1]),
+        ),
+        (pdpt, 0, pd),
+        (root, 0, pdpt),
+    ];
+    let reads = target.read_count;
+    for (parent, index, table) in freed {
+        target
+            .apply(
+                &[JournalWrite::new(
+                    FrameAddress(parent.physical_start()),
+                    index,
+                    0,
+                )],
+                &[],
+            )
+            .unwrap();
+        // SAFETY: the host model has no CPU, so nothing walks the root, and
+        // the parent's entry was cleared above.
+        unsafe { fixture.roles.reclaim_retiring_table(root, parent, table) }.unwrap();
+    }
+    assert_eq!(target.read_count, reads);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+    for table in page_tables {
+        assert_eq!(target.entries.get(&(table, 300)), Some(&STALE));
+    }
+
+    // Only the freed tables' frames are left free, so the refill after the
+    // first batch must take its tables from them. The first batch gets
+    // three never-used frames.
+    for candidate in fixture.candidates.iter_mut() {
+        if let Some(candidate) = candidate.take() {
+            fixture.roles.cancel_table_candidate(candidate).unwrap();
+        }
+    }
+    let mut fresh = std::vec::Vec::new();
+    let mut reused = std::vec::Vec::new();
+    while fixture.roles.available_frames() != 0 {
+        let allocation = fixture.roles.allocate(1).unwrap();
+        if old.contains(&allocation.physical_start()) {
+            reused.push(allocation);
+        } else if fresh.len() < 3 {
+            fresh.push(allocation);
+        } else {
+            // Held for the test's life: the range has no destructor.
+            let _ = allocation;
+        }
+    }
+    assert_eq!(fresh.len(), 3);
+    for (slot, (allocation, level)) in fresh
+        .into_iter()
+        .zip([TableLevel::Pdpt, TableLevel::Pd, TableLevel::Pt])
+        .enumerate()
+    {
+        assert!(
+            target
+                .entries
+                .keys()
+                .all(|(table, _)| *table != allocation.physical_start())
+        );
+        // SAFETY: the fake target holds no entry for this frame.
+        let zeroed = unsafe { fixture.roles.assume_zeroed(allocation) }.unwrap();
+        fixture.candidates[slot] = Some(fixture.roles.prepare_table(zeroed, owner, level).unwrap());
+    }
+    for allocation in reused {
+        fixture.roles.cancel_allocation(allocation).unwrap();
+    }
+    assert_eq!(fixture.roles.available_frames(), 4);
+
+    assert_eq!(fixture.map(&mut target).0, Ok(()));
+    for (index, page) in Fixture::pages().enumerate() {
+        assert_eq!(
+            fixture.leaf(&target, page),
+            Some(fixture.backing_start + index as u64 * BASE_PAGE_SIZE)
+        );
+    }
+    let second = START + 2 * BASE_PAGE_SIZE;
+    let new_pdpt = entry(&target, root.physical_start(), 0);
+    let new_pd = entry(&target, new_pdpt, 0);
+    let second_table = entry(&target, new_pd, ((second >> 21) & 0x1ff) as usize);
+    assert!(
+        old.contains(&second_table),
+        "the second page table reuses a freed table's frame"
+    );
+    // Three of the four freed frames became tables or candidates, each
+    // zeroed first; a stale leaf survives only in the frame still free.
+    assert_eq!(fixture.roles.available_frames(), 1);
+    let still_free = fixture.roles.allocate(1).unwrap().physical_start();
+    assert!(
+        target
+            .entries
+            .iter()
+            .filter(|(_, value)| **value == STALE)
+            .all(|((table, _), _)| *table == still_free)
+    );
+    assert_eq!(
+        target
+            .entries
+            .iter()
+            .filter(|((table, _), value)| *table == second_table && **value != 0)
+            .count(),
+        2,
+        "the reused page table holds only the new mapping's two leaves"
+    );
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}

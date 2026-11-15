@@ -119,6 +119,9 @@ pub(crate) enum AddressSpaceCoherencyError {
     NotTarget,
     TeardownRequiresLeave,
     Retired,
+    /// The root is retiring (DW2 §10.14 revision 2 item 0): no CPU may enter
+    /// it and no mutation may be prepared on it again.
+    Retiring,
 }
 
 /// Move-only proof that one CPU is published resident in this exact root.
@@ -207,6 +210,8 @@ struct CoherencyState<const CPUS: usize> {
     residency_epochs: [u64; CPUS],
     shootdown_generation: u64,
     phase: MutationPhase<CPUS>,
+    /// Set once, never cleared: see [`AddressSpaceCoherency::begin_retiring`].
+    retiring: bool,
 }
 
 impl<const CPUS: usize> CoherencyState<CPUS> {
@@ -216,6 +221,7 @@ impl<const CPUS: usize> CoherencyState<CPUS> {
             residency_epochs: [0; CPUS],
             shootdown_generation: 0,
             phase: MutationPhase::Idle,
+            retiring: false,
         }
     }
 }
@@ -253,6 +259,9 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
     pub(crate) fn enter(&self, cpu: CpuIndex) -> Result<Residency, AddressSpaceCoherencyError> {
         let index = self.checked_cpu(cpu)?;
         let mut state = self.state.lock();
+        if state.retiring {
+            return Err(AddressSpaceCoherencyError::Retiring);
+        }
         match state.phase {
             MutationPhase::Prepared(_)
             | MutationPhase::Published(RequestState {
@@ -329,6 +338,9 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
     ) -> Result<MutationTransaction<'_, CPUS>, AddressSpaceCoherencyError> {
         self.validate_scope(scope)?;
         let mut state = self.state.lock();
+        if state.retiring {
+            return Err(AddressSpaceCoherencyError::Retiring);
+        }
         match state.phase {
             MutationPhase::Idle => {}
             MutationPhase::Retired => return Err(AddressSpaceCoherencyError::Retired),
@@ -401,6 +413,32 @@ impl<const CPUS: usize> AddressSpaceCoherency<CPUS> {
             active: true,
             _cpu_local: PhantomData,
         })
+    }
+
+    /// Moves this root one way into retiring (DW2 §10.14 revision 2 item 0):
+    /// from here on [`Self::enter`] and [`Self::prepare_mutation`] refuse
+    /// it, so the zero residents required here, under the same lock, stay
+    /// zero for good. Only [`Self::prepare_uncontended_teardown`] still
+    /// runs. Repeating it on a retiring root is accepted.
+    pub(crate) fn begin_retiring(&self) -> Result<(), AddressSpaceCoherencyError> {
+        let mut state = self.state.lock();
+        match state.phase {
+            MutationPhase::Idle => {}
+            MutationPhase::Retired => return Err(AddressSpaceCoherencyError::Retired),
+            MutationPhase::Prepared(_) | MutationPhase::Published(_) => {
+                return Err(AddressSpaceCoherencyError::MutationInFlight);
+            }
+        }
+        if state.residents.count() != 0 {
+            return Err(AddressSpaceCoherencyError::TeardownRequiresLeave);
+        }
+        state.retiring = true;
+        Ok(())
+    }
+
+    /// Whether [`Self::begin_retiring`] has run on this root.
+    pub(crate) fn is_retiring(&self) -> bool {
+        self.state.lock().retiring
     }
 
     /// Acquire-loads this CPU's pending request for the vector `0xe2` handler.
@@ -1215,6 +1253,56 @@ mod tests {
             coherency.enter(cpu0).err(),
             Some(AddressSpaceCoherencyError::Retired)
         );
+    }
+
+    /// DW2 §10.14 revision 2 item 0: a root begins retiring only with no
+    /// CPU resident and nothing in flight; from then on, for good, no CPU
+    /// may enter and no mutation may be prepared, while the final teardown
+    /// still runs.
+    #[test]
+    fn a_retiring_root_refuses_entry_and_mutation_but_not_its_teardown() {
+        let coherency = coherency::<2>();
+        let cpu0 = CpuIndex::new(0).unwrap();
+        let cpu1 = CpuIndex::new(1).unwrap();
+        let scope = InvalidationScope::pages(0x1000, 0x1000).unwrap();
+        let resident = coherency.enter(cpu0).unwrap();
+        assert_eq!(
+            coherency.begin_retiring(),
+            Err(AddressSpaceCoherencyError::TeardownRequiresLeave)
+        );
+        assert!(!coherency.is_retiring());
+        coherency.leave_after_local_flush(resident).unwrap();
+        let prepared = coherency
+            .prepare_mutation(MappingMutation::Unmap, scope)
+            .unwrap();
+        assert_eq!(
+            coherency.begin_retiring(),
+            Err(AddressSpaceCoherencyError::MutationInFlight)
+        );
+        drop(prepared);
+
+        coherency.begin_retiring().unwrap();
+        coherency.begin_retiring().unwrap();
+        assert!(coherency.is_retiring());
+        for cpu in [cpu0, cpu1] {
+            assert_eq!(
+                coherency.enter(cpu).err(),
+                Some(AddressSpaceCoherencyError::Retiring)
+            );
+        }
+        assert_eq!(coherency.resident_cpus().count(), 0);
+        assert!(matches!(
+            coherency.prepare_mutation(MappingMutation::Unmap, scope),
+            Err(AddressSpaceCoherencyError::Retiring)
+        ));
+        let permit = coherency
+            .prepare_uncontended_teardown()
+            .unwrap()
+            .publish()
+            .try_complete()
+            .unwrap();
+        assert_eq!(permit.target_count(), 0);
+        assert!(coherency.is_retiring());
     }
 
     #[test]

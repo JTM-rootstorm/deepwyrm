@@ -408,6 +408,33 @@ pub(crate) unsafe trait AddressSpacePublisher: publisher_seal::Sealed {
     }
 }
 
+pub(crate) mod detached_seal {
+    pub trait Sealed {}
+}
+
+/// The page-table side of a retiring root's lease removal (DW2 §10.14
+/// revision 2 item 1), used only by
+/// [`AddressRegion::remove_mapping_detached`]. It is deliberately not an
+/// [`AddressSpacePublisher`]: it publishes nothing, writing no leaf,
+/// allocating no table and reclaiming none. The removed mappings' leaves
+/// stay in tables no CPU can walk, which are freed whole afterwards.
+///
+/// # Safety
+///
+/// A value may exist only for an owned root (never the primordial) bound to
+/// `address_space_key`, which is retiring with no CPU resident, so that no
+/// CPU can walk that root or hold a translation or paging-structure entry
+/// cached from it, and only while that holds. The live implementation is
+/// built only from a Process quiescence proof under the paging lock.
+#[allow(
+    unsafe_code,
+    reason = "root retirement and residency are architecture invariants Rust cannot prove"
+)]
+pub(crate) unsafe trait DetachedTeardown: detached_seal::Sealed {
+    /// The retiring root this value stands for.
+    fn address_space_key(&self) -> AddressSpaceKey;
+}
+
 /// Identity-bound in-memory publisher used by the G2 concrete host gate.
 #[cfg(test)]
 pub(crate) struct PrimordialHostPublisher {

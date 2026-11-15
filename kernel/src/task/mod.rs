@@ -540,6 +540,14 @@ pub(crate) struct ProcessQuiescenceProof {
     generation: u64,
 }
 
+impl ProcessQuiescenceProof {
+    /// The Process this proof is for. Only the task authority validates
+    /// the proof itself.
+    pub(crate) const fn process(&self) -> ProcessKey {
+        self.process
+    }
+}
+
 /// A fully bound CREATED Process whose parent hierarchy slot is reserved but
 /// not yet discoverable through normal TaskGroup traversal.
 ///

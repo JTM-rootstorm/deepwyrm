@@ -2324,6 +2324,71 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             reservation,
         )
     }
+
+    /// Moves an exited child's root one way into retiring at its owed
+    /// teardown's first step (DW2 §10.14 revision 2 item 0); repeated on
+    /// every later step, it changes nothing.
+    pub(crate) fn begin_retiring_child_root(
+        &self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<(), RootBindingError> {
+        self.root_bindings.begin_retiring(process, address_space)
+    }
+
+    /// Whether an exited child's root is retiring.
+    pub(crate) fn child_root_is_retiring(
+        &self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<bool, RootBindingError> {
+        self.root_bindings.is_retiring(process, address_space)
+    }
+
+    /// Whether any user pin or mutation holds part of `address_space`.
+    pub(crate) fn user_pins_hold_any(
+        &self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> bool {
+        self.user_pins.holds_any(address_space)
+    }
+
+    /// The sealed teardown publisher of a retiring child root (DW2 §10.14
+    /// revision 2 item 1), alive only within this paging lock hold.
+    pub(crate) fn retiring_teardown_publisher(
+        &self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        proof: &crate::task::ProcessQuiescenceProof,
+    ) -> Result<address_space::RetiringRootPublisher<'_>, RootBindingError> {
+        self.root_bindings
+            .retiring_teardown_publisher(process, address_space, proof)
+    }
+
+    /// One table step of a retiring child root (DW2 §10.14 revision 2
+    /// item 2), holding the pin reservation for this step only.
+    pub(crate) fn teardown_retiring_tables_step(
+        &mut self,
+        process: crate::task::ProcessKey,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> Result<address_space::TableTeardownStep, RootBindingError> {
+        let reservation = self
+            .user_pins
+            .reserve_teardown(address_space)
+            .map_err(|_| RootBindingError::MutationInFlight)?;
+        let mut scratch = self
+            .target
+            .current_scratch_target()
+            .map_err(|_| RootBindingError::CpuMismatch)?;
+        self.root_bindings.teardown_tables_step(
+            self.target.roles,
+            &mut scratch,
+            process,
+            address_space,
+            &self.user_pins,
+            reservation,
+        )
+    }
 }
 
 /// The live process session's builder and every constructor of a session

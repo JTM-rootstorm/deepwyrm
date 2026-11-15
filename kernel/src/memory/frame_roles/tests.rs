@@ -274,6 +274,95 @@ fn exact_empty_hierarchy_proof_reclaims_descendants_bottom_up() {
     assert_eq!(roles.check_invariants(), Ok(()));
 }
 
+#[allow(unsafe_code, reason = "the host model commits synthetic zeroed tables")]
+fn commit_child(
+    roles: &mut TestManager,
+    owner: TableOwnerKey,
+    level: TableLevel,
+    parent: Option<TableIdentity>,
+) -> TableIdentity {
+    let frame = allocate_zeroed(roles, 1);
+    let candidate = roles.prepare_table(frame, owner, level).unwrap();
+    roles.commit_table(candidate, parent).unwrap()
+}
+
+/// DW2 §10.14 revision 2 item 2: one table of a retiring hierarchy is freed
+/// alone only when it is a committed child table of the root's owner, below
+/// that root, under the parent its record names, with no committed child of
+/// its own; every refusal changes nothing. Freed bottom-up, the root's count
+/// reaches zero and the empty-hierarchy proof then passes observing none.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model stands in for a retiring root no CPU can walk"
+)]
+fn a_retiring_table_is_freed_alone_only_without_children() {
+    let mut roles: FrameRoleManager<2, 16> = manager(BASE_PAGE_SIZE, 12);
+    let initial = roles.available_frames();
+    let owner = roles.create_table_owner().unwrap();
+    let root = commit_child(&mut roles, owner, TableLevel::Pml4, None);
+    let pdpt = commit_child(&mut roles, owner, TableLevel::Pdpt, Some(root));
+    let pd = commit_child(&mut roles, owner, TableLevel::Pd, Some(pdpt));
+    let pt = commit_child(&mut roles, owner, TableLevel::Pt, Some(pd));
+    let other_owner = roles.create_table_owner().unwrap();
+    let other_root = commit_child(&mut roles, other_owner, TableLevel::Pml4, None);
+    let other_pdpt = commit_child(&mut roles, other_owner, TableLevel::Pdpt, Some(other_root));
+    assert_eq!(roles.hierarchy_table_count(root), Ok(3));
+    assert_eq!(roles.hierarchy_table_count(other_root), Ok(1));
+    assert_eq!(
+        roles.hierarchy_table_count(pd),
+        Err(FrameRoleError::WrongRole)
+    );
+
+    let held = roles.available_frames();
+    let refused = [
+        // A table with a committed child.
+        (root, pdpt, pd),
+        (root, root, pdpt),
+        // The PML4 itself.
+        (root, root, root),
+        // A parent its record does not name, or of the wrong level.
+        (root, pdpt, pt),
+        (root, root, pd),
+        // Another owner's root, table or parent.
+        (other_root, pd, pt),
+        (root, other_root, other_pdpt),
+        // A root that is not a PML4.
+        (pdpt, pd, pt),
+    ];
+    for (refused_root, parent, table) in refused {
+        // SAFETY: the host model owns these hierarchies alone; the call is
+        // refused before it changes anything.
+        let result = unsafe { roles.reclaim_retiring_table(refused_root, parent, table) };
+        assert!(
+            result.is_err(),
+            "freed {table:?} under {parent:?} of {refused_root:?}"
+        );
+        assert_eq!(roles.available_frames(), held);
+        assert_eq!(roles.hierarchy_table_count(root), Ok(3));
+        assert_eq!(roles.hierarchy_table_count(other_root), Ok(1));
+    }
+
+    for (parent, table, left) in [(pd, pt, 2), (pdpt, pd, 1), (root, pdpt, 0)] {
+        assert_eq!(roles.check_retiring_table(root, parent, table), Ok(()));
+        // SAFETY: the host model owns this hierarchy alone and no CPU runs on
+        // it; the parent's entry is not modelled.
+        unsafe { roles.reclaim_retiring_table(root, parent, table) }.unwrap();
+        assert_eq!(roles.hierarchy_table_count(root), Ok(left));
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+    assert_eq!(roles.available_frames(), held + 3);
+    assert!(roles.validate_table_identity(pt).is_err());
+
+    let empty = roles.begin_empty_table_hierarchy(root).unwrap();
+    let empty = roles.finish_empty_table_hierarchy(empty).unwrap();
+    let empty_root = roles.finish_preflighted_hierarchy(empty);
+    // SAFETY: the host model's root has no table below it and no CPU on it.
+    unsafe { roles.reclaim_preflighted_empty_table_root(empty_root) };
+    assert_eq!(roles.available_frames(), initial - 2);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
 #[test]
 fn staged_root_requires_a_unique_candidate_and_can_publish_after_rollback() {
     let mut roles = manager(BASE_PAGE_SIZE, 4);
