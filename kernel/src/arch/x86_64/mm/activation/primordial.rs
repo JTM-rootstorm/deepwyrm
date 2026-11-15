@@ -643,6 +643,9 @@ const FAMILY_G_STEP_BYTES: u64 = 2 * 1024 * 1024;
 /// Index entries one step of queued finalization visits (DW2 §10.12 item
 /// 2): 512, a 2 MiB step's pages, like a teardown step's table entries.
 const FINALIZE_STEP_ENTRIES: u64 = 512;
+/// The step report's record of each owed finalization, by its owed slot
+/// (DW2 §10.19 revision 2 item 1): written only under T.
+static OWED_WAITS: step_report::OwedWaits<MEMORY_OBJECTS> = step_report::OwedWaits::new();
 const _: () = assert!(FAMILY_G_STEP_BYTES <= PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE);
 /// One hold of an on-demand commit (DW2 M6 §8.2, §8.11 R1): it zeroes every
 /// frame it takes, so it is kept well below a family-G step.
@@ -2057,11 +2060,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }) else {
                 // Stopped at a safe point. A call in steps keeps the steps
                 // it made; a pinned map output is let go.
+                step_report::call_ended(cpu.index(), None);
                 self.settle_map_output(output.take(), user, None);
                 return Err(());
             };
             let Some((phase, root, process, snapshot)) = prepared else {
                 // The quantum expired: let the output pin go and park.
+                step_report::call_ended(cpu.index(), None);
                 self.settle_map_output(output.take(), user, None);
                 return Ok(self.park_call(ParkedCall::Region(steps)));
             };
@@ -2069,6 +2074,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if let Some(snapshot) = snapshot {
                 if let Err(status) = steps.set_snapshot(snapshot) {
                     // Refused as one call would be, before any step.
+                    step_report::call_ended(cpu.index(), None);
                     let ready = {
                         let mut guard = self.runtime.lock();
                         let mut runtime = guard.on(&mut self.owned);
@@ -2094,6 +2100,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     Ok(pinned) => output = Some(pinned),
                     Err(status) => {
                         if let Some(status) = steps.abandon(status) {
+                            // Ended before this run's first step.
+                            step_report::call_ended(cpu.index(), None);
                             let ready = {
                                 let mut guard = self.runtime.lock();
                                 let mut runtime = guard.on(&mut self.owned);
@@ -2169,6 +2177,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             match finished {
                 FamilyGBegun::Returned(ready) => {
+                    // The step just taken was the call's last.
+                    step_report::call_ended(cpu.index(), Some(call));
                     self.settle_map_output(output.take(), user, address);
                     return Ok(ready);
                 }
@@ -2178,6 +2188,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         stepped = true;
                         continue;
                     };
+                    step_report::call_ended(cpu.index(), Some(call));
                     let ready = {
                         let mut guard = self.runtime.lock();
                         let mut runtime = guard.on(&mut self.owned);
@@ -2267,8 +2278,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         }
                         Some(runtime.fill_in_user_range(&mut next, end, buffer.write))
                     }) {
-                        Err(()) => return Some(Err(())),
+                        Err(()) => {
+                            step_report::call_ended(cpu.index(), None);
+                            return Some(Err(()));
+                        }
                         Ok(None) => {
+                            step_report::call_ended(cpu.index(), None);
                             let cursor = FillCursor::Buffer {
                                 index,
                                 next: Some(next),
@@ -2277,11 +2292,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 Ok(self.park_call(ParkedCall::FillIn { request, cursor })),
                             );
                         }
-                        Ok(Some(Err(status))) => return Some(self.return_status(status)),
+                        Ok(Some(Err(status))) => {
+                            // The fill that failed was its last step.
+                            step_report::call_ended(cpu.index(), Some(StepCall::FillIn));
+                            return Some(self.return_status(status));
+                        }
                         Ok(Some(Ok(()))) => stepped = true,
                     }
                 }
             }
+            // The buffers' last fill, if any, is the fill-in's last step.
+            step_report::call_ended(self.cpu.index(), stepped.then_some(StepCall::FillIn));
         }
         // `dma_map` maps frames, not leaves: commit its range first (§8.6),
         // but only for a caller whose resource `dma_map` would accept and
@@ -2301,6 +2322,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 FillCursor::Dma { next: None } | FillCursor::Buffer { .. } => offset,
             };
             loop {
+                // Whether this safe point's hold took a commit step.
+                let mut committed = false;
                 match self.at_step_safe_point(stepped, StepCall::Commit, |runtime, yielding| {
                     if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
                         runtime.service_pending_timer_expiries_on_bootstrap();
@@ -2319,6 +2342,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     ) else {
                         return Some(Ok(true));
                     };
+                    committed = true;
                     Some(runtime.commit_on_demand_step(
                         memory_object,
                         offset,
@@ -2327,19 +2351,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         &mut next,
                     ))
                 }) {
-                    Err(()) => return Some(Err(())),
+                    Err(()) => {
+                        step_report::call_ended(cpu.index(), None);
+                        return Some(Err(()));
+                    }
                     Ok(None) => {
+                        step_report::call_ended(cpu.index(), None);
                         let cursor = FillCursor::Dma { next: Some(next) };
                         return Some(Ok(self.park_call(ParkedCall::FillIn { request, cursor })));
                     }
-                    Ok(Some(Ok(true))) => break,
+                    Ok(Some(Ok(true))) => {
+                        step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
+                        break;
+                    }
                     Ok(Some(Ok(false))) => stepped = true,
                     Ok(Some(Err(
                         status @ (deepwyrm_abi::DW_STATUS_NO_RESOURCES
                         | deepwyrm_abi::DW_STATUS_NO_MEMORY),
-                    ))) => return Some(self.return_status(status)),
+                    ))) => {
+                        step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
+                        return Some(self.return_status(status));
+                    }
                     // The syscall reports a bad range or handle itself.
-                    Ok(Some(Err(_))) => break,
+                    Ok(Some(Err(_))) => {
+                        step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
+                        break;
+                    }
                 }
             }
         }
@@ -2414,9 +2451,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 })
             });
             match step {
-                Err(()) => return Err(()),
-                Ok(None) => return Ok(self.park_call(ParkedCall::Commit { request, next })),
-                Ok(Some(Some(ready))) => return Ok(ready),
+                Err(()) => {
+                    step_report::call_ended(cpu.index(), None);
+                    return Err(());
+                }
+                Ok(None) => {
+                    step_report::call_ended(cpu.index(), None);
+                    return Ok(self.park_call(ParkedCall::Commit { request, next }));
+                }
+                Ok(Some(Some(ready))) => {
+                    // This safe point's hold took the call's last step.
+                    step_report::call_ended(cpu.index(), Some(StepCall::Commit));
+                    return Ok(ready);
+                }
                 Ok(Some(None)) => stepped = true,
             }
         }
@@ -2465,8 +2512,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                     (!yielding).then(|| runtime.prepare_guard_free_usercopy())
                 }) {
-                    Err(()) => return Zeroing::Stopped(allocation),
-                    Ok(None) => return Zeroing::Yielded { allocation, first },
+                    Err(()) => {
+                        step_report::call_ended(cpu.index(), None);
+                        return Zeroing::Stopped(allocation);
+                    }
+                    Ok(None) => {
+                        step_report::call_ended(cpu.index(), None);
+                        return Zeroing::Yielded { allocation, first };
+                    }
                     Ok(Some((fresh, fresh_root, fresh_process))) => {
                         phase = Some(fresh);
                         root = fresh_root;
@@ -2484,6 +2537,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             first += count;
             stepped = true;
         }
+        // The last zeroing step, if any, ends here; with none, the timing
+        // begun above ends untaken.
+        step_report::call_ended(cpu.index(), stepped.then_some(StepCall::Create));
         let phase = phase.expect("every safe point that ran took a fresh phase");
         let mut access = self.paging.guard_free_access(self.runtime.guard_free());
         let mut paging = access.lock();
@@ -6342,6 +6398,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         binding: crate::device::InterruptBinding,
     ) -> Result<(), ()> {
+        let owed_before = self.core.memory.owed_slots().count();
         let parent_release = {
             let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
             let mut paging = self.paging.lock();
@@ -6366,6 +6423,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             );
             finalizer.retry_deferred_interrupt_exact(binding)
         };
+        self.note_owed_finalizations(owed_before);
         if let Some(parent_release) = parent_release {
             self.core.cleanup.push(parent_release);
             self.drain_finalizers()?;
@@ -6423,19 +6481,58 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn finalize_owed_step(&mut self) -> bool {
         let owed = if self.core.memory.finalization_owed() {
             let cpu = self.cpu().index();
-            step_report::timed_nested(cpu, StepCall::Finalize, || {
+            let began = step_report::now();
+            // The object completed in this step that was queued first, for
+            // the report's longest wait (DW2 §10.19 revision 2 item 1).
+            let mut oldest: Option<(u64, u64)> = None;
+            let owed = step_report::timed_nested(cpu, StepCall::Finalize, || {
                 let mut paging = self.paging.lock();
-                self.core.memory.finalize_owed_step(
+                self.core.memory.finalize_owed_step_observed(
                     &mut self.core.registry,
                     &mut *paging.target.roles,
                     FINALIZE_STEP_ENTRIES,
+                    |slot, freed, completed| {
+                        OWED_WAITS.freed(slot, freed);
+                        if completed
+                            && let Some((queued, pages)) = OWED_WAITS.completed(slot)
+                            && oldest.is_none_or(|(first, _)| queued < first)
+                        {
+                            oldest = Some((queued, pages));
+                        }
+                    },
                 )
-            })
+            });
+            if let (Some(began), Some(ended)) = (began, step_report::now()) {
+                if let Some((queued, pages)) = oldest {
+                    step_report::finalize_waited(ended.saturating_sub(queued), pages);
+                }
+                step_report::finalize_stepped(cpu, began, ended, owed);
+            }
+            owed
         } else {
             false
         };
         step_report::owed(step_report::Owed::Finalize, owed);
         owed
+    }
+
+    /// Records, for the step report, the owed finalizations queued since
+    /// the queue held `before` (DW2 §10.19 revision 2 items 1 and 2). Only
+    /// a step takes from the queue, and none runs between the count and
+    /// this, so they are its newest entries.
+    fn note_owed_finalizations(&self, before: usize) {
+        let queued = self.core.memory.owed_slots().skip(before);
+        let mut queued = queued.peekable();
+        if queued.peek().is_none() {
+            return;
+        }
+        let Some(now) = step_report::now() else {
+            return;
+        };
+        step_report::finalize_queued(before == 0, now);
+        for slot in queued {
+            OWED_WAITS.queued(slot, now);
+        }
     }
 
     /// The one way a hold that pushed ends (DW2 §10.15 revision 2 items
@@ -6469,6 +6566,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Pops the cleanup queue until it is empty, cascading.
     fn drain_cleanup_queue(&mut self) {
+        let owed_before = self.core.memory.owed_slots().count();
         loop {
             // Popping in place is what allows the cascade: finalizing one
             // release pushes its parents back onto this same queue, and they are
@@ -6537,6 +6635,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             self.core.cleanup.push(parent_release);
         }
+        self.note_owed_finalizations(owed_before);
     }
 
     /// Settles the resources of `thread`'s call that will not finish (DW2
@@ -8324,6 +8423,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 },
             }
 
+            // A Thread this loop enters sets its own source again where it
+            // resumes (DW2 §10.19 revision 2 item 3).
+            step_report::set_drain_source(this.cpu.index(), step_report::DrainSource::Idle);
             let scheduled = {
                 let mut guard = this.runtime.lock();
                 let mut runtime = guard.on(&mut this.owned);

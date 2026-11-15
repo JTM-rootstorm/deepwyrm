@@ -1544,6 +1544,60 @@ mod owed_finalization {
         roles.check_invariants().unwrap();
     }
 
+    /// DW2 §10.19 revision 2: the step report sees each object a step works
+    /// on by its owed slot, oldest first, with the frames freed and its
+    /// completion; the frames it is told of are the frames that came back.
+    #[test]
+    fn a_step_reports_each_object_s_slot_frames_and_completion() {
+        let mut roles = roles();
+        let initial = roles.available_frames();
+        let mut registry = ObjectRegistry::<4>::new();
+        let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let mut authority = MemoryObjectAuthority::<2, 1>::new();
+        let (first, first_frames) = on_demand(
+            &mut authority,
+            &mut registry,
+            &mut roles,
+            group,
+            600,
+            &[0, 599],
+        )
+        .unwrap();
+        let (second, second_frames) =
+            on_demand(&mut authority, &mut registry, &mut roles, group, 8, &[3]).unwrap();
+        assert_eq!(authority.owed_slots().count(), 0);
+        finalize(&mut authority, &mut registry, first);
+        finalize(&mut authority, &mut registry, second);
+        let slots: std::vec::Vec<usize> = authority.owed_slots().collect();
+        assert_eq!(slots.len(), 2);
+        assert_ne!(slots[0], slots[1]);
+        let mut seen = std::vec::Vec::new();
+        while authority.finalize_owed_step_observed(
+            &mut registry,
+            &mut roles,
+            300,
+            |slot, freed, completed| seen.push((slot, freed, completed)),
+        ) {
+            let left: std::vec::Vec<usize> = authority.owed_slots().collect();
+            assert!(slots.ends_with(&left), "the oldest goes first");
+        }
+        assert_eq!(authority.owed_slots().count(), 0);
+        for (index, frames) in [(0, first_frames), (1, second_frames)] {
+            let mine: std::vec::Vec<_> = seen
+                .iter()
+                .filter(|(slot, _, _)| *slot == slots[index])
+                .collect();
+            let completions = mine.iter().filter(|(_, _, completed)| *completed).count();
+            assert_eq!(completions, 1, "each completes once");
+            assert!(mine.last().unwrap().2, "and last");
+            // Every frame but the root, which completion frees.
+            let freed: u64 = mine.iter().map(|(_, freed, _)| freed).sum();
+            assert_eq!(freed, frames - 1);
+        }
+        assert_eq!(roles.available_frames(), initial);
+        roles.check_invariants().unwrap();
+    }
+
     /// Second security pass D-2: a completion reads the root's entries, so
     /// one step of the live budget completes one object, however small.
     #[test]

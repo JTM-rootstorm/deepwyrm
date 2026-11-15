@@ -1350,6 +1350,30 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
         budget: u64,
     ) -> bool {
+        self.finalize_owed_step_observed(registry, roles, budget, |_, _, _| {})
+    }
+
+    /// The owed slots, oldest first (DW2 §10.19 revision 2: the step report
+    /// keys its record of each queued object by its slot).
+    pub(crate) fn owed_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.owed_len).map(|index| self.owed_order[(self.owed_head + index) % OBJECTS])
+    }
+
+    /// [`Self::finalize_owed_step`], telling `observe` of each object it
+    /// worked on: its slot, the frames this step freed of it, and whether
+    /// it completed. Only reported; the step is the same.
+    #[cfg(deepwyrm_integrated)]
+    pub(crate) fn finalize_owed_step_observed<
+        const REGISTRY_OBJECTS: usize,
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        budget: u64,
+        mut observe: impl FnMut(usize, u64, bool),
+    ) -> bool {
         let mut left = budget;
         while left != 0 && self.owed_len != 0 {
             let slot = self.owed_order[self.owed_head];
@@ -1370,6 +1394,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
                     });
             }
             left = left.saturating_sub(visited.max(1));
+            observe(slot, freed, cursor >= pages);
             if cursor < pages {
                 break;
             }
