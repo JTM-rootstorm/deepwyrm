@@ -145,6 +145,23 @@ pub(crate) fn settle_hold_queues<const CAPACITY: usize, const CPUS: usize>(
     }
 }
 
+/// Owed work a hold queued (DW2 §10.19 revision 3): an on-demand object's
+/// finalization, an exited Process's teardown, or both.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OwedQueued {
+    pub(crate) finalization: bool,
+    pub(crate) teardown: bool,
+}
+
+/// Whether a hold on `cpu` that queued `queued` wakes the BSP as it ends
+/// (DW2 §10.19 revision 3 item 1). Only the BSP steps owed work while idle,
+/// and nothing else wakes it when work is queued, so a hold elsewhere that
+/// queued any wakes it, once however much it queued; the BSP's own needs
+/// none, since it reaches a drain before it can idle.
+pub(crate) const fn owed_work_wakes_bsp(cpu: usize, bsp: usize, queued: OwedQueued) -> bool {
+    cpu != bsp && (queued.finalization || queued.teardown)
+}
+
 #[cfg(test)]
 #[path = "hold_end/tests.rs"]
 mod tests;

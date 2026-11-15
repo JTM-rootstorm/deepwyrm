@@ -275,3 +275,42 @@ fn a_hold_ending_with_the_shared_queue_full_is_named() {
 fn a_hold_ending_with_the_service_queue_full_is_named() {
     assert_hold_ended(true, false);
 }
+
+/// DW2 §10.19 revision 3 item 1: a hold wakes the BSP for owed work only
+/// off the BSP, and only if it queued some, finalization or teardown.
+#[test]
+fn only_a_hold_off_the_bsp_that_queued_owed_work_wakes_it() {
+    const BSP: usize = 0;
+    let none = OwedQueued::default();
+    let finalization = OwedQueued {
+        finalization: true,
+        teardown: false,
+    };
+    let teardown = OwedQueued {
+        finalization: false,
+        teardown: true,
+    };
+    let both = OwedQueued {
+        finalization: true,
+        teardown: true,
+    };
+    for (cpu, queued, wakes) in [
+        // The BSP's own queueing: never.
+        (0, none, false),
+        (0, finalization, false),
+        (0, teardown, false),
+        (0, both, false),
+        // Another CPU: when it queued anything.
+        (1, none, false),
+        (1, finalization, true),
+        (2, teardown, true),
+        (3, both, true),
+        (3, none, false),
+    ] {
+        assert_eq!(
+            owed_work_wakes_bsp(cpu, BSP, queued),
+            wakes,
+            "cpu {cpu}, {queued:?}"
+        );
+    }
+}

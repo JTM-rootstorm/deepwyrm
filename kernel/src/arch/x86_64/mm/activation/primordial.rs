@@ -4072,6 +4072,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
             );
         }
     }
+
+    /// A hold off the BSP that queued owed work wakes it, now that T is
+    /// released (DW2 §10.19 revision 3 item 1).
+    fn after_release() {
+        if let Some(sent) = crate::time::deliver_bsp_owed_work_wake() {
+            step_report::owed_wake(sent);
+        }
+    }
 }
 
 /// A carrier is built only from a held runtime guard, which mints its
@@ -6072,6 +6080,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .slot_of(process.object_id())
             .unwrap_or_else(|| panic!("an exited Process has no registry slot"));
         self.core.owed_teardown.push(slot, process);
+        self.owed_work_queued(crate::syscall::OwedQueued {
+            finalization: false,
+            teardown: true,
+        });
+    }
+
+    /// This hold queued owed work (DW2 §10.19 revision 3 item 1): off the
+    /// BSP, the BSP is woken once as the hold releases T, so a BSP halted
+    /// idle steps it at once rather than at its next timer deadline.
+    fn owed_work_queued(&self, queued: crate::syscall::OwedQueued) {
+        let cpu = self.cpu();
+        if crate::syscall::owed_work_wakes_bsp(
+            cpu.index(),
+            crate::cpu::CpuIndex::BOOTSTRAP.index(),
+            queued,
+        ) {
+            crate::time::mark_bsp_owed_work(cpu);
+        }
     }
 
     /// One step of the oldest owed teardown (DW2 §10.10 items 2 and 3), on
@@ -6526,6 +6552,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if queued.peek().is_none() {
             return;
         }
+        self.owed_work_queued(crate::syscall::OwedQueued {
+            finalization: true,
+            teardown: false,
+        });
         let Some(now) = step_report::now() else {
             return;
         };

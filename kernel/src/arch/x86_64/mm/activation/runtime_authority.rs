@@ -56,6 +56,11 @@ const _: () = assert!(
 pub(super) trait HoldEndCheck {
     /// `taken` is where the hold's guard was acquired, for the panic.
     fn check_hold_end(&self, taken: &'static core::panic::Location<'static>);
+
+    /// Runs on this CPU once the hold has released T, for work the hold
+    /// left that must not be done under it (DW2 §10.19 revision 3: the
+    /// BSP's wake for owed work). It sees no guarded state.
+    fn after_release() {}
 }
 
 /// Coarse DW0-H transaction boundary for the still-monolithic live authority
@@ -248,6 +253,7 @@ impl<T: HoldEndCheck> Drop for RuntimeAuthorityGuard<'_, T> {
                 .tickets
                 .serving
                 .store(self.ticket + 1, Ordering::Release);
+            T::after_release();
         }
     }
 }

@@ -612,6 +612,43 @@ pub(crate) fn complete_q35_bsp_retirement_check(
         .map_err(|_| LiveTimeError::Faulted)
 }
 
+/// Per CPU, whether a hold on it queued owed work for the BSP (DW2 §10.19
+/// revision 3): set in the hold, taken as the hold releases T. Written and
+/// read only on its own CPU.
+static BSP_OWED_WAKE_PENDING: [core::sync::atomic::AtomicBool; CPU_CAPACITY] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; CPU_CAPACITY];
+
+/// A hold on `cpu` queued owed work the BSP must step (DW2 §10.19 revision
+/// 3 item 1): the BSP is woken once as the hold ends, however much it
+/// queued.
+pub(crate) fn mark_bsp_owed_work(cpu: CpuIndex) {
+    if let Some(pending) = BSP_OWED_WAKE_PENDING.get(cpu.index()) {
+        pending.store(true, Ordering::Relaxed);
+    }
+}
+
+/// After this CPU released T: if its hold queued owed work, wakes the BSP,
+/// whatever it is doing, with a Wake in its mailbox and the rendezvous IPI.
+/// The IPI is what a halting BSP cannot miss: one taken before its idle
+/// commit leaves the latch that makes the commit rescan, and one still
+/// pending at `sti; hlt` ends the halt. A busy BSP only latches it. `None`
+/// if nothing was pending; `Some(false)` if the wake could not be sent, in
+/// which case the work stays owed and the BSP's next drain steps it.
+pub(crate) fn deliver_bsp_owed_work_wake() -> Option<bool> {
+    let cpu = installed_current_cpu_index().ok()?;
+    if !BSP_OWED_WAKE_PENDING
+        .get(cpu.index())?
+        .swap(false, Ordering::Relaxed)
+    {
+        return None;
+    }
+    let sent = crate::arch::x86_64::idle::publish_bsp_service_wake().is_ok()
+        && LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
+            .identity()
+            .is_some_and(|bsp| send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous).is_ok());
+    Some(sent)
+}
+
 fn current_cpu_is_timer_service() -> Result<bool, LiveTimeError> {
     Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
 }

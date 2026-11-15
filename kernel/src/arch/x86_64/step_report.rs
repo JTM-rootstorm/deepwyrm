@@ -164,6 +164,10 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// Finalize steps by what drained, counted whether or not they were
     /// nested in a timed step.
     finalize_steps: [AtomicU64; SOURCES],
+    /// Wakes of the BSP for owed work (DW2 §10.19 revision 3), sent and
+    /// not sent.
+    owed_wakes: AtomicU64,
+    owed_wakes_unsent: AtomicU64,
 }
 
 impl<const CPUS: usize> StepTally<CPUS> {
@@ -184,7 +188,19 @@ impl<const CPUS: usize> StepTally<CPUS> {
             finalize_gap_longest: AtomicU64::new(0),
             finalize_step_longest: AtomicU64::new(0),
             finalize_steps: [const { AtomicU64::new(0) }; SOURCES],
+            owed_wakes: AtomicU64::new(0),
+            owed_wakes_unsent: AtomicU64::new(0),
         }
+    }
+
+    /// A hold woke the BSP for owed work (`sent`), or could not.
+    pub(crate) fn owed_wake(&self, sent: bool) {
+        let count = if sent {
+            &self.owed_wakes
+        } else {
+            &self.owed_wakes_unsent
+        };
+        count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// An object's finalization was queued at `now`, into a queue that was
@@ -252,6 +268,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
             .map(|source: usize| self.finalize_steps[source].load(Ordering::Relaxed));
         line(format_args!(
             "finalize-steps gate={gate} syscall={syscall} fault={fault} idle={idle} other={other}"
+        ));
+        line(format_args!(
+            "owed-wakes={} unsent={}",
+            self.owed_wakes.load(Ordering::Relaxed),
+            self.owed_wakes_unsent.load(Ordering::Relaxed)
         ));
     }
 
@@ -325,6 +346,34 @@ impl<const CPUS: usize> StepTally<CPUS> {
         let result = step();
         if let Some(ended) = now() {
             self.step_ended(cpu, call, ended);
+        }
+        result
+    }
+
+    /// Times `step` on `cpu` as one step of `call`, with `now`. A step being
+    /// timed there already, of a call in whose hold this one runs, keeps
+    /// its start: both are recorded, the outer one including this one's
+    /// time (DW2 §10.19 revision 3 item 3).
+    pub(crate) fn timed<T>(
+        &self,
+        cpu: usize,
+        call: StepCall,
+        mut now: impl FnMut() -> Option<u64>,
+        step: impl FnOnce() -> T,
+    ) -> T {
+        let outer = self
+            .started
+            .get(cpu)
+            .map_or(0, |slot| slot.swap(0, Ordering::Relaxed));
+        if let Some(began) = now() {
+            self.step_began(cpu, began);
+        }
+        let result = step();
+        if let Some(ended) = now() {
+            self.step_ended(cpu, call, ended);
+        }
+        if let Some(slot) = self.started.get(cpu) {
+            slot.store(outer, Ordering::Relaxed);
         }
         result
     }
@@ -553,12 +602,12 @@ mod live {
 
     /// Times `step` on `cpu` as one step of `call`.
     pub(crate) fn timed<T>(cpu: usize, call: StepCall, step: impl FnOnce() -> T) -> T {
-        step_began(cpu);
-        let result = step();
-        if let Some(now) = now() {
-            TALLY.step_ended(cpu, call, now);
-        }
-        result
+        TALLY.timed(cpu, call, now, step)
+    }
+
+    /// A hold woke the BSP for owed work (see [`StepTally::owed_wake`]).
+    pub(crate) fn owed_wake(sent: bool) {
+        TALLY.owed_wake(sent);
     }
 
     pub(crate) fn report() {
@@ -609,8 +658,8 @@ mod live {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
     after_safe_point, allow_teardown_step, at_safe_point, call_ended, finalize_queued,
-    finalize_stepped, finalize_waited, now, owed, parked_call_ended, report, set_drain_source,
-    step_began, take_teardown_step, timed, timed_nested,
+    finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended, report,
+    set_drain_source, step_began, take_teardown_step, timed, timed_nested,
 };
 
 #[cfg(test)]
@@ -810,6 +859,7 @@ mod tests {
                 "finalize-gap-longest-us=0",
                 "finalize-step-longest-us=0",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=0",
+                "owed-wakes=0 unsent=0",
             ]
         );
     }
@@ -829,6 +879,7 @@ mod tests {
                 "finalize-gap-longest-us=3000",
                 "finalize-step-longest-us=1000",
                 "finalize-steps gate=2 syscall=0 fault=0 idle=0 other=0",
+                "owed-wakes=0 unsent=0",
             ]
         );
     }
@@ -848,6 +899,7 @@ mod tests {
                 "finalize-gap-longest-us=2000",
                 "finalize-step-longest-us=100",
                 "finalize-steps gate=0 syscall=1 fault=0 idle=1 other=0",
+                "owed-wakes=0 unsent=0",
             ]
         );
     }
@@ -874,6 +926,7 @@ mod tests {
                 "finalize-gap-longest-us=3000",
                 "finalize-step-longest-us=25500",
                 "finalize-steps gate=2 syscall=0 fault=1 idle=0 other=0",
+                "owed-wakes=0 unsent=0",
             ]
         );
     }
@@ -891,6 +944,7 @@ mod tests {
                 "finalize-gap-longest-us=898000",
                 "finalize-step-longest-us=1000",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=1",
+                "owed-wakes=0 unsent=0",
             ]
         );
         // Without a clock at the report, only closed gaps.
@@ -1013,6 +1067,40 @@ mod tests {
         // Ending a call on a CPU past the table changes nothing.
         tally.call_ended(7, Some(StepCall::Map), 1);
         assert_eq!(tally.longest(), None);
+    }
+
+    #[test]
+    fn a_teardown_step_inside_another_call_s_step_records_both() {
+        let tally = StepTally::<2>::new();
+        // A commit's step began at a safe point at 0; inside its hold a
+        // teardown step runs from 2 to 5 ms; the commit's next safe point
+        // is at 9 ms.
+        tally.step_began(0, 0);
+        let ran = tally.timed(0, StepCall::Teardown, clock(&[2, 5]), || 3);
+        assert_eq!(ran, 3);
+        assert!(tally.timing(0), "the commit's step is still being timed");
+        tally.step_ended(0, StepCall::Commit, 9_000_000);
+        let lines = lines(&tally);
+        assert_eq!(
+            lines[3],
+            "call-longest-us map=0 unmap=0 protect=0 fill=0 commit=9000 create=0 teardown=3000 release=0 finalize=0"
+        );
+        assert_eq!(
+            lines[4],
+            "call-steps map=0 unmap=0 protect=0 fill=0 commit=1 create=0 teardown=1 release=0 finalize=0"
+        );
+        // With nothing being timed, a teardown step leaves nothing open.
+        tally.timed(1, StepCall::Teardown, clock(&[10, 11]), || ());
+        assert!(!tally.timing(1));
+    }
+
+    #[test]
+    fn wakes_for_owed_work_are_counted_sent_and_unsent() {
+        let tally = StepTally::<2>::new();
+        tally.owed_wake(true);
+        tally.owed_wake(true);
+        tally.owed_wake(false);
+        assert_eq!(finalize_lines(&tally, None)[4], "owed-wakes=2 unsent=1");
     }
 
     #[test]
