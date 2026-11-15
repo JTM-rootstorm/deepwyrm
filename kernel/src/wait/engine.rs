@@ -1005,14 +1005,31 @@ pub(crate) fn finish_wait_operation<
     Ok((output, winner, releases))
 }
 
+/// Delivers one expired deadline's timeout claim and wakes its block if the
+/// timeout won. `Ok(false)` means it lost: another winner was claimed first,
+/// or the operation was already completed and its ledger entry removed.
+///
+/// The timer interrupt pops the key under the time lock and calls this only
+/// after releasing it, so a signal and the resumed waiter's completion can run
+/// on another CPU in between. A wait publishes its ledger entry before it
+/// registers its deadline and removes it only by completing, so a missing
+/// entry is that lost race. Wake keys are never reissued, so a missing entry
+/// cannot belong to a newer block.
 pub(crate) fn claim_timeout_and_wake<const EXECUTION: usize>(
     execution: &ExecutionDomain<EXECUTION>,
     wake: BlockWakeKey,
 ) -> Result<bool, BlockedOperationError> {
-    if !execution
+    let claimed = execution
         .blocked_operations()
-        .try_claim_winner(wake, BlockedOperationWinner::Timeout)?
-    {
+        .try_claim_winner(wake, BlockedOperationWinner::Timeout)
+        .or_else(|error| {
+            if error == BlockedOperationError::StaleReservation {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })?;
+    if !claimed {
         return Ok(false);
     }
     match execution.wake(wake) {
@@ -2145,6 +2162,176 @@ mod tests {
         assert!(releases.is_empty());
         assert_eq!(waits.len(), 0);
         assert_eq!(operations.len(), 0);
+        assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+        close_event(&mut registry, &mut tasks, &events, process, event);
+    }
+
+    /// The timer interrupt pops an expired deadline under the time lock and
+    /// delivers its timeout claim only after releasing it. A signal on
+    /// another CPU can win, and the resumed waiter can complete its
+    /// operation, in between. The late claim has lost: it reports "did not
+    /// win", wakes nothing, and cannot touch the Thread's next block.
+    #[test]
+    fn timeout_claim_after_signal_completion_loses_without_waking() {
+        let (mut registry, mut tasks, execution, process, thread) = running_fixture();
+        let events = Events::new();
+        let timers = Timers::new();
+        let channels = Channels::new();
+        let waits = Waits::new();
+        let (event_key, event) = install_event(&mut registry, &mut tasks, &events, process);
+        let request = [DwWaitItemV1 {
+            handle: event,
+            signals: DW_SIGNAL_SIGNALED,
+        }];
+        let mut operations = WaitOperationRegistry::<u32, 1>::new();
+        let mut deadlines = HostDeadline::<2>::new();
+        let begin = |registry: &mut Registry,
+                     tasks: &mut Tasks,
+                     operations: &mut WaitOperationRegistry<u32, 1>,
+                     deadlines: &mut HostDeadline<2>,
+                     output: u32,
+                     deadline_ns: u64| {
+            let set = ResolvedWaitSet::resolve(tasks, registry, process, &request).unwrap();
+            let outcome = begin_registered_wait(
+                set,
+                output,
+                WaitDeadline::Finite(deadline_ns),
+                WaitBeginContext {
+                    registry,
+                    tasks,
+                    sources: WaitSources {
+                        events: &events,
+                        timers: &timers,
+                        channels: &channels,
+                        interrupts: None,
+                        waits: &waits,
+                    },
+                    execution: &execution,
+                    operations,
+                    cpu: crate::cpu::CpuIndex::BOOTSTRAP,
+                    process,
+                    thread,
+                },
+                Some(deadlines),
+            )
+            .unwrap_or_else(|failure| panic!("finite wait begin failed: {:?}", failure.error));
+            let WaitBeginOutcome::Suspended { wake, .. } = outcome else {
+                panic!("finite unsignaled wait must suspend");
+            };
+            wake
+        };
+        let wake = begin(
+            &mut registry,
+            &mut tasks,
+            &mut operations,
+            &mut deadlines,
+            0xb1,
+            50,
+        );
+
+        // The interrupt pops the expired key; its claim is not yet delivered.
+        let mut expired = [None; 2];
+        assert_eq!(deadlines.queue.expire(50, &mut expired), 1);
+        assert_eq!(expired[0], Some(wake));
+
+        // The signal wins and wakes the waiter.
+        let (wakes, pins) = events
+            .signal(event_key, DwSignals(0), DW_SIGNAL_SIGNALED, &waits)
+            .unwrap()
+            .into_parts();
+        let mut signalled = 0;
+        for intent in wakes.into_iter().flatten() {
+            let winner = BlockedOperationWinner::Signal {
+                item_index: intent.item_index(),
+                observed: intent.observed(),
+            };
+            assert!(
+                execution
+                    .blocked_operations()
+                    .try_claim_winner(intent.wake_key(), winner)
+                    .unwrap()
+            );
+            execution.wake(intent.wake_key()).unwrap();
+            signalled += 1;
+        }
+        assert_eq!(signalled, 1);
+        for pin in pins.into_iter().flatten() {
+            assert!(registry.release_internal(pin).unwrap().is_none());
+        }
+
+        // The resumed waiter completes, removing its ledger entry; its
+        // deadline cancellation tolerates the already-popped registration.
+        let (output, winner, releases) = finish_wait_operation(
+            &mut registry,
+            &mut tasks,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            wake,
+        )
+        .unwrap();
+        assert_eq!(output, 0xb1);
+        assert_eq!(
+            winner,
+            BlockedOperationWinner::Signal {
+                item_index: 0,
+                observed: DW_SIGNAL_SIGNALED,
+            }
+        );
+        assert!(releases.is_empty());
+        assert_eq!(operations.len(), 0);
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Runnable)
+        );
+
+        // The late timeout claim lost: no error, no second wake.
+        assert_eq!(claim_timeout_and_wake(&execution, wake), Ok(false));
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Runnable)
+        );
+        assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
+
+        // The Thread blocks again with a fresh key. The stale key still
+        // loses and neither wakes nor claims the new block.
+        let cleared = events
+            .signal(event_key, DW_SIGNAL_SIGNALED, DwSignals(0), &waits)
+            .unwrap();
+        assert_eq!(cleared.len(), 0);
+        let next = begin(
+            &mut registry,
+            &mut tasks,
+            &mut operations,
+            &mut deadlines,
+            0xb2,
+            200,
+        );
+        assert_ne!(next, wake);
+        assert_eq!(claim_timeout_and_wake(&execution, wake), Ok(false));
+        assert_eq!(
+            execution.scheduler_state(thread),
+            Some(SchedulerThreadState::Blocked)
+        );
+        assert_eq!(execution.blocked_operations().winner(next), Ok(None));
+
+        // The new block's own deadline still times it out.
+        assert_eq!(deadlines.queue.expire(200, &mut expired), 1);
+        assert_eq!(expired[0], Some(next));
+        assert_eq!(claim_timeout_and_wake(&execution, next), Ok(true));
+        let (output, winner, _releases) = finish_wait_operation(
+            &mut registry,
+            &mut tasks,
+            &waits,
+            &execution,
+            &mut operations,
+            Some(&mut deadlines),
+            next,
+        )
+        .unwrap();
+        assert_eq!(output, 0xb2);
+        assert_eq!(winner, BlockedOperationWinner::Timeout);
         assert_eq!(execution.schedule_next().unwrap().current, Some(thread));
         close_event(&mut registry, &mut tasks, &events, process, event);
     }
