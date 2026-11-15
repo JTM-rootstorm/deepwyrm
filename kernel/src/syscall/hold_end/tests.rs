@@ -276,41 +276,51 @@ fn a_hold_ending_with_the_service_queue_full_is_named() {
     assert_hold_ended(true, false);
 }
 
-/// DW2 §10.19 revision 3 item 1: a hold wakes the BSP for owed work only
-/// off the BSP, and only if it queued some, finalization or teardown.
+/// DW2 §10.19 revision 3: a hold off the BSP wakes it when it turned the
+/// idle BSP's "owed work I can step" from false to true: a queue taken from
+/// empty that is still owed at the hold's end, or the bootstrap's root
+/// retired with teardown owed. Never for the BSP's own holds.
 #[test]
-fn only_a_hold_off_the_bsp_that_queued_owed_work_wakes_it() {
+fn a_hold_wakes_the_bsp_only_for_owed_work_it_newly_made_steppable() {
     const BSP: usize = 0;
-    let none = OwedQueued::default();
-    let finalization = OwedQueued {
-        finalization: true,
-        teardown: false,
+    let change = |queued_from_empty, owed_at_end| OwedQueueChange {
+        queued_from_empty,
+        owed_at_end,
     };
-    let teardown = OwedQueued {
-        finalization: false,
-        teardown: true,
+    let facts = |finalization, teardown, retired| OwedHoldFacts {
+        finalization,
+        teardown,
+        bootstrap_retired_with_teardown_owed: retired,
     };
-    let both = OwedQueued {
-        finalization: true,
-        teardown: true,
-    };
-    for (cpu, queued, wakes) in [
-        // The BSP's own queueing: never.
-        (0, none, false),
-        (0, finalization, false),
-        (0, teardown, false),
-        (0, both, false),
-        // Another CPU: when it queued anything.
-        (1, none, false),
-        (1, finalization, true),
-        (2, teardown, true),
-        (3, both, true),
-        (3, none, false),
+    let none = change(false, false);
+    let new_owed = change(true, true);
+    // Queued into an empty queue and finished within the hold.
+    let done_within = change(true, false);
+    // Queued into a non-empty queue: owed at the end, not newly.
+    let already_owed = change(false, true);
+    let wake = |queue, retirement| OwedWake { queue, retirement };
+    for (cpu, facts, expected) in [
+        (1, facts(none, none, false), wake(false, false)),
+        (1, facts(new_owed, none, false), wake(true, false)),
+        (2, facts(none, new_owed, false), wake(true, false)),
+        (3, facts(new_owed, new_owed, false), wake(true, false)),
+        (1, facts(done_within, none, false), wake(false, false)),
+        (1, facts(none, done_within, false), wake(false, false)),
+        (
+            1,
+            facts(already_owed, already_owed, false),
+            wake(false, false),
+        ),
+        (2, facts(done_within, new_owed, false), wake(true, false)),
+        (1, facts(none, none, true), wake(false, true)),
+        (3, facts(new_owed, already_owed, true), wake(true, true)),
+        // The BSP's own holds: never.
+        (BSP, facts(new_owed, new_owed, true), wake(false, false)),
+        (BSP, facts(new_owed, none, false), wake(false, false)),
+        (BSP, facts(none, none, true), wake(false, false)),
     ] {
-        assert_eq!(
-            owed_work_wakes_bsp(cpu, BSP, queued),
-            wakes,
-            "cpu {cpu}, {queued:?}"
-        );
+        let woken = owed_work_wake(cpu, BSP, facts);
+        assert_eq!(woken, expected, "cpu {cpu}, {facts:?}");
+        assert_eq!(woken.any(), expected.queue || expected.retirement);
     }
 }

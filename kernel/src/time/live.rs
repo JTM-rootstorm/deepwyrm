@@ -612,41 +612,104 @@ pub(crate) fn complete_q35_bsp_retirement_check(
         .map_err(|_| LiveTimeError::Faulted)
 }
 
-/// Per CPU, whether a hold on it queued owed work for the BSP (DW2 §10.19
-/// revision 3): set in the hold, taken as the hold releases T. Written and
-/// read only on its own CPU.
-static BSP_OWED_WAKE_PENDING: [core::sync::atomic::AtomicBool; CPU_CAPACITY] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; CPU_CAPACITY];
+/// Per CPU, what its current hold did that may wake the BSP for owed work
+/// (DW2 §10.19 revision 3), and the wake that hold's end decided. Written
+/// and read only on its own CPU: the events and the decision under T, the
+/// delivery just after T is released.
+static BSP_OWED_WAKE: [AtomicU8; CPU_CAPACITY] = [const { AtomicU8::new(0) }; CPU_CAPACITY];
 
-/// A hold on `cpu` queued owed work the BSP must step (DW2 §10.19 revision
-/// 3 item 1): the BSP is woken once as the hold ends, however much it
-/// queued.
-pub(crate) fn mark_bsp_owed_work(cpu: CpuIndex) {
-    if let Some(pending) = BSP_OWED_WAKE_PENDING.get(cpu.index()) {
-        pending.store(true, Ordering::Relaxed);
+const OWED_FINALIZATION_FROM_EMPTY: u8 = 1 << 0;
+const OWED_TEARDOWN_FROM_EMPTY: u8 = 1 << 1;
+const OWED_BOOTSTRAP_RETIRED: u8 = 1 << 2;
+const OWED_EVENTS: u8 =
+    OWED_FINALIZATION_FROM_EMPTY | OWED_TEARDOWN_FROM_EMPTY | OWED_BOOTSTRAP_RETIRED;
+const OWED_WAKE_QUEUE: u8 = 1 << 3;
+const OWED_WAKE_RETIREMENT: u8 = 1 << 4;
+const OWED_WAKES: u8 = OWED_WAKE_QUEUE | OWED_WAKE_RETIREMENT;
+
+/// Something a hold did that may give an idle BSP owed work to step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BspOwedEvent {
+    /// Queued an owed finalization while none was owed.
+    FinalizationFromEmpty,
+    /// Queued an owed teardown while none was owed.
+    TeardownFromEmpty,
+    /// Retired the bootstrap's root.
+    BootstrapRetired,
+}
+
+/// A hold on `cpu` did `event`; its end decides whether the BSP is woken.
+pub(crate) fn mark_bsp_owed_event(cpu: CpuIndex, event: BspOwedEvent) {
+    let bit = match event {
+        BspOwedEvent::FinalizationFromEmpty => OWED_FINALIZATION_FROM_EMPTY,
+        BspOwedEvent::TeardownFromEmpty => OWED_TEARDOWN_FROM_EMPTY,
+        BspOwedEvent::BootstrapRetired => OWED_BOOTSTRAP_RETIRED,
+    };
+    if let Some(state) = BSP_OWED_WAKE.get(cpu.index()) {
+        state.store(state.load(Ordering::Relaxed) | bit, Ordering::Relaxed);
     }
 }
 
-/// After this CPU released T: if its hold queued owed work, wakes the BSP,
+/// At this CPU's hold end, under T, with what is owed then: turns the
+/// hold's events into the wake to deliver after the release, or none.
+pub(crate) fn settle_bsp_owed_events(finalization_owed: bool, teardown_owed: bool) {
+    let Ok(cpu) = installed_current_cpu_index() else {
+        return;
+    };
+    let Some(state) = BSP_OWED_WAKE.get(cpu.index()) else {
+        return;
+    };
+    let events = state.load(Ordering::Relaxed);
+    if events & OWED_EVENTS == 0 {
+        return;
+    }
+    let facts = crate::syscall::OwedHoldFacts {
+        finalization: crate::syscall::OwedQueueChange {
+            queued_from_empty: events & OWED_FINALIZATION_FROM_EMPTY != 0,
+            owed_at_end: finalization_owed,
+        },
+        teardown: crate::syscall::OwedQueueChange {
+            queued_from_empty: events & OWED_TEARDOWN_FROM_EMPTY != 0,
+            owed_at_end: teardown_owed,
+        },
+        bootstrap_retired_with_teardown_owed: events & OWED_BOOTSTRAP_RETIRED != 0 && teardown_owed,
+    };
+    let wake = crate::syscall::owed_work_wake(cpu.index(), CpuIndex::BOOTSTRAP.index(), facts);
+    let pending = (events & OWED_WAKES)
+        | if wake.queue { OWED_WAKE_QUEUE } else { 0 }
+        | if wake.retirement {
+            OWED_WAKE_RETIREMENT
+        } else {
+            0
+        };
+    state.store(pending, Ordering::Relaxed);
+}
+
+/// After this CPU released T: if its hold decided a wake, wakes the BSP,
 /// whatever it is doing, with a Wake in its mailbox and the rendezvous IPI.
 /// The IPI is what a halting BSP cannot miss: one taken before its idle
 /// commit leaves the latch that makes the commit rescan, and one still
-/// pending at `sti; hlt` ends the halt. A busy BSP only latches it. `None`
-/// if nothing was pending; `Some(false)` if the wake could not be sent, in
-/// which case the work stays owed and the BSP's next drain steps it.
-pub(crate) fn deliver_bsp_owed_work_wake() -> Option<bool> {
+/// pending at `sti; hlt` ends the halt. A busy BSP only latches it.
+/// `None` if no wake was due (the common path is one load); otherwise the
+/// cause and whether it was sent. Unsent, the work stays owed and the BSP's
+/// next drain or visit steps it.
+pub(crate) fn deliver_bsp_owed_work_wake() -> Option<(crate::syscall::OwedWake, bool)> {
     let cpu = installed_current_cpu_index().ok()?;
-    if !BSP_OWED_WAKE_PENDING
-        .get(cpu.index())?
-        .swap(false, Ordering::Relaxed)
-    {
+    let state = BSP_OWED_WAKE.get(cpu.index())?;
+    let pending = state.load(Ordering::Relaxed);
+    if pending & OWED_WAKES == 0 {
         return None;
     }
+    state.store(pending & !OWED_WAKES, Ordering::Relaxed);
+    let cause = crate::syscall::OwedWake {
+        queue: pending & OWED_WAKE_QUEUE != 0,
+        retirement: pending & OWED_WAKE_RETIREMENT != 0,
+    };
     let sent = crate::arch::x86_64::idle::publish_bsp_service_wake().is_ok()
         && LOCAL_APIC_SLOTS[CpuIndex::BOOTSTRAP.index()]
             .identity()
             .is_some_and(|bsp| send_live_ipi(bsp.local_apic_id, LiveIpiVector::Rendezvous).is_ok());
-    Some(sent)
+    Some((cause, sent))
 }
 
 fn current_cpu_is_timer_service() -> Result<bool, LiveTimeError> {

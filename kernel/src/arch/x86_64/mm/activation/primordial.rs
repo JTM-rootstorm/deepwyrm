@@ -4071,13 +4071,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
                  empty: {shared}, F-service queue empty: {services})"
             );
         }
+        // What the hold did for the idle BSP, against what is owed at its
+        // end (DW2 §10.19 revision 3); delivered after the release.
+        crate::time::settle_bsp_owed_events(
+            self.core.memory.finalization_owed(),
+            !self.core.owed_teardown.is_empty(),
+        );
     }
 
-    /// A hold off the BSP that queued owed work wakes it, now that T is
-    /// released (DW2 §10.19 revision 3 item 1).
+    /// A hold off the BSP that made owed work steppable for it wakes it,
+    /// now that T is released (DW2 §10.19 revision 3).
     fn after_release() {
-        if let Some(sent) = crate::time::deliver_bsp_owed_work_wake() {
-            step_report::owed_wake(sent);
+        if let Some((cause, sent)) = crate::time::deliver_bsp_owed_work_wake() {
+            step_report::owed_wake(cause.queue, cause.retirement, sent);
         }
     }
 }
@@ -6079,25 +6085,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .registry
             .slot_of(process.object_id())
             .unwrap_or_else(|| panic!("an exited Process has no registry slot"));
-        self.core.owed_teardown.push(slot, process);
-        self.owed_work_queued(crate::syscall::OwedQueued {
-            finalization: false,
-            teardown: true,
-        });
-    }
-
-    /// This hold queued owed work (DW2 §10.19 revision 3 item 1): off the
-    /// BSP, the BSP is woken once as the hold releases T, so a BSP halted
-    /// idle steps it at once rather than at its next timer deadline.
-    fn owed_work_queued(&self, queued: crate::syscall::OwedQueued) {
-        let cpu = self.cpu();
-        if crate::syscall::owed_work_wakes_bsp(
-            cpu.index(),
-            crate::cpu::CpuIndex::BOOTSTRAP.index(),
-            queued,
-        ) {
-            crate::time::mark_bsp_owed_work(cpu);
+        if self.core.owed_teardown.is_empty() {
+            // From empty: the hold's end decides whether to wake the BSP
+            // (DW2 §10.19 revision 3).
+            crate::time::mark_bsp_owed_event(
+                self.cpu(),
+                crate::time::BspOwedEvent::TeardownFromEmpty,
+            );
         }
+        self.core.owed_teardown.push(slot, process);
     }
 
     /// One step of the oldest owed teardown (DW2 §10.10 items 2 and 3), on
@@ -6384,6 +6380,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 drained,
             )
             .map_err(|_| ())?;
+        if process == self.core.primordial_process {
+            // The BSP's idle visit can step owed teardown from now on (DW2
+            // §10.19 revision 3): the hold's end wakes it if any is owed.
+            crate::time::mark_bsp_owed_event(
+                self.cpu(),
+                crate::time::BspOwedEvent::BootstrapRetired,
+            );
+        }
         self.core.cleanup.push_optional(
             self.core
                 .registry
@@ -6552,10 +6556,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if queued.peek().is_none() {
             return;
         }
-        self.owed_work_queued(crate::syscall::OwedQueued {
-            finalization: true,
-            teardown: false,
-        });
+        if before == 0 {
+            // From empty: the hold's end decides whether to wake the BSP
+            // (DW2 §10.19 revision 3).
+            crate::time::mark_bsp_owed_event(
+                self.cpu(),
+                crate::time::BspOwedEvent::FinalizationFromEmpty,
+            );
+        }
         let Some(now) = step_report::now() else {
             return;
         };

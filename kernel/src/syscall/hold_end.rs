@@ -145,21 +145,59 @@ pub(crate) fn settle_hold_queues<const CAPACITY: usize, const CPUS: usize>(
     }
 }
 
-/// Owed work a hold queued (DW2 §10.19 revision 3): an on-demand object's
-/// finalization, an exited Process's teardown, or both.
+/// What a hold did to one queue of owed work (DW2 §10.19 revision 3): it
+/// queued into it while it was empty, and the queue was still non-empty
+/// when the hold ended.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct OwedQueued {
-    pub(crate) finalization: bool,
-    pub(crate) teardown: bool,
+pub(crate) struct OwedQueueChange {
+    pub(crate) queued_from_empty: bool,
+    pub(crate) owed_at_end: bool,
 }
 
-/// Whether a hold on `cpu` that queued `queued` wakes the BSP as it ends
-/// (DW2 §10.19 revision 3 item 1). Only the BSP steps owed work while idle,
-/// and nothing else wakes it when work is queued, so a hold elsewhere that
-/// queued any wakes it, once however much it queued; the BSP's own needs
-/// none, since it reaches a drain before it can idle.
-pub(crate) const fn owed_work_wakes_bsp(cpu: usize, bsp: usize, queued: OwedQueued) -> bool {
-    cpu != bsp && (queued.finalization || queued.teardown)
+/// What a hold did that can give an idle BSP owed work it can step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OwedHoldFacts {
+    pub(crate) finalization: OwedQueueChange,
+    pub(crate) teardown: OwedQueueChange,
+    /// The bootstrap's root retired in the hold, with teardown owed at its
+    /// end: from then on the BSP's idle visit can step it.
+    pub(crate) bootstrap_retired_with_teardown_owed: bool,
+}
+
+/// Why a hold wakes the BSP for owed work, if it does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OwedWake {
+    /// A queue went from empty to non-empty and stayed so.
+    pub(crate) queue: bool,
+    /// The bootstrap's root retired with teardown owed.
+    pub(crate) retirement: bool,
+}
+
+impl OwedWake {
+    pub(crate) const fn any(self) -> bool {
+        self.queue || self.retirement
+    }
+}
+
+/// Whether a hold on `cpu` wakes the BSP as it ends (DW2 §10.19 revision
+/// 3): whenever it turned the idle BSP's "is there owed work I can step"
+/// from false to true. A queue that was already non-empty has woken the
+/// BSP or will be seen at its own check; one emptied again within the hold
+/// needs nobody; the BSP's own holds need no wake, since it checks before
+/// it idles.
+pub(crate) const fn owed_work_wake(cpu: usize, bsp: usize, facts: OwedHoldFacts) -> OwedWake {
+    if cpu == bsp {
+        return OwedWake {
+            queue: false,
+            retirement: false,
+        };
+    }
+    let finalization = facts.finalization.queued_from_empty && facts.finalization.owed_at_end;
+    let teardown = facts.teardown.queued_from_empty && facts.teardown.owed_at_end;
+    OwedWake {
+        queue: finalization || teardown,
+        retirement: facts.bootstrap_retired_with_teardown_owed,
+    }
 }
 
 #[cfg(test)]

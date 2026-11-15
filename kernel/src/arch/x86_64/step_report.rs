@@ -168,6 +168,10 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// not sent.
     owed_wakes: AtomicU64,
     owed_wakes_unsent: AtomicU64,
+    /// Wakes by cause: a queue newly owed, the bootstrap's root retired
+    /// with teardown owed (one wake can have both).
+    owed_wakes_queue: AtomicU64,
+    owed_wakes_retirement: AtomicU64,
 }
 
 impl<const CPUS: usize> StepTally<CPUS> {
@@ -190,17 +194,26 @@ impl<const CPUS: usize> StepTally<CPUS> {
             finalize_steps: [const { AtomicU64::new(0) }; SOURCES],
             owed_wakes: AtomicU64::new(0),
             owed_wakes_unsent: AtomicU64::new(0),
+            owed_wakes_queue: AtomicU64::new(0),
+            owed_wakes_retirement: AtomicU64::new(0),
         }
     }
 
-    /// A hold woke the BSP for owed work (`sent`), or could not.
-    pub(crate) fn owed_wake(&self, sent: bool) {
+    /// A hold woke the BSP for owed work (`sent`), or could not, for a
+    /// queue newly owed, the bootstrap's retirement, or both.
+    pub(crate) fn owed_wake(&self, queue: bool, retirement: bool, sent: bool) {
         let count = if sent {
             &self.owed_wakes
         } else {
             &self.owed_wakes_unsent
         };
         count.fetch_add(1, Ordering::Relaxed);
+        if queue {
+            self.owed_wakes_queue.fetch_add(1, Ordering::Relaxed);
+        }
+        if retirement {
+            self.owed_wakes_retirement.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// An object's finalization was queued at `now`, into a queue that was
@@ -270,9 +283,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
             "finalize-steps gate={gate} syscall={syscall} fault={fault} idle={idle} other={other}"
         ));
         line(format_args!(
-            "owed-wakes={} unsent={}",
+            "owed-wakes={} unsent={} queue={} retirement={}",
             self.owed_wakes.load(Ordering::Relaxed),
-            self.owed_wakes_unsent.load(Ordering::Relaxed)
+            self.owed_wakes_unsent.load(Ordering::Relaxed),
+            self.owed_wakes_queue.load(Ordering::Relaxed),
+            self.owed_wakes_retirement.load(Ordering::Relaxed)
         ));
     }
 
@@ -606,8 +621,8 @@ mod live {
     }
 
     /// A hold woke the BSP for owed work (see [`StepTally::owed_wake`]).
-    pub(crate) fn owed_wake(sent: bool) {
-        TALLY.owed_wake(sent);
+    pub(crate) fn owed_wake(queue: bool, retirement: bool, sent: bool) {
+        TALLY.owed_wake(queue, retirement, sent);
     }
 
     pub(crate) fn report() {
@@ -859,7 +874,7 @@ mod tests {
                 "finalize-gap-longest-us=0",
                 "finalize-step-longest-us=0",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=0",
-                "owed-wakes=0 unsent=0",
+                "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
     }
@@ -879,7 +894,7 @@ mod tests {
                 "finalize-gap-longest-us=3000",
                 "finalize-step-longest-us=1000",
                 "finalize-steps gate=2 syscall=0 fault=0 idle=0 other=0",
-                "owed-wakes=0 unsent=0",
+                "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
     }
@@ -899,7 +914,7 @@ mod tests {
                 "finalize-gap-longest-us=2000",
                 "finalize-step-longest-us=100",
                 "finalize-steps gate=0 syscall=1 fault=0 idle=1 other=0",
-                "owed-wakes=0 unsent=0",
+                "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
     }
@@ -926,7 +941,7 @@ mod tests {
                 "finalize-gap-longest-us=3000",
                 "finalize-step-longest-us=25500",
                 "finalize-steps gate=2 syscall=0 fault=1 idle=0 other=0",
-                "owed-wakes=0 unsent=0",
+                "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
     }
@@ -944,7 +959,7 @@ mod tests {
                 "finalize-gap-longest-us=898000",
                 "finalize-step-longest-us=1000",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=1",
-                "owed-wakes=0 unsent=0",
+                "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
         // Without a clock at the report, only closed gaps.
@@ -1095,12 +1110,15 @@ mod tests {
     }
 
     #[test]
-    fn wakes_for_owed_work_are_counted_sent_and_unsent() {
+    fn wakes_for_owed_work_are_counted_sent_unsent_and_by_cause() {
         let tally = StepTally::<2>::new();
-        tally.owed_wake(true);
-        tally.owed_wake(true);
-        tally.owed_wake(false);
-        assert_eq!(finalize_lines(&tally, None)[4], "owed-wakes=2 unsent=1");
+        tally.owed_wake(true, false, true);
+        tally.owed_wake(false, true, true);
+        tally.owed_wake(true, true, false);
+        assert_eq!(
+            finalize_lines(&tally, None)[4],
+            "owed-wakes=2 unsent=1 queue=2 retirement=2"
+        );
     }
 
     #[test]
