@@ -643,6 +643,9 @@ const FAMILY_G_STEP_BYTES: u64 = 2 * 1024 * 1024;
 /// Index entries one step of queued finalization visits (DW2 §10.12 item
 /// 2): 512, a 2 MiB step's pages, like a teardown step's table entries.
 const FINALIZE_STEP_ENTRIES: u64 = 512;
+/// The step report's record of each owed finalization, by its owed slot
+/// (DW2 §10.19 revision 2 item 1): written only under T.
+static OWED_WAITS: step_report::OwedWaits<MEMORY_OBJECTS> = step_report::OwedWaits::new();
 const _: () = assert!(FAMILY_G_STEP_BYTES <= PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64 * PAGE_SIZE);
 /// One hold of an on-demand commit (DW2 M6 §8.2, §8.11 R1): it zeroes every
 /// frame it takes, so it is kept well below a family-G step.
@@ -6342,6 +6345,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         binding: crate::device::InterruptBinding,
     ) -> Result<(), ()> {
+        let owed_before = self.core.memory.owed_slots().count();
         let parent_release = {
             let mut timer_deadlines = crate::time::LiveTimerDeadlineAuthority;
             let mut paging = self.paging.lock();
@@ -6366,6 +6370,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             );
             finalizer.retry_deferred_interrupt_exact(binding)
         };
+        self.note_owed_finalizations(owed_before);
         if let Some(parent_release) = parent_release {
             self.core.cleanup.push(parent_release);
             self.drain_finalizers()?;
@@ -6423,19 +6428,58 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn finalize_owed_step(&mut self) -> bool {
         let owed = if self.core.memory.finalization_owed() {
             let cpu = self.cpu().index();
-            step_report::timed_nested(cpu, StepCall::Finalize, || {
+            let began = step_report::now();
+            // The object completed in this step that was queued first, for
+            // the report's longest wait (DW2 §10.19 revision 2 item 1).
+            let mut oldest: Option<(u64, u64)> = None;
+            let owed = step_report::timed_nested(cpu, StepCall::Finalize, || {
                 let mut paging = self.paging.lock();
-                self.core.memory.finalize_owed_step(
+                self.core.memory.finalize_owed_step_observed(
                     &mut self.core.registry,
                     &mut *paging.target.roles,
                     FINALIZE_STEP_ENTRIES,
+                    |slot, freed, completed| {
+                        OWED_WAITS.freed(slot, freed);
+                        if completed
+                            && let Some((queued, pages)) = OWED_WAITS.completed(slot)
+                            && oldest.is_none_or(|(first, _)| queued < first)
+                        {
+                            oldest = Some((queued, pages));
+                        }
+                    },
                 )
-            })
+            });
+            if let (Some(began), Some(ended)) = (began, step_report::now()) {
+                if let Some((queued, pages)) = oldest {
+                    step_report::finalize_waited(ended.saturating_sub(queued), pages);
+                }
+                step_report::finalize_stepped(cpu, began, ended, owed);
+            }
+            owed
         } else {
             false
         };
         step_report::owed(step_report::Owed::Finalize, owed);
         owed
+    }
+
+    /// Records, for the step report, the owed finalizations queued since
+    /// the queue held `before` (DW2 §10.19 revision 2 items 1 and 2). Only
+    /// a step takes from the queue, and none runs between the count and
+    /// this, so they are its newest entries.
+    fn note_owed_finalizations(&self, before: usize) {
+        let queued = self.core.memory.owed_slots().skip(before);
+        let mut queued = queued.peekable();
+        if queued.peek().is_none() {
+            return;
+        }
+        let Some(now) = step_report::now() else {
+            return;
+        };
+        step_report::finalize_queued(before == 0, now);
+        for slot in queued {
+            OWED_WAITS.queued(slot, now);
+        }
     }
 
     /// The one way a hold that pushed ends (DW2 §10.15 revision 2 items
@@ -6469,6 +6513,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Pops the cleanup queue until it is empty, cascading.
     fn drain_cleanup_queue(&mut self) {
+        let owed_before = self.core.memory.owed_slots().count();
         loop {
             // Popping in place is what allows the cascade: finalizing one
             // release pushes its parents back onto this same queue, and they are
@@ -6537,6 +6582,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             self.core.cleanup.push(parent_release);
         }
+        self.note_owed_finalizations(owed_before);
     }
 
     /// Settles the resources of `thread`'s call that will not finish (DW2
@@ -8324,6 +8370,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 },
             }
 
+            // A Thread this loop enters sets its own source again where it
+            // resumes (DW2 §10.19 revision 2 item 3).
+            step_report::set_drain_source(this.cpu.index(), step_report::DrainSource::Idle);
             let scheduled = {
                 let mut guard = this.runtime.lock();
                 let mut runtime = guard.on(&mut this.owned);

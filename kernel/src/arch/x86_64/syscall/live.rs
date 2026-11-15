@@ -1421,6 +1421,7 @@ fn poll_entry_safe_point()
 unsafe fn native_runtime_rendezvous_reaper<R: crate::syscall::native::NativeRendezvousRuntime>(
     context: *mut (),
 ) -> ! {
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Other);
     let RendezvousAction(request) = take_rendezvous_action().unwrap_or_else(|| halt_forever());
     let reaper = crate::arch::x86_64::rendezvous::verify_native_rendezvous_reaper_entry()
         .unwrap_or_else(|| halt_forever());
@@ -1610,6 +1611,7 @@ unsafe fn native_runtime_timer_pre_iret<
 ) {
     allow_teardown_step_here();
     loop {
+        drain_source_here(crate::arch::x86_64::step_report::DrainSource::Gate);
         poll_timer_return_stop(context);
         validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
         {
@@ -1639,6 +1641,7 @@ unsafe fn native_runtime_timer_pre_iret<
                 crate::syscall::native::NativePreemptionPlan::Return => {}
                 crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
                     switch_kernel_context(plan);
+                    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Gate);
                     context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
                     // SAFETY: [CARRIER] `context` was just re-read from the destination CPU's
                     // binding after the switch.
@@ -1656,6 +1659,7 @@ unsafe fn native_runtime_timer_pre_iret<
             break;
         }
     }
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Other);
 }
 
 /// Fixed assembly seam for CPL3-origin Local APIC timer return. Returning from
@@ -1722,6 +1726,7 @@ unsafe fn native_runtime_user_page_fault<
     error: u64,
 ) {
     use crate::syscall::native::UserPageFaultOutcome;
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Fault);
     let record = user_page_fault_record(frame, cr2, error);
     if !crate::arch::x86_64::exceptions::page_fault_may_be_served(error, cr2) {
         end_user_page_fault::<R>(context, TerminalAction::UserException(record));
@@ -1781,6 +1786,7 @@ unsafe fn native_runtime_user_page_fault<
             crate::syscall::native::NativePreemptionPlan::Return => {}
             crate::syscall::native::NativePreemptionPlan::Switch(plan) => {
                 switch_kernel_context(plan);
+                drain_source_here(crate::arch::x86_64::step_report::DrainSource::Fault);
                 context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
                 // SAFETY: [CARRIER] `context` was re-read from this CPU's binding after the switch.
                 let runtime = unsafe { &mut *context.cast::<R>() };
@@ -1796,6 +1802,7 @@ unsafe fn native_runtime_user_page_fault<
         }
     }
     poll_timer_return_stop(context);
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Other);
 }
 
 /// Fixed assembly seam for a CPL3 page fault (DW2 M6 §8.5). `frame` is the
@@ -1933,6 +1940,7 @@ pub(crate) fn bind_native_runtime_user_exception_handler() -> Result<
 unsafe fn native_runtime_fresh_thread<R: crate::syscall::native::NativeSyscallFrameRuntime>(
     context: *mut (),
 ) -> ! {
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Other);
     let carrier = core::ptr::NonNull::new(context.cast::<R>()).unwrap_or_else(|| halt_forever());
     // SAFETY: [DIVERGENT] reached only through `dw_x86_64_first_run_thread_entry` on a fresh
     // Thread's stack, so no frame that resumes holds a reference to this CPU's carrier.
@@ -1963,6 +1971,7 @@ unsafe extern "sysv64" fn native_runtime_terminal_reaper<
 >(
     context: *mut (),
 ) -> ! {
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Other);
     let Some(action) = take_terminal_action() else {
         halt_forever();
     };
@@ -2037,6 +2046,7 @@ unsafe fn native_runtime_trampoline<
         halt_forever();
     }
     end_teardown_allowance_here();
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Syscall);
     // The syscall gate entered with IF clear. A remote Stop may therefore be
     // published in the stationary mailbox while its e1 delivery is still
     // pending in the local APIC. Poll the authoritative mailbox before any
@@ -2113,6 +2123,8 @@ unsafe fn native_runtime_trampoline<
                 }
                 crate::syscall::native::NativeSuspendPlan::IdleCurrent => {
                     loop {
+                        // Idling on this blocked Thread's root.
+                        drain_source_here(crate::arch::x86_64::step_report::DrainSource::Idle);
                         let idle = crate::arch::x86_64::idle::prepare_current_idle()
                             .unwrap_or_else(|_| halt_forever());
                         let poll = {
@@ -2266,6 +2278,7 @@ unsafe fn native_runtime_trampoline<
             // outgoing stack frame still contains its source facade pointer;
             // reacquire the destination's one-shot published carrier before
             // any scheduler, terminal, mapping, or user-return operation.
+            drain_source_here(crate::arch::x86_64::step_report::DrainSource::Syscall);
             context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
             let result = {
                 // SAFETY: [CARRIER] `context` was just re-read from the destination CPU's binding
@@ -2309,6 +2322,7 @@ unsafe fn native_runtime_trampoline<
         crate::syscall::native::SyscallControl::YieldCurrent => halt_forever(),
     }
     service_syscall_return_preemption::<R>(&mut context, frame);
+    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Other);
 }
 
 /// The checks after a dispatched or continued call, before its control is
@@ -2401,6 +2415,7 @@ fn yield_parked_call<
         };
         if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
             switch_kernel_context(plan);
+            drain_source_here(crate::arch::x86_64::step_report::DrainSource::Syscall);
             *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
             // SAFETY: [CARRIER] `*context` was just re-read from the destination CPU's binding
             // after the switch.
@@ -2448,6 +2463,7 @@ fn service_syscall_return_preemption<
             if let crate::syscall::native::NativePreemptionPlan::Switch(plan) = plan {
                 frame.revoke_authorized_return();
                 switch_kernel_context(plan);
+                drain_source_here(crate::arch::x86_64::step_report::DrainSource::Syscall);
                 *context = current_runtime_context::<R>().unwrap_or_else(|| halt_forever());
                 // SAFETY: [CARRIER] `*context` was just re-read from the destination CPU's binding
                 // after the switch.
@@ -2515,6 +2531,16 @@ fn allow_teardown_step_here() {
 fn end_teardown_allowance_here() {
     if let Some(cpu) = current_cpu_index() {
         crate::arch::x86_64::step_report::take_teardown_step(cpu);
+    }
+}
+
+/// This CPU's drains are `source`'s from here, for the step report's count
+/// of finalize steps by what drained (DW2 §10.19 revision 2 item 3). Set
+/// at each entry and wherever a switched-out Thread resumes, so a resumed
+/// path counts as its own entry.
+fn drain_source_here(source: crate::arch::x86_64::step_report::DrainSource) {
+    if let Some(cpu) = current_cpu_index() {
+        crate::arch::x86_64::step_report::set_drain_source(cpu, source);
     }
 }
 
