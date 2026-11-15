@@ -514,6 +514,21 @@ enum ThreadTerminationPreparation {
     Remote(PreparedRemoteThreadTermination),
 }
 
+/// The pause between two tries of a terminal preparation whose stop plan
+/// was refused (ProcessExit, ProcessTerminate, TaskGroupTerminate,
+/// ThreadTerminate and the exception path). It runs with IF clear and with
+/// no T, P or S held, so it acknowledges this CPU's pending TLB shootdown on
+/// every iteration: the next try retakes T uncontended and never reaches the
+/// ticket spin's service, and the refused target may be waiting, directly or
+/// through its own initiator, for this CPU's acknowledgement (DW2 §10.16
+/// review of revision 2, F1).
+fn pause_before_termination_retry() {
+    for _ in 0..64 {
+        user_access::service_local_tlb_shootdown();
+        core::hint::spin_loop();
+    }
+}
+
 /// Waits, guard-free, for every published remote Stop's exact
 /// acknowledgement. The token keeps the wait out of any runtime-authority
 /// guard: a stopped CPU acknowledges from its own safe point, which may need
@@ -529,7 +544,10 @@ fn await_remote_stop_permits(
         let Some(deferred) = deferred else {
             continue;
         };
-        let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(deferred);
+        let ((), permit) = crate::arch::x86_64::idle::await_live_remote_stop(
+            deferred,
+            user_access::service_local_tlb_shootdown,
+        );
         permits[cpu_index] = Some(permit);
     }
     permits
@@ -2719,9 +2737,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ProcessTerminationPreparation::Retry => {
                     runtime.end_hold(crate::syscall::HoldEnd::Stage);
                     drop(guard);
-                    for _ in 0..64 {
-                        core::hint::spin_loop();
-                    }
+                    pause_before_termination_retry();
                     continue;
                 }
                 ProcessTerminationPreparation::Immediate(result) => {
@@ -4498,15 +4514,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         );
     }
 
-    /// Whether this CPU's mailbox holds a Stop, read under T at the start of
-    /// a hold that would move the CPU into a state no Stop may be published
-    /// to (DW2 §10.16 revision 2 item 2). The mailbox stays authoritative:
-    /// the caller services the Stop from it after the hold.
+    /// Whether this CPU's mailbox holds a requested Stop, read under T at the
+    /// start of a hold that would move the CPU into a state no Stop may be
+    /// published to (DW2 §10.16 revision 2 item 2). It consumes nothing: no
+    /// pending Wake is taken. The caller services the Stop from the mailbox
+    /// after the hold.
     fn stop_published(&self) -> bool {
-        matches!(
-            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        )
+        crate::arch::x86_64::idle::current_stop_requested()
     }
 
     fn install_deferred_current(
@@ -7314,9 +7328,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 ProcessTerminationPreparation::Retry => {
                                     runtime.end_hold(crate::syscall::HoldEnd::Stage);
                                     drop(guard);
-                                    for _ in 0..64 {
-                                        core::hint::spin_loop();
-                                    }
+                                    pause_before_termination_retry();
                                     continue;
                                 }
                                 ProcessTerminationPreparation::Immediate(result) => {
@@ -7349,9 +7361,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 ProcessTerminationPreparation::Retry => {
                                     runtime.end_hold(crate::syscall::HoldEnd::Stage);
                                     drop(guard);
-                                    for _ in 0..64 {
-                                        core::hint::spin_loop();
-                                    }
+                                    pause_before_termination_retry();
                                     continue;
                                 }
                                 ProcessTerminationPreparation::Immediate(result) => {
@@ -7380,9 +7390,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 TaskGroupTerminationPreparation::Retry => {
                                     runtime.end_hold(crate::syscall::HoldEnd::Stage);
                                     drop(guard);
-                                    for _ in 0..64 {
-                                        core::hint::spin_loop();
-                                    }
+                                    pause_before_termination_retry();
                                     continue;
                                 }
                                 TaskGroupTerminationPreparation::Immediate(result) => {
@@ -7414,9 +7422,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                                 ThreadTerminationPreparation::Retry => {
                                     runtime.end_hold(crate::syscall::HoldEnd::Stage);
                                     drop(guard);
-                                    for _ in 0..64 {
-                                        core::hint::spin_loop();
-                                    }
+                                    pause_before_termination_retry();
                                     continue;
                                 }
                                 ThreadTerminationPreparation::Immediate(result) => {

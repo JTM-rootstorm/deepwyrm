@@ -98,6 +98,12 @@ pub(crate) enum StopRefusal {
     /// prepared away from it, whose destination may already execute (DW2
     /// §10.15 audit R2).
     PreparedSwitch,
+    /// The terminal Thread's Running claim while the CPU still holds a
+    /// suspended claim, whatever its control: a switch whose destination has
+    /// not reached its handoff hold, so the stop's retirement of the Running
+    /// claim would fail (`SwitchPending`). It ends at that hold (§10.16
+    /// review of revision 2, F3).
+    SwitchUnfinished,
 }
 
 /// Decides publication for one target CPU from its facts. `owner` gives a
@@ -141,6 +147,9 @@ pub(crate) fn decide_stop_publication<T: Copy + Eq, P: Copy + Eq>(
     }
     if claim == StopTarget::Suspended && facts.control == WaitControlHandoff::Clear {
         return Err(StopRefusal::PreparedSwitch);
+    }
+    if claim == StopTarget::Running && facts.suspended.is_some() {
+        return Err(StopRefusal::SwitchUnfinished);
     }
     let Some(root) = facts.active_root else {
         return Err(StopRefusal::NoActiveRoot);

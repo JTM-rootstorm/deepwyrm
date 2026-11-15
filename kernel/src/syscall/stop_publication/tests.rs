@@ -92,15 +92,33 @@ fn a_stoppable_cpu_is_published_to() {
             retire_unentered: true,
         })
     );
-    // A Running claim of the terminal Thread beside another Thread's
-    // suspended claim names the Running one.
-    assert_eq!(
-        decide(StopTargetFacts {
+}
+
+/// §10.16 review of revision 2, F3: a Running claim of the terminal Thread
+/// beside another Thread's suspended claim is a switch whose destination has
+/// not reached its handoff hold, whatever the control; the stop could not
+/// retire that Running claim (`SwitchPending`).
+#[test]
+fn a_running_target_beside_a_suspended_claim_is_refused() {
+    for control in [
+        WaitControlHandoff::Clear,
+        WaitControlHandoff::Pending { replacement: true },
+        WaitControlHandoff::Idle,
+        WaitControlHandoff::Resuming,
+    ] {
+        let facts = StopTargetFacts {
             suspended: claim(OTHER, false),
+            control,
             ..running()
-        }),
-        RUNNING
-    );
+        };
+        assert_eq!(
+            decide(facts),
+            Err(StopRefusal::SwitchUnfinished),
+            "{facts:?}"
+        );
+    }
+    // Once the handoff completes the suspended claim, it is published.
+    assert_eq!(decide(running()), RUNNING);
 }
 
 /// No terminal claim on the CPU: nothing is published, whatever else holds.

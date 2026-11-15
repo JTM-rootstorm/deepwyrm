@@ -547,6 +547,13 @@ impl RendezvousMailbox {
         self.state.load(Ordering::Acquire) == MAILBOX_IDLE
     }
 
+    /// Whether a Stop is requested and not yet acknowledged. One load: it
+    /// takes no Wake and no lock, so a check made only to decide whether to
+    /// go on changes nothing.
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.state.load(Ordering::Acquire) == MAILBOX_STOP_REQUESTED
+    }
+
     /// Coalesces a wake without modifying the stop state or request payload.
     pub(crate) fn publish_wake(&self) {
         self.wake_pending.store(true, Ordering::Release);
@@ -1017,6 +1024,7 @@ mod tests {
         acknowledge(&mailbox, identity(thread));
         // Acknowledged, not reclaimed: the stopped CPU already runs `next`.
         assert!(!mailbox.stop_is_idle());
+        assert!(!mailbox.stop_requested());
         let busy = mailbox.publish_stop(identity(next), 2_u64).unwrap_err();
         assert_eq!(busy.error(), StopPublishError::Busy);
         assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 1);
@@ -1025,6 +1033,38 @@ mod tests {
         acknowledge(&mailbox, identity(next));
         assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 3);
         assert!(mailbox.stop_is_idle());
+    }
+
+    /// DW2 §10.16 review of revision 2, F2: the check a hold makes before a
+    /// transition consumes nothing. A pending Wake survives it, and it is
+    /// true exactly while a Stop is requested and not yet acknowledged.
+    #[test]
+    fn the_stop_check_consumes_no_wake_and_sees_only_a_requested_stop() {
+        let mut objects = ObjectRegistry::<8>::new();
+        let thread = thread_key(&mut objects);
+        let mailbox = RendezvousMailbox::new(2).unwrap();
+        mailbox.publish_wake();
+        assert!(!mailbox.stop_requested());
+        assert!(!mailbox.stop_requested());
+        assert_eq!(mailbox.take_notification(), MailboxNotification::Wake);
+        assert_eq!(mailbox.take_notification(), MailboxNotification::None);
+
+        let deferred = mailbox.publish_stop(identity(thread), 7_u64).unwrap();
+        mailbox.publish_wake();
+        assert!(mailbox.stop_requested());
+        assert!(mailbox.stop_requested(), "the check is repeatable");
+        acknowledge(&mailbox, identity(thread));
+        assert!(
+            !mailbox.stop_requested(),
+            "an acknowledged Stop is not requested"
+        );
+        assert_eq!(mailbox.complete_reclaim(deferred).unwrap(), 7);
+        assert!(!mailbox.stop_requested());
+        assert_eq!(
+            mailbox.take_notification(),
+            MailboxNotification::Wake,
+            "the Wake published beside the Stop survived every check"
+        );
     }
 
     #[test]

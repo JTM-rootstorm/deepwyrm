@@ -533,9 +533,17 @@ pub(crate) fn publish_live_remote_stop<R>(
 /// Acquire-consumes one exact-safe acknowledgement before returning the
 /// caller's deferred resource. The bounded failure path retains the mailbox
 /// witness and fails stop; it never turns a timeout into permission to reclaim.
+///
+/// The wait spins with IF clear, so it cannot take the TLB-shootdown IPI.
+/// `spin_service` runs on every iteration and acknowledges this CPU's pending
+/// shootdown (the live kernel passes `service_local_tlb_shootdown`, as the
+/// runtime locks do): the Stop's target may itself be a shootdown initiator
+/// waiting for this CPU's acknowledgement before it reaches a safe point
+/// (DW2 §10.16 review of revision 2, F1).
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn await_live_remote_stop<R>(
     mut deferred: DeferredReclaim<R>,
+    spin_service: fn(),
 ) -> (R, RemoteStopReclaimPermit) {
     let identity = deferred.request().identity();
     let target = CpuIndex::new(identity.target_cpu())
@@ -551,6 +559,7 @@ pub(crate) fn await_live_remote_stop<R>(
             }
             Err(failure) if failure.error() == ReclaimError::AwaitingAcknowledgement => {
                 deferred = failure.into_deferred();
+                spin_service();
                 core::hint::spin_loop();
             }
             Err(failure) => {
@@ -614,6 +623,17 @@ pub(crate) fn take_current_notification_at_safe_point() -> MailboxNotification {
     LIVE_IDLE_WAKE
         .take_notification(cpu)
         .unwrap_or_else(|_| fail_transport_and_halt())
+}
+
+/// Whether this CPU's mailbox holds a requested Stop, read without consuming
+/// anything (no Wake is taken, no request lock): a hold's check before a
+/// transition no Stop may be published across (DW2 §10.16 revision 2 item 2).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn current_stop_requested() -> bool {
+    let Ok(cpu) = current_cpu() else {
+        fail_transport_and_halt();
+    };
+    LIVE_IDLE_WAKE.mailboxes[cpu.index()].stop_requested()
 }
 
 /// Whether `cpu`'s rendezvous mailbox could take a Stop now (DW2 §10.16

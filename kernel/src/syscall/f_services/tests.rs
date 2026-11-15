@@ -2784,18 +2784,16 @@ fn a_remote_stop_settles_every_handoff_state() {
 /// terminal and last made current there, and every other fact stoppable.
 fn publication_facts(
     fixture: &Fixture,
+    target: ThreadKey,
 ) -> crate::syscall::stop_publication::StopTargetFacts<ThreadKey, ProcessKey> {
     let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
-    let (suspended, running) = crate::syscall::stop_publication::claim_facts(
-        &fixture.execution,
-        cpu,
-        &[Some(fixture.thread)],
-    );
+    let (suspended, running) =
+        crate::syscall::stop_publication::claim_facts(&fixture.execution, cpu, &[Some(target)]);
     crate::syscall::stop_publication::StopTargetFacts {
         suspended,
         running,
         control: fixture.control.handoff(),
-        last_scheduled: Some(fixture.thread),
+        last_scheduled: Some(target),
         root_switch_flight: false,
         active_root: Some(fixture.process),
         mailbox_idle: true,
@@ -2810,10 +2808,23 @@ fn publication(
     crate::syscall::stop_publication::StopPublication,
     crate::syscall::stop_publication::StopRefusal,
 > {
+    publication_of(fixture, fixture.thread)
+}
+
+/// As `publication`, for a Stop naming `target`, which the fixture's CPU
+/// made current last.
+fn publication_of(
+    fixture: &Fixture,
+    target: ThreadKey,
+) -> Result<
+    crate::syscall::stop_publication::StopPublication,
+    crate::syscall::stop_publication::StopRefusal,
+> {
     let process = fixture.process;
-    crate::syscall::stop_publication::decide_stop_publication(publication_facts(fixture), |_| {
-        process
-    })
+    crate::syscall::stop_publication::decide_stop_publication(
+        publication_facts(fixture, target),
+        |_| process,
+    )
 }
 
 /// Blocks the fixture's Thread in a `WaitOne` and returns its event.
@@ -2929,11 +2940,24 @@ fn a_stop_is_refused_across_a_wait_switch_and_published_otherwise() {
         "the destination is not terminal: the R2 test reads it unfiltered"
     );
     assert_eq!(publication(&fixture), Err(StopRefusal::PreparedSwitch));
+    // F3: a Stop for the destination is refused until its handoff too.
+    let destination = fixture.sender.unwrap();
+    assert_eq!(
+        publication_of(&fixture, destination),
+        Err(StopRefusal::SwitchUnfinished)
+    );
 
     // The destination's handoff ends the state.
     let outgoing = fixture.execution.suspended_claim_on(cpu).unwrap();
     fixture.execution.complete_switch_on(outgoing).unwrap();
     assert_eq!(publication(&fixture), Ok(StopPublication::Nothing));
+    assert_eq!(
+        publication_of(&fixture, destination),
+        Ok(StopPublication::Publish {
+            claim: StopTarget::Running,
+            retire_unentered: false,
+        })
+    );
     retire_wait_for_stop(
         &mut fixture,
         event,
@@ -2982,21 +3006,35 @@ fn a_stop_is_refused_across_a_wait_switch_and_published_otherwise() {
 /// DW2 §10.16 revision 2 items 1 and 6 for a yield, which prepares its
 /// switch as a preemption does: the outgoing Thread keeps the suspended
 /// claim with a Clear control and the destination the Running claim, and a
-/// Stop for the outgoing Thread is refused until the destination's handoff.
+/// Stop for the outgoing Thread, or for the destination, is refused until the
+/// destination's handoff (F3 for the destination).
 #[test]
 fn a_stop_is_refused_across_a_yield_switch() {
-    use crate::syscall::stop_publication::{StopPublication, StopRefusal};
+    use crate::syscall::stop_publication::{StopPublication, StopRefusal, StopTarget};
     let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
     let fixture = Fixture::with_runnable_sender();
+    let destination = fixture.sender.unwrap();
     let decision = fixture
         .execution
         .yield_current_on(cpu, fixture.thread)
         .unwrap();
     assert_eq!(decision.previous, Some(fixture.thread));
-    assert_eq!(decision.current, fixture.sender);
+    assert_eq!(decision.current, Some(destination));
     let outgoing = fixture.execution.suspended_claim_on(cpu).unwrap();
     assert_eq!(outgoing.thread(), fixture.thread);
     assert_eq!(publication(&fixture), Err(StopRefusal::PreparedSwitch));
+    // F3: the destination, terminal and made current last, is refused too.
+    assert_eq!(
+        publication_of(&fixture, destination),
+        Err(StopRefusal::SwitchUnfinished)
+    );
     fixture.execution.complete_switch_on(outgoing).unwrap();
     assert_eq!(publication(&fixture), Ok(StopPublication::Nothing));
+    assert_eq!(
+        publication_of(&fixture, destination),
+        Ok(StopPublication::Publish {
+            claim: StopTarget::Running,
+            retire_unentered: false,
+        })
+    );
 }
