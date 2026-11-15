@@ -23,29 +23,42 @@ fn pages(first: u64, count: u64) -> PageRange {
 
 /// A boot-phase allocator over `(first page, page count)` candidates.
 fn boot(ranges: &[(u64, u64)]) -> Allocator {
+    boot_below(ranges, limit())
+}
+
+fn boot_below<const N: usize>(
+    ranges: &[(u64, u64)],
+    limit: PhysicalAddressLimit,
+) -> PhysicalFrameAllocator<N> {
     let candidates: Vec<_> = ranges
         .iter()
         .map(|(first, count)| pages(*first, *count))
         .collect();
-    Allocator::from_candidates(&candidates, limit(), []).unwrap()
+    PhysicalFrameAllocator::from_candidates(&candidates, limit, []).unwrap()
 }
 
 /// Leaked storage of the given lengths, filled with garbage `adopt_buddy`
 /// must overwrite.
-fn storage(tags: usize, links: usize, bases: usize) -> BuddyStorage {
+fn storage(tags: usize, links: usize, bases: usize, hints: usize) -> BuddyStorage {
     BuddyStorage {
         tags: Box::leak(vec![0xa5_u8; tags].into_boxed_slice()),
         links: Box::leak(vec![FreeLink { next: 7, prev: 9 }; links].into_boxed_slice()),
         bases: Box::leak(vec![u64::MAX; bases].into_boxed_slice()),
+        hints: Box::leak(vec![u32::MAX; hints].into_boxed_slice()),
     }
 }
 
-fn storage_for(allocator: &Allocator) -> BuddyStorage {
+fn storage_for<const N: usize>(allocator: &PhysicalFrameAllocator<N>) -> BuddyStorage {
     let frames = usize::try_from(allocator.initial_frames()).unwrap();
-    storage(frames, frames, allocator.initial_range_count())
+    storage(
+        frames,
+        frames,
+        allocator.initial_range_count(),
+        allocator.range_hint_count(),
+    )
 }
 
-fn adopt(allocator: &mut Allocator) {
+fn adopt<const N: usize>(allocator: &mut PhysicalFrameAllocator<N>) {
     let storage = storage_for(allocator);
     assert!(allocator.adopt_buddy(storage).is_ok());
     assert_eq!(allocator.check_buddy(), Ok(()));
@@ -114,7 +127,11 @@ fn adoption_refuses_wrong_storage_and_a_second_adoption() {
         (frames, frames, 1),
         (frames, frames, 3),
     ] {
-        assert!(allocator.adopt_buddy(storage(tags, links, bases)).is_err());
+        assert!(
+            allocator
+                .adopt_buddy(storage(tags, links, bases, 1))
+                .is_err()
+        );
         assert_eq!(blocks(&allocator), []);
         assert_eq!(allocator.available_frames(), 24);
         // Still the boot phase: first fit.
@@ -135,7 +152,10 @@ fn storage_is_refused_at_u32_max_pages() {
         let candidate = PageRange::from_page_count(PAGE, count, limit).unwrap();
         let allocator = Allocator::from_candidates(&[candidate], limit, []).unwrap();
         let count = usize::try_from(count).unwrap();
-        assert_eq!(allocator.accepts_buddy_storage(count, count, 1), accepted);
+        assert_eq!(
+            allocator.accepts_buddy_storage(count, count, 1, allocator.range_hint_count()),
+            accepted
+        );
     }
 }
 
@@ -554,5 +574,156 @@ fn a_model_of_mixed_allocations_and_frees_agrees_with_the_buddy_allocator() {
         allocator.free_run(run).unwrap();
     }
     assert_eq!(allocator.available_frames(), allocator.initial_frames());
+    assert_eq!(allocator.check_buddy(), Ok(()));
+}
+
+/// The plain linear definitions: the range holding `physical`, and its page
+/// position in the concatenation of the ranges.
+fn linear(ranges: &[PageRange], physical: u64) -> (Option<usize>, Option<usize>) {
+    let mut base = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        if range.start <= physical && physical < range.end {
+            let position = base + ((physical - range.start) / PAGE) as usize;
+            return (Some(index), Some(position));
+        }
+        base += range.page_count() as usize;
+    }
+    (None, None)
+}
+
+/// Every page of every range, the pages just around each range, addresses
+/// inside pages, in the holes and past the end.
+fn probes(ranges: &[PageRange]) -> Vec<u64> {
+    let mut addresses = vec![0, PAGE, u64::MAX, u64::MAX - PAGE + 1, 1 << 51];
+    for range in ranges {
+        let mut page = range.start;
+        while page < range.end {
+            addresses.extend([page, page + 1, page + PAGE - 1]);
+            page += PAGE;
+        }
+        addresses.extend([
+            range.start - PAGE,
+            range.start - 1,
+            range.end,
+            range.end + PAGE,
+        ]);
+    }
+    for pair in ranges.windows(2) {
+        addresses.push(pair[0].end + (pair[1].start - pair[0].end) / 2);
+    }
+    if let Some(last) = ranges.last() {
+        addresses.extend([last.end + (1 << 30), last.end.next_multiple_of(1 << 30)]);
+    }
+    addresses
+}
+
+/// Checks the range lookup and `page_position`, before and after adoption,
+/// against the linear definitions; returns the hint count.
+fn check_positions<const N: usize>(ranges: &[(u64, u64)], limit: PhysicalAddressLimit) -> usize {
+    let before: PhysicalFrameAllocator<N> = boot_below(ranges, limit);
+    let mut after: PhysicalFrameAllocator<N> = boot_below(ranges, limit);
+    adopt(&mut after);
+    let initial = after.initial[..after.initial_len].to_vec();
+    assert_eq!(initial.len(), ranges.len());
+    let buddy = after.buddy.as_ref().unwrap();
+    for address in probes(&initial) {
+        let (index, position) = linear(&initial, address);
+        assert_eq!(
+            buddy.range_index(&initial, address),
+            index,
+            "address {address:#x}"
+        );
+        assert_eq!(
+            after.page_position(address),
+            position,
+            "address {address:#x}"
+        );
+        assert_eq!(
+            before.page_position(address),
+            position,
+            "address {address:#x}"
+        );
+    }
+    after.range_hint_count()
+}
+
+#[test]
+fn range_lookups_agree_with_the_linear_definition_over_hinted_layouts() {
+    // The model test's layout: one granule.
+    assert_eq!(
+        check_positions::<16>(&[(3, 1500), (2053, 2500), (8192, 1800)], limit()),
+        1
+    );
+    // 24 small ranges inside the first GiB, and two in the next granule.
+    let mut many: Vec<_> = (0..24).map(|index| (1 + index * 9000, 7 + index)).collect();
+    many.extend([((1 << 18) + 3, 5), ((1 << 18) + 4000, 2)]);
+    assert_eq!(check_positions::<32>(&many, limit()), 2);
+    // A range from below a granule boundary to above the next one, with
+    // ranges on either side.
+    let across = [(5, 10), ((1 << 18) - 6, (1 << 18) + 20), ((3 << 18) + 7, 3)];
+    assert_eq!(check_positions::<16>(&across, limit()), 4);
+}
+
+#[test]
+fn range_lookups_agree_with_the_linear_definition_far_above_4_tib() {
+    // A last byte near 64 TiB needs 46 bits: granules of 2^34 bytes.
+    let wide = PhysicalAddressLimit::new(1_u64 << 52).unwrap();
+    let ranges = [
+        (3, 8),
+        ((1 << 22) - 2, 6),
+        ((1 << 33) + 9, 4),
+        ((1 << 34) - 3, 2),
+    ];
+    let count = check_positions::<16>(&ranges, wide);
+    let last_end = ((1_u64 << 34) - 1) * PAGE;
+    assert_eq!(count as u64, ((last_end - 1) >> 34) + 1);
+    assert!(count > 1 && count <= 4096);
+}
+
+#[test]
+fn adoption_refuses_a_hints_slice_of_the_wrong_length() {
+    // Ranges reaching into the third GiB: three hints.
+    let mut allocator = boot(&[(8, 8), ((2 << 18) + 1, 4)]);
+    assert_eq!(allocator.range_hint_count(), 3);
+    for hints in [0, 2, 4] {
+        assert!(allocator.adopt_buddy(storage(12, 12, 2, hints)).is_err());
+        assert_eq!(blocks(&allocator), []);
+        assert_eq!(allocator.check_buddy(), Ok(()));
+    }
+    assert!(allocator.adopt_buddy(storage(12, 12, 2, 3)).is_ok());
+    assert_eq!(
+        blocks(&allocator),
+        [
+            (8, 3),
+            ((2 << 18) + 1, 0),
+            ((2 << 18) + 2, 1),
+            ((2 << 18) + 4, 0)
+        ]
+    );
+    assert_eq!(allocator.check_buddy(), Ok(()));
+}
+
+#[test]
+fn a_wrong_hint_fails_the_check() {
+    let layout = [(5, 10), ((1 << 18) - 6, (1 << 18) + 20), ((3 << 18) + 7, 3)];
+    let mut allocator = adopted(&layout);
+    let count = allocator.range_hint_count();
+    assert_eq!(count, 4);
+    for granule in 0..count {
+        for delta in [1_i32, -1] {
+            let hints = allocator.buddy.as_mut().unwrap().hints_mut();
+            let original = hints[granule];
+            let Some(wrong) = original.checked_add_signed(delta) else {
+                continue;
+            };
+            hints[granule] = wrong;
+            assert_eq!(
+                allocator.check_buddy(),
+                Err(PhysicalMemoryError::InvalidFrame),
+                "granule {granule} hint {wrong}"
+            );
+            allocator.buddy.as_mut().unwrap().hints_mut()[granule] = original;
+        }
+    }
     assert_eq!(allocator.check_buddy(), Ok(()));
 }

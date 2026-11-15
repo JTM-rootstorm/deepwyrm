@@ -251,11 +251,13 @@ impl FreeLink {
 
 /// The buddy allocator's per-page and per-range metadata, carved from the
 /// grown role table's run: `tags` and `links` have one entry per allocator
-/// page, `bases` one per initial range.
+/// page, `bases` one per initial range, and `hints` one per granule of the
+/// range lookup ([`PhysicalFrameAllocator::range_hint_count`]).
 pub(super) struct BuddyStorage {
     pub(super) tags: &'static mut [u8],
     pub(super) links: &'static mut [FreeLink],
     pub(super) bases: &'static mut [u64],
+    pub(super) hints: &'static mut [u32],
 }
 
 /// The frame allocator over sanitized, already-reserved physical ranges, in
@@ -512,22 +514,40 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
 
     /// Whether [`Self::adopt_buddy`] accepts storage of these lengths: this
     /// is the first adoption, `tags` and `links` hold one entry per initial
-    /// frame, that count is below `u32::MAX`, and `bases` holds one entry
-    /// per initial range.
-    pub(super) fn accepts_buddy_storage(&self, tags: usize, links: usize, bases: usize) -> bool {
+    /// frame, that count is below `u32::MAX`, `bases` holds one entry per
+    /// initial range, and `hints` [`Self::range_hint_count`] entries.
+    pub(super) fn accepts_buddy_storage(
+        &self,
+        tags: usize,
+        links: usize,
+        bases: usize,
+        hints: usize,
+    ) -> bool {
         self.buddy.is_none()
             && tags == links
             && u64::try_from(tags).is_ok_and(|tags| tags == self.initial_frames())
             && u32::try_from(tags).is_ok_and(|tags| tags < u32::MAX)
             && bases == self.initial_len
+            && hints == self.range_hint_count()
+    }
+
+    /// The hints the buddy allocator's range lookup needs: one per granule
+    /// of at least 1 GiB up to the last initial range's last byte, at most
+    /// 4096; 0 without initial ranges.
+    pub(super) fn range_hint_count(&self) -> usize {
+        buddy::hint_count(&self.initial[..self.initial_len])
     }
 
     /// Switches to the buddy allocator over `storage` (DW2 M7 §12.2), seeded
     /// from the boot free list in order. Refuses, returning `storage`, unless
     /// [`Self::accepts_buddy_storage`] holds; nothing fails after that check.
     pub(super) fn adopt_buddy(&mut self, storage: BuddyStorage) -> Result<(), BuddyStorage> {
-        if !self.accepts_buddy_storage(storage.tags.len(), storage.links.len(), storage.bases.len())
-        {
+        if !self.accepts_buddy_storage(
+            storage.tags.len(),
+            storage.links.len(),
+            storage.bases.len(),
+            storage.hints.len(),
+        ) {
             return Err(storage);
         }
         self.buddy = Some(Buddy::seed(
@@ -545,7 +565,8 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
 
     /// The position of the page holding `physical_start` in the
     /// concatenation of the initial ranges, or `None` outside them: a
-    /// linear scan at boot, a binary search after growth.
+    /// linear scan at boot, and after growth a walk from the hint of the
+    /// address's granule.
     pub(super) fn page_position(&self, physical_start: u64) -> Option<usize> {
         let initial = &self.initial[..self.initial_len];
         if let Some(buddy) = self.buddy.as_ref() {
@@ -562,7 +583,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         None
     }
 
-    /// Checks the buddy allocator's invariants I1 to I5 (DW2 M7 §12.2); `Ok`
+    /// Checks the buddy allocator's invariants I1 to I6 (DW2 M7 §12.2); `Ok`
     /// before adoption. Linear in the allocator pages.
     pub(super) fn check_buddy(&self) -> Result<(), PhysicalMemoryError> {
         self.buddy.as_ref().map_or(Ok(()), |buddy| {

@@ -19,6 +19,14 @@
 //! - I4. No two free blocks are buddies of the same order whose union lies
 //!   inside one initial range.
 //! - I5. `free_pages` is the sum of the free blocks' pages.
+//! - I6. `hints[g]` is the index of the first initial range whose end is
+//!   above `g << hint_shift` (the first range that can hold an address in
+//!   granule `g`), or the range count if there is none, for every granule up
+//!   to the last initial range's last byte.
+//!
+//! Finding the initial range that holds an address starts at the hint of its
+//! granule and walks upward over the ranges that share the granule, so the
+//! common case costs one or two comparisons.
 
 use super::{BASE_PAGE_SIZE, BuddyStorage, FreeLink, PageRange, PhysicalMemoryError};
 
@@ -34,6 +42,10 @@ pub(super) struct Buddy {
     links: &'static mut [FreeLink],
     /// Per initial range: the allocator pages before it.
     bases: &'static mut [u64],
+    /// Per granule of 2^`hint_shift` bytes: the first initial range that
+    /// can hold an address in it (I6).
+    hints: &'static mut [u32],
+    hint_shift: u32,
     /// Per order: position + 1 of the first free block, 0 = empty.
     heads: [u32; BUDDY_ORDERS],
     /// Bit k is set iff `heads[k] != 0`.
@@ -49,14 +61,29 @@ const fn end_pfn(range: PageRange) -> u64 {
     range.end / BASE_PAGE_SIZE
 }
 
-/// The initial range holding `physical`, by binary search over the sorted,
-/// disjoint initial ranges.
-fn range_index(ranges: &[PageRange], physical: u64) -> Option<usize> {
-    let index = ranges.partition_point(|range| range.end <= physical);
-    ranges
-        .get(index)
-        .filter(|range| range.start <= physical)
-        .map(|_| index)
+/// The granule size, as a shift, of the hints over `ranges`: at least
+/// 1 GiB, and large enough that at most 4096 granules reach the last
+/// initial range's last byte.
+fn hint_shift(ranges: &[PageRange]) -> u32 {
+    let bits = ranges
+        .last()
+        .map_or(0, |last| 64 - (last.end - 1).leading_zeros());
+    bits.saturating_sub(12).max(30)
+}
+
+/// How many hints the initial ranges `ranges` need: one per granule up to
+/// the last range's last byte, and none without ranges.
+pub(super) fn hint_count(ranges: &[PageRange]) -> usize {
+    ranges.last().map_or(0, |last| {
+        (((last.end - 1) >> hint_shift(ranges)) + 1) as usize
+    })
+}
+
+/// The hint of granule `granule` by its definition (I6): the first range
+/// whose end is above the granule's start.
+fn hint_for(ranges: &[PageRange], shift: u32, granule: usize) -> u32 {
+    let start = (granule as u64) << shift;
+    ranges.partition_point(|range| range.end <= start) as u32
 }
 
 /// Whether the block of 2^`order` pages at `pfn` lies inside `range`.
@@ -92,7 +119,12 @@ impl Buddy {
     /// inside one initial range: the initial ranges never touch, since the
     /// boot list merges touching ranges and a reservation leaves a gap.
     pub(super) fn seed(storage: BuddyStorage, initial: &[PageRange], free: &[PageRange]) -> Self {
-        let BuddyStorage { tags, links, bases } = storage;
+        let BuddyStorage {
+            tags,
+            links,
+            bases,
+            hints,
+        } = storage;
         tags.fill(0);
         links.fill(FreeLink::EMPTY);
         let mut base = 0_u64;
@@ -100,23 +132,48 @@ impl Buddy {
             *entry = base;
             base += range.page_count();
         }
+        // The hints come before the first lookup below.
+        let shift = hint_shift(initial);
+        for (granule, hint) in hints.iter_mut().enumerate() {
+            *hint = hint_for(initial, shift, granule);
+        }
         let mut buddy = Self {
             tags,
             links,
             bases,
+            hints,
+            hint_shift: shift,
             heads: [0; BUDDY_ORDERS],
             nonempty: 0,
             free_pages: 0,
         };
         let mut total = 0_u64;
         for range in free {
-            let index = range_index(initial, range.start)
+            let index = buddy
+                .range_index(initial, range.start)
                 .expect("a boot free range lies inside one initial range");
             buddy.insert_range(initial, index, first_pfn(*range), range.page_count());
             total += range.page_count();
         }
         buddy.free_pages = total;
         buddy
+    }
+
+    /// The initial range holding `physical`: from the hint of its granule,
+    /// upward over the ranges that can still hold it.
+    pub(super) fn range_index(&self, ranges: &[PageRange], physical: u64) -> Option<usize> {
+        let granule = usize::try_from(physical >> self.hint_shift).ok()?;
+        let mut index = *self.hints.get(granule)? as usize;
+        while let Some(range) = ranges.get(index) {
+            if range.start > physical {
+                return None;
+            }
+            if physical < range.end {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
     }
 
     /// The position of the page at `pfn`, which lies inside `ranges[index]`.
@@ -134,7 +191,7 @@ impl Buddy {
     }
 
     pub(super) fn page_position(&self, ranges: &[PageRange], physical: u64) -> Option<usize> {
-        let index = range_index(ranges, physical)?;
+        let index = self.range_index(ranges, physical)?;
         usize::try_from(self.bases[index] + (physical - ranges[index].start) / BASE_PAGE_SIZE).ok()
     }
 
@@ -299,7 +356,8 @@ impl Buddy {
         ranges: &[PageRange],
         range: PageRange,
     ) -> Result<(), PhysicalMemoryError> {
-        let index = range_index(ranges, range.start)
+        let index = self
+            .range_index(ranges, range.start)
             .filter(|index| ranges[*index].contains(range))
             .ok_or(PhysicalMemoryError::InvalidFrame)?;
         if self.overlaps_free_in(ranges, index, range) {
@@ -360,13 +418,24 @@ impl Buddy {
         self.free_pages
     }
 
-    /// Checks I1 to I5; any violation is reported as `InvalidFrame`.
+    /// Checks I1 to I6; any violation is reported as `InvalidFrame`.
     pub(super) fn check(&self, ranges: &[PageRange]) -> Result<(), PhysicalMemoryError> {
         const VIOLATION: Result<(), PhysicalMemoryError> = Err(PhysicalMemoryError::InvalidFrame);
         let total = ranges.iter().map(|range| range.page_count()).sum::<u64>();
         if self.bases.len() != ranges.len()
             || u64::try_from(self.tags.len()) != Ok(total)
             || self.links.len() != self.tags.len()
+        {
+            return VIOLATION;
+        }
+        // I6.
+        if self.hint_shift != hint_shift(ranges)
+            || self.hints.len() != hint_count(ranges)
+            || self
+                .hints
+                .iter()
+                .enumerate()
+                .any(|(granule, hint)| *hint != hint_for(ranges, self.hint_shift, granule))
         {
             return VIOLATION;
         }
@@ -453,6 +522,12 @@ impl Buddy {
             return VIOLATION;
         }
         Ok(())
+    }
+
+    /// The hints, for tests that corrupt one.
+    #[cfg(test)]
+    pub(super) fn hints_mut(&mut self) -> &mut [u32] {
+        self.hints
     }
 
     /// The free blocks in address order, as (physical start, order).

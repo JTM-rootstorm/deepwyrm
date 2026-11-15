@@ -702,6 +702,8 @@ pub(crate) struct RoleTableLayout {
     links_offset: usize,
     bases_offset: usize,
     bases: usize,
+    hints_offset: usize,
+    hints: usize,
     tags_offset: usize,
     bytes: u64,
 }
