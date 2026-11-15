@@ -475,7 +475,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn untake_index_frame(&mut self, frame: Taken) {
         self.allocator
             .free_run(frame.range)
-            .expect("a live run frees: the free list is sized by the role slots (M1)");
+            .expect("a live run frees: the boot free list is sized by the role slots (M1), and the buddy allocator links every page");
         self.vacate(frame.slot);
     }
 
@@ -742,7 +742,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .expect("a freed index frame is live");
         self.allocator
             .free_run(record.range)
-            .expect("a live run frees: the free list is sized by the role slots (M1)");
+            .expect("a live run frees: the boot free list is sized by the role slots (M1), and the buddy allocator links every page");
         self.vacate(slot);
     }
 

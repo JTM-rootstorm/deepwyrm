@@ -502,7 +502,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .expect("a validated chain stays whole while it is freed");
             self.allocator
                 .free_run(run.range)
-                .expect("a live run frees: the free list is sized by the role slots (M1)");
+                .expect("a live run frees: the boot free list is sized by the role slots (M1), and the buddy allocator links every page");
             self.vacate(run.slot);
             object_page += run.range.page_count();
             next = self.link_identity(run.link.next);

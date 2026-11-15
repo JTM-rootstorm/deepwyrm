@@ -1742,6 +1742,16 @@ fn read_physical_bytes_with_scratch<I: ActiveScratchIo>(
     Ok(())
 }
 
+/// What growing the frame-role table left: its slots, and the allocator's
+/// free pages and largest free block, in pages, right after the move.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameRoleGrowth {
+    pub(crate) slots: usize,
+    pub(crate) free_pages: u64,
+    pub(crate) largest_free_pages: u64,
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
@@ -1867,13 +1877,15 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Moves the frame-role table into a run of RAM sized from installed
-    /// memory, reached through the direct map (DW2 M2 §5.3), and returns
-    /// its slot count. The early BSP is the only CPU running.
+    /// memory, reached through the direct map (DW2 M2 §5.3), which also
+    /// switches the frame allocator to the buddy allocator (DW2 M7 §12.2),
+    /// and returns the slot count and the free memory after the move. The
+    /// early BSP is the only CPU running.
     #[allow(
         unsafe_code,
         reason = "the direct map is the role table's only mapping of the run the manager allocated"
     )]
-    pub(crate) fn grow_frame_roles(&mut self) -> Result<usize, LiveActiveTargetError> {
+    pub(crate) fn grow_frame_roles(&mut self) -> Result<FrameRoleGrowth, LiveActiveTargetError> {
         let roles = &mut *self.target.roles;
         let layout = roles
             .grown_layout()
@@ -1905,7 +1917,11 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if let Some(direct) = self.target.scratch_bindings.direct {
             roles.set_index_memory(DIRECT_MAP_INDEX_MEMORY.init(DirectMapIndexMemory(direct)));
         }
-        Ok(layout.slot_count())
+        Ok(FrameRoleGrowth {
+            slots: layout.slot_count(),
+            free_pages: roles.available_frames(),
+            largest_free_pages: roles.largest_free_pages(),
+        })
     }
 
     pub(crate) fn install_kernel_mmio_page(

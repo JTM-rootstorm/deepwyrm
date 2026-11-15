@@ -1064,15 +1064,21 @@ fn growth_keeps_identities_adds_slots_and_indexes_tables() {
 }
 
 #[test]
-fn the_grown_free_list_holds_more_holes_than_the_boot_list() {
-    // The boot free list has 2 ranges; growth sizes it by the slot count.
+fn a_grown_manager_survives_far_more_holes_than_the_boot_list_holds() {
+    // The boot free list holds 2 ranges; after growth the buddy allocator
+    // links every page, so a free never runs out of list entries.
     let mut roles = manager(BASE_PAGE_SIZE, 512);
     grow(&mut roles);
+    let initial = roles.available_frames();
     let mut grants = Vec::new();
-    for _ in 0..8 {
-        grants.push(roles.allocate(1).unwrap());
+    while let Ok(grant) = roles.allocate(1) {
+        grants.push(grant);
     }
-    // Freeing every other run leaves four holes at once.
+    assert_eq!(grants.len() as u64, initial);
+    assert_eq!(roles.available_frames(), 0);
+    assert_eq!(roles.check_invariants(), Ok(()));
+    // Freeing every other page by address leaves a hole per pair at once.
+    grants.sort_by_key(|grant| grant.physical_start());
     let mut kept = Vec::new();
     for (index, grant) in grants.into_iter().enumerate() {
         if index % 2 == 0 {
@@ -1081,10 +1087,14 @@ fn the_grown_free_list_holds_more_holes_than_the_boot_list() {
             kept.push(grant);
         }
     }
+    assert!(kept.len() > 200);
+    assert_eq!(roles.available_frames(), initial - kept.len() as u64);
+    assert_eq!(roles.largest_free_pages(), 1);
     assert_eq!(roles.check_invariants(), Ok(()));
     for grant in kept {
         roles.cancel_allocation(grant).unwrap();
     }
+    assert_eq!(roles.available_frames(), initial);
     assert_eq!(roles.check_invariants(), Ok(()));
 }
 
@@ -1167,9 +1177,8 @@ fn a_role_change_during_a_hierarchy_proof_invalidates_it() {
     unsafe_code,
     reason = "the host model hands the manager a leaked buffer as its grown run"
 )]
-fn growth_succeeds_when_the_boot_free_list_is_longer_than_the_grown_bound() {
-    // Production shape: the boot free list (64) is longer than the bound
-    // the grown table needs on a small machine (1 initial range + 17 slots).
+fn growth_succeeds_on_a_small_machine() {
+    // A boot free list of 64 ranges and 2 MiB of allocator RAM.
     let mut roles: FrameRoleManager<64, 16> = {
         let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
         let candidate = PageRange::from_page_count(BASE_PAGE_SIZE, 512, limit).unwrap();
@@ -1177,9 +1186,13 @@ fn growth_succeeds_when_the_boot_free_list_is_longer_than_the_grown_bound() {
         FrameRoleManager::new(allocator).unwrap()
     };
     let layout = roles.grown_layout().unwrap();
-    assert!(layout.ranges > 64);
     let grant = roles.allocate(layout.page_count()).unwrap();
     // SAFETY: an 8-aligned leaked buffer of the run's size, used by nothing else.
     unsafe { roles.adopt_storage(grant, grown_run(layout.page_count() * BASE_PAGE_SIZE)) }.unwrap();
+    assert_eq!(roles.check_invariants(), Ok(()));
+    assert_eq!(roles.available_frames(), 512 - layout.page_count());
+    let run = roles.allocate(3).unwrap();
+    assert_eq!(roles.available_frames(), 512 - layout.page_count() - 3);
+    roles.cancel_allocation(run).unwrap();
     assert_eq!(roles.check_invariants(), Ok(()));
 }

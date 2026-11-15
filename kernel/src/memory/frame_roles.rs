@@ -19,7 +19,8 @@ use super::boot_map::BootstrapMemoryWitness;
 use super::boot_map::{BootMapError, BootstrapReservation, SanitizedBootMap};
 use super::growable::GrowableStore;
 use super::physical::{
-    BASE_PAGE_SIZE, PageRange, PhysicalFrameAllocator, PhysicalMemoryError, PhysicalRange,
+    BASE_PAGE_SIZE, BuddyStorage, FreeLink, PageRange, PhysicalFrameAllocator, PhysicalMemoryError,
+    PhysicalRange,
 };
 
 #[path = "frame_roles/chain.rs"]
@@ -665,11 +666,13 @@ impl StagedTableCommit {
 
 /// The sole dynamic allocator and physical-role registry.
 ///
-/// It starts with `ROLE_CAPACITY` slots and `RANGE_CAPACITY` free ranges held
-/// inline. Once the direct map is active, [`Self::adopt_storage`] moves the
-/// slots, the free-slot stack and the free list into one run of RAM sized
-/// from installed memory, and adds an index from each allocator page to the
-/// role starting there (DW2 large-memory plan, M2 §5.3).
+/// It starts with `ROLE_CAPACITY` slots and an allocator with `RANGE_CAPACITY`
+/// free ranges, held inline. Once the direct map is active,
+/// [`Self::adopt_storage`] moves the slots and the free-slot stack into one
+/// run of RAM sized from installed memory, adds an index from each allocator
+/// page to the role starting there (DW2 large-memory plan, M2 §5.3), and
+/// switches the allocator to a buddy allocator whose per-page metadata lives
+/// in the same run (M7 §12.2).
 pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     domain: u64,
     allocator: PhysicalFrameAllocator<RANGE_CAPACITY>,
@@ -696,8 +699,10 @@ pub(crate) struct RoleTableLayout {
     free_slots_offset: usize,
     starts_offset: usize,
     starts: usize,
-    ranges_offset: usize,
-    ranges: usize,
+    links_offset: usize,
+    bases_offset: usize,
+    bases: usize,
+    tags_offset: usize,
     bytes: u64,
 }
 
@@ -745,3 +750,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> ObjectPages
 #[cfg(test)]
 #[path = "frame_roles/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "frame_roles/grown_tests.rs"]
+mod grown_tests;

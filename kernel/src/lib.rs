@@ -397,7 +397,7 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         .unwrap_or_else(|error| panic!("failed to activate Deep-owned paging: {error:?}"));
         // The boot role table holds 4096 roles; with the direct map active,
         // it moves into RAM sized from installed memory (DW2 M2 §5.3).
-        let role_slots = active_paging
+        let role_growth = active_paging
             .grow_frame_roles()
             .unwrap_or_else(|error| panic!("failed to grow the frame-role table: {error:?}"));
         let pm_timer = {
@@ -785,27 +785,47 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         );
         #[cfg(not(feature = "test-support"))]
         {
-            let mut record = *b"frame-role slots=00000000000000000000";
-            let digits = &mut record[17..];
-            let mut value = role_slots;
-            for digit in digits.iter_mut().rev() {
-                *digit = b'0' + (value % 10) as u8;
-                value /= 10;
+            /// Emits one `[memory]` record of labels each followed by a
+            /// decimal value.
+            fn emit_memory_record(fields: &[(&[u8], u64)]) {
+                let mut message = [0_u8; 96];
+                let mut length = 0;
+                for (label, value) in fields {
+                    let mut digits = [0_u8; 20];
+                    let mut count = 0;
+                    let mut value = *value;
+                    loop {
+                        digits[count] = b'0' + (value % 10) as u8;
+                        count += 1;
+                        value /= 10;
+                        if value == 0 {
+                            break;
+                        }
+                    }
+                    let end = length + label.len() + count;
+                    if end > message.len() {
+                        return;
+                    }
+                    message[length..length + label.len()].copy_from_slice(label);
+                    length += label.len();
+                    for digit in digits[..count].iter().rev() {
+                        message[length] = *digit;
+                        length += 1;
+                    }
+                }
+                if let Ok(message) = core::str::from_utf8(&message[..length]) {
+                    let _ =
+                        debug::emit_early_record(debug::DiagnosticLevel::Info, "memory", message);
+                }
             }
-            let first = digits
-                .iter()
-                .position(|digit| *digit != b'0')
-                .unwrap_or(digits.len() - 1);
-            let mut message = [0_u8; 37];
-            let length = 17 + digits.len() - first;
-            message[..17].copy_from_slice(&record[..17]);
-            message[17..length].copy_from_slice(&record[17 + first..]);
-            if let Ok(message) = core::str::from_utf8(&message[..length]) {
-                let _ = debug::emit_early_record(debug::DiagnosticLevel::Info, "memory", message);
-            }
+            emit_memory_record(&[(b"frame-role slots=", role_growth.slots as u64)]);
+            emit_memory_record(&[
+                (b"buddy free-pages=", role_growth.free_pages),
+                (b" largest-pages=", role_growth.largest_free_pages),
+            ]);
         }
         #[cfg(feature = "test-support")]
-        let _ = role_slots;
+        let _ = role_growth;
         #[cfg(feature = "test-support")]
         match test_support::BUILD_GUEST_TEST {
             #[cfg(deepwyrm_memory_guest)]

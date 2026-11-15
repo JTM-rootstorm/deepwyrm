@@ -1266,8 +1266,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// The run the grown role table needs: one slot per 2 MiB of allocator
     /// RAM beyond the boot slots, its free-slot stack, a start index entry
-    /// per allocator page, and the free list sized by `free_range_bound`
-    /// (DW2 M2 §5.3).
+    /// per allocator page (DW2 M2 §5.3), and the buddy allocator's metadata:
+    /// a link pair and a tag per allocator page and a base per initial range
+    /// (DW2 M7 §12.2).
     pub(crate) fn grown_layout(&self) -> Result<RoleTableLayout, FrameRoleError> {
         let frames = self.allocator.initial_frames();
         let slots = usize::try_from(frames.div_ceil(GROWN_SLOT_PAGES))
@@ -1276,12 +1277,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .filter(|slots| u32::try_from(*slots).is_ok_and(|slots| slots < u32::MAX))
             .ok_or(FrameRoleError::Capacity)?;
         let starts = usize::try_from(frames).map_err(|_| FrameRoleError::Capacity)?;
-        // The bound can be below the boot list on small machines, but the
-        // move needs a longer list: keep at least one more than the boot list.
-        let ranges = self
-            .allocator
-            .free_list_capacity_for(slots)
-            .max(RANGE_CAPACITY + 1);
+        let bases = self.allocator.initial_range_count();
         let align = |offset: usize| offset.checked_next_multiple_of(8);
         let after = |offset: usize, count: usize, size: usize| {
             count
@@ -1293,9 +1289,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             after(0, slots, core::mem::size_of::<RoleSlot>()).ok_or(FrameRoleError::Capacity)?;
         let starts_offset = after(free_slots_offset, slots, core::mem::size_of::<u32>())
             .ok_or(FrameRoleError::Capacity)?;
-        let ranges_offset = after(starts_offset, starts, core::mem::size_of::<u32>())
+        let links_offset = after(starts_offset, starts, core::mem::size_of::<u32>())
             .ok_or(FrameRoleError::Capacity)?;
-        let bytes = after(ranges_offset, ranges, core::mem::size_of::<PageRange>())
+        let bases_offset = after(links_offset, starts, core::mem::size_of::<FreeLink>())
+            .ok_or(FrameRoleError::Capacity)?;
+        let tags_offset = after(bases_offset, bases, core::mem::size_of::<u64>())
+            .ok_or(FrameRoleError::Capacity)?;
+        let bytes = after(tags_offset, starts, core::mem::size_of::<u8>())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(FrameRoleError::Capacity)?;
         Ok(RoleTableLayout {
@@ -1303,18 +1303,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             free_slots_offset,
             starts_offset,
             starts,
-            ranges_offset,
-            ranges,
+            links_offset,
+            bases_offset,
+            bases,
+            tags_offset,
             bytes,
         })
     }
 
-    /// Moves the role table, the free-slot stack and the free list into the
-    /// run `grant` names, which `base` maps, and builds the start index there
-    /// (DW2 M2 §5.3). Slot numbers and generations are kept, so every issued
-    /// identity stays valid. The run itself takes a permanent role. Every
-    /// check happens before anything changes; on an error the grant comes
-    /// back and the manager is as it was.
+    /// Moves the role table and the free-slot stack into the run `grant`
+    /// names, which `base` maps, builds the start index there (DW2 M2 §5.3),
+    /// and hands the allocator its buddy metadata there, which switches it to
+    /// the buddy allocator (DW2 M7 §12.2). Slot numbers and generations are
+    /// kept, so every issued identity stays valid. The run itself takes a
+    /// permanent role. Every check, the allocator's acceptance of the buddy
+    /// storage included, happens before anything changes; on an error the
+    /// grant comes back and the manager is as it was.
     ///
     /// # Safety
     ///
@@ -1339,7 +1343,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             && !self.roles.is_adopted()
             && self.starts.is_none()
             && layout.slots > ROLE_CAPACITY
-            && layout.ranges > RANGE_CAPACITY
+            && self
+                .allocator
+                .accepts_buddy_storage(layout.starts, layout.starts, layout.bases)
             && (base as usize).is_multiple_of(8);
         if !valid {
             return Err(GrantTransitionError::new(FrameRoleError::WrongRole, grant));
@@ -1351,17 +1357,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // unused; every part lies inside `layout.bytes`, at most its length,
         // and starts 8-aligned. Each part is fully written before a slice of
         // it is made.
-        let (slots, free_slots, starts, ranges) = unsafe {
+        let (slots, free_slots, starts, buddy) = unsafe {
             (
                 Self::carve(base, 0, layout.slots, EMPTY_ROLE_SLOT),
                 Self::carve(base, layout.free_slots_offset, layout.slots, 0_u32),
                 Self::carve(base, layout.starts_offset, layout.starts, 0_u32),
-                Self::carve(
-                    base,
-                    layout.ranges_offset,
-                    layout.ranges,
-                    PageRange::empty(),
-                ),
+                BuddyStorage {
+                    links: Self::carve(base, layout.links_offset, layout.starts, FreeLink::EMPTY),
+                    bases: Self::carve(base, layout.bases_offset, layout.bases, 0_u64),
+                    tags: Self::carve(base, layout.tags_offset, layout.starts, 0_u8),
+                },
             )
         };
         self.replace_record(
@@ -1388,8 +1393,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         self.free_slot_count = old_free + new_free;
         self.allocator
-            .adopt_free_list(ranges)
-            .unwrap_or_else(|_| panic!("the checked free-list adoption failed"));
+            .adopt_buddy(buddy)
+            .unwrap_or_else(|_| panic!("the checked buddy adoption failed"));
         self.starts = Some(starts);
         for slot in 0..self.roles.len() {
             if let Some(record) = self.roles.as_slice()[slot].record {
@@ -1431,6 +1436,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.allocator.available_frames()
     }
 
+    /// Pages in the largest run one allocation can take now.
+    pub(crate) fn largest_free_pages(&self) -> u64 {
+        self.allocator.largest_free_pages()
+    }
+
     pub(crate) fn check_invariants(&self) -> Result<(), FrameRoleError> {
         let mut dynamic_pages = 0_u64;
         for (left_index, left) in self.roles.as_slice().iter().enumerate() {
@@ -1463,6 +1473,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         {
             return Err(FrameRoleError::InvariantViolation);
         }
+        self.allocator
+            .check_buddy()
+            .map_err(|_| FrameRoleError::InvariantViolation)?;
         self.check_chains()?;
         self.check_indexes()
     }
@@ -1649,15 +1662,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// The start index position of `physical_start`, a page of allocator RAM.
     fn start_position(&self, physical_start: u64) -> Option<usize> {
-        let mut base = 0_u64;
-        for range in self.allocator.initial_page_ranges() {
-            if range.start <= physical_start && physical_start < range.end {
-                return usize::try_from(base + (physical_start - range.start) / BASE_PAGE_SIZE)
-                    .ok();
-            }
-            base += range.page_count();
-        }
-        None
+        self.allocator.page_position(physical_start)
     }
 
     fn set_start(&mut self, record: RoleRecord, slot: usize) {
