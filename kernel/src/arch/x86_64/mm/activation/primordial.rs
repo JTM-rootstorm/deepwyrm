@@ -844,25 +844,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let prepared = loop {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
-            if matches!(
-                crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-            ) {
-                return false;
-            }
-            if runtime
-                .core
-                .shared
-                .execution
-                .terminal_scheduler_current_on(&runtime.core.tasks, self.cpu)
-                .unwrap_or_else(|error| {
-                    panic!("scheduler-current terminal state lookup failed: {error:?}")
-                })
-                .is_some()
-            {
-                drop(guard);
-                core::hint::spin_loop();
-                continue;
+            match runtime.safe_point_entry() {
+                crate::task::SafePointEntry::Stopped => return false,
+                crate::task::SafePointEntry::AwaitStopPublication => {
+                    drop(guard);
+                    core::hint::spin_loop();
+                    continue;
+                }
+                crate::task::SafePointEntry::Proceed => {}
             }
             break runtime.prepare_scheduler_root_switch();
         };
@@ -2543,24 +2532,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             &mut PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
         ) -> T,
     ) -> Result<T, ()> {
-        if !self.synchronize_scheduler_current_at_safe_point_detached() {
-            return Err(());
+        // The root synchronization's hold and the operation's are two holds,
+        // and a termination's preparation can run between them with its Stop
+        // published only after it: this hold decides again (§10.15 review
+        // Q3). An exited Thread's operation never runs, so a resumed parked
+        // call never finds its record settled by another CPU's drain.
+        loop {
+            if !self.synchronize_scheduler_current_at_safe_point_detached() {
+                return Err(());
+            }
+            let mut guard = self.runtime.lock();
+            let mut runtime = guard.on(&mut self.owned);
+            match runtime.safe_point_entry() {
+                crate::task::SafePointEntry::Stopped => return Err(()),
+                crate::task::SafePointEntry::AwaitStopPublication => {
+                    drop(guard);
+                    core::hint::spin_loop();
+                    continue;
+                }
+                crate::task::SafePointEntry::Proceed => {}
+            }
+            #[cfg(deepwyrm_dw1e_platform)]
+            if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                runtime
+                    .service_q35_retirement_at_bsp_safe_point()
+                    .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
+            }
+            return Ok(operation(&mut runtime));
         }
-        let mut guard = self.runtime.lock();
-        let mut runtime = guard.on(&mut self.owned);
-        if matches!(
-            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        ) {
-            return Err(());
-        }
-        #[cfg(deepwyrm_dw1e_platform)]
-        if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-            runtime
-                .service_q35_retirement_at_bsp_safe_point()
-                .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
-        }
-        Ok(operation(&mut runtime))
     }
 
     /// A safe point between two steps of a call in steps (DW2 §10.8 item 1).
@@ -3981,6 +3980,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// is no field to reselect (TSV row 85).
     const fn cpu(&self) -> crate::cpu::CpuIndex {
         self.owned.owner.cpu()
+    }
+
+    /// A safe point's decision for this hold, from this CPU's mailbox and
+    /// its scheduler-current Thread's terminal state (§10.15 review Q3).
+    fn safe_point_entry(&self) -> crate::task::SafePointEntry {
+        let stop_published = matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        );
+        let terminal_current = !stop_published
+            && self
+                .core
+                .shared
+                .execution
+                .terminal_scheduler_current_on(&self.core.tasks, self.cpu())
+                .unwrap_or_else(|error| {
+                    panic!("scheduler-current terminal state lookup failed: {error:?}")
+                })
+                .is_some();
+        crate::task::safe_point_entry(stop_published, terminal_current)
     }
 }
 

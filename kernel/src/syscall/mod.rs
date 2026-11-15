@@ -28,7 +28,12 @@ pub(crate) use region_steps::{MapStep, RegionSteps};
 )]
 mod parked_calls;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use parked_calls::{PARKED_CALL_THREADS, ParkedCalls};
+pub(crate) use parked_calls::PARKED_CALL_THREADS;
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+pub(crate) use parked_calls::ParkedCalls;
 
 #[allow(
     unused_imports,
