@@ -1,5 +1,7 @@
 //! A remote Stop's precommit, classified once (DW2 §10.15 revision 2 item 4;
-//! step-6 design review §5b, D-B, D-C).
+//! step-6 design review §5b, D-B, D-C). Clear with a suspended claim (D-C) is
+//! named and refused: it is a prepared switch whose destination already runs
+//! on this CPU, and stopping there is not sound (audit R2).
 //!
 //! The stopped CPU's precommit reads the facts a Thread's handoff into and
 //! out of a suspension leaves behind (its suspended and Running claims, what
@@ -13,19 +15,36 @@
 use super::adapters::WaitControlHandoff;
 use super::f_services::{FServiceOperationOwner, FServiceOwnerError};
 
+/// This CPU's Running claim, compared with the Stop's exact claim on its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunningClaim {
+    /// No Running claim.
+    None,
+    /// The Running claim is the Stop's.
+    Stopped,
+    /// The Running claim names another Thread: a replacement chosen by a
+    /// block, not yet entered.
+    Other,
+}
+
+/// Which of this CPU's claims is the Stop's. The precommit refuses a Stop
+/// that matches neither (`StaleRequest`) and prefers the suspended claim, so
+/// only these two can reach the classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopClaim {
+    /// The suspended claim is the Stop's; `running` is the Running claim,
+    /// observed independently.
+    Suspended { running: RunningClaim },
+    /// The Running claim is the Stop's and no suspended claim is.
+    Running,
+}
+
 /// What the stopped CPU's precommit observes, after every rejectable
-/// identity check has passed.
+/// identity check has passed (those include that a suspended claim's
+/// Thread is the one this CPU physically executes).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StopHandoffFacts {
-    /// The CPU's suspended claim is the Stop's exact claim.
-    pub(crate) suspended: bool,
-    /// The CPU's Running claim is the Stop's exact claim.
-    pub(crate) running: bool,
-    /// The CPU's Running claim names another Thread: a replacement chosen
-    /// by a block, not yet entered.
-    pub(crate) other_running: bool,
-    /// This CPU physically executes the stopped Thread.
-    pub(crate) physically_executes: bool,
+    pub(crate) claim: StopClaim,
     /// A terminal handoff owns this CPU's continuation (deferred current).
     pub(crate) terminal_owned: bool,
     /// The stopped Thread has a call parked between steps.
@@ -52,10 +71,6 @@ pub(crate) enum StopHandoffState {
     Pending { replacement: bool },
     /// Its suspension idles the CPU.
     Idle,
-    /// Its suspension's switch was prepared (by `prepare_suspend`, or by an
-    /// idle poll that returned `Switch`) and has not completed: the control
-    /// is clear and the suspended claim is still this CPU's (D-C).
-    SwitchPrepared,
     /// Its idle poll found the winner, short of the resume's handoff. The
     /// scheduler has already turned the suspended claim into a Running one
     /// (`schedule_from_idle_on`), so this is met on the Running branch; a
@@ -95,21 +110,28 @@ pub(crate) fn classify_stop_handoff(facts: StopHandoffFacts) -> StopHandoffPlan 
         Err(FServiceOwnerError::Missing) => false,
         Err(FServiceOwnerError::Ambiguous) => unclassified("the operation owner is ambiguous"),
     };
-    let state = match (facts.suspended, facts.running) {
-        (true, false) => {
-            if !facts.physically_executes {
-                unclassified("a suspended claim this CPU does not execute");
+    let state = match facts.claim {
+        StopClaim::Suspended {
+            running: RunningClaim::Stopped,
+        } => unclassified("both claims are the Stop's"),
+        StopClaim::Suspended { running } => match facts.control {
+            WaitControlHandoff::Pending { replacement } => StopHandoffState::Pending {
+                replacement: replacement || running == RunningClaim::Other,
+            },
+            WaitControlHandoff::Idle => StopHandoffState::Idle,
+            WaitControlHandoff::Resuming => StopHandoffState::Resuming,
+            // A switch prepared away from the stopped Thread (by
+            // `prepare_suspend`, a preemption, a yield or an idle poll) whose
+            // destination has not reached its handoff: the destination
+            // already runs on this CPU, and the reaper would resume it from
+            // the continuation it saved when it last switched out, which its
+            // run since has overwritten. Not sound to stop here (DW2 §10.15
+            // audit R2); refused until a design says what the stop does.
+            WaitControlHandoff::Clear => {
+                unclassified("a prepared switch's outgoing Thread, its destination already running")
             }
-            match facts.control {
-                WaitControlHandoff::Pending { replacement } => StopHandoffState::Pending {
-                    replacement: replacement || facts.other_running,
-                },
-                WaitControlHandoff::Idle => StopHandoffState::Idle,
-                WaitControlHandoff::Resuming => StopHandoffState::Resuming,
-                WaitControlHandoff::Clear => StopHandoffState::SwitchPrepared,
-            }
-        }
-        (false, true) => match (facts.control, transfer_service_cleanup, facts.parked_call) {
+        },
+        StopClaim::Running => match (facts.control, transfer_service_cleanup, facts.parked_call) {
             (WaitControlHandoff::Clear, false, false) => StopHandoffState::Running,
             (WaitControlHandoff::Clear, false, true) => StopHandoffState::RunningWithParkedCall,
             (WaitControlHandoff::Clear, true, false) => StopHandoffState::ResumedUnsettled,
@@ -120,14 +142,17 @@ pub(crate) fn classify_stop_handoff(facts: StopHandoffFacts) -> StopHandoffPlan 
             // claim back as a Running claim at once; the control stays
             // `Resuming` until the resume's handoff hold.
             (WaitControlHandoff::Resuming, _, false) => StopHandoffState::Resuming,
-            _ => unclassified("a Running claim with a suspension handoff in flight"),
+            (WaitControlHandoff::Resuming, _, true) => {
+                unclassified("a parked call beside a resuming suspension")
+            }
+            (WaitControlHandoff::Pending { .. } | WaitControlHandoff::Idle, _, _) => {
+                unclassified("a Running claim with a suspension handoff in flight")
+            }
         },
-        (true, true) => unclassified("both claims are the Stop's"),
-        (false, false) => unclassified("neither claim is the Stop's"),
     };
     StopHandoffPlan {
         state,
-        suspended_claim: facts.suspended,
+        suspended_claim: matches!(facts.claim, StopClaim::Suspended { .. }),
         retire_control: facts.control != WaitControlHandoff::Clear,
         transfer_service_cleanup,
     }

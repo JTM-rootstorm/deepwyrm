@@ -2348,32 +2348,26 @@ fn a_remote_stop_retires_a_pending_suspension() {
     let cancelled = fixture.control.pending_quantum_cancellation();
     assert!(!fixture.control.is_clear());
     assert_eq!(
-        fixture.services.retire_idle_control_for_stop(
-            &mut fixture.control,
-            wake.thread(),
-            wake.execution_generation() + 1,
-        ),
+        fixture
+            .control
+            .retire_idle_for_stop(wake.thread(), wake.execution_generation() + 1,),
         Err(WaitSuspendError::InvalidDecision),
         "a stale generation must not retire it"
     );
     assert!(!fixture.control.is_clear());
     assert_eq!(
-        fixture.services.retire_idle_control_for_stop(
-            &mut fixture.control,
-            wake.thread(),
-            wake.execution_generation(),
-        ),
+        fixture
+            .control
+            .retire_idle_for_stop(wake.thread(), wake.execution_generation(),),
         Ok(cancelled)
     );
     assert!(fixture.control.is_clear());
     // Nothing is left for a later suspension's `prepare_suspend`, and a
     // second retire finds nothing.
     assert_eq!(
-        fixture.services.retire_idle_control_for_stop(
-            &mut fixture.control,
-            wake.thread(),
-            wake.execution_generation(),
-        ),
+        fixture
+            .control
+            .retire_idle_for_stop(wake.thread(), wake.execution_generation(),),
         Err(WaitSuspendError::InvalidDecision)
     );
     // The operation itself is retired by the stop's cleanup; here its
@@ -2474,20 +2468,16 @@ fn a_remote_stop_retires_a_resuming_idle_suspension() {
     // the exact suspension.
     assert!(!fixture.control.is_clear());
     assert_eq!(
-        fixture.services.retire_idle_control_for_stop(
-            &mut fixture.control,
-            wake.thread(),
-            wake.execution_generation() + 1,
-        ),
+        fixture
+            .control
+            .retire_idle_for_stop(wake.thread(), wake.execution_generation() + 1,),
         Err(WaitSuspendError::InvalidDecision),
         "a stale generation must not retire it"
     );
     assert_eq!(
-        fixture.services.retire_idle_control_for_stop(
-            &mut fixture.control,
-            wake.thread(),
-            wake.execution_generation(),
-        ),
+        fixture
+            .control
+            .retire_idle_for_stop(wake.thread(), wake.execution_generation(),),
         Ok(None)
     );
     assert!(fixture.control.is_clear());
@@ -2541,13 +2531,19 @@ enum HandoffReached {
     unsafe_code,
     reason = "the fixture's running Thread is the physical carrier and the synthetic entry is fixed for these suspension tests"
 )]
-fn stop_after(reached: HandoffReached) -> crate::syscall::stop_handoff::StopHandoffState {
-    use crate::syscall::stop_handoff::{StopHandoffFacts, classify_stop_handoff};
+fn stop_after(reached: HandoffReached) -> Option<crate::syscall::stop_handoff::StopHandoffState> {
+    use crate::syscall::stop_handoff::{
+        RunningClaim, StopClaim, StopHandoffFacts, StopHandoffPlan, StopHandoffState,
+        classify_stop_handoff,
+    };
     const ENTRY: u64 = 0xffff_8000_0012_3000;
     let cpu = crate::cpu::CpuIndex::BOOTSTRAP;
     let mut fixture = match reached {
         HandoffReached::Switch => Fixture::with_runnable_sender(),
-        _ => Fixture::new(),
+        HandoffReached::Pending
+        | HandoffReached::Idle
+        | HandoffReached::Resuming
+        | HandoffReached::ResumedUnsettled => Fixture::new(),
     };
     assert_eq!(
         fixture
@@ -2645,17 +2641,47 @@ fn stop_after(reached: HandoffReached) -> crate::syscall::stop_handoff::StopHand
         assert!(suspended.is_none() && running.is_some());
         assert_eq!(fixture.control.handoff(), WaitControlHandoff::Resuming);
     }
-    let plan = classify_stop_handoff(StopHandoffFacts {
-        suspended: suspended.is_some(),
-        running: suspended.is_none() && running.is_some(),
-        other_running: running_claim.is_some_and(|claim| claim.thread() != thread),
-        physically_executes: true,
+    let running_fact = match running_claim {
+        None => RunningClaim::None,
+        Some(claim) if claim.thread() == thread => RunningClaim::Stopped,
+        Some(_) => RunningClaim::Other,
+    };
+    let facts = StopHandoffFacts {
+        claim: if suspended.is_some() {
+            StopClaim::Suspended {
+                running: running_fact,
+            }
+        } else {
+            StopClaim::Running
+        },
         terminal_owned: false,
         parked_call: false,
         outbox_staged: 0,
         control: fixture.control.handoff(),
         owner: fixture.services.operation_owner(thread),
-    });
+    };
+    let classified = std::panic::catch_unwind(|| classify_stop_handoff(facts));
+    let plan = match (reached, classified) {
+        (HandoffReached::Switch, Err(_)) => {
+            // Audit R2: refused. The fixture is cleaned up as a stop
+            // would, so it drops whole.
+            assert_eq!(
+                facts.claim,
+                StopClaim::Suspended {
+                    running: RunningClaim::Other
+                }
+            );
+            StopHandoffPlan {
+                state: StopHandoffState::Running,
+                suspended_claim: true,
+                retire_control: false,
+                transfer_service_cleanup: true,
+            }
+        }
+        (HandoffReached::Switch, Ok(plan)) => panic!("a prepared switch classified: {plan:?}"),
+        (_, Ok(plan)) => plan,
+        (_, Err(_)) => panic!("{reached:?} did not classify"),
+    };
     assert!(plan.transfer_service_cleanup, "{reached:?}: {plan:?}");
 
     // Its actions, then the commit's claim retirement.
@@ -2722,7 +2748,7 @@ fn stop_after(reached: HandoffReached) -> crate::syscall::stop_handoff::StopHand
         "{reached:?}: a wait's cleanup releases nothing the event still holds"
     );
     close_event(&mut fixture, event);
-    plan.state
+    (!matches!(reached, HandoffReached::Switch)).then_some(plan.state)
 }
 
 /// DW2 §10.15 revision 2 items 4–5: a remote Stop at every point of a
@@ -2735,19 +2761,20 @@ fn a_remote_stop_settles_every_handoff_state() {
     use crate::syscall::stop_handoff::StopHandoffState;
     assert_eq!(
         stop_after(HandoffReached::Pending),
-        StopHandoffState::Pending { replacement: false }
+        Some(StopHandoffState::Pending { replacement: false })
     );
-    assert_eq!(stop_after(HandoffReached::Idle), StopHandoffState::Idle);
     assert_eq!(
-        stop_after(HandoffReached::Switch),
-        StopHandoffState::SwitchPrepared
+        stop_after(HandoffReached::Idle),
+        Some(StopHandoffState::Idle)
     );
+    // Audit R2: a prepared switch is refused (see `stop_after`).
+    assert_eq!(stop_after(HandoffReached::Switch), None);
     assert_eq!(
         stop_after(HandoffReached::Resuming),
-        StopHandoffState::Resuming
+        Some(StopHandoffState::Resuming)
     );
     assert_eq!(
         stop_after(HandoffReached::ResumedUnsettled),
-        StopHandoffState::ResumedUnsettled
+        Some(StopHandoffState::ResumedUnsettled)
     );
 }

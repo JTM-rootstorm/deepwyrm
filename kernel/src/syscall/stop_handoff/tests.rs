@@ -4,10 +4,7 @@ use super::*;
 
 fn running() -> StopHandoffFacts {
     StopHandoffFacts {
-        suspended: false,
-        running: true,
-        other_running: false,
-        physically_executes: true,
+        claim: StopClaim::Running,
         terminal_owned: false,
         parked_call: false,
         outbox_staged: 0,
@@ -18,8 +15,9 @@ fn running() -> StopHandoffFacts {
 
 fn suspended(control: WaitControlHandoff) -> StopHandoffFacts {
     StopHandoffFacts {
-        suspended: true,
-        running: false,
+        claim: StopClaim::Suspended {
+            running: RunningClaim::None,
+        },
         control,
         owner: Ok(FServiceOperationOwner::GenericWait),
         ..running()
@@ -86,7 +84,9 @@ fn every_handoff_state_classifies_with_its_actions() {
         ),
         (
             StopHandoffFacts {
-                other_running: true,
+                claim: StopClaim::Suspended {
+                    running: RunningClaim::Other,
+                },
                 ..suspended(WaitControlHandoff::Pending { replacement: false })
             },
             plan(
@@ -120,11 +120,6 @@ fn every_handoff_state_classifies_with_its_actions() {
                 ..running()
             },
             plan(StopHandoffState::Resuming, false, true, false),
-        ),
-        // D-C: Clear with a suspended claim is a prepared switch, classified.
-        (
-            suspended(WaitControlHandoff::Clear),
-            plan(StopHandoffState::SwitchPrepared, true, false, true),
         ),
         // The initiator already cleaned the operation: no transfer.
         (
@@ -195,14 +190,30 @@ fn unclassifiable_handoffs_panic_naming_their_facts() {
             "{message}"
         );
     }
-    let neither = panics(StopHandoffFacts {
-        running: false,
-        ..running()
-    });
-    assert!(neither.contains("neither claim"), "{neither}");
-    let elsewhere = panics(StopHandoffFacts {
-        physically_executes: false,
+    let both = panics(StopHandoffFacts {
+        claim: StopClaim::Suspended {
+            running: RunningClaim::Stopped,
+        },
         ..suspended(WaitControlHandoff::Idle)
     });
-    assert!(elsewhere.contains("does not execute"), "{elsewhere}");
+    assert!(both.contains("both claims"), "{both}");
+    // Audit R2: a Stop for a prepared switch's outgoing Thread, its
+    // destination already running here, is refused, with or without a
+    // replacement's Running claim.
+    for running in [RunningClaim::None, RunningClaim::Other] {
+        let switch = panics(StopHandoffFacts {
+            claim: StopClaim::Suspended { running },
+            ..suspended(WaitControlHandoff::Clear)
+        });
+        assert!(
+            switch.contains("a prepared switch's outgoing Thread"),
+            "{switch}"
+        );
+    }
+    let parked_resuming = panics(StopHandoffFacts {
+        control: WaitControlHandoff::Resuming,
+        parked_call: true,
+        ..running()
+    });
+    assert!(parked_resuming.contains("resuming"), "{parked_resuming}");
 }

@@ -1174,17 +1174,6 @@ impl<OUTPUT, AtomicPin, const OBJECTS: usize, const ATOMIC_WAITERS: usize, const
             | (u32::from(!self.atomic_operations.is_empty()) << 2)
     }
 
-    /// Clears the ephemeral idle handoff only when it names the exact blocked
-    /// generation being retired by the e1 safe point.
-    pub(crate) fn retire_idle_control_for_stop(
-        &self,
-        control: &mut NativeWaitControl,
-        thread: ThreadKey,
-        execution_generation: u64,
-    ) -> Result<Option<crate::task::SchedulerQuantumTicket>, WaitSuspendError> {
-        control.retire_idle_for_stop(thread, execution_generation)
-    }
-
     /// A remote Stop's actions on the stopped Thread's suspension handoff, as
     /// its classified `plan` names them (DW2 §10.15 revision 2 item 4): the
     /// wait control is retired when the plan says so, and the quantum

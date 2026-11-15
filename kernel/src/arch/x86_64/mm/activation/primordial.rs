@@ -836,9 +836,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Synchronizes the scheduler-current root without crossing an already
     /// published remote Stop. Terminal preparation deliberately moves a
     /// remote current's execution resources while retaining its scheduler
-    /// claim until the target acknowledges that Stop. Preparation and mailbox
-    /// publication straddle the shared runtime guard, so a target that enters
-    /// that narrow gap waits for publication before root synchronization.
+    /// claim until the target acknowledges that Stop. Both publishers (the
+    /// termination dispatch and the exception path) publish the Stop inside
+    /// the preparation's hold, so this hold sees that Stop whenever it sees
+    /// the terminal current; the wait below is kept as a fail-safe for a
+    /// terminal current without a Stop, which no path produces today.
     fn synchronize_scheduler_current_at_safe_point_detached(&mut self) -> bool {
         let prepared = loop {
             let mut guard = self.runtime.lock();
@@ -5719,9 +5721,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             for candidate in candidates.into_iter().flatten() {
                 user.recycle_table_candidate(candidate);
             }
-            // The Process is quiesced and no CPU is resident on its root, so
-            // no TLB can hold the removed translations: the unmapped lease
-            // pins are released now.
+            // This CPU is resident: it tears the primordial Process's userspace
+            // down on its own active root. The publisher's journal invalidates
+            // each removed translation on this CPU as it clears it (`invlpg`),
+            // and the Process is quiesced, so none of its Threads runs anywhere.
+            // No TLB can therefore reach a removed page: the unmapped lease pins
+            // are released now, and finalizing their releases in any later
+            // drain, the terminal reaper's first-hold `Drain` included, frees
+            // frames no translation reaches.
             let releases = releases.settle_locally(&mut self.core.registry);
             for release in releases.into_items().into_iter().flatten() {
                 self.core.cleanup.push(release);
@@ -6826,11 +6833,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // continuation may finalize them. Every earlier hold ended with the
         // shared queue empty, so they are this CPU's own pushes.
         let thread = self.own.scheduled().thread;
+        // The Running claim is compared with the Stop's claim on its own, not
+        // inferred from which claim the precommit chose.
+        let running_claim = match running {
+            None => crate::syscall::RunningClaim::None,
+            Some(running) if matches_identity(running) => crate::syscall::RunningClaim::Stopped,
+            Some(_) => crate::syscall::RunningClaim::Other,
+        };
         let plan = crate::syscall::classify_stop_handoff(crate::syscall::StopHandoffFacts {
-            suspended: was_suspended,
-            running: !was_suspended,
-            other_running: running.is_some_and(|running| running.thread() != thread),
-            physically_executes: self.owned.physically_executing.physically_executes(thread),
+            claim: if was_suspended {
+                crate::syscall::StopClaim::Suspended {
+                    running: running_claim,
+                }
+            } else {
+                crate::syscall::StopClaim::Running
+            },
             terminal_owned: self.own.deferred_current.is_some(),
             parked_call: self.core.parked.holds(thread),
             outbox_staged: self.core.outboxes.staged(self.cpu().index()),
@@ -8381,10 +8398,13 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
             let publication = runtime.complete_physical_switch_handoff();
-            // The continuation gave up its suspended claim at this handoff, so
-            // its idle resume ends here: until now a remote stop could still
-            // find it suspended, and its precommit retires a resuming control
-            // exactly as an idle one.
+            // The idle resume ends here. The scheduler already turned the
+            // suspended claim into a Running one at the idle poll's
+            // `ResumeCurrent`; until this hold the control stays `Resuming`,
+            // and a remote stop's precommit meets it on its Running branch and
+            // retires it (DW2 §10.15 revision 2 item 4). A resume after a
+            // switch completes its outgoing claim here and finds the control
+            // already clear.
             runtime.own.wait_control.finish_idle_resume();
             publication
         };

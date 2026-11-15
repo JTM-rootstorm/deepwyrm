@@ -27,7 +27,9 @@ pub(crate) use hold_end::{
     CleanupOutboxes, HoldEnd, assert_hold_ended, hold_end_for, settle_hold_queues,
 };
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use stop_handoff::{StopHandoffFacts, StopHandoffPlan, classify_stop_handoff};
+pub(crate) use stop_handoff::{
+    RunningClaim, StopClaim, StopHandoffFacts, StopHandoffPlan, classify_stop_handoff,
+};
 #[cfg_attr(
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
     allow(
