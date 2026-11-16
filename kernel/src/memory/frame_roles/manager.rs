@@ -1578,7 +1578,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Publishes `record` in the slot at the head of the free list, which
     /// must be `slot`.
     pub(super) fn occupy(&mut self, slot: usize, generation: u32, record: RoleRecord) {
-        self.store(slot, generation, Some(record));
+        self.occupy_slot(slot, generation, record);
         self.set_start(record, slot);
         self.version = self.version.wrapping_add(1);
     }
@@ -1595,10 +1595,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Empties a live slot and returns it to the free list unless its
     /// generation is spent.
     pub(super) fn vacate(&mut self, slot: usize) {
-        let generation = self.live_generation(slot).expect("a vacated slot was live");
-        let record = self.record_at(slot).expect("a vacated slot was live");
-        self.store(slot, generation, None);
-        self.clear_start(record);
+        let (start, dynamic) = self.vacate_slot(slot);
+        self.clear_start(start, dynamic);
         self.version = self.version.wrapping_add(1);
     }
 
@@ -1619,11 +1617,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn clear_start(&mut self, record: RoleRecord) {
-        if !record.role.is_dynamic() {
+    /// Clears the start index entry of a role that started at `start`;
+    /// nothing for a role that is not `dynamic`.
+    fn clear_start(&mut self, start: u64, dynamic: bool) {
+        if !dynamic {
             return;
         }
-        let Some(position) = self.start_position(record.range.start) else {
+        let Some(position) = self.start_position(start) else {
             return;
         };
         if let Some(starts) = self.starts.as_deref_mut() {

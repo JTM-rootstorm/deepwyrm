@@ -98,6 +98,32 @@ impl StoredRole {
         }
     }
 
+    /// Whether a slot holding this role is indexed by its start: the same
+    /// truth table as [`FrameRole::is_dynamic`], false exactly for the
+    /// three external roles.
+    #[inline]
+    const fn is_dynamic(self) -> bool {
+        match self {
+            Self::External(_) | Self::ExternalImmutableModule { .. } | Self::ExternalDeviceMmio => {
+                false
+            }
+            Self::Free
+            | Self::AllocatedUninitialized
+            | Self::Zeroed
+            | Self::BackingAllocated(_)
+            | Self::ObjectBacking(_)
+            | Self::ArchitectureBootstrap(_)
+            | Self::RootCandidate { .. }
+            | Self::TableCandidate { .. }
+            | Self::Root { .. }
+            | Self::PageTable { .. }
+            | Self::RoleTableStorage
+            | Self::IndexRoot(_)
+            | Self::IndexNode(_)
+            | Self::ObjectPage(_) => true,
+        }
+    }
+
     /// Rewrites the root-list link of a slot of PML4 level.
     fn set_next_root(&mut self, next: u32) {
         match self {
@@ -601,6 +627,82 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             start,
             role,
         };
+    }
+
+    /// Publishes `record` in the free slot `slot`, which must be the head of
+    /// the free list (DW2 §12.6 item 3). A role of PML4 level goes through
+    /// [`Self::store`], which keeps the root list; any other is written in
+    /// place: the slot is popped from the free list and its four fields
+    /// written, leaving exactly what `store` would.
+    #[inline]
+    pub(super) fn occupy_slot(&mut self, slot: usize, generation: u32, record: RoleRecord) {
+        if is_pml4_level(record.role) {
+            self.store(slot, generation, Some(record));
+            return;
+        }
+        let slot_link = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .expect("a slot number fits the lists' links");
+        let pages = u32::try_from(record.range.page_count())
+            .expect("a stored run has at most u32::MAX pages");
+        assert!(pages != 0, "a stored run has at least one page");
+        // Not of PML4 level, and the slot was free: no root-list link, and
+        // no mark or table count to keep.
+        let role = StoredRole::pack(record.role, self.domain, (0, 0), 0);
+        let entry = &mut self.roles.as_mut_slice()[slot];
+        assert!(
+            matches!(entry.role, StoredRole::Free),
+            "an occupied slot was free"
+        );
+        assert_eq!(
+            self.first_free, slot_link,
+            "slots are occupied from the head of the free list"
+        );
+        self.first_free = u32::try_from(entry.start).expect("a free slot links to a slot number");
+        self.free_slot_count = self
+            .free_slot_count
+            .checked_sub(1)
+            .expect("an occupied slot came from the free list");
+        entry.generation = generation;
+        entry.pages = pages;
+        entry.start = record.range.start;
+        entry.role = role;
+    }
+
+    /// Empties the live slot `slot` (DW2 §12.6 item 3) and returns the start
+    /// of the run it held and whether its role was dynamic, for the start
+    /// index. A slot of PML4 level goes through [`Self::store`], which keeps
+    /// the root list; any other is written in place: emptied, and pushed on
+    /// the free list unless its generation is spent, leaving exactly what
+    /// `store` would.
+    #[inline]
+    pub(super) fn vacate_slot(&mut self, slot: usize) -> (u64, bool) {
+        let entry = self.roles.as_slice()[slot];
+        assert!(entry.pages != 0, "a vacated slot was live");
+        if entry.role.next_root().is_some() {
+            let record = self.record_at(slot).expect("a vacated slot was live");
+            self.store(slot, entry.generation, None);
+            return (record.range.start, record.role.is_dynamic());
+        }
+        let slot_link = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .expect("a slot number fits the lists' links");
+        let next = if entry.generation == u32::MAX {
+            // Spent: retired, on no list.
+            0
+        } else {
+            let next = self.first_free;
+            self.first_free = slot_link;
+            self.free_slot_count += 1;
+            u64::from(next)
+        };
+        let stored = &mut self.roles.as_mut_slice()[slot];
+        stored.pages = 0;
+        stored.start = next;
+        stored.role = StoredRole::Free;
+        (entry.start, entry.role.is_dynamic())
     }
 
     /// Removes the slot whose link is `target` from the root list.

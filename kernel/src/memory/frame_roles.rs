@@ -893,3 +893,7 @@ mod grown_tests;
 #[cfg(test)]
 #[path = "frame_roles/slot_tests.rs"]
 mod slot_tests;
+
+#[cfg(test)]
+#[path = "frame_roles/slot_writer_tests.rs"]
+mod slot_writer_tests;
