@@ -122,11 +122,69 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pages += range.page_count();
             runs += 1;
         }
+        let head = head.expect("a nonempty request took a run");
+        if runs > INDEX_RUN_THRESHOLD {
+            return match self.index_allocation(head, pages) {
+                Ok(root) => Ok(BackingAllocation {
+                    head: root.unwrap_or(head),
+                    pages,
+                    runs,
+                    indexed: root.is_some(),
+                }),
+                Err(error) => {
+                    self.free_chain(head, ChainState::Allocated);
+                    Err(error)
+                }
+            };
+        }
         Ok(BackingAllocation {
-            head: head.expect("a nonempty request took a run"),
+            head,
             pages,
             runs,
+            indexed: false,
         })
+    }
+
+    /// Converts the whole allocated chain `head` of `pages` pages into an
+    /// index in two passes (DW2 §12.10 part 2 item 4), or leaves it a chain
+    /// (`Ok(None)`) when the manager has no index memory or no index holds
+    /// `pages`. The first pass takes and links the root and nodes and is the
+    /// only one that can fail; on failure it has freed them, and the chain
+    /// is whole for the caller to free. The second walks the chain once:
+    /// each run's pages get entries naming it, and the run takes the
+    /// `ObjectPage` role with its first object page as its place.
+    pub(super) fn index_allocation(
+        &mut self,
+        head: FrameRoleIdentity,
+        pages: u64,
+    ) -> Result<Option<FrameRoleIdentity>, FrameRoleError> {
+        let Some(index) = self.take_eager_index(pages)? else {
+            return Ok(None);
+        };
+        let mut leaf = None;
+        let mut object_page = 0;
+        let mut next = Some(head);
+        while let Some(identity) = next {
+            let run = self
+                .chain_run(head, identity, object_page, ChainState::Allocated)
+                .expect("a whole chain converts");
+            next = self.link_identity(run.link.next);
+            let count = run.range.page_count();
+            self.write_run_entries(&index, identity, object_page, count, &mut leaf);
+            self.replace_record(
+                run.slot,
+                RoleRecord {
+                    range: run.range,
+                    role: FrameRole::ObjectPage(IndexEntryLink {
+                        owner: index.root.raw,
+                        place: object_page,
+                    }),
+                },
+            );
+            object_page += count;
+        }
+        assert_eq!(object_page, pages, "a converted chain holds its pages");
+        Ok(Some(index.root))
     }
 
     /// Allocates `page_count` pages as a chain, has `zero` clear every page,
@@ -148,13 +206,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         zero: &mut dyn FnMut(u64) -> bool,
     ) -> Result<ObjectBackingGrant, FrameRoleError> {
         let allocation = self.allocate_backing(page_count)?;
-        let zeroed = self
-            .backing_allocation_segments(&allocation)
-            .expect("a fresh allocation is a whole chain")
-            .all(|segment| {
-                (0..segment.byte_len / BASE_PAGE_SIZE)
-                    .all(|page| zero(segment.physical_start + page * BASE_PAGE_SIZE))
-            });
+        let zeroed = if allocation.indexed {
+            self.zero_backing_pages(&allocation, 0, allocation.pages, zero)
+        } else {
+            self.backing_allocation_segments(&allocation)
+                .expect("a fresh allocation is a whole chain")
+                .all(|segment| {
+                    (0..segment.byte_len / BASE_PAGE_SIZE)
+                        .all(|page| zero(segment.physical_start + page * BASE_PAGE_SIZE))
+                })
+        };
         if !zeroed {
             self.cancel_backing_allocation(allocation)
                 .unwrap_or_else(|_| panic!("a fresh backing allocation frees"));
@@ -183,6 +244,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         else {
             return false;
         };
+        if allocation.indexed {
+            return self.zero_index_pages(allocation.head, allocation.pages, first, end, zero);
+        }
         if self.chain_totals(allocation.head, ChainState::Allocated)
             != Ok((allocation.pages, allocation.runs))
         {
@@ -223,6 +287,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         allocation: BackingAllocation,
     ) -> Result<ObjectBackingGrant, GrantTransitionError<BackingAllocation>> {
+        if allocation.indexed {
+            return self.assume_index_zeroed(allocation);
+        }
         match self.chain_totals(allocation.head, ChainState::Allocated) {
             Ok(totals) if totals == (allocation.pages, allocation.runs) => {}
             Ok(_) => {
@@ -265,12 +332,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         allocation: BackingAllocation,
     ) -> Result<(), GrantTransitionError<BackingAllocation>> {
-        if let Err(error) = self.release_chain(
-            allocation.head,
-            ChainState::Allocated,
-            allocation.pages,
-            allocation.runs,
-        ) {
+        let released = if allocation.indexed {
+            self.release_eager_index(allocation.head, RootUse::Allocated, allocation.pages)
+        } else {
+            self.release_chain(
+                allocation.head,
+                ChainState::Allocated,
+                allocation.pages,
+                allocation.runs,
+            )
+        };
+        if let Err(error) = released {
             return Err(GrantTransitionError::new(error, allocation));
         }
         Ok(())

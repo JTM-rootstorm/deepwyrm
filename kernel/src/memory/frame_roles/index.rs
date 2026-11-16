@@ -1,13 +1,18 @@
-//! On-demand object backing: a per-object radix index (DW2 M6 §8.3).
+//! Object backing held as a per-object radix index: on-demand backings
+//! (DW2 M6 §8.3) and eager backings of many runs (DW2 §12.10 part 2).
 //!
 //! The backing is a tree of 512-entry node pages keyed by object page,
 //! sized at creation to the object (at most four levels). The root node
-//! holds the backing's identity. An entry is the raw role identity of a
-//! child node or, at level 0, of a committed page; zero is empty, and no
-//! identity is zero. Every step checks the entry's role against the root
-//! (`owner`) and the place it must hold, so a stale, foreign or misplaced
-//! entry fails as a chain walk does. Pages and nodes are added only through
-//! `&mut self`, each zeroed before any entry names it.
+//! holds the backing's identity and its state. An entry is the raw role
+//! identity of a child node or, at level 0, of the frames holding that
+//! page; zero is empty, and no identity is zero. Under an on-demand root a
+//! level-0 entry names a committed page of exactly one page at exactly its
+//! place; under an eager root it names the run holding the page, whose
+//! place is the run's first object page, so a run of n pages is named by n
+//! entries. Every step checks the entry's role against the root (`owner`)
+//! and the place it must hold, so a stale, foreign or misplaced entry fails
+//! as a chain walk does. Pages and nodes are added only through `&mut
+//! self`, each zeroed before any entry names it.
 
 use super::*;
 
@@ -20,6 +25,9 @@ pub(crate) const INDEX_MAX_PAGES: u64 = 1 << 36;
 /// Frames one commit allocates at most: a node per level below the root,
 /// and the page.
 pub(crate) const INDEX_MAX_COMMIT_FRAMES: usize = INDEX_MAX_LEVELS as usize;
+/// An eager backing whose allocation took more runs than this is held as
+/// an index; one of this many runs or fewer stays a chain (DW2 §12.10).
+pub(crate) const INDEX_RUN_THRESHOLD: u64 = 16;
 
 const PLACE_LEVEL_SHIFT: u32 = 60;
 const _: () = assert!(INDEX_MAX_PAGES < 1 << PLACE_LEVEL_SHIFT);
@@ -52,13 +60,65 @@ pub(crate) trait IndexMemory: Sync {
     unsafe fn zero(&self, page: u64) -> bool;
 }
 
-/// The root of an on-demand backing.
+/// What an index root's backing is (DW2 §12.10 part 2 item 1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IndexRootState {
+    /// An on-demand backing: pages are committed one at a time.
+    OnDemand,
+    /// An eager backing whose runs are taken and not yet zeroed: it
+    /// resolves for its zeroing only.
+    EagerAllocated,
+    /// An eager backing, every page held by a run.
+    Eager,
+    /// An eager backing being freed in steps: the pages before the release
+    /// cursor have no entries. Nothing resolves it; only its release steps,
+    /// its final release and the invariant check take it.
+    EagerFreeing,
+}
+
+/// The root of an indexed backing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct IndexRootLink {
     /// The object's size in pages.
     pub(super) pages: u64,
     /// Levels of the tree, 1 to 4; the root's level is `levels - 1`.
     pub(super) levels: u8,
+    pub(super) state: IndexRootState,
+}
+
+/// Which roots a caller takes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RootUse {
+    /// On-demand roots only: commit, decommit and their costs.
+    OnDemand,
+    /// Zeroed eager roots, being freed or not: their final release.
+    Eager,
+    /// Eager roots not yet zeroed only: their zeroing and cancellation.
+    Allocated,
+    /// On-demand and zeroed eager roots not being freed: lookups.
+    Live,
+    /// On-demand and zeroed eager roots, being freed or not: release steps.
+    Release,
+    /// Every root: the invariant check.
+    Any,
+}
+
+impl RootUse {
+    #[inline]
+    const fn accepts(self, state: IndexRootState) -> bool {
+        matches!(
+            (self, state),
+            (
+                Self::OnDemand | Self::Live | Self::Release,
+                IndexRootState::OnDemand
+            ) | (
+                Self::Eager | Self::Live | Self::Release,
+                IndexRootState::Eager
+            ) | (Self::Eager | Self::Release, IndexRootState::EagerFreeing)
+                | (Self::Allocated, IndexRootState::EagerAllocated)
+                | (Self::Any, _)
+        )
+    }
 }
 
 /// A node below the root, or a committed page: its root and its place. A
@@ -113,10 +173,12 @@ struct IndexStep {
     first_page: u64,
 }
 
-/// The steps an index walk took, and the committed page it reached, if any.
+/// The steps an index walk took, and the frames it reached, if any: their
+/// identity, their run and the object page the run starts at (the page
+/// itself under an on-demand root).
 type IndexWalk = (
     [Option<IndexStep>; INDEX_MAX_LEVELS as usize],
-    Option<(FrameRoleIdentity, PageRange)>,
+    Option<(FrameRoleIdentity, PageRange, u64)>,
 );
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
@@ -149,6 +211,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             FrameRole::IndexRoot(IndexRootLink {
                 pages: page_count,
                 levels,
+                state: IndexRootState::OnDemand,
             }),
         )?;
         Ok(ObjectBackingGrant {
@@ -160,13 +223,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
-    /// The root of the on-demand backing `head`.
+    /// The root of the indexed backing `head`, if its state is one `wanted`
+    /// takes.
+    #[inline]
     fn index_root(
         &self,
         head: FrameRoleIdentity,
+        wanted: RootUse,
     ) -> Result<(PageRange, IndexRootLink), FrameRoleError> {
         match self.index_root_at(self.slot(head)?) {
-            Some(root) if head.domain == self.domain => Ok(root),
+            Some(root) if head.domain == self.domain && wanted.accepts(root.1.state) => Ok(root),
             Some(_) | None => Err(FrameRoleError::WrongRole),
         }
     }
@@ -181,7 +247,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         byte_len: u64,
         writable: bool,
     ) -> Result<(), FrameRoleError> {
-        let Ok((_, root)) = self.index_root(backing.0) else {
+        let Ok((_, root)) = self.index_root(backing.0, RootUse::Live) else {
             return self
                 .object_segments(backing, offset, byte_len, writable)
                 .map(|_| ());
@@ -201,19 +267,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// Whether `backing` is on demand.
+    /// Whether `backing` is on demand: an eager root is not.
     pub(crate) fn is_on_demand(&self, backing: BackingIdentity) -> bool {
-        self.index_root(backing.0).is_ok()
+        self.index_root(backing.0, RootUse::OnDemand).is_ok()
     }
 
-    /// The entry `raw` names, checked to hold `role` at `place` under the
-    /// root `owner`.
+    /// The entry `raw` names, checked to hold `role` under the root
+    /// `owner`: a node, or a page of an on-demand root, is one page at
+    /// exactly `place`; a run of an eager root (`run`) starts at or below
+    /// the object page `place` and holds it (DW2 §12.10 part 2 item 2).
+    #[inline]
     fn index_entry(
         &self,
         owner: FrameRoleIdentity,
         raw: u64,
         node: bool,
         place: u64,
+        run: bool,
     ) -> Result<(FrameRoleIdentity, PageRange, IndexEntryLink), FrameRoleError> {
         let identity = FrameRoleIdentity {
             domain: self.domain,
@@ -224,20 +294,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .filter(|facts| facts.node == node)
             .ok_or(FrameRoleError::WrongRole)?;
         let link = facts.link;
-        if link.owner != owner.raw || link.place != place || facts.range.page_count() != 1 {
+        let placed = if run {
+            place
+                .checked_sub(link.place)
+                .is_some_and(|offset| offset < facts.range.page_count())
+        } else {
+            link.place == place && facts.range.page_count() == 1
+        };
+        if link.owner != owner.raw || !placed {
             return Err(FrameRoleError::WrongRole);
         }
         Ok((identity, facts.range, link))
     }
 
-    /// Walks from the root of `head` towards `page`. Returns the steps taken
-    /// down to the deepest node that exists, and the committed page if the
-    /// walk reached it.
-    fn index_walk(&self, head: FrameRoleIdentity, page: u64) -> Result<IndexWalk, FrameRoleError> {
-        let (root_range, root) = self.index_root(head)?;
+    /// Walks from the root of `head`, if `wanted` takes it, towards `page`.
+    /// Returns the steps taken down to the deepest node that exists, and
+    /// the frames holding the page if the walk reached them. Under an eager
+    /// root every page has an entry, so an empty one is refused.
+    fn index_walk(
+        &self,
+        head: FrameRoleIdentity,
+        page: u64,
+        wanted: RootUse,
+    ) -> Result<IndexWalk, FrameRoleError> {
+        let (root_range, root) = self.index_root(head, wanted)?;
         if page >= root.pages {
             return Err(FrameRoleError::WrongRole);
         }
+        let eager = root.state != IndexRootState::OnDemand;
         let memory = self.memory()?;
         let mut steps = [None; INDEX_MAX_LEVELS as usize];
         let mut node = root_range.start;
@@ -254,29 +338,36 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             });
             let raw = memory.read(node, entry);
             if raw == 0 {
+                if eager {
+                    return Err(FrameRoleError::WrongRole);
+                }
                 return Ok((steps, None));
             }
             if level == 0 {
-                let (identity, range, _) = self.index_entry(head, raw, false, page)?;
-                return Ok((steps, Some((identity, range))));
+                let (identity, range, link) = self.index_entry(head, raw, false, page, eager)?;
+                return Ok((steps, Some((identity, range, link.place))));
             }
             let (_, range, _) =
-                self.index_entry(head, raw, true, node_place(first_page, level - 1))?;
+                self.index_entry(head, raw, true, node_place(first_page, level - 1), false)?;
             node = range.start;
             node_first = first_page;
         }
         Err(FrameRoleError::InvariantViolation)
     }
 
-    /// The committed page at object page `page` of the on-demand backing
-    /// `head`, or [`FrameRoleError::Absent`] when it has none yet.
+    /// The frames at object page `page` of the on-demand or zeroed eager
+    /// backing `head`: the run holding it and its physical address, or
+    /// [`FrameRoleError::Absent`] when an on-demand page has none yet.
     pub(super) fn index_resolve(
         &self,
         head: FrameRoleIdentity,
         page: u64,
     ) -> Result<(FrameRoleIdentity, u64), FrameRoleError> {
-        match self.index_walk(head, page)? {
-            (_, Some((identity, range))) => Ok((identity, range.start)),
+        match self.index_walk(head, page, RootUse::Live)? {
+            // `index_entry` checked `place <= page` inside the run.
+            (_, Some((identity, range, place))) => {
+                Ok((identity, range.start + (page - place) * BASE_PAGE_SIZE))
+            }
             (_, None) => Err(FrameRoleError::Absent),
         }
     }
@@ -289,7 +380,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         backing: BackingIdentity,
         page: u64,
     ) -> Result<u64, FrameRoleError> {
-        let (steps, found) = self.index_walk(backing.0, page)?;
+        let (steps, found) = self.index_walk(backing.0, page, RootUse::OnDemand)?;
         if found.is_some() {
             return Ok(0);
         }
@@ -314,12 +405,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let end = first
             .checked_add(count)
             .ok_or(FrameRoleError::InvariantViolation)?;
+        // An eager root is refused even for an empty range.
+        self.index_root(backing.0, RootUse::OnDemand)?;
         // The node last counted at each height (1 = a leaf node): the pages
         // run in order, so a node a page shares is the one counted last.
         let mut counted: [Option<u64>; INDEX_MAX_COMMIT_FRAMES] = [None; INDEX_MAX_COMMIT_FRAMES];
         let mut total = 0_u64;
         for page in first..end {
-            let (steps, found) = self.index_walk(backing.0, page)?;
+            let (steps, found) = self.index_walk(backing.0, page, RootUse::OnDemand)?;
             if found.is_some() {
                 continue;
             }
@@ -353,8 +446,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         page: u64,
     ) -> Result<OnDemandCommit, FrameRoleError> {
         let head = backing.0;
-        let (steps, found) = self.index_walk(head, page)?;
-        if let Some((_, range)) = found {
+        let (steps, found) = self.index_walk(head, page, RootUse::OnDemand)?;
+        if let Some((_, range, _)) = found {
             return Ok(OnDemandCommit {
                 physical_start: range.start,
                 frames: 0,
@@ -465,21 +558,35 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.vacate(frame.slot);
     }
 
-    /// Counts every node and committed page below the root of `head`,
-    /// checking each.
-    fn index_count(&self, head: FrameRoleIdentity) -> Result<u64, FrameRoleError> {
-        let (root_range, root) = self.index_root(head)?;
+    /// Counts every node below the root of `head`, if `wanted` takes it,
+    /// and each committed page of an on-demand root or each run of an eager
+    /// one, checking each (DW2 §12.10 part 2 item 9).
+    fn index_count(&self, head: FrameRoleIdentity, wanted: RootUse) -> Result<u64, FrameRoleError> {
+        let (root_range, root) = self.index_root(head, wanted)?;
         let memory = self.memory()?;
-        self.index_count_node(
+        let mut runs = (root.state != IndexRootState::OnDemand).then_some(RunScan {
+            partial: root.state == IndexRootState::EagerFreeing,
+            ..RunScan::default()
+        });
+        let frames = self.index_count_node(
             memory,
             head,
             root_range.start,
             root.levels - 1,
             0,
             root.pages,
-        )
+            &mut runs,
+        )?;
+        match runs {
+            Some(scan) if !scan.whole(root.pages) => Err(FrameRoleError::WrongRole),
+            Some(_) | None => Ok(frames),
+        }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one recursive walk carries the root, the node's place and the eager scan"
+    )]
     fn index_count_node(
         &self,
         memory: &'static dyn IndexMemory,
@@ -488,6 +595,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         level: u8,
         first_page: u64,
         pages: u64,
+        runs: &mut Option<RunScan>,
     ) -> Result<u64, FrameRoleError> {
         let span = entry_span(level);
         let mut frames = 0_u64;
@@ -501,10 +609,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 return Err(FrameRoleError::WrongRole);
             }
             if level == 0 {
-                self.index_entry(head, raw, false, entry_first)?;
+                match runs {
+                    Some(scan) => {
+                        if !self.scan_run(head, raw, entry_first, scan)? {
+                            continue;
+                        }
+                    }
+                    None => {
+                        self.index_entry(head, raw, false, entry_first, false)?;
+                    }
+                }
             } else {
                 let (_, range, _) =
-                    self.index_entry(head, raw, true, node_place(entry_first, level - 1))?;
+                    self.index_entry(head, raw, true, node_place(entry_first, level - 1), false)?;
                 frames += self.index_count_node(
                     memory,
                     head,
@@ -512,6 +629,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     level - 1,
                     entry_first,
                     pages,
+                    runs,
                 )?;
             }
             frames += 1;
@@ -519,17 +637,60 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok(frames)
     }
 
+    /// Checks the entry `raw` at object page `page` of an eager root,
+    /// entries arriving in page order: no page after the first is missing,
+    /// each run is reached at its first page right where the last ended,
+    /// and every entry inside a run names that run. `true` if the entry
+    /// starts a run, which is then counted once.
+    fn scan_run(
+        &self,
+        head: FrameRoleIdentity,
+        raw: u64,
+        page: u64,
+        scan: &mut RunScan,
+    ) -> Result<bool, FrameRoleError> {
+        if scan.seen && page != scan.next {
+            return Err(FrameRoleError::WrongRole);
+        }
+        scan.next = page + 1;
+        if scan.seen && raw == scan.run {
+            return if page < scan.run_end {
+                Ok(false)
+            } else {
+                Err(FrameRoleError::WrongRole)
+            };
+        }
+        let (_, range, link) = self.index_entry(head, raw, false, page, true)?;
+        let starts_here = link.place == page;
+        let fits = if scan.seen {
+            starts_here && scan.run_end == page
+        } else {
+            // The first entry: page 0, unless a stepped release has freed
+            // the pages before it (a root being freed only).
+            scan.partial || (page == 0 && starts_here)
+        };
+        if !fits {
+            return Err(FrameRoleError::WrongRole);
+        }
+        scan.seen = true;
+        scan.run = raw;
+        scan.run_end = link.place + range.page_count();
+        Ok(true)
+    }
+
     /// The frames an on-demand backing holds: its root, nodes and committed
-    /// pages, the weight its object is charged (DW2 M6 §8.4).
+    /// pages, the weight its object is charged (DW2 M6 §8.4). An eager root
+    /// is refused.
     pub(crate) fn on_demand_frames(&self, backing: BackingIdentity) -> Result<u64, FrameRoleError> {
-        Ok(self.index_count(backing.0)? + 1)
+        Ok(self.index_count(backing.0, RootUse::OnDemand)? + 1)
     }
 
     /// Frees the committed pages of the on-demand backing in object pages
     /// `[start, end)` (clamped to the object), visiting at most `budget`
     /// index entries: a committed page, or an absent entry, whose whole span
     /// is skipped at once. Nodes stay. Returns the first page not examined,
-    /// the pages freed and the entries visited (DW2 §10.9 item 5).
+    /// the pages freed and the entries visited (DW2 §10.9 item 5). An eager
+    /// root is refused.
     ///
     /// The caller guarantees no mapping, TLB, device or kernel access can
     /// still reach a page of the range.
@@ -541,14 +702,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         budget: u64,
     ) -> Result<(u64, u64, u64), FrameRoleError> {
         let head = backing.0;
-        let (_, root) = self.index_root(head)?;
+        let (_, root) = self.index_root(head, RootUse::OnDemand)?;
         let end = end.min(root.pages);
         let memory = self.memory()?;
         let mut cursor = start;
         let mut freed = 0_u64;
         let mut visited = 0_u64;
         while cursor < end && visited < budget {
-            let (steps, found) = self.index_walk(head, cursor)?;
+            let (steps, found) = self.index_walk(head, cursor, RootUse::OnDemand)?;
             let deepest = *steps
                 .iter()
                 .flatten()
@@ -556,7 +717,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .ok_or(FrameRoleError::InvariantViolation)?;
             visited += 1;
             match found {
-                Some((identity, _)) => {
+                Some((identity, _, _)) => {
                     #[allow(
                         unsafe_code,
                         reason = "the manager owns its index nodes exclusively under `&mut self`"
@@ -582,17 +743,33 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok((cursor.min(end.max(start)), freed, visited))
     }
 
-    /// One step of finalizing an on-demand backing (DW2 §10.12 item 2):
-    /// frees its committed pages and nodes in object-page order from
-    /// `cursor`, visiting at most `budget` entries. A committed page is
-    /// unlinked and freed; an absent entry skips its span; once the cursor
-    /// reaches the end of a node below the root (its span, clamped to the
-    /// object), that node is empty and is freed with its parent entry
-    /// cleared, cascading upward before the budget is checked again, so a
-    /// step may visit up to `INDEX_MAX_LEVELS - 1` entries past `budget`.
-    /// The root stays. Returns the new cursor, the frames freed and the
-    /// entries visited; the index below the root is empty once the cursor
-    /// reaches the object's end.
+    /// One step of finalizing an on-demand or zeroed eager backing (DW2
+    /// §10.12 item 2, §12.10 part 2 item 6): frees its frames and nodes in
+    /// object-page order from `cursor`, visiting at most `budget` entries.
+    ///
+    /// A zeroed eager root becomes a root being freed on the first step, so
+    /// nothing resolves it from then on.
+    ///
+    /// Under an on-demand root a committed page is unlinked and freed and
+    /// an absent entry skips its span. Under an eager root the entry at the
+    /// cursor names a run: a run that goes on past the cursor's leaf moves
+    /// the cursor to the leaf's end (one visit); a run that ends with a
+    /// leaf below the root is freed whole with the cursor moved to its end
+    /// (one visit); a run that ends inside its leaf, or in a root that is
+    /// its own leaf, has its entries from the cursor cleared (one visit
+    /// each, as far as the budget goes) and is freed once all are. A run is
+    /// so freed at its last leaf, after the leaves before it, which named
+    /// it, were freed.
+    ///
+    /// Once the cursor reaches the end of a node below the root (its span,
+    /// clamped to the object), that node is empty of live entries and is
+    /// freed with its parent entry cleared, cascading upward before the
+    /// budget is checked again, so a step may visit up to
+    /// `INDEX_MAX_LEVELS - 1` entries past `budget`. The root stays.
+    /// Returns the new cursor, what was freed (on demand: the frames,
+    /// pages and nodes; eager: the run pages only, the object's charge,
+    /// since its nodes are not charged) and the entries visited; the index
+    /// below the root is empty once the cursor reaches the object's end.
     ///
     /// The caller guarantees nothing can commit into the backing or reach
     /// its pages: its object is finalizing.
@@ -603,22 +780,80 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         budget: u64,
     ) -> Result<(u64, u64, u64), FrameRoleError> {
         let head = backing.0;
-        let (_, root) = self.index_root(head)?;
+        let (root_range, root) = self.index_root(head, RootUse::Release)?;
+        let eager = root.state != IndexRootState::OnDemand;
+        if root.state == IndexRootState::Eager {
+            // From the first step on, nothing resolves the backing: the
+            // pages before the cursor lose their entries.
+            let slot = self.slot(head)?;
+            self.replace_record(
+                slot,
+                RoleRecord {
+                    range: root_range,
+                    role: FrameRole::IndexRoot(IndexRootLink {
+                        state: IndexRootState::EagerFreeing,
+                        ..root
+                    }),
+                },
+            );
+        }
         let pages = root.pages;
         let memory = self.memory()?;
         let mut cursor = cursor.min(pages);
         let mut freed = 0_u64;
         let mut visited = 0_u64;
         while cursor < pages && visited < budget {
-            let (steps, found) = self.index_walk(head, cursor)?;
+            let (steps, found) = self.index_walk(head, cursor, RootUse::Release)?;
             let depth = steps
                 .iter()
                 .rposition(Option::is_some)
                 .ok_or(FrameRoleError::InvariantViolation)?;
             let deepest = steps[depth].ok_or(FrameRoleError::InvariantViolation)?;
-            visited += 1;
             match found {
-                Some((identity, _)) => {
+                Some((identity, range, place)) if eager => {
+                    // `deepest` is the cursor's entry in its leaf.
+                    let leaf_first = deepest.first_page - deepest.entry as u64;
+                    let leaf_end = leaf_first
+                        .checked_add(INDEX_FANOUT)
+                        .ok_or(FrameRoleError::InvariantViolation)?
+                        .min(pages);
+                    let run_end = place
+                        .checked_add(range.page_count())
+                        .ok_or(FrameRoleError::InvariantViolation)?;
+                    if run_end > leaf_end {
+                        cursor = leaf_end;
+                        visited += 1;
+                    } else if depth != 0 && run_end == leaf_end {
+                        let slot = self.slot(identity)?;
+                        self.free_index_slot(slot);
+                        freed += range.page_count();
+                        cursor = run_end;
+                        visited += 1;
+                    } else {
+                        let stop = run_end.min(cursor + (budget - visited));
+                        for page in cursor..stop {
+                            #[allow(
+                                unsafe_code,
+                                reason = "the manager owns its index nodes exclusively under `&mut self`"
+                            )]
+                            // SAFETY: `deepest.node` is a leaf of this
+                            // backing, which the manager owns exclusively
+                            // under `&mut self`; the entry lies in it.
+                            unsafe {
+                                memory.write(deepest.node, (page - leaf_first) as usize, 0)
+                            };
+                        }
+                        visited += stop - cursor;
+                        cursor = stop;
+                        if cursor == run_end {
+                            let slot = self.slot(identity)?;
+                            self.free_index_slot(slot);
+                            freed += range.page_count();
+                        }
+                    }
+                }
+                Some((identity, _, _)) => {
+                    visited += 1;
                     #[allow(
                         unsafe_code,
                         reason = "the manager owns its index nodes exclusively under `&mut self`"
@@ -634,6 +869,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     cursor += 1;
                 }
                 None => {
+                    visited += 1;
                     cursor = deepest
                         .first_page
                         .checked_add(entry_span(deepest.level))
@@ -659,6 +895,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     raw,
                     true,
                     node_place(parent.first_page, parent.level - 1),
+                    false,
                 )?;
                 #[allow(
                     unsafe_code,
@@ -671,26 +908,61 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 };
                 let slot = self.slot(identity)?;
                 self.free_index_slot(slot);
-                freed += 1;
+                if !eager {
+                    freed += 1;
+                }
                 visited += 1;
             }
         }
         Ok((cursor, freed, visited))
     }
 
-    /// Frees an on-demand backing whole, after checking every node and
-    /// page.
-    pub(super) fn release_index(&mut self, head: FrameRoleIdentity) -> Result<(), FrameRoleError> {
-        self.index_count(head)?;
-        let (root_range, root) = self.index_root(head)?;
+    /// Frees an indexed backing whose root `wanted` takes whole, after
+    /// checking every node, page and run.
+    pub(super) fn release_index(
+        &mut self,
+        head: FrameRoleIdentity,
+        wanted: RootUse,
+    ) -> Result<(), FrameRoleError> {
+        self.index_count(head, wanted)?;
+        let (root_range, root) = self.index_root(head, wanted)?;
         let memory = self.memory()?;
-        self.index_free_node(memory, head, root_range.start, root.levels - 1, 0);
+        self.index_free_node(
+            memory,
+            head,
+            root_range.start,
+            root.levels - 1,
+            0,
+            root.state != IndexRootState::OnDemand,
+            &mut 0,
+        );
         let root_slot = self.slot(head)?;
         self.free_index_slot(root_slot);
         Ok(())
     }
 
+    /// [`Self::release_index`] for an eager root of `pages` pages.
+    pub(super) fn release_eager_index(
+        &mut self,
+        head: FrameRoleIdentity,
+        wanted: RootUse,
+        pages: u64,
+    ) -> Result<(), FrameRoleError> {
+        match self.index_root(head, wanted) {
+            Ok((_, root)) if root.pages == pages => self.release_index(head, wanted),
+            Ok(_) => Err(FrameRoleError::WrongRole),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Frees every frame below the checked node at `node`, children first.
+    /// Under an eager root (`runs`) each run is freed at the first entry
+    /// naming it; the entries after it, which name it too, are passed by
+    /// (`last` is the run last freed).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one recursive walk carries the root, the node's place and the last run freed"
+    )]
     fn index_free_node(
         &mut self,
         memory: &'static dyn IndexMemory,
@@ -698,11 +970,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         node: u64,
         level: u8,
         first_page: u64,
+        runs: bool,
+        last: &mut u64,
     ) {
         let span = entry_span(level);
         for entry in 0..INDEX_FANOUT as usize {
             let raw = memory.read(node, entry);
-            if raw == 0 {
+            if raw == 0 || (level == 0 && runs && raw == *last) {
                 continue;
             }
             let entry_first = first_page + entry as u64 * span;
@@ -712,10 +986,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 node_place(entry_first, level - 1)
             };
             let (identity, range, _) = self
-                .index_entry(head, raw, level != 0, place)
+                .index_entry(head, raw, level != 0, place, level == 0 && runs)
                 .expect("a checked index stays whole while it is freed");
             if level != 0 {
-                self.index_free_node(memory, head, range.start, level - 1, entry_first);
+                self.index_free_node(
+                    memory,
+                    head,
+                    range.start,
+                    level - 1,
+                    entry_first,
+                    runs,
+                    last,
+                );
+            } else {
+                *last = raw;
             }
             let slot = self.slot(identity).expect("a checked entry is live");
             self.free_index_slot(slot);
@@ -730,8 +1014,210 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.vacate(slot);
     }
 
-    /// Every index node and committed page is reached from exactly one
-    /// root's walk.
+    /// Takes, zeroes and links the root of an eager index of `pages` pages
+    /// and every node its size needs (DW2 §12.10 part 2 item 4, first
+    /// pass): the only part of a conversion that can fail, and on failure
+    /// everything taken is freed. `Ok(None)` when the manager has no index
+    /// memory or no index holds `pages`.
+    pub(super) fn take_eager_index(
+        &mut self,
+        pages: u64,
+    ) -> Result<Option<EagerIndex>, FrameRoleError> {
+        let (Some(memory), Some(levels)) = (self.index_memory, levels_for(pages)) else {
+            return Ok(None);
+        };
+        let root = self.take_index_frame(
+            memory,
+            FrameRole::IndexRoot(IndexRootLink {
+                pages,
+                levels,
+                state: IndexRootState::EagerAllocated,
+            }),
+        )?;
+        let index = EagerIndex {
+            memory,
+            root: root.identity,
+            node: root.range.start,
+            levels,
+        };
+        if let Err(error) = self.take_index_nodes(&index, pages) {
+            // Every node taken is linked, and every leaf is empty.
+            self.index_free_node(
+                memory,
+                root.identity,
+                root.range.start,
+                levels - 1,
+                0,
+                true,
+                &mut 0,
+            );
+            self.free_index_slot(root.slot);
+            return Err(error);
+        }
+        Ok(Some(index))
+    }
+
+    /// Takes and links every node below the root of `index` that covers a
+    /// page below `pages`, level by level from the top, so each parent is
+    /// linked before its children (no recursion: a syscall reaches it).
+    fn take_index_nodes(&mut self, index: &EagerIndex, pages: u64) -> Result<(), FrameRoleError> {
+        for level in (0..index.levels - 1).rev() {
+            // The pages a node of `level` covers: one entry of its parent.
+            let span = entry_span(level + 1);
+            let mut first = 0;
+            while first < pages {
+                let parent = self.node_at(index, first, level + 1);
+                let child = self.take_index_frame(
+                    index.memory,
+                    FrameRole::IndexNode(IndexEntryLink {
+                        owner: index.root.raw,
+                        place: node_place(first, level),
+                    }),
+                )?;
+                #[allow(
+                    unsafe_code,
+                    reason = "the manager owns its index nodes exclusively under `&mut self`"
+                )]
+                // SAFETY: `parent` is a node of this new index, which the
+                // manager owns exclusively under `&mut self`.
+                unsafe {
+                    index.memory.write(
+                        parent,
+                        ((first / span) % INDEX_FANOUT) as usize,
+                        child.identity.raw,
+                    )
+                };
+                first += span;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the entries of object pages `[first, first + count)` of the
+    /// index `index` to name `run` (DW2 §12.10 part 2 item 4, second pass).
+    /// `leaf` keeps the leaf last written, by its number, so a leaf is found
+    /// once for the pages it holds.
+    pub(super) fn write_run_entries(
+        &mut self,
+        index: &EagerIndex,
+        run: FrameRoleIdentity,
+        first: u64,
+        count: u64,
+        leaf: &mut Option<(u64, u64)>,
+    ) {
+        for page in first..first + count {
+            let number = page / INDEX_FANOUT;
+            let node = match *leaf {
+                Some((known, node)) if known == number => node,
+                Some(_) | None => {
+                    let node = self.node_at(index, page, 0);
+                    *leaf = Some((number, node));
+                    node
+                }
+            };
+            #[allow(
+                unsafe_code,
+                reason = "the manager owns its index nodes exclusively under `&mut self`"
+            )]
+            // SAFETY: `node` is a leaf of this new index, which the manager
+            // owns exclusively under `&mut self`.
+            unsafe {
+                index
+                    .memory
+                    .write(node, (page % INDEX_FANOUT) as usize, run.raw)
+            };
+        }
+    }
+
+    /// The node of level `target` of the new index `index` that holds
+    /// object page `page`; it must be linked.
+    fn node_at(&self, index: &EagerIndex, page: u64, target: u8) -> u64 {
+        let mut node = index.node;
+        for level in (target + 1..index.levels).rev() {
+            let span = entry_span(level);
+            let first = page / span * span;
+            let raw = index
+                .memory
+                .read(node, ((page / span) % INDEX_FANOUT) as usize);
+            let (_, range, _) = self
+                .index_entry(index.root, raw, true, node_place(first, level - 1), false)
+                .expect("an index just linked is whole");
+            node = range.start;
+        }
+        node
+    }
+
+    /// Has `zero` clear pages `[first, end)` of the eager index allocation
+    /// `root` of `pages` pages, run by run from `first` (DW2 §12.10 part 2
+    /// item 5). `false` if a page fails or the root is not one.
+    pub(super) fn zero_index_pages(
+        &self,
+        root: FrameRoleIdentity,
+        pages: u64,
+        first: u64,
+        end: u64,
+        zero: &mut dyn FnMut(u64) -> bool,
+    ) -> bool {
+        if !self
+            .index_root(root, RootUse::Allocated)
+            .is_ok_and(|(_, link)| link.pages == pages)
+        {
+            return false;
+        }
+        let mut page = first;
+        while page < end {
+            let Ok((_, Some((_, range, place)))) = self.index_walk(root, page, RootUse::Allocated)
+            else {
+                return false;
+            };
+            let stop = (place + range.page_count()).min(end);
+            if !(page..stop).all(|page| zero(range.start + (page - place) * BASE_PAGE_SIZE)) {
+                return false;
+            }
+            page = stop;
+        }
+        true
+    }
+
+    /// Makes a zeroed eager index allocation one object backing: its root
+    /// changes state, one write (DW2 §12.10 part 2 item 5).
+    pub(super) fn assume_index_zeroed(
+        &mut self,
+        allocation: BackingAllocation,
+    ) -> Result<ObjectBackingGrant, GrantTransitionError<BackingAllocation>> {
+        let head = allocation.head;
+        let (range, link) = match self.index_root(head, RootUse::Allocated) {
+            Ok(root) if root.1.pages == allocation.pages => root,
+            Ok(_) => {
+                return Err(GrantTransitionError::new(
+                    FrameRoleError::WrongRole,
+                    allocation,
+                ));
+            }
+            Err(error) => return Err(GrantTransitionError::new(error, allocation)),
+        };
+        let slot = self.slot(head).expect("a root just read is live");
+        self.replace_record(
+            slot,
+            RoleRecord {
+                range,
+                role: FrameRole::IndexRoot(IndexRootLink {
+                    state: IndexRootState::Eager,
+                    ..link
+                }),
+            },
+        );
+        Ok(ObjectBackingGrant {
+            identity: BackingIdentity(head),
+            range,
+            kind: ObjectBackingKind::AllocatorIndexed,
+            pages: allocation.pages,
+            runs: allocation.runs,
+        })
+    }
+
+    /// Every index node, committed page and eager run is reached from
+    /// exactly one root's walk, and every eager root is whole.
     pub(super) fn check_indexes(&self) -> Result<(), FrameRoleError> {
         let mut linked = 0_u64;
         let mut reached = 0_u64;
@@ -744,7 +1230,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 FrameRole::IndexRoot(_) => {
                     let identity = self.identity(slot, entry.generation)?;
                     reached += self
-                        .index_count(identity)
+                        .index_count(identity, RootUse::Any)
                         .map_err(|_| FrameRoleError::InvariantViolation)?;
                 }
                 FrameRole::AllocatedUninitialized
@@ -767,6 +1253,44 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
+/// An eager index whose root and nodes are linked, for its runs' entries.
+pub(super) struct EagerIndex {
+    memory: &'static dyn IndexMemory,
+    pub(super) root: FrameRoleIdentity,
+    node: u64,
+    levels: u8,
+}
+
+/// What a count of an eager root's entries has seen, in page order.
+#[derive(Clone, Copy, Default)]
+struct RunScan {
+    /// Whether the root is being freed: its first entry may then lie
+    /// inside a run, past page 0, or there may be none.
+    partial: bool,
+    seen: bool,
+    /// The page after the last entry seen.
+    next: u64,
+    /// The run the last entry named, and the page after its end.
+    run: u64,
+    run_end: u64,
+}
+
+impl RunScan {
+    /// Whether the entries seen reach the end of an object of `pages`
+    /// pages; none at all only once a stepped release has freed them all.
+    const fn whole(self, pages: u64) -> bool {
+        if self.seen {
+            self.next == pages && self.run_end == pages
+        } else {
+            self.partial
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "index_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "indexed_tests.rs"]
+mod indexed_tests;

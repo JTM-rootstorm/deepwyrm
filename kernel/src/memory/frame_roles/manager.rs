@@ -1187,7 +1187,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 grant.pages,
                 grant.runs,
             ),
-            ObjectBackingKind::OnDemand => self.release_index(grant.identity.0),
+            ObjectBackingKind::OnDemand => self.release_index(grant.identity.0, RootUse::OnDemand),
+            ObjectBackingKind::AllocatorIndexed => {
+                self.release_eager_index(grant.identity.0, RootUse::Eager, grant.pages)
+            }
             ObjectBackingKind::ImmutableModule { .. } | ObjectBackingKind::DeviceMmio => {
                 Err(FrameRoleError::WrongRole)
             }

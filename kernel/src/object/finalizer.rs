@@ -229,8 +229,10 @@ impl<
                                 failure.error()
                             )
                         });
-                // An on-demand object's frees are owed and done in steps
-                // (DW2 §10.12); its slot stays finalizing until then.
+                // The frees of an on-demand object, and of a page-backed
+                // object whose backing is indexed, are owed and done in
+                // steps (DW2 §10.12, §12.10 part 2); its slot stays
+                // finalizing until then.
                 if let Some(finalization) = self.memory.defer_finalization(finalization) {
                     push_pending(
                         pending,

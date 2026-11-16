@@ -37,7 +37,7 @@ use chain::ChainState;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use index::OnDemandCommit;
 pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory};
-use index::{IndexEntryLink, IndexRootLink};
+use index::{INDEX_RUN_THRESHOLD, IndexEntryLink, IndexRootLink, IndexRootState, RootUse};
 pub(crate) use storage::MAX_GROWTH_PARTS;
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]
@@ -229,6 +229,10 @@ pub(crate) enum ObjectBackingKind {
     /// Allocator pages given on first touch through a per-object index
     /// (DW2 M6 §8.3).
     OnDemand,
+    /// Allocator runs taken at creation, held through a per-object index
+    /// because they were more than [`INDEX_RUN_THRESHOLD`] (DW2 §12.10
+    /// part 2).
+    AllocatorIndexed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,11 +329,12 @@ enum FrameRole {
     },
     ExternalDeviceMmio,
     RoleTableStorage,
-    /// The root node of an on-demand backing: the backing's identity.
+    /// The root node of an indexed backing: the backing's identity.
     IndexRoot(IndexRootLink),
-    /// A node of an on-demand backing's index below its root.
+    /// A node of an indexed backing's index below its root.
     IndexNode(IndexEntryLink),
-    /// A committed page of an on-demand backing.
+    /// A committed page of an on-demand backing, or a run of any length of
+    /// an eager indexed backing, whose place is its first object page.
     ObjectPage(IndexEntryLink),
 }
 
@@ -362,7 +367,15 @@ impl FrameRole {
             }
             Self::ExternalDeviceMmio => FrameRoleKind::ExternalDeviceMmio,
             Self::RoleTableStorage => FrameRoleKind::RoleTableStorage,
-            Self::IndexRoot(_) => FrameRoleKind::ObjectBacking(ObjectBackingKind::OnDemand),
+            Self::IndexRoot(link) => match link.state {
+                IndexRootState::OnDemand => {
+                    FrameRoleKind::ObjectBacking(ObjectBackingKind::OnDemand)
+                }
+                IndexRootState::EagerAllocated => FrameRoleKind::BackingAllocated,
+                IndexRootState::Eager | IndexRootState::EagerFreeing => {
+                    FrameRoleKind::ObjectBacking(ObjectBackingKind::AllocatorIndexed)
+                }
+            },
             Self::IndexNode(_) => FrameRoleKind::BackingIndexNode,
             Self::ObjectPage(_) => FrameRoleKind::OnDemandPage,
         }
@@ -685,13 +698,17 @@ impl ObjectBackingGrant {
 }
 
 /// Move-only ownership of a backing's runs before they are zeroed: the
-/// chain [`FrameRoleManager::allocate_backing`] made (DW2 M3 §6.3).
+/// chain [`FrameRoleManager::allocate_backing`] made (DW2 M3 §6.3), or the
+/// index it became (DW2 §12.10 part 2).
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "a backing allocation must be zeroed into a backing or cancelled"]
 pub(crate) struct BackingAllocation {
+    /// The chain's head run, or the index's root.
     head: FrameRoleIdentity,
     pages: u64,
     runs: u64,
+    /// Whether the runs are held through an index.
+    indexed: bool,
 }
 
 impl BackingAllocation {

@@ -1621,8 +1621,89 @@ mod owed_finalization {
         assert_eq!(registry.charged_pages(group), 0);
     }
 
+    /// DW2 §12.10 part 2 items 6 and 8: a page-backed object whose backing
+    /// is indexed is owed too, and each step lowers its charge, its pages,
+    /// by the run pages it freed; its index nodes are not charged.
     #[test]
-    fn only_on_demand_objects_are_owed() {
+    #[allow(
+        unsafe_code,
+        reason = "the host model never dereferences synthetic physical memory"
+    )]
+    fn an_indexed_page_backed_object_is_freed_in_steps_its_charge_falling_by_run_pages() {
+        let mut roles = synthetic_frame_role_manager::<64, 128>(0x1000, 96);
+        roles.set_index_memory(Box::leak(Box::<Model>::default()));
+        // Every other page held: 48 one-page holes.
+        let mut gaps = std::vec::Vec::new();
+        for _ in 0..48 {
+            gaps.push(roles.allocate(1).unwrap());
+            roles.allocate(1).unwrap();
+        }
+        for gap in gaps {
+            roles.cancel_allocation(gap).unwrap();
+        }
+        let initial = roles.available_frames();
+        let pages = 40;
+        let allocation = roles.allocate_backing(pages).unwrap();
+        // SAFETY: the host model never dereferences the synthetic runs.
+        let backing = unsafe { roles.assume_backing_zeroed(allocation) }.unwrap();
+        assert_eq!(backing.kind(), ObjectBackingKind::AllocatorIndexed);
+        assert_eq!(backing.run_count(), pages);
+        // The runs and the root.
+        assert_eq!(roles.available_frames(), initial - pages - 1);
+
+        let mut registry = ObjectRegistry::<3>::new();
+        let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        authority
+            .grant_backing(
+                &creation,
+                backing,
+                pages * PAGE_SIZE,
+                MemoryObjectKind::PageBacked,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        let owner = registry.creation_into_internal(creation).unwrap();
+        let mut tag = ChargeTag::EMPTY;
+        assert!(tag.push(group));
+        registry.set_charge_tag(owner.id(), tag).unwrap();
+        registry.set_charge_pages(owner.id(), pages).unwrap();
+        finalize(&mut authority, &mut registry, owner);
+        assert!(authority.finalization_owed());
+        assert_eq!(registry.charged_pages(group), pages as usize);
+
+        let mut charged = pages as usize;
+        let mut steps = 0;
+        let mut freed_total = 0_u64;
+        loop {
+            let held = roles.available_frames();
+            let owed = authority.finalize_owed_step_observed(
+                &mut registry,
+                &mut roles,
+                5,
+                |_, freed, _| freed_total += freed,
+            );
+            steps += 1;
+            roles.check_invariants().unwrap();
+            let back = usize::try_from(roles.available_frames() - held).unwrap();
+            if !owed {
+                // The completing step also frees the root, which was never
+                // charged.
+                assert_eq!(registry.charged_pages(group), 0);
+                assert_eq!(back, charged + 1);
+                break;
+            }
+            assert_eq!(registry.charged_pages(group), charged - back);
+            charged -= back;
+        }
+        assert!(steps > 3, "the object takes several steps");
+        assert_eq!(freed_total, pages);
+        assert_eq!(roles.available_frames(), initial);
+    }
+
+    #[test]
+    fn a_chain_backed_object_is_completed_at_once() {
         let mut registry = ObjectRegistry::<1>::new();
         let mut authority = MemoryObjectAuthority::<1, 1>::new();
         let (_, owner) = grant(
@@ -1635,7 +1716,7 @@ mod owed_finalization {
         let finalization = authority.take_finalization(last).unwrap();
         let finalization = authority
             .defer_finalization(finalization)
-            .expect("a page-backed object completes at once");
+            .expect("a chain-backed object completes at once");
         assert!(!authority.finalization_owed());
         let (cleanup, _backing) = into_page_backed_cancellation_parts(finalization);
         let _ = registry.complete_payload_finalization(cleanup);
