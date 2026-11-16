@@ -33,6 +33,8 @@ mod manager;
 mod slot;
 #[path = "frame_roles/storage.rs"]
 mod storage;
+#[path = "frame_roles/tables.rs"]
+mod tables;
 use chain::ChainState;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use index::OnDemandCommit;
