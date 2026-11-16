@@ -9,8 +9,7 @@ extern crate std;
 
 use super::super::physical::PhysicalAddressLimit;
 use super::*;
-use std::boxed::Box;
-use std::{vec, vec::Vec};
+use std::vec::Vec;
 
 const PAGE: u64 = BASE_PAGE_SIZE;
 /// Free ranges for every hole the live runs can leave at boot.
@@ -56,20 +55,9 @@ fn manager(page_count: u64, domain: Option<u64>) -> Manager {
     roles
 }
 
-#[allow(
-    unsafe_code,
-    reason = "the host model hands the manager a leaked buffer as its grown run"
-)]
+/// Grows from three staged runs.
 fn grow(roles: &mut Manager) {
-    let layout = roles.grown_layout().unwrap();
-    let grant = roles.allocate(layout.page_count()).unwrap();
-    let words = usize::try_from((layout.page_count() * PAGE).div_ceil(8)).unwrap();
-    let base = Box::leak(vec![0_u64; words].into_boxed_slice())
-        .as_mut_ptr()
-        .cast();
-    // SAFETY: the leaked buffer is 8-aligned, the run's size, and used by
-    // nothing else.
-    unsafe { roles.adopt_storage(grant, base) }.unwrap();
+    test_support::grow_in_leaked_runs(roles, 3);
 }
 
 /// A fixed-seed xorshift generator.
@@ -485,12 +473,13 @@ fn drive(mut fast: Manager, mut reference: Manager, seed: u64, steps: usize, cap
     );
     assert!(driver.vacated_roots > 0, "a slot of PML4 level is vacated");
     assert!(driver.retired > 0, "a spent slot is retired");
-    // Index nodes and pages no root reaches would fail the index check:
-    // vacate them, then check both managers whole.
+    // Index nodes and pages no root reaches would fail the index check, and
+    // table storage that is not the grown table's would fail the storage
+    // check: vacate them, then check both managers whole.
     while let Some(index) = driver.live.iter().position(|live| {
         matches!(
             fast.record_at(live.slot).map(|record| record.role),
-            Some(FrameRole::IndexNode(_) | FrameRole::ObjectPage(_))
+            Some(FrameRole::IndexNode(_) | FrameRole::ObjectPage(_) | FrameRole::RoleTableStorage)
         )
     }) {
         driver.vacate(&mut fast, &mut reference, index);

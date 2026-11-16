@@ -226,11 +226,14 @@ pub enum PhysicalMemoryError {
 /// `candidates + reservations` ranges, which become the initial ranges.
 ///
 /// Afterwards an allocation takes the start of a free range and never adds
-/// one. A free returns exactly one allocated run, and every run lies inside
+/// one, except an aligned boot-phase allocation
+/// ([`PhysicalFrameAllocator::allocate_largest_aligned`]), which may take the
+/// middle of a free range and split it in two: it adds one range and one live
+/// run. A free returns exactly one allocated run, and every run lies inside
 /// one initial range. Inside an initial range holding `k` live runs, the free
-/// pages form at most `k + 1` maximal intervals; merging across adjacent
-/// initial ranges only lowers the count. Summed, the free list holds at most
-/// the initial ranges plus the live runs.
+/// pages form at most `k + 1` maximal intervals, wherever the runs lie;
+/// merging across adjacent initial ranges only lowers the count. Summed, the
+/// free list holds at most the initial ranges plus the live runs.
 pub const fn free_range_bound(candidates: usize, reservations: usize, live_runs: usize) -> usize {
     candidates + reservations + live_runs
 }
@@ -490,6 +493,67 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         Ok(PageRange { start, end })
     }
 
+    /// Boot phase only (DW2 M7 §12.9): among the free ranges, takes from the
+    /// one whose interior aligned to `align_pages` is longest (the lowest of
+    /// equals) `min(max_pages, that interior rounded down to a multiple of
+    /// align_pages)` pages, starting at its first aligned page. The run may
+    /// lie in the middle of the free range, which then splits in two; the
+    /// free list stays within [`free_range_bound`], since the run is one more
+    /// live run. `NoFramesAvailable` when no free range holds one aligned
+    /// multiple; refused once the buddy allocator has taken over. Selection
+    /// and all arithmetic complete before the free list changes.
+    pub(super) fn allocate_largest_aligned(
+        &mut self,
+        max_pages: u64,
+        align_pages: u64,
+    ) -> Result<PageRange, PhysicalMemoryError> {
+        if max_pages == 0 || align_pages == 0 || self.buddy.is_some() {
+            return Err(PhysicalMemoryError::InvalidPageRange);
+        }
+        let align = align_pages
+            .checked_mul(BASE_PAGE_SIZE)
+            .ok_or(PhysicalMemoryError::AddressOverflow)?;
+        // (index, aligned start, usable pages) of the best range so far.
+        let mut best: Option<(usize, u64, u64)> = None;
+        for (index, range) in self.free[..self.free_len].iter().enumerate() {
+            let Some(start) = range.start.checked_next_multiple_of(align) else {
+                continue;
+            };
+            let Some(interior) = range.end.checked_sub(start) else {
+                continue;
+            };
+            let usable = interior / BASE_PAGE_SIZE / align_pages * align_pages;
+            if usable > 0 && best.is_none_or(|(_, _, longest)| usable > longest) {
+                best = Some((index, start, usable));
+            }
+        }
+        let (index, start, usable) = best.ok_or(PhysicalMemoryError::NoFramesAvailable)?;
+        let end = usable
+            .min(max_pages)
+            .checked_mul(BASE_PAGE_SIZE)
+            .and_then(|bytes| start.checked_add(bytes))
+            .ok_or(PhysicalMemoryError::AddressOverflow)?;
+        let range = self.free[index];
+        match (start == range.start, end == range.end) {
+            (true, true) => self.remove_free(index),
+            (true, false) => self.free[index].start = end,
+            (false, true) => self.free[index].end = start,
+            (false, false) => {
+                if self.free_len == RANGE_CAPACITY {
+                    return Err(PhysicalMemoryError::CapacityExceeded);
+                }
+                self.shift_right(index + 1);
+                self.free[index].end = start;
+                self.free[index + 1] = PageRange {
+                    start: end,
+                    end: range.end,
+                };
+                self.free_len += 1;
+            }
+        }
+        Ok(PageRange { start, end })
+    }
+
     /// Returns one previously allocated contiguous run. Callers above this
     /// mechanism must prove that no live role still owns the run.
     pub(super) fn free_run(&mut self, range: PageRange) -> Result<(), PhysicalMemoryError> {
@@ -589,6 +653,12 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         self.buddy.as_ref().map_or(Ok(()), |buddy| {
             buddy.check(&self.initial[..self.initial_len])
         })
+    }
+
+    /// The boot phase's free ranges, in address order.
+    #[cfg(test)]
+    pub(super) fn boot_free_ranges(&self) -> &[PageRange] {
+        &self.free[..self.free_len]
     }
 
     /// The free buddy blocks in address order, as (physical start, order);

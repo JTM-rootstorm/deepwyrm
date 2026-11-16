@@ -818,7 +818,10 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                         debug::emit_early_record(debug::DiagnosticLevel::Info, "memory", message);
                 }
             }
-            emit_memory_record(&[(b"frame-role slots=", role_growth.slots as u64)]);
+            emit_memory_record(&[
+                (b"frame-role slots=", role_growth.slots as u64),
+                (b" pieces=", role_growth.pieces as u64),
+            ]);
             emit_memory_record(&[
                 (b"buddy free-pages=", role_growth.free_pages),
                 (b" largest-pages=", role_growth.largest_free_pages),

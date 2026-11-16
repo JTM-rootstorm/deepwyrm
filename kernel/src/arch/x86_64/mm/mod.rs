@@ -18,6 +18,7 @@ pub(crate) const AP_TRAMPOLINE_LIMIT: u64 = 0x10_0000;
 
 pub(crate) mod direct_map;
 mod journal;
+pub(crate) mod table_map;
 pub(crate) mod transition;
 
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]

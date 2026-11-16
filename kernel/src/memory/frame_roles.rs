@@ -31,11 +31,14 @@ mod index;
 mod manager;
 #[path = "frame_roles/slot.rs"]
 mod slot;
+#[path = "frame_roles/storage.rs"]
+mod storage;
 use chain::ChainState;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use index::OnDemandCommit;
 pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory};
 use index::{IndexEntryLink, IndexRootLink};
+pub(crate) use storage::MAX_GROWTH_PARTS;
 #[cfg(test)]
 #[path = "frame_roles/test_support.rs"]
 mod test_support;
@@ -796,11 +799,13 @@ impl StagedTableCommit {
 /// The sole dynamic allocator and physical-role registry.
 ///
 /// It starts with `ROLE_CAPACITY` slots and an allocator with `RANGE_CAPACITY`
-/// free ranges, held inline. Once the direct map is active,
-/// [`Self::adopt_storage`] moves the slots into one run of RAM sized from installed memory, adds an index from each allocator
-/// page to the role starting there (DW2 large-memory plan, M2 §5.3), and
+/// free ranges, held inline. While the deep root is built, the runs of RAM
+/// the grown table needs are staged one by one; once they are mapped back to
+/// back at one virtual range, [`Self::adopt_storage`] moves the slots there,
+/// sized from installed memory (DW2 large-memory plan, M7 §12.9), adds an
+/// index from each allocator page to the role starting there (M2 §5.3), and
 /// switches the allocator to a buddy allocator whose per-page metadata lives
-/// in the same run (M7 §12.2).
+/// in the same range (M7 §12.2).
 pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
     domain: u64,
     allocator: PhysicalFrameAllocator<RANGE_CAPACITY>,
@@ -818,6 +823,9 @@ pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPAC
     /// After growth: for each allocator page, in initial-range order, one
     /// plus the slot of the dynamic role starting at that page, or zero.
     starts: Option<&'static mut [u32]>,
+    /// The runs the grown table is staged in, a prefix of the array in
+    /// staging order; once the table is grown, the runs it lives in.
+    staged: [Option<AllocationGrant>; MAX_GROWTH_PARTS],
     next_table_owner: u64,
     next_epoch: u64,
     /// Changes whenever any role record changes; binds hierarchy proofs.
@@ -826,7 +834,7 @@ pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPAC
     index_memory: Option<&'static dyn IndexMemory>,
 }
 
-/// Where each part of the grown role table lies in its run, in bytes.
+/// Where each part of the grown role table lies in its range, in bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RoleTableLayout {
     slots: usize,
@@ -842,7 +850,7 @@ pub(crate) struct RoleTableLayout {
 }
 
 impl RoleTableLayout {
-    /// Pages the run needs.
+    /// Pages the table needs.
     pub(crate) const fn page_count(&self) -> u64 {
         self.bytes.div_ceil(BASE_PAGE_SIZE)
     }
@@ -897,3 +905,7 @@ mod slot_tests;
 #[cfg(test)]
 #[path = "frame_roles/slot_writer_tests.rs"]
 mod slot_writer_tests;
+
+#[cfg(test)]
+#[path = "frame_roles/storage_tests.rs"]
+mod storage_tests;

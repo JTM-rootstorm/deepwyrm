@@ -269,3 +269,239 @@ fn the_free_range_bound_counts_reservations_that_split_ranges() {
         Err(PhysicalMemoryError::CapacityExceeded)
     ));
 }
+
+mod aligned {
+    //! The boot phase's aligned allocation (DW2 M7 §12.9 item 3).
+
+    extern crate std;
+
+    use super::*;
+    use std::{boxed::Box, vec, vec::Vec};
+
+    const PAGE: u64 = BASE_PAGE_SIZE;
+    type Allocator = PhysicalFrameAllocator<64>;
+
+    fn limit() -> PhysicalAddressLimit {
+        PhysicalAddressLimit::new(1_u64 << 40).unwrap()
+    }
+
+    /// A fixed-seed xorshift generator.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// Up to eight disjoint candidate ranges at random page offsets and
+    /// lengths, some with 2 MiB-aligned interiors.
+    fn generated_map(rng: &mut Rng) -> Allocator {
+        let mut candidates = Vec::new();
+        let mut next = 1 + rng.below(600);
+        for _ in 0..1 + rng.below(8) {
+            let longest = if rng.below(3) == 0 { 2600 } else { 700 };
+            let pages = 1 + rng.below(longest);
+            candidates.push(PageRange {
+                start: next * PAGE,
+                end: (next + pages) * PAGE,
+            });
+            next += pages + 1 + rng.below(900);
+        }
+        PhysicalFrameAllocator::from_candidates(&candidates, limit(), []).unwrap()
+    }
+
+    /// The longest aligned interior of any free range, in pages, rounded
+    /// down to a multiple of `align`: what the allocation must take from.
+    fn longest_aligned(allocator: &Allocator, align: u64) -> u64 {
+        allocator
+            .boot_free_ranges()
+            .iter()
+            .map(|range| {
+                let start = range.start.next_multiple_of(align * PAGE);
+                range.end.saturating_sub(start) / PAGE / align * align
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The boot free list is sorted, disjoint, non-empty and inside the
+    /// initial ranges, and no free range touches a live run.
+    fn check(allocator: &Allocator, live: &[PageRange]) {
+        let free = allocator.boot_free_ranges();
+        for pair in free.windows(2) {
+            assert!(pair[0].end < pair[1].start, "{pair:?}");
+        }
+        for range in free {
+            assert!(range.start < range.end);
+            assert!(allocator.contains_initial(*range));
+            assert!(live.iter().all(|run| !run.overlaps(*range)));
+        }
+        for run in live {
+            assert!(allocator.contains_initial(*run));
+        }
+        let held: u64 = live.iter().map(|run| run.page_count()).sum();
+        assert_eq!(
+            allocator.available_frames() + held,
+            allocator.initial_frames()
+        );
+    }
+
+    #[test]
+    fn aligned_runs_start_aligned_fit_the_request_and_conserve_pages() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut aligned_runs = 0;
+        let mut middle_runs = 0;
+        for _ in 0..300 {
+            let mut allocator = generated_map(&mut rng);
+            let mut live = Vec::new();
+            for _ in 0..12 {
+                let align = [1, 2, 8, 512][rng.below(4) as usize];
+                let extra = rng.below(2) * rng.below(align);
+                let max = align * (1 + rng.below(6)) + extra;
+                let longest = longest_aligned(&allocator, align);
+                let before = allocator.available_frames();
+                match allocator.allocate_largest_aligned(max, align) {
+                    Ok(run) => {
+                        let pages = run.page_count();
+                        assert!(run.start.is_multiple_of(align * PAGE), "{run:?} {align}");
+                        assert!(pages <= max && pages <= longest);
+                        assert_eq!(pages, longest.min(max));
+                        if max.is_multiple_of(align) {
+                            assert!(pages.is_multiple_of(align));
+                        }
+                        assert_eq!(allocator.available_frames(), before - pages);
+                        if align > 1 {
+                            aligned_runs += 1;
+                        }
+                        if !allocator
+                            .boot_free_ranges()
+                            .iter()
+                            .all(|free| free.end != run.start)
+                        {
+                            middle_runs += 1;
+                        }
+                        live.push(run);
+                    }
+                    Err(error) => {
+                        assert_eq!(error, PhysicalMemoryError::NoFramesAvailable);
+                        assert_eq!(longest, 0);
+                        assert_eq!(allocator.available_frames(), before);
+                    }
+                }
+                check(&allocator, &live);
+            }
+            // Freed in any order, the free list is the initial ranges again.
+            while !live.is_empty() {
+                let run = live.remove(rng.below(live.len() as u64) as usize);
+                allocator.free_run(run).unwrap();
+                check(&allocator, &live);
+            }
+            assert_eq!(
+                allocator.boot_free_ranges(),
+                &allocator.initial[..allocator.initial_len]
+            );
+        }
+        assert!(aligned_runs > 300 && middle_runs > 100);
+    }
+
+    #[test]
+    fn an_aligned_run_from_the_middle_of_a_range_splits_it() {
+        // Pages 1 to 1999: the 2 MiB-aligned interior starts at page 512.
+        let candidates = [PageRange {
+            start: PAGE,
+            end: 2000 * PAGE,
+        }];
+        let mut allocator = Allocator::from_candidates(&candidates, limit(), []).unwrap();
+        let run = allocator.allocate_largest_aligned(4096, 512).unwrap();
+        assert_eq!(
+            run,
+            PageRange {
+                start: 512 * PAGE,
+                end: 1536 * PAGE
+            }
+        );
+        assert_eq!(
+            allocator.boot_free_ranges(),
+            &[
+                PageRange {
+                    start: PAGE,
+                    end: 512 * PAGE
+                },
+                PageRange {
+                    start: 1536 * PAGE,
+                    end: 2000 * PAGE
+                },
+            ]
+        );
+        // Nothing aligned to 2 MiB is left; any page alignment takes the
+        // largest range from its start.
+        assert_eq!(
+            allocator.allocate_largest_aligned(512, 512),
+            Err(PhysicalMemoryError::NoFramesAvailable)
+        );
+        assert_eq!(
+            allocator.allocate_largest_aligned(10_000, 1),
+            Ok(PageRange {
+                start: PAGE,
+                end: 512 * PAGE
+            })
+        );
+        assert_eq!(
+            allocator.allocate_largest_aligned(0, 1),
+            Err(PhysicalMemoryError::InvalidPageRange)
+        );
+        assert_eq!(
+            allocator.allocate_largest_aligned(1, 0),
+            Err(PhysicalMemoryError::InvalidPageRange)
+        );
+    }
+
+    #[test]
+    fn a_split_with_no_free_range_slot_left_is_refused_and_changes_nothing() {
+        let candidates = [PageRange {
+            start: PAGE,
+            end: 2000 * PAGE,
+        }];
+        let mut allocator =
+            PhysicalFrameAllocator::<1>::from_candidates(&candidates, limit(), []).unwrap();
+        assert_eq!(
+            allocator.allocate_largest_aligned(512, 512),
+            Err(PhysicalMemoryError::CapacityExceeded)
+        );
+        assert_eq!(allocator.boot_free_ranges(), &candidates);
+        // A run at the range's start needs no new slot.
+        assert!(allocator.allocate_largest_aligned(512, 1).is_ok());
+    }
+
+    #[test]
+    fn the_aligned_allocation_is_refused_after_growth() {
+        let candidates = [PageRange {
+            start: PAGE,
+            end: 2000 * PAGE,
+        }];
+        let mut allocator = Allocator::from_candidates(&candidates, limit(), []).unwrap();
+        let frames = usize::try_from(allocator.initial_frames()).unwrap();
+        let storage = BuddyStorage {
+            tags: Box::leak(vec![0_u8; frames].into_boxed_slice()),
+            links: Box::leak(vec![FreeLink::EMPTY; frames].into_boxed_slice()),
+            bases: Box::leak(vec![0_u64; allocator.initial_range_count()].into_boxed_slice()),
+            hints: Box::leak(vec![0_u32; allocator.range_hint_count()].into_boxed_slice()),
+        };
+        assert!(allocator.adopt_buddy(storage).is_ok());
+        let available = allocator.available_frames();
+        assert_eq!(
+            allocator.allocate_largest_aligned(512, 512),
+            Err(PhysicalMemoryError::InvalidPageRange)
+        );
+        assert_eq!(allocator.available_frames(), available);
+        assert_eq!(allocator.check_buddy(), Ok(()));
+    }
+}
