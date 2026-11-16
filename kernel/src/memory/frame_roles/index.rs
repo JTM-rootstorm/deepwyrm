@@ -27,11 +27,26 @@ pub(crate) const INDEX_MAX_PAGES: u64 = 1 << 36;
 pub(crate) const INDEX_MAX_COMMIT_FRAMES: usize = INDEX_MAX_LEVELS as usize;
 /// An eager backing whose allocation took more runs than this is held as
 /// an index; one of this many runs or fewer stays a chain (DW2 §12.10).
+/// It is also the most runs an allocation's first hold takes (DW2 §12.11).
 pub(crate) const INDEX_RUN_THRESHOLD: u64 = 16;
+/// One building step links runs until it has linked this many (DW2
+/// §12.11 part 2 item 3)...
+pub(crate) const BUILD_STEP_RUNS: u64 = 512;
+/// ...or this many pages, or the request is covered.
+pub(crate) const BUILD_STEP_PAGES: u64 = 65_536;
+/// The most pages one run linked into a building index holds: the size of
+/// a zeroing step. A longer run of the first hold is split.
+pub(crate) const RUN_CAP: u64 = 4096;
+/// The most nodes linking one run can need: a leaf for each 512 pages it
+/// covers and one more it may start inside, and one node on each level
+/// above, since a run is shorter than a level-1 node's span.
+pub(super) const LINK_MAX_NODES: usize =
+    (RUN_CAP / INDEX_FANOUT) as usize + 1 + (INDEX_MAX_LEVELS as usize - 1);
 
 const PLACE_LEVEL_SHIFT: u32 = 60;
 const _: () = assert!(INDEX_MAX_PAGES < 1 << PLACE_LEVEL_SHIFT);
 const _: () = assert!(INDEX_FANOUT * 8 == BASE_PAGE_SIZE);
+const _: () = assert!(RUN_CAP < INDEX_FANOUT * INDEX_FANOUT);
 
 /// Reads, writes and zeroes index node pages and committed pages by
 /// physical address: the direct map in the kernel, a model in host tests.
@@ -65,6 +80,12 @@ pub(crate) trait IndexMemory: Sync {
 pub(super) enum IndexRootState {
     /// An on-demand backing: pages are committed one at a time.
     OnDemand,
+    /// An eager backing being allocated in steps (DW2 §12.11 part 2 item
+    /// 1): its entries name whole runs, gapless from page 0 to the pages
+    /// linked so far, which may be fewer than `pages`. Nothing resolves it;
+    /// only its building steps, its abandonment and the invariant check
+    /// take it.
+    EagerBuilding,
     /// An eager backing whose runs are taken and not yet zeroed: it
     /// resolves for its zeroing only.
     EagerAllocated,
@@ -95,6 +116,11 @@ pub(super) enum RootUse {
     Eager,
     /// Eager roots not yet zeroed only: their zeroing and cancellation.
     Allocated,
+    /// Eager roots being built only: a building step.
+    Building,
+    /// Eager roots being built or not yet zeroed: an allocation abandoned
+    /// or cancelled.
+    Unfinished,
     /// On-demand and zeroed eager roots not being freed: lookups.
     Live,
     /// On-demand and zeroed eager roots, being freed or not: release steps.
@@ -115,7 +141,14 @@ impl RootUse {
                 Self::Eager | Self::Live | Self::Release,
                 IndexRootState::Eager
             ) | (Self::Eager | Self::Release, IndexRootState::EagerFreeing)
-                | (Self::Allocated, IndexRootState::EagerAllocated)
+                | (
+                    Self::Allocated | Self::Unfinished,
+                    IndexRootState::EagerAllocated
+                )
+                | (
+                    Self::Building | Self::Unfinished,
+                    IndexRootState::EagerBuilding
+                )
                 | (Self::Any, _)
         )
     }
@@ -130,17 +163,17 @@ pub(super) struct IndexEntryLink {
     pub(super) place: u64,
 }
 
-const fn node_place(first_page: u64, level: u8) -> u64 {
+pub(super) const fn node_place(first_page: u64, level: u8) -> u64 {
     first_page | ((level as u64) << PLACE_LEVEL_SHIFT)
 }
 
 /// Pages one entry of a node at `level` covers.
-const fn entry_span(level: u8) -> u64 {
+pub(super) const fn entry_span(level: u8) -> u64 {
     1 << (9 * level as u32)
 }
 
 /// The fewest levels that cover `pages`.
-fn levels_for(pages: u64) -> Option<u8> {
+pub(super) fn levels_for(pages: u64) -> Option<u8> {
     (1..=INDEX_MAX_LEVELS).find(|&levels| pages <= entry_span(levels))
 }
 
@@ -154,12 +187,12 @@ pub(crate) struct OnDemandCommit {
     pub(crate) frames: u64,
 }
 
-/// One frame taken for a commit, not yet linked.
+/// One frame taken for a commit or a run's nodes, not yet linked.
 #[derive(Clone, Copy)]
-struct Taken {
-    slot: usize,
-    identity: FrameRoleIdentity,
-    range: PageRange,
+pub(super) struct Taken {
+    pub(super) slot: usize,
+    pub(super) identity: FrameRoleIdentity,
+    pub(super) range: PageRange,
 }
 
 /// A validated step of a walk from the root.
@@ -189,7 +222,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.index_memory = Some(memory);
     }
 
-    fn memory(&self) -> Result<&'static dyn IndexMemory, FrameRoleError> {
+    pub(super) fn memory(&self) -> Result<&'static dyn IndexMemory, FrameRoleError> {
         self.index_memory.ok_or(FrameRoleError::WrongRole)
     }
 
@@ -226,7 +259,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// The root of the indexed backing `head`, if its state is one `wanted`
     /// takes.
     #[inline]
-    fn index_root(
+    pub(super) fn index_root(
         &self,
         head: FrameRoleIdentity,
         wanted: RootUse,
@@ -523,7 +556,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Takes one zeroed page and publishes `role` on it.
-    fn take_index_frame(
+    pub(super) fn take_index_frame(
         &mut self,
         memory: &'static dyn IndexMemory,
         role: FrameRole,
@@ -551,7 +584,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Gives back a frame [`Self::take_index_frame`] took, before any entry
     /// names it.
-    fn untake_index_frame(&mut self, frame: Taken) {
+    pub(super) fn untake_index_frame(&mut self, frame: Taken) {
         self.allocator
             .free_run(frame.range)
             .expect("a live run frees: the boot free list is sized by the role slots (M1), and the buddy allocator links every page");
@@ -561,11 +594,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Counts every node below the root of `head`, if `wanted` takes it,
     /// and each committed page of an on-demand root or each run of an eager
     /// one, checking each (DW2 §12.10 part 2 item 9).
-    fn index_count(&self, head: FrameRoleIdentity, wanted: RootUse) -> Result<u64, FrameRoleError> {
+    pub(super) fn index_count(
+        &self,
+        head: FrameRoleIdentity,
+        wanted: RootUse,
+    ) -> Result<u64, FrameRoleError> {
         let (root_range, root) = self.index_root(head, wanted)?;
         let memory = self.memory()?;
         let mut runs = (root.state != IndexRootState::OnDemand).then_some(RunScan {
             partial: root.state == IndexRootState::EagerFreeing,
+            building: root.state == IndexRootState::EagerBuilding,
             ..RunScan::default()
         });
         let frames = self.index_count_node(
@@ -1006,7 +1044,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    fn free_index_slot(&mut self, slot: usize) {
+    pub(super) fn free_index_slot(&mut self, slot: usize) {
         let range = self.run_at(slot).expect("a freed index frame is live");
         self.allocator
             .free_run(range)
@@ -1014,89 +1052,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.vacate(slot);
     }
 
-    /// Takes, zeroes and links the root of an eager index of `pages` pages
-    /// and every node its size needs (DW2 §12.10 part 2 item 4, first
-    /// pass): the only part of a conversion that can fail, and on failure
-    /// everything taken is freed. `Ok(None)` when the manager has no index
-    /// memory or no index holds `pages`.
-    pub(super) fn take_eager_index(
-        &mut self,
-        pages: u64,
-    ) -> Result<Option<EagerIndex>, FrameRoleError> {
-        let (Some(memory), Some(levels)) = (self.index_memory, levels_for(pages)) else {
-            return Ok(None);
-        };
-        let root = self.take_index_frame(
-            memory,
-            FrameRole::IndexRoot(IndexRootLink {
-                pages,
-                levels,
-                state: IndexRootState::EagerAllocated,
-            }),
-        )?;
-        let index = EagerIndex {
-            memory,
-            root: root.identity,
-            node: root.range.start,
-            levels,
-        };
-        if let Err(error) = self.take_index_nodes(&index, pages) {
-            // Every node taken is linked, and every leaf is empty.
-            self.index_free_node(
-                memory,
-                root.identity,
-                root.range.start,
-                levels - 1,
-                0,
-                true,
-                &mut 0,
-            );
-            self.free_index_slot(root.slot);
-            return Err(error);
-        }
-        Ok(Some(index))
-    }
-
-    /// Takes and links every node below the root of `index` that covers a
-    /// page below `pages`, level by level from the top, so each parent is
-    /// linked before its children (no recursion: a syscall reaches it).
-    fn take_index_nodes(&mut self, index: &EagerIndex, pages: u64) -> Result<(), FrameRoleError> {
-        for level in (0..index.levels - 1).rev() {
-            // The pages a node of `level` covers: one entry of its parent.
-            let span = entry_span(level + 1);
-            let mut first = 0;
-            while first < pages {
-                let parent = self.node_at(index, first, level + 1);
-                let child = self.take_index_frame(
-                    index.memory,
-                    FrameRole::IndexNode(IndexEntryLink {
-                        owner: index.root.raw,
-                        place: node_place(first, level),
-                    }),
-                )?;
-                #[allow(
-                    unsafe_code,
-                    reason = "the manager owns its index nodes exclusively under `&mut self`"
-                )]
-                // SAFETY: `parent` is a node of this new index, which the
-                // manager owns exclusively under `&mut self`.
-                unsafe {
-                    index.memory.write(
-                        parent,
-                        ((first / span) % INDEX_FANOUT) as usize,
-                        child.identity.raw,
-                    )
-                };
-                first += span;
-            }
-        }
-        Ok(())
-    }
-
     /// Writes the entries of object pages `[first, first + count)` of the
-    /// index `index` to name `run` (DW2 §12.10 part 2 item 4, second pass).
-    /// `leaf` keeps the leaf last written, by its number, so a leaf is found
-    /// once for the pages it holds.
+    /// index `index` to name `run` (DW2 §12.11 part 2 item 3, second pass);
+    /// every node on their paths is linked. `leaf` keeps the leaf last
+    /// written, by its number, so a leaf is found once for the pages it
+    /// holds.
     pub(super) fn write_run_entries(
         &mut self,
         index: &EagerIndex,
@@ -1129,9 +1089,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// The node of level `target` of the new index `index` that holds
-    /// object page `page`; it must be linked.
-    fn node_at(&self, index: &EagerIndex, page: u64, target: u8) -> u64 {
+    /// The node of level `target` of the index `index` being built that
+    /// holds object page `page`; it must be linked.
+    pub(super) fn node_at(&self, index: &EagerIndex, page: u64, target: u8) -> u64 {
         let mut node = index.node;
         for level in (target + 1..index.levels).rev() {
             let span = entry_span(level);
@@ -1141,7 +1101,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .read(node, ((page / span) % INDEX_FANOUT) as usize);
             let (_, range, _) = self
                 .index_entry(index.root, raw, true, node_place(first, level - 1), false)
-                .expect("an index just linked is whole");
+                .expect("a node an index being built has linked is whole");
             node = range.start;
         }
         node
@@ -1253,12 +1213,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
-/// An eager index whose root and nodes are linked, for its runs' entries.
+/// An eager index being built, for linking its runs' nodes and entries.
 pub(super) struct EagerIndex {
-    memory: &'static dyn IndexMemory,
+    pub(super) memory: &'static dyn IndexMemory,
     pub(super) root: FrameRoleIdentity,
-    node: u64,
-    levels: u8,
+    /// The root node's physical address.
+    pub(super) node: u64,
+    pub(super) levels: u8,
 }
 
 /// What a count of an eager root's entries has seen, in page order.
@@ -1267,6 +1228,9 @@ struct RunScan {
     /// Whether the root is being freed: its first entry may then lie
     /// inside a run, past page 0, or there may be none.
     partial: bool,
+    /// Whether the root is being built: its entries may then end before
+    /// its pages do, at a run's end, or there may be none.
+    building: bool,
     seen: bool,
     /// The page after the last entry seen.
     next: u64,
@@ -1277,12 +1241,14 @@ struct RunScan {
 
 impl RunScan {
     /// Whether the entries seen reach the end of an object of `pages`
-    /// pages; none at all only once a stepped release has freed them all.
+    /// pages, or, while it is being built, the end of the last run; none
+    /// at all only once a stepped release has freed them all, or before a
+    /// building step has linked any.
     const fn whole(self, pages: u64) -> bool {
         if self.seen {
-            self.next == pages && self.run_end == pages
+            self.next == self.run_end && (self.next == pages || self.building)
         } else {
-            self.partial
+            self.partial || self.building
         }
     }
 }

@@ -19,10 +19,10 @@ pub(super) enum ChainState {
 
 /// One validated run of a chain.
 #[derive(Clone, Copy)]
-struct ChainRun {
-    slot: usize,
-    range: PageRange,
-    link: ChainLink,
+pub(super) struct ChainRun {
+    pub(super) slot: usize,
+    pub(super) range: PageRange,
+    pub(super) link: ChainLink,
 }
 
 /// The physical pieces of one object range, in object order. The shared
@@ -76,10 +76,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> Iterator
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
 {
-    /// Allocates `page_count` pages as a chain of runs, largest free run
-    /// first, so unfragmented memory gives one run (DW2 M3 §6.3). Fails only
+    /// The first hold of a backing's allocation (DW2 M3 §6.3, §12.11 part
+    /// 2 item 2): takes `page_count` pages as a chain of runs, largest free
+    /// run first, so unfragmented memory gives one run, stopping after
+    /// [`INDEX_RUN_THRESHOLD`] runs when the manager could hold the backing
+    /// as an index. If the runs cover the request, the allocation is that
+    /// chain, complete. If not, the root of an index is taken and zeroed,
+    /// and the allocation is building: the runs taken are its remainder,
+    /// linked by [`Self::extend_backing`]. With no index memory, or past
+    /// [`INDEX_MAX_PAGES`], the chain is completed in this call. Fails only
     /// when memory or role slots run out, and then frees what it took.
-    pub(crate) fn allocate_backing(
+    pub(crate) fn begin_backing(
         &mut self,
         page_count: u64,
     ) -> Result<BackingAllocation, FrameRoleError> {
@@ -88,11 +95,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 PhysicalMemoryError::InvalidPageRange,
             ));
         }
+        let indexable = self.index_memory.zip(index::levels_for(page_count));
+        let most_runs = if indexable.is_some() {
+            INDEX_RUN_THRESHOLD
+        } else {
+            u64::MAX
+        };
         let mut head: Option<FrameRoleIdentity> = None;
         let mut last: Option<usize> = None;
         let mut pages = 0_u64;
         let mut runs = 0_u64;
-        while pages < page_count {
+        while pages < page_count && runs < most_runs {
             let (slot, generation, identity, range) = match self.take_run(page_count - pages) {
                 Ok(taken) => taken,
                 Err(error) => {
@@ -123,68 +136,57 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             runs += 1;
         }
         let head = head.expect("a nonempty request took a run");
-        if runs > INDEX_RUN_THRESHOLD {
-            return match self.index_allocation(head, pages) {
-                Ok(root) => Ok(BackingAllocation {
-                    head: root.unwrap_or(head),
-                    pages,
-                    runs,
-                    indexed: root.is_some(),
-                }),
-                Err(error) => {
-                    self.free_chain(head, ChainState::Allocated);
-                    Err(error)
-                }
-            };
-        }
+        let Some((memory, levels)) = indexable.filter(|_| pages < page_count) else {
+            return Ok(BackingAllocation {
+                head,
+                pages,
+                runs,
+                indexed: false,
+                linked: pages,
+                remainder: None,
+            });
+        };
+        let root = match self.take_index_frame(
+            memory,
+            FrameRole::IndexRoot(IndexRootLink {
+                pages: page_count,
+                levels,
+                state: IndexRootState::EagerBuilding,
+            }),
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                self.free_chain(head, ChainState::Allocated);
+                return Err(error);
+            }
+        };
         Ok(BackingAllocation {
-            head,
-            pages,
-            runs,
-            indexed: false,
+            head: root.identity,
+            pages: page_count,
+            runs: 0,
+            indexed: true,
+            linked: 0,
+            remainder: Some(RemainderChain { head, pages, runs }),
         })
     }
 
-    /// Converts the whole allocated chain `head` of `pages` pages into an
-    /// index in two passes (DW2 §12.10 part 2 item 4), or leaves it a chain
-    /// (`Ok(None)`) when the manager has no index memory or no index holds
-    /// `pages`. The first pass takes and links the root and nodes and is the
-    /// only one that can fail; on failure it has freed them, and the chain
-    /// is whole for the caller to free. The second walks the chain once:
-    /// each run's pages get entries naming it, and the run takes the
-    /// `ObjectPage` role with its first object page as its place.
-    pub(super) fn index_allocation(
+    /// Allocates `page_count` pages in one call: [`Self::begin_backing`],
+    /// then [`Self::extend_backing`] until complete. For the boot allocator,
+    /// [`Self::allocate_zeroed_backing`] and host tests; a create builds in
+    /// steps instead. On failure every frame taken is freed at once.
+    pub(crate) fn allocate_backing(
         &mut self,
-        head: FrameRoleIdentity,
-        pages: u64,
-    ) -> Result<Option<FrameRoleIdentity>, FrameRoleError> {
-        let Some(index) = self.take_eager_index(pages)? else {
-            return Ok(None);
-        };
-        let mut leaf = None;
-        let mut object_page = 0;
-        let mut next = Some(head);
-        while let Some(identity) = next {
-            let run = self
-                .chain_run(head, identity, object_page, ChainState::Allocated)
-                .expect("a whole chain converts");
-            next = self.link_identity(run.link.next);
-            let count = run.range.page_count();
-            self.write_run_entries(&index, identity, object_page, count, &mut leaf);
-            self.replace_record(
-                run.slot,
-                RoleRecord {
-                    range: run.range,
-                    role: FrameRole::ObjectPage(IndexEntryLink {
-                        owner: index.root.raw,
-                        place: object_page,
-                    }),
-                },
-            );
-            object_page += count;
+        page_count: u64,
+    ) -> Result<BackingAllocation, FrameRoleError> {
+        let mut allocation = self.begin_backing(page_count)?;
+        while !allocation.is_complete() {
+            if let Err(error) = self.extend_backing(&mut allocation) {
+                self.cancel_backing_allocation(allocation)
+                    .unwrap_or_else(|_| panic!("a backing allocation that failed a step frees"));
+                return Err(error);
+            }
         }
-        assert_eq!(object_page, pages, "a converted chain holds its pages");
-        Ok(Some(index.root))
+        Ok(allocation)
     }
 
     /// Allocates `page_count` pages as a chain, has `zero` clear every page,
@@ -230,7 +232,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Has `zero` clear pages `[first, first + count)` of `allocation`: part
     /// of the zeroing `allocate_zeroed_backing` does whole, so a caller can
     /// release its locks between parts (DW2 M4b). `false` if a page fails,
-    /// or the pages are not all in the allocation.
+    /// the pages are not all in the allocation, or it is not complete.
     pub(crate) fn zero_backing_pages(
         &self,
         allocation: &BackingAllocation,
@@ -238,6 +240,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         count: u64,
         zero: &mut dyn FnMut(u64) -> bool,
     ) -> bool {
+        if !allocation.is_complete() {
+            return false;
+        }
         let Some(end) = first
             .checked_add(count)
             .filter(|end| *end <= allocation.pages)
@@ -287,6 +292,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         allocation: BackingAllocation,
     ) -> Result<ObjectBackingGrant, GrantTransitionError<BackingAllocation>> {
+        if !allocation.is_complete() {
+            return Err(GrantTransitionError::new(
+                FrameRoleError::WrongRole,
+                allocation,
+            ));
+        }
         if allocation.indexed {
             return self.assume_index_zeroed(allocation);
         }
@@ -328,12 +339,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
+    /// Frees an allocation whole, at any stage: its remainder, and its
+    /// index with every run and node linked. For the boot allocator and
+    /// `allocate_backing`; a create abandons instead (DW2 §12.11 part 2 item
+    /// 6), since an index may be large.
     pub(crate) fn cancel_backing_allocation(
         &mut self,
         allocation: BackingAllocation,
     ) -> Result<(), GrantTransitionError<BackingAllocation>> {
         let released = if allocation.indexed {
-            self.release_eager_index(allocation.head, RootUse::Allocated, allocation.pages)
+            self.cancel_index_allocation(&allocation)
         } else {
             self.release_chain(
                 allocation.head,
@@ -538,7 +553,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         Ok((slot, generation, identity, range))
     }
 
-    fn link_next(&mut self, slot: usize, next: u64) {
+    pub(super) fn link_next(&mut self, slot: usize, next: u64) {
         let mut record = self.record_at(slot).expect("a linked run is live");
         let FrameRole::BackingAllocated(link) = &mut record.role else {
             panic!("only a run being allocated is linked");
@@ -548,7 +563,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Frees every run of a chain already checked whole.
-    fn free_chain(&mut self, head: FrameRoleIdentity, state: ChainState) {
+    pub(super) fn free_chain(&mut self, head: FrameRoleIdentity, state: ChainState) {
         let mut object_page = 0;
         let mut next = Some(head);
         while let Some(identity) = next {
@@ -583,7 +598,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// The pages and runs of `head`'s whole chain.
-    fn chain_totals(
+    pub(super) fn chain_totals(
         &self,
         head: FrameRoleIdentity,
         state: ChainState,
@@ -605,7 +620,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// The run `identity` names, checked to be the run of `head`'s chain
     /// that starts at `object_page` and holds `state`'s role. An external
     /// backing (boot module, device BAR) is a chain of its one run.
-    fn chain_run(
+    pub(super) fn chain_run(
         &self,
         head: FrameRoleIdentity,
         identity: FrameRoleIdentity,
@@ -638,7 +653,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         })
     }
 
-    fn link_identity(&self, raw: u64) -> Option<FrameRoleIdentity> {
+    pub(super) fn link_identity(&self, raw: u64) -> Option<FrameRoleIdentity> {
         (raw != 0).then_some(FrameRoleIdentity {
             domain: self.domain,
             raw,
