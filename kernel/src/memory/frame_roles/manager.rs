@@ -88,6 +88,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .map_err(|_| {
                 FrameRoleInitializationError::Role(FrameRoleError::ManagerDomainExhausted)
             })?;
+        // SAFETY: `destination` is the caller's unique, live storage (this
+        // function's contract). Each field is written once through a raw
+        // field pointer, never read first; the allocator was initialized in
+        // place above. Only after every field is written is the storage
+        // borrowed as a manager. The destructuring below names every field
+        // without `..`, so a field added later without a write here does not
+        // compile.
         unsafe {
             core::ptr::addr_of_mut!((*destination).domain).write(domain);
             GrowableStore::init_in_place(
@@ -101,7 +108,21 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             core::ptr::addr_of_mut!((*destination).next_table_owner).write(1);
             core::ptr::addr_of_mut!((*destination).next_epoch).write(1);
             core::ptr::addr_of_mut!((*destination).version).write(0);
+            core::ptr::addr_of_mut!((*destination).index_memory).write(None);
             let manager = &mut *destination;
+            let Self {
+                domain: _,
+                allocator: _,
+                roles: _,
+                first_free: _,
+                free_slot_count: _,
+                first_root: _,
+                starts: _,
+                next_table_owner: _,
+                next_epoch: _,
+                version: _,
+                index_memory: _,
+            } = manager;
             manager
                 .fill_boot_free_slots()
                 .map_err(FrameRoleInitializationError::Role)?;
