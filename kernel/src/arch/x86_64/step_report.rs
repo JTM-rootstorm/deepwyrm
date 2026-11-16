@@ -164,6 +164,9 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// Finalize steps by what drained, counted whether or not they were
     /// nested in a timed step.
     finalize_steps: [AtomicU64; SOURCES],
+    /// The most finalize steps one hold of the runtime lock ran (DW2
+    /// §12.11 part 2 item 11).
+    finalize_hold_longest: AtomicU64,
     /// Wakes of the BSP for owed work (DW2 §10.19 revision 3), sent and
     /// not sent.
     owed_wakes: AtomicU64,
@@ -222,6 +225,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
             finalize_gap_longest: AtomicU64::new(0),
             finalize_step_longest: AtomicU64::new(0),
             finalize_steps: [const { AtomicU64::new(0) }; SOURCES],
+            finalize_hold_longest: AtomicU64::new(0),
             owed_wakes: AtomicU64::new(0),
             owed_wakes_unsent: AtomicU64::new(0),
             owed_wakes_queue: AtomicU64::new(0),
@@ -306,6 +310,15 @@ impl<const CPUS: usize> StepTally<CPUS> {
         }
     }
 
+    /// A hold of the runtime lock ended having run `steps` finalize steps;
+    /// a hold that ran none records nothing.
+    pub(crate) fn finalize_hold_ended(&self, steps: u32) {
+        if steps != 0 {
+            self.finalize_hold_longest
+                .fetch_max(u64::from(steps), Ordering::Relaxed);
+        }
+    }
+
     /// An object completed after waiting `wait` ns since it was queued,
     /// having freed `pages` frames. One writer at a time (T), so the pair
     /// is kept together.
@@ -343,6 +356,10 @@ impl<const CPUS: usize> StepTally<CPUS> {
             .map(|source: usize| self.finalize_steps[source].load(Ordering::Relaxed));
         line(format_args!(
             "finalize-steps gate={gate} syscall={syscall} fault={fault} idle={idle} other={other}"
+        ));
+        line(format_args!(
+            "finalize-steps-in-one-hold longest={}",
+            self.finalize_hold_longest.load(Ordering::Relaxed)
         ));
         line(format_args!(
             "owed-wakes={} unsent={} queue={} retirement={}",
@@ -621,6 +638,12 @@ mod live {
         TALLY.finalize_stepped(drain_source(cpu), began, ended, owed);
     }
 
+    /// A hold of the runtime lock ended having run `steps` finalize steps
+    /// (see [`StepTally::finalize_hold_ended`]).
+    pub(crate) fn finalize_hold_ended(steps: u32) {
+        TALLY.finalize_hold_ended(steps);
+    }
+
     /// An owed finalization completed (see [`StepTally::finalize_waited`]).
     pub(crate) fn finalize_waited(wait: u64, pages: u64) {
         TALLY.finalize_waited(wait, pages);
@@ -767,8 +790,8 @@ mod live {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
     after_safe_point, allow_teardown_step, at_safe_point, backing_allocated, backing_made,
-    call_ended, finalize_queued, finalize_stepped, finalize_waited, now, owed, owed_wake,
-    parked_call_ended, report, set_drain_source, step_began, take_teardown_step, timed,
+    call_ended, finalize_hold_ended, finalize_queued, finalize_stepped, finalize_waited, now, owed,
+    owed_wake, parked_call_ended, report, set_drain_source, step_began, take_teardown_step, timed,
     timed_nested,
 };
 
@@ -1053,6 +1076,7 @@ mod tests {
                 "finalize-gap-longest-us=0",
                 "finalize-step-longest-us=0",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=0",
+                "finalize-steps-in-one-hold longest=0",
                 "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
@@ -1073,6 +1097,7 @@ mod tests {
                 "finalize-gap-longest-us=3000",
                 "finalize-step-longest-us=1000",
                 "finalize-steps gate=2 syscall=0 fault=0 idle=0 other=0",
+                "finalize-steps-in-one-hold longest=0",
                 "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
@@ -1093,6 +1118,7 @@ mod tests {
                 "finalize-gap-longest-us=2000",
                 "finalize-step-longest-us=100",
                 "finalize-steps gate=0 syscall=1 fault=0 idle=1 other=0",
+                "finalize-steps-in-one-hold longest=0",
                 "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
@@ -1120,6 +1146,7 @@ mod tests {
                 "finalize-gap-longest-us=3000",
                 "finalize-step-longest-us=25500",
                 "finalize-steps gate=2 syscall=0 fault=1 idle=0 other=0",
+                "finalize-steps-in-one-hold longest=0",
                 "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
@@ -1138,6 +1165,7 @@ mod tests {
                 "finalize-gap-longest-us=898000",
                 "finalize-step-longest-us=1000",
                 "finalize-steps gate=0 syscall=0 fault=0 idle=0 other=1",
+                "finalize-steps-in-one-hold longest=0",
                 "owed-wakes=0 unsent=0 queue=0 retirement=0",
             ]
         );
@@ -1295,9 +1323,26 @@ mod tests {
         tally.owed_wake(false, true, true);
         tally.owed_wake(true, true, false);
         assert_eq!(
-            finalize_lines(&tally, None)[4],
+            finalize_lines(&tally, None)[5],
             "owed-wakes=2 unsent=1 queue=2 retirement=2"
         );
+    }
+
+    /// DW2 §12.11 part 2 item 11: the line keeps the most finalize steps
+    /// any one hold ran, a later hold with fewer or none not lowering it.
+    #[test]
+    fn the_most_finalize_steps_in_one_hold_is_kept() {
+        let tally = StepTally::<2>::new();
+        let held = |tally: &StepTally<2>| finalize_lines(tally, None)[4].clone();
+        assert_eq!(held(&tally), "finalize-steps-in-one-hold longest=0");
+        tally.finalize_hold_ended(0);
+        assert_eq!(held(&tally), "finalize-steps-in-one-hold longest=0");
+        tally.finalize_hold_ended(1);
+        assert_eq!(held(&tally), "finalize-steps-in-one-hold longest=1");
+        tally.finalize_hold_ended(3);
+        tally.finalize_hold_ended(1);
+        tally.finalize_hold_ended(0);
+        assert_eq!(held(&tally), "finalize-steps-in-one-hold longest=3");
     }
 
     #[test]

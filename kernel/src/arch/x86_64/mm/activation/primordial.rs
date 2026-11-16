@@ -4050,6 +4050,12 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     /// Exited Processes whose roots are owed teardown, by registry slot
     /// (DW2 §10.10 item 1); stepped by drains on a live Process's root.
     owed_teardown: crate::object::slot_queue::SlotQueue<ProcessKey, REGISTRY_OBJECTS>,
+    /// This hold's one finalize step (DW2 §12.11 part 2 item 11) and the
+    /// finalize steps it ran: a drain steps only while none ran, every step
+    /// that runs is counted, and the guard's hold-end check reads and
+    /// renews it, with only `&self`, hence the `Cell`. Every access is
+    /// under T.
+    finalize_budget: core::cell::Cell<crate::syscall::HoldStepBudget>,
 }
 
 /// Everything the runtime authority guards: the core authorities and every
@@ -4120,6 +4126,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
             self.core.memory.finalization_owed(),
             !self.core.owed_teardown.is_empty(),
         );
+        // The finalize steps this hold ran, for the report; the next hold
+        // starts with its own step (DW2 §12.11 part 2 item 11).
+        step_report::finalize_hold_ended(self.core.finalize_budget.take().end());
     }
 
     /// A hold off the BSP that made owed work steppable for it wakes it,
@@ -6520,7 +6529,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.owed_teardown_step() {
             self.drain_cleanup_queue();
         }
-        // Last, so objects the teardown step just finalized share it.
+        // Last, so objects the teardown step just finalized share it. Only
+        // the hold's first drain steps finalization; a later one finds the
+        // budget spent and leaves it owed for the next hold.
         self.finalize_owed_step();
         step_report::owed(
             step_report::Owed::Teardown,
@@ -6530,10 +6541,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// One step of the queued finalization of on-demand objects (DW2
-    /// §10.12 item 5), in every drain: it needs only T, P and the direct
-    /// map, so it runs on whatever root is active. `true` if any remain.
+    /// §10.12 item 5), at most one in a hold of T (DW2 §12.11 part 2 item
+    /// 11): the first drain of the hold that finds finalization owed takes
+    /// the step; every later one in the hold runs none and leaves it owed
+    /// for the next hold. It needs only T, P and the direct map, so it runs
+    /// on whatever root is active. `true` if any remain.
     fn finalize_owed_step(&mut self) -> bool {
+        if self.core.memory.finalization_owed() && !self.core.finalize_budget.get_mut().may_step() {
+            step_report::owed(step_report::Owed::Finalize, true);
+            return true;
+        }
+        self.finalize_owed_step_unbudgeted()
+    }
+
+    /// [`Self::finalize_owed_step`] without asking the hold's budget: only
+    /// for the system's end, which completes every owed finalization in its
+    /// one hold. Every step it runs is still counted as the hold's.
+    fn finalize_owed_step_unbudgeted(&mut self) -> bool {
         let owed = if self.core.memory.finalization_owed() {
+            self.core.finalize_budget.get_mut().ran();
             let cpu = self.cpu().index();
             let began = step_report::now();
             // The object completed in this step that was queued first, for
@@ -7028,8 +7054,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         // The system is ending: every owed finalization completes here, so
         // the capacity proof below sees each slot free (DW2 §10.12, step-6
-        // review D1). Bounded by what the last drains queued.
-        while self.finalize_owed_step() {}
+        // review D1). Bounded by what the last drains queued. Many steps in
+        // this one hold, past its budget, so the unbudgeted step.
+        while self.finalize_owed_step_unbudgeted() {}
+        // The system is ending: these steps complete what is owed, not one
+        // hold's share of it, so the hold-end check does not report them.
+        // Drains after this in the hold are counted as any hold's.
+        self.core.finalize_budget.get_mut().discard();
         if self.core.memory.active_lease_count() != 0
             || self
                 .core
@@ -8272,7 +8303,10 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // A touch refused while a dead job's teardown or an object's
             // finalization is owed frees owed memory first (§10.10 item 7,
             // §10.12 item 6): this entry's one step, in a whole drain, then
-            // the touch comes again.
+            // the touch comes again. The finalize step is the hold's one
+            // (DW2 §12.11 part 2 item 11): if this hold's safe point already
+            // ran it, this drain skips it, `Released` is still returned, the
+            // touch comes again and the next hold steps.
             if matches!(
                 outcome,
                 crate::syscall::native::UserPageFaultOutcome::Exhausted(_)
@@ -9224,6 +9258,9 @@ pub(super) fn enter(
                                 outboxes: (crate::syscall::CleanupOutboxes::new()),
                                 parked: (crate::syscall::ParkedCalls::new()),
                                 owed_teardown: (crate::object::slot_queue::SlotQueue::new()),
+                                finalize_budget: (core::cell::Cell::new(
+                                    crate::syscall::HoldStepBudget::new()
+                                )),
                             }
                         );
                         init_fields!(

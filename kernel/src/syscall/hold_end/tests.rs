@@ -530,3 +530,27 @@ fn the_state_round_trips_through_its_bits() {
     assert_eq!(OwedHoldState::from_bits(state.bits()), state);
     assert_eq!(OwedHoldState::from_bits(0), OwedHoldState::default());
 }
+
+/// DW2 §12.11 part 2 item 11: a hold may run one step. It may step until
+/// a step ran; the end reports every step that ran, asked or not, and
+/// starts the next hold with its own step; a discard forgets the count.
+#[test]
+fn a_hold_step_budget_allows_one_step_and_counts_every_step_run() {
+    let mut budget = HoldStepBudget::new();
+    assert!(budget.may_step(), "a fresh hold may step");
+    assert_eq!(budget.end(), 0, "a hold that ran nothing ran no step");
+    budget.ran();
+    assert!(!budget.may_step(), "no second step after one ran");
+    budget.ran();
+    assert!(!budget.may_step());
+    assert_eq!(budget.end(), 2, "a step run without asking is counted");
+    assert!(budget.may_step(), "the end gave the next hold its step");
+    assert_eq!(budget.end(), 0, "the end cleared the count");
+    budget.ran();
+    assert_eq!(budget.end(), 1);
+    budget.ran();
+    budget.ran();
+    budget.discard();
+    assert!(budget.may_step(), "a discard leaves the hold its step");
+    assert_eq!(budget.end(), 0, "a discard leaves nothing to report");
+}

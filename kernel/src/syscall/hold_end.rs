@@ -145,6 +145,46 @@ pub(crate) fn settle_hold_queues<const CAPACITY: usize, const CPUS: usize>(
     }
 }
 
+/// The steps of one kind of owed work a hold has run, and whether it may
+/// run another: one per hold (DW2 §12.11 part 2 item 11). A step that runs
+/// is counted with [`Self::ran`] whether or not it asked
+/// [`Self::may_step`], so the count read at the hold's end with
+/// [`Self::end`] is what the hold ran, not what the budget allowed.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct HoldStepBudget {
+    steps: u32,
+}
+
+impl HoldStepBudget {
+    pub(crate) const fn new() -> Self {
+        Self { steps: 0 }
+    }
+
+    /// Whether the hold may run a step: while it has run none.
+    pub(crate) const fn may_step(&self) -> bool {
+        self.steps == 0
+    }
+
+    /// One step ran in the hold.
+    pub(crate) const fn ran(&mut self) {
+        self.steps = self.steps.saturating_add(1);
+    }
+
+    /// At the hold's end: the steps it ran, and a fresh budget for the
+    /// next hold.
+    pub(crate) const fn end(&mut self) -> u32 {
+        let steps = self.steps;
+        self.steps = 0;
+        steps
+    }
+
+    /// Forgets the steps run so far in the hold, which are not a hold's to
+    /// report (the system's end completing every owed step at once).
+    pub(crate) const fn discard(&mut self) {
+        self.steps = 0;
+    }
+}
+
 /// What a hold did to one queue of owed work (DW2 §10.19 revision 3): it
 /// queued into it while it was empty, and the queue was still non-empty
 /// when the hold ended.
