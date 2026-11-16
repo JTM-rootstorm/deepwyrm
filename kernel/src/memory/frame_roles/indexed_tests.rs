@@ -745,3 +745,56 @@ fn an_on_demand_root_still_refuses_a_multi_page_entry_an_eager_root_takes() {
     assert_eq!(resolve(&roles, root, 3), Err(FrameRoleError::WrongRole));
     assert_eq!(resolve(&roles, root, 0), Err(FrameRoleError::WrongRole));
 }
+
+#[test]
+fn a_gap_or_a_misplaced_entry_in_an_eager_index_fails_the_invariants() {
+    let (mut roles, model) = small(256);
+    let _held = holes(&mut roles, &[4; 20]);
+    // 17 runs of four pages; the root is the leaf.
+    let grant = backing(&mut roles, 68);
+    assert_eq!(grant.run_count(), 17);
+    assert_eq!(roles.check_invariants(), Ok(()));
+    let root = grant.physical_start();
+    let write = |entry: usize, value: u64| {
+        #[allow(unsafe_code, reason = "the test owns the model's node")]
+        // SAFETY: the model's root node, which the test owns.
+        unsafe {
+            model.write(root, entry, value)
+        };
+    };
+    let first = model.read(root, 0);
+    let second = model.read(root, 4);
+    assert_ne!(first, second);
+    // A gap inside a run, then between runs.
+    for page in [5, 8] {
+        let raw = model.read(root, page);
+        write(page, 0);
+        assert_eq!(
+            roles.check_invariants(),
+            Err(FrameRoleError::InvariantViolation),
+            "page {page}"
+        );
+        assert_eq!(
+            resolve(&roles, grant.identity(), page as u64),
+            Err(FrameRoleError::WrongRole)
+        );
+        write(page, raw);
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+    // A page naming a run before it, or after it, that does not hold it.
+    let raw = model.read(root, 9);
+    for wrong in [first, second, model.read(root, 12)] {
+        write(9, wrong);
+        assert_eq!(
+            roles.check_invariants(),
+            Err(FrameRoleError::InvariantViolation)
+        );
+        assert_eq!(
+            resolve(&roles, grant.identity(), 9),
+            Err(FrameRoleError::WrongRole)
+        );
+    }
+    write(9, raw);
+    assert_eq!(roles.check_invariants(), Ok(()));
+    roles.cancel_object_backing(grant).unwrap();
+}
