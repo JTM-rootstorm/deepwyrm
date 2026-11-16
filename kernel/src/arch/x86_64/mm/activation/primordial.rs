@@ -4050,10 +4050,11 @@ struct PrimordialRuntimeCore<'roles, const RANGE_CAPACITY: usize, const ROLE_CAP
     /// Exited Processes whose roots are owed teardown, by registry slot
     /// (DW2 §10.10 item 1); stepped by drains on a live Process's root.
     owed_teardown: crate::object::slot_queue::SlotQueue<ProcessKey, REGISTRY_OBJECTS>,
-    /// This hold's one finalize step (DW2 §12.11 part 2 item 11): taken by
-    /// the first step a drain runs in the hold, refused to every later one,
-    /// and read and renewed by the guard's hold-end check, which has only
-    /// `&self`, hence the `Cell`. Every access is under T.
+    /// This hold's one finalize step (DW2 §12.11 part 2 item 11) and the
+    /// finalize steps it ran: a drain steps only while none ran, every step
+    /// that runs is counted, and the guard's hold-end check reads and
+    /// renews it, with only `&self`, hence the `Cell`. Every access is
+    /// under T.
     finalize_budget: core::cell::Cell<crate::syscall::HoldStepBudget>,
 }
 
@@ -4125,9 +4126,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
             self.core.memory.finalization_owed(),
             !self.core.owed_teardown.is_empty(),
         );
-        // The finalize steps this hold ran through its budget, for the
-        // report; the next hold starts with its own step (DW2 §12.11 part 2
-        // item 11).
+        // The finalize steps this hold ran, for the report; the next hold
+        // starts with its own step (DW2 §12.11 part 2 item 11).
         step_report::finalize_hold_ended(self.core.finalize_budget.take().end());
     }
 
@@ -6547,18 +6547,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// for the next hold. It needs only T, P and the direct map, so it runs
     /// on whatever root is active. `true` if any remain.
     fn finalize_owed_step(&mut self) -> bool {
-        if self.core.memory.finalization_owed() && !self.core.finalize_budget.get_mut().take() {
+        if self.core.memory.finalization_owed() && !self.core.finalize_budget.get_mut().may_step() {
             step_report::owed(step_report::Owed::Finalize, true);
             return true;
         }
         self.finalize_owed_step_unbudgeted()
     }
 
-    /// [`Self::finalize_owed_step`] without the hold's budget, and not
-    /// counted in the report's steps in one hold: only for the system's
-    /// end, which completes every owed finalization in its one hold.
+    /// [`Self::finalize_owed_step`] without asking the hold's budget: only
+    /// for the system's end, which completes every owed finalization in its
+    /// one hold. Every step it runs is still counted as the hold's.
     fn finalize_owed_step_unbudgeted(&mut self) -> bool {
         let owed = if self.core.memory.finalization_owed() {
+            self.core.finalize_budget.get_mut().ran();
             let cpu = self.cpu().index();
             let began = step_report::now();
             // The object completed in this step that was queued first, for
@@ -7056,6 +7057,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // review D1). Bounded by what the last drains queued. Many steps in
         // this one hold, past its budget, so the unbudgeted step.
         while self.finalize_owed_step_unbudgeted() {}
+        // The system is ending: these steps complete what is owed, not one
+        // hold's share of it, so the hold-end check does not report them.
+        // Drains after this in the hold are counted as any hold's.
+        self.core.finalize_budget.get_mut().discard();
         if self.core.memory.active_lease_count() != 0
             || self
                 .core
