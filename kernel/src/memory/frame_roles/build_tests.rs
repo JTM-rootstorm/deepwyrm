@@ -706,3 +706,38 @@ fn an_allocation_abandoned_at_each_stage_owes_only_what_is_linked() {
         assert_eq!(roles.check_invariants(), Ok(()));
     }
 }
+
+/// DW2 §12.11 part 2 item 6: an index abandoned with fewer pages linked
+/// than one level below its root covers keeps its root's levels, with
+/// `pages` set to what is linked, and is freed by owed steps all the same:
+/// one run of 300 pages under a two-level root, and one of 4,096 under a
+/// three-level root.
+#[test]
+fn an_index_abandoned_with_less_linked_than_its_levels_cover_is_freed_in_steps() {
+    let mut two_level = std::vec![1; 30];
+    two_level.extend([300; 18]);
+    for (sizes, pages, levels, run) in [
+        (two_level, 17 * 300, 2, 300),
+        (std::vec![16_500; 17], 16 * 16_500 + 100, 3, RUN_CAP),
+    ] {
+        let (mut roles, _, _held) = holed(&sizes);
+        let initial = roles.available_frames();
+        let mut allocation = roles.begin_backing(pages).unwrap();
+        let root = allocation.head;
+        assert_eq!(
+            roles.index_root(root, RootUse::Any).unwrap().1.levels,
+            levels
+        );
+        roles.extend_backing_runs(&mut allocation, 1).unwrap();
+        assert_eq!(allocation.linked, run);
+        assert!(run <= entry_span(levels - 1), "fits a shallower index");
+        let owed = roles.abandon_backing(allocation).expect("a run is linked");
+        assert_eq!(owed.pages(), run);
+        let (_, link) = roles.index_root(root, RootUse::Any).unwrap();
+        assert_eq!((link.pages, link.levels), (run, levels));
+        assert_eq!(roles.check_invariants(), Ok(()));
+        assert_eq!(free_owed(&mut roles, owed, 5), run);
+        assert_eq!(roles.available_frames(), initial, "{levels} levels");
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+}
