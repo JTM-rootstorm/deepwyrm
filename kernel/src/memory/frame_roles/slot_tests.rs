@@ -179,9 +179,9 @@ fn pages(start: u64, count: u64) -> PageRange {
     }
 }
 
-#[test]
-fn a_record_of_every_role_kind_survives_a_store_and_a_read() {
-    let mut roles = manager(BASE_PAGE_SIZE, 8);
+/// One role of every kind, with owners and parents of `roles`' domain and
+/// links at their limits.
+fn every_role(roles: &TestManager) -> [FrameRole; 18] {
     let owner = TableOwnerKey {
         domain: roles.domain,
         raw: u64::MAX,
@@ -196,7 +196,7 @@ fn a_record_of_every_role_kind_survives_a_store_and_a_read() {
         owner: u64::MAX,
         place: u64::MAX - 1,
     };
-    let kinds = [
+    [
         FrameRole::AllocatedUninitialized,
         FrameRole::Zeroed,
         FrameRole::BackingAllocated(link),
@@ -238,7 +238,13 @@ fn a_record_of_every_role_kind_survives_a_store_and_a_read() {
         }),
         FrameRole::IndexNode(entry),
         FrameRole::ObjectPage(entry),
-    ];
+    ]
+}
+
+#[test]
+fn a_record_of_every_role_kind_survives_a_store_and_a_read() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let kinds = every_role(&roles);
     // One page, and the most a slot stores, at the top of a 52-bit space.
     let ranges = [
         pages(BASE_PAGE_SIZE, 1),
@@ -786,4 +792,105 @@ fn check_invariants_fails_on_two_roots_of_one_owner() {
         roles.check_invariants(),
         Err(FrameRoleError::InvariantViolation)
     );
+}
+
+#[test]
+fn table_at_answers_only_for_a_committed_table() {
+    let mut roles = manager(BASE_PAGE_SIZE, 64);
+    let (root, child) = root_with_child(&mut roles);
+    let root_slot = roles.slot(root.role).unwrap();
+    let child_slot = roles.slot(child.role).unwrap();
+    let proof = roles.begin_empty_table_hierarchy(root).unwrap();
+    assert_eq!(
+        roles.table_at(root_slot),
+        Some(TableFacts {
+            start: root.physical_start(),
+            owner: root.owner().raw,
+            level: TableLevel::Pml4,
+            parent: 0,
+            mark: proof.epoch,
+            tables: 1,
+        })
+    );
+    assert_eq!(
+        roles.table_at(child_slot),
+        Some(TableFacts {
+            start: child.physical_start(),
+            owner: child.owner().raw,
+            level: TableLevel::Pdpt,
+            parent: root.role.raw,
+            mark: 0,
+            tables: 0,
+        })
+    );
+
+    // A free slot, a table candidate and every role that is not a committed
+    // table say nothing.
+    let free = roles.next_slot().unwrap().0;
+    assert_eq!(roles.table_at(free), None);
+    let owner = roles.create_table_owner().unwrap();
+    for level in [TableLevel::Pml4, TableLevel::Pd] {
+        let candidate = allocate_zeroed(&mut roles, 1);
+        let candidate = roles.prepare_table(candidate, owner, level).unwrap();
+        assert_eq!(
+            roles.table_at(roles.slot(candidate.identity).unwrap()),
+            None
+        );
+        roles.cancel_table_candidate(candidate).unwrap();
+    }
+    for role in every_role(&roles) {
+        let record = RoleRecord {
+            range: pages(1 << 40, 1),
+            role,
+        };
+        let slot = occupy_next(&mut roles, record);
+        let committed = matches!(role, FrameRole::PageTable { .. });
+        assert_eq!(roles.table_at(slot).is_some(), committed, "{role:?}");
+        roles.vacate(slot);
+    }
+}
+
+#[test]
+fn record_at_agrees_with_the_slot_view_for_every_role_kind() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let free = roles.next_slot().unwrap().0;
+    assert_eq!(roles.record_at(free), None);
+    assert_eq!(roles.record_at(free), roles.slot_view(free).record);
+    for range in [
+        pages(BASE_PAGE_SIZE, 1),
+        pages(
+            (1 << 52) - u64::from(u32::MAX) * BASE_PAGE_SIZE,
+            u64::from(u32::MAX),
+        ),
+    ] {
+        for role in every_role(&roles) {
+            let record = RoleRecord { range, role };
+            let slot = occupy_next(&mut roles, record);
+            assert_eq!(roles.record_at(slot), Some(record));
+            assert_eq!(roles.record_at(slot), roles.slot_view(slot).record);
+            roles.vacate(slot);
+        }
+    }
+}
+
+#[test]
+fn live_generation_is_none_for_a_free_and_a_retired_slot() {
+    let mut roles = manager(BASE_PAGE_SIZE, 8);
+    let never_used = roles.next_slot().unwrap().0;
+    assert_eq!(roles.live_generation(never_used), None);
+    let grant = roles.allocate(1).unwrap();
+    let slot = slot_number(grant.identity);
+    assert_eq!(roles.live_generation(slot), Some(1));
+    roles.cancel_allocation(grant).unwrap();
+    assert_eq!(roles.live_generation(slot), None);
+
+    roles.test_set_generation(slot, u32::MAX - 1);
+    let last = roles.allocate(1).unwrap();
+    assert_eq!(slot_number(last.identity), slot);
+    assert_eq!(roles.live_generation(slot), Some(u32::MAX));
+    roles.cancel_allocation(last).unwrap();
+    assert_eq!(roles.live_generation(slot), None);
+    assert_eq!(roles.slot_view(slot).generation, u32::MAX);
+    // Past the table.
+    assert_eq!(roles.live_generation(roles.roles.len()), None);
 }

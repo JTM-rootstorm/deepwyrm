@@ -482,7 +482,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn link_next(&mut self, slot: usize, next: u64) {
-        let mut record = self.slot_view(slot).record.expect("a linked run is live");
+        let mut record = self.record_at(slot).expect("a linked run is live");
         let FrameRole::BackingAllocated(link) = &mut record.role else {
             panic!("only a run being allocated is linked");
         };
@@ -556,10 +556,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         state: ChainState,
     ) -> Result<ChainRun, FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self
-            .slot_view(slot)
-            .record
-            .ok_or(FrameRoleError::InvalidGrant)?;
+        let record = self.record_at(slot).ok_or(FrameRoleError::InvalidGrant)?;
         let link = match (state, record.role) {
             (ChainState::Allocated, FrameRole::BackingAllocated(link))
             | (ChainState::Backing, FrameRole::ObjectBacking(link)) => link,

@@ -459,6 +459,21 @@ struct SlotView {
     tables: u32,
 }
 
+/// What a committed table's slot says about it: the questions the page
+/// walk and the empty-hierarchy proof ask, read without building a
+/// [`FrameRole`]. Owners and parents are raw values in this manager's
+/// domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TableFacts {
+    start: u64,
+    owner: u64,
+    level: TableLevel,
+    /// The parent's raw identity; 0 on a PML4.
+    parent: u64,
+    mark: u64,
+    tables: u32,
+}
+
 /// Allocator pages per role slot the grown table adds beyond the boot table:
 /// one per page, so slots cannot run out before pages do, since every run
 /// takes one slot and at least one page (DW2 M3 §6.7).

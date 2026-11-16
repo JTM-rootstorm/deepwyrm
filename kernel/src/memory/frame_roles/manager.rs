@@ -329,7 +329,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Ok(slot) => slot,
             Err(error) => return Err(GrantTransitionError::new(error, grant)),
         };
-        if self.slot_view(slot).record
+        if self.record_at(slot)
             != Some(RoleRecord {
                 range: grant.range,
                 role: FrameRole::TableCandidate {
@@ -424,7 +424,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .flatten()
             {
                 let tables = self
-                    .slot_view(counted)
+                    .table_at(counted)
+                    .expect("a counted slot is a committed table")
                     .tables
                     .checked_add(1)
                     .expect("a table count stays below the slot count");
@@ -461,18 +462,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &self,
         table: TableIdentity,
     ) -> Result<(), FrameRoleError> {
-        let record = self.record(table.role)?;
-        if record.range.start != table.physical_start
-            || record.range.page_count() != 1
-            || record.role
-                != (FrameRole::PageTable {
-                    owner: table.owner,
-                    level: table.level,
-                    parent: match record.role {
-                        FrameRole::PageTable { parent, .. } => parent,
-                        _ => None,
-                    },
-                })
+        let facts = self.table_facts(table.role)?;
+        if facts.start != table.physical_start
+            || table.owner.domain != self.domain
+            || facts.owner != table.owner.raw
+            || facts.level != table.level
         {
             return Err(FrameRoleError::WrongRole);
         }
@@ -490,23 +484,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let slot = self
             .dynamic_slot_at(physical_start)
             .ok_or(FrameRoleError::WrongRole)?;
-        let entry = self.slot_view(slot);
-        let record = entry.record.ok_or(FrameRoleError::WrongRole)?;
-        if !(record.range.start == physical_start
-            && record.range.page_count() == 1
-            && matches!(
-                record.role,
-                FrameRole::PageTable {
-                    owner: record_owner,
-                    level: record_level,
-                    ..
-                } if record_owner == owner && record_level == level
-            ))
-        {
+        // `validate_owner` guarantees the owner's domain is this manager's.
+        let facts = self.table_at(slot).ok_or(FrameRoleError::WrongRole)?;
+        if !(facts.start == physical_start && facts.owner == owner.raw && facts.level == level) {
             return Err(FrameRoleError::WrongRole);
         }
+        let generation = self
+            .live_generation(slot)
+            .ok_or(FrameRoleError::WrongRole)?;
         Ok(TableIdentity {
-            role: self.identity(slot, entry.generation)?,
+            role: self.identity(slot, generation)?,
             owner,
             level,
             physical_start,
@@ -523,14 +510,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if parent.owner != child.owner || parent.level.child() != Some(child.level) {
             return Err(FrameRoleError::InvalidTableParent);
         }
-        let child_record = self.record(child.role)?;
-        if !matches!(
-            child_record.role,
-            FrameRole::PageTable {
-                parent: Some(parent_role),
-                ..
-            } if parent_role == parent.role
-        ) {
+        // Both identities were validated by `slot`, so their domain is this
+        // manager's and the raw parent compares.
+        if self.table_facts(child.role)?.parent != parent.role.raw {
             return Err(FrameRoleError::InvalidTableParent);
         }
         Ok(())
@@ -577,12 +559,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(FrameRoleError::InvalidTableParent);
         }
         let parent_slot = self.slot(parent.role)?;
-        if self.slot_view(parent_slot).mark != candidate.epoch {
+        if self.table_at(parent_slot).map(|facts| facts.mark) != Some(candidate.epoch) {
             return Err(FrameRoleError::InvalidTableParent);
         }
         self.validate_table_child(parent, child)?;
         let child_slot = self.slot(child.role)?;
-        if self.slot_view(child_slot).mark == candidate.epoch {
+        if self.table_at(child_slot).map(|facts| facts.mark) == Some(candidate.epoch) {
             return Err(FrameRoleError::InvalidTableParent);
         }
         self.set_mark(child_slot, candidate.epoch);
@@ -606,7 +588,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             return Err(FrameRoleError::InvalidTableParent);
         }
         self.validate_table_identity(candidate.root)?;
-        let root = self.slot_view(self.slot(candidate.root.role)?);
+        let root = self.table_facts(candidate.root.role)?;
         if root.mark != candidate.epoch || root.tables != candidate.observed {
             return Err(FrameRoleError::InvalidTableParent);
         }
@@ -645,26 +627,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let slot = self
             .slot(table.role)
             .unwrap_or_else(|error| panic!("preflighted table disappeared: {error:?}"));
-        let entry = self.slot_view(slot);
-        let Some(RoleRecord {
-            range,
-            role:
-                FrameRole::PageTable {
-                    owner,
-                    level,
-                    parent: Some(parent),
-                },
-        }) = entry.record
+        let Some(facts) = self
+            .table_at(slot)
+            .filter(|facts| facts.level != TableLevel::Pml4)
         else {
             panic!("preflighted table is not a committed child table");
         };
-        if entry.mark != grant.epoch
-            || owner != grant.root.owner
-            || level != table.level
-            || range.start != table.physical_start
+        // The grant's root and the table's identity were minted by this
+        // manager (`slot` checked the table's), so owners compare raw.
+        if facts.mark != grant.epoch
+            || grant.root.owner.domain != self.domain
+            || facts.owner != grant.root.owner.raw
+            || facts.level != table.level
+            || facts.start != table.physical_start
         {
             panic!("table was not observed by this hierarchy proof");
         }
+        let owner = grant.root.owner;
+        let level = facts.level;
+        let parent = FrameRoleIdentity {
+            domain: self.domain,
+            raw: facts.parent,
+        };
+        let range = PageRange {
+            start: facts.start,
+            end: facts.start + BASE_PAGE_SIZE,
+        };
         grant.remaining = grant
             .remaining
             .checked_sub(1)
@@ -698,7 +686,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .flatten()
         {
             let tables = self
-                .slot_view(counted)
+                .table_at(counted)
+                .expect("a counted slot is a committed table")
                 .tables
                 .checked_sub(1)
                 .expect("a table count covers every committed child it counted");
@@ -712,7 +701,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if root.level != TableLevel::Pml4 {
             return Err(FrameRoleError::WrongRole);
         }
-        Ok(self.slot_view(self.slot(root.role)?).tables)
+        Ok(self.table_facts(root.role)?.tables)
     }
 
     /// Checks that `table` may be freed alone from the retiring hierarchy
@@ -738,7 +727,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.root_slot_of(parent.role)? != self.slot(root.role)? {
             return Err(FrameRoleError::InvalidTableParent);
         }
-        if self.slot_view(self.slot(table.role)?).tables != 0 {
+        if self.table_facts(table.role)?.tables != 0 {
             return Err(FrameRoleError::InvalidTableParent);
         }
         Ok(())
@@ -808,16 +797,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn root_slot_of(&self, mut identity: FrameRoleIdentity) -> Result<usize, FrameRoleError> {
         for _ in 0..4 {
             let slot = self.slot(identity)?;
-            match self.slot_view(slot).record.map(|record| record.role) {
-                Some(FrameRole::PageTable {
+            match self.table_at(slot) {
+                Some(TableFacts {
                     level: TableLevel::Pml4,
                     ..
                 }) => return Ok(slot),
-                Some(FrameRole::PageTable {
-                    parent: Some(parent),
-                    ..
-                }) => identity = parent,
-                _ => return Err(FrameRoleError::InvalidTableParent),
+                Some(facts) => {
+                    identity = FrameRoleIdentity {
+                        domain: self.domain,
+                        raw: facts.parent,
+                    };
+                }
+                None => return Err(FrameRoleError::InvalidTableParent),
             }
         }
         Err(FrameRoleError::InvalidTableParent)
@@ -841,7 +832,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if root.level != TableLevel::Pml4 {
             return Err(FrameRoleError::WrongRole);
         }
-        if self.slot_view(self.slot(root.role)?).tables != 0 {
+        if self.table_facts(root.role)?.tables != 0 {
             return Err(FrameRoleError::InvalidTableParent);
         }
         Ok(())
@@ -1363,7 +1354,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|_| panic!("the checked buddy adoption failed"));
         self.starts = Some(starts);
         for slot in 0..self.roles.len() {
-            if let Some(record) = self.slot_view(slot).record {
+            if let Some(record) = self.record_at(slot) {
                 self.set_start(record, slot);
             }
         }
@@ -1456,10 +1447,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         replacement: FrameRole,
     ) -> Result<(), FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self
-            .slot_view(slot)
-            .record
-            .ok_or(FrameRoleError::InvalidGrant)?;
+        let record = self.record_at(slot).ok_or(FrameRoleError::InvalidGrant)?;
         if record.range != range || record.role != expected {
             return Err(FrameRoleError::WrongRole);
         }
@@ -1480,10 +1468,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         expected: FrameRole,
     ) -> Result<(), FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self
-            .slot_view(slot)
-            .record
-            .ok_or(FrameRoleError::InvalidGrant)?;
+        let record = self.record_at(slot).ok_or(FrameRoleError::InvalidGrant)?;
         if record.range != range || record.role != expected || !record.role.is_dynamic() {
             return Err(FrameRoleError::WrongRole);
         }
@@ -1579,18 +1564,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Replaces the record of a live slot with the same range.
     pub(super) fn replace_record(&mut self, slot: usize, record: RoleRecord) {
-        let view = self.slot_view(slot);
-        assert!(view.record.is_some(), "a replaced record was live");
-        self.store(slot, view.generation, Some(record));
+        let generation = self
+            .live_generation(slot)
+            .expect("a replaced record was live");
+        self.store(slot, generation, Some(record));
         self.version = self.version.wrapping_add(1);
     }
 
     /// Empties a live slot and returns it to the free list unless its
     /// generation is spent.
     pub(super) fn vacate(&mut self, slot: usize) {
-        let view = self.slot_view(slot);
-        let record = view.record.expect("a vacated slot was live");
-        self.store(slot, view.generation, None);
+        let generation = self.live_generation(slot).expect("a vacated slot was live");
+        let record = self.record_at(slot).expect("a vacated slot was live");
+        self.store(slot, generation, None);
         self.clear_start(record);
         self.version = self.version.wrapping_add(1);
     }
@@ -1668,11 +1654,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .ok_or(FrameRoleError::InvalidGrant)?,
         )
         .map_err(|_| FrameRoleError::InvalidGrant)?;
-        if slot >= self.roles.len() {
-            return Err(FrameRoleError::InvalidGrant);
-        }
-        let entry = self.slot_view(slot);
-        if generation == 0 || entry.generation != generation || entry.record.is_none() {
+        if generation == 0 || self.live_generation(slot) != Some(generation) {
             return Err(FrameRoleError::InvalidGrant);
         }
         Ok(slot)
@@ -1680,9 +1662,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     pub(super) fn record(&self, identity: FrameRoleIdentity) -> Result<RoleRecord, FrameRoleError> {
         let slot = self.slot(identity)?;
-        self.slot_view(slot)
-            .record
-            .ok_or(FrameRoleError::InvalidGrant)
+        self.record_at(slot).ok_or(FrameRoleError::InvalidGrant)
+    }
+
+    /// The facts of the committed table `identity` names: `WrongRole` if
+    /// it names a live slot that is not one.
+    fn table_facts(&self, identity: FrameRoleIdentity) -> Result<TableFacts, FrameRoleError> {
+        self.table_at(self.slot(identity)?)
+            .ok_or(FrameRoleError::WrongRole)
     }
 
     fn validate_owner(&self, owner: TableOwnerKey) -> Result<(), FrameRoleError> {
@@ -1696,7 +1683,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let grant = &staged.grant;
         self.validate_owner(grant.owner)?;
         if self.slot(grant.identity)? != staged.slot
-            || self.slot_view(staged.slot).record
+            || self.record_at(staged.slot)
                 != Some(RoleRecord {
                     range: grant.range,
                     role: FrameRole::TableCandidate {

@@ -265,6 +265,85 @@ const fn is_pml4_level(role: FrameRole) -> bool {
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
 {
+    /// The generation of slot `slot` if it is live, from two fields: a live
+    /// slot has at least one page. `None` for a free or retired slot and for
+    /// a slot past the table.
+    #[inline]
+    pub(super) fn live_generation(&self, slot: usize) -> Option<u32> {
+        self.roles
+            .as_slice()
+            .get(slot)
+            .filter(|entry| entry.pages != 0)
+            .map(|entry| entry.generation)
+    }
+
+    /// The record slot `slot` holds: one unpack of its role and range.
+    #[inline]
+    pub(super) fn record_at(&self, slot: usize) -> Option<RoleRecord> {
+        let entry = self.roles.as_slice()[slot];
+        entry.role.unpack(self.domain).map(|role| RoleRecord {
+            range: PageRange {
+                start: entry.start,
+                end: entry.start + u64::from(entry.pages) * BASE_PAGE_SIZE,
+            },
+            role,
+        })
+    }
+
+    /// The facts of a committed table of exactly one page in slot `slot`;
+    /// `None` for any other slot. No [`FrameRole`] is built.
+    #[inline]
+    pub(super) fn table_at(&self, slot: usize) -> Option<TableFacts> {
+        let entry = self.roles.as_slice()[slot];
+        if entry.pages != 1 {
+            return None;
+        }
+        match entry.role {
+            StoredRole::Root {
+                owner,
+                mark,
+                tables,
+                ..
+            } => Some(TableFacts {
+                start: entry.start,
+                owner,
+                level: TableLevel::Pml4,
+                parent: 0,
+                mark,
+                tables,
+            }),
+            StoredRole::PageTable {
+                owner,
+                parent,
+                mark,
+                tables,
+                level,
+            } => Some(TableFacts {
+                start: entry.start,
+                owner,
+                level,
+                parent,
+                mark,
+                tables,
+            }),
+            StoredRole::Free
+            | StoredRole::AllocatedUninitialized
+            | StoredRole::Zeroed
+            | StoredRole::BackingAllocated(_)
+            | StoredRole::ObjectBacking(_)
+            | StoredRole::ArchitectureBootstrap(_)
+            | StoredRole::RootCandidate { .. }
+            | StoredRole::TableCandidate { .. }
+            | StoredRole::External(_)
+            | StoredRole::ExternalImmutableModule { .. }
+            | StoredRole::ExternalDeviceMmio
+            | StoredRole::RoleTableStorage
+            | StoredRole::IndexRoot(_)
+            | StoredRole::IndexNode(_)
+            | StoredRole::ObjectPage(_) => None,
+        }
+    }
+
     /// Slot `slot`, unpacked.
     #[inline]
     pub(super) fn slot_view(&self, slot: usize) -> SlotView {
@@ -328,6 +407,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Some(record) => {
                 let pages = u32::try_from(record.range.page_count())
                     .expect("a stored run has at most u32::MAX pages");
+                assert!(pages != 0, "a stored run has at least one page");
                 let role = StoredRole::pack(record.role, self.domain, counts, next_root);
                 (pages, record.range.start, role)
             }

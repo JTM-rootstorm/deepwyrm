@@ -737,10 +737,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn free_index_slot(&mut self, slot: usize) {
-        let record = self
-            .slot_view(slot)
-            .record
-            .expect("a freed index frame is live");
+        let record = self.record_at(slot).expect("a freed index frame is live");
         self.allocator
             .free_run(record.range)
             .expect("a live run frees: the boot free list is sized by the role slots (M1), and the buddy allocator links every page");
