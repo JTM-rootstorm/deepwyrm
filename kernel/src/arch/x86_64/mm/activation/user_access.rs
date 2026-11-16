@@ -1204,36 +1204,26 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         });
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "the authenticated scratch session zeroes the exclusive physical allocation before the typed Zeroed transition"
-    )]
-    pub(crate) fn allocate_zeroed_backing(
-        &mut self,
-        page_count: u64,
-    ) -> Result<ObjectBackingGrant, LiveUserAccessError> {
-        let limit = self.selected_root().physical_limit();
-        let scratch = &mut self.target.scratch;
-        let mut zero = |page: u64| {
-            FrameAddress::new(page, limit)
-                .is_ok_and(|frame| scratch.zero_allocator_frame(frame).is_ok())
-        };
-        // SAFETY: `zero` clears each exclusively owned page of the new
-        // backing through the authenticated scratch mapping, or fails.
-        unsafe { self.roles.allocate_zeroed_backing(page_count, &mut zero) }
-            .inspect(backing_made)
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
-    }
-
-    /// A new MemoryObject's backing, allocated and not yet zeroed, for
-    /// zeroing in steps (DW2 M4b).
-    pub(crate) fn allocate_backing(
+    /// A new MemoryObject's backing, its first hold: at most 16 runs, and
+    /// an index root if they do not cover it, built on in steps and then
+    /// zeroed in steps (DW2 M4b, §12.11 part 2 item 2).
+    pub(crate) fn begin_backing(
         &mut self,
         page_count: u64,
     ) -> Result<crate::memory::frame_roles::BackingAllocation, LiveUserAccessError> {
         self.roles
-            .allocate_backing(page_count)
+            .begin_backing(page_count)
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+    }
+
+    /// One building step of a new MemoryObject's backing (DW2 §12.11 part
+    /// 2 item 3); `false` if it failed, the allocation left valid for
+    /// abandonment.
+    pub(crate) fn extend_backing(
+        &mut self,
+        allocation: &mut crate::memory::frame_roles::BackingAllocation,
+    ) -> bool {
+        self.roles.extend_backing(allocation).is_ok()
     }
 
     /// A new on-demand MemoryObject's backing: its index root, zeroed, and
@@ -1283,16 +1273,6 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .unwrap_or_else(|_| panic!("a zeroed backing allocation becomes a backing"));
         backing_made(&backing);
         backing
-    }
-
-    /// Frees an allocation that will not become a backing.
-    pub(crate) fn cancel_backing(
-        &mut self,
-        allocation: crate::memory::frame_roles::BackingAllocation,
-    ) {
-        self.roles
-            .cancel_backing_allocation(allocation)
-            .unwrap_or_else(|_| panic!("a fresh backing allocation frees"));
     }
 
     #[allow(
