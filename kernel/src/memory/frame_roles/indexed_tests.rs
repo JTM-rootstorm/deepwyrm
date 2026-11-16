@@ -577,10 +577,15 @@ fn release_in_steps<const R: usize, const S: usize>(
         let back = roles.available_frames() - before;
         assert!(back >= freed && back - freed <= u64::from(INDEX_MAX_LEVELS) * visited);
         assert_eq!(roles.check_invariants(), Ok(()));
-        // The pages from the cursor on still resolve.
+        // A backing being freed resolves for nobody, its pages past the
+        // cursor included.
         for page in [next, next + 1, pages - 1] {
             if (next..pages).contains(&page) {
-                assert!(resolve(roles, backing, page).is_ok(), "page {page}");
+                assert_eq!(
+                    resolve(roles, backing, page),
+                    Err(FrameRoleError::WrongRole),
+                    "page {page}"
+                );
             }
         }
         freed_pages += freed;
@@ -781,6 +786,20 @@ fn a_gap_or_a_misplaced_entry_in_an_eager_index_fails_the_invariants() {
         write(page, raw);
         assert_eq!(roles.check_invariants(), Ok(()));
     }
+    // The first run's entries cleared, as a stepped release would leave
+    // them: an `Eager` root that no release has stepped is not whole.
+    let cleared: Vec<u64> = (0..4).map(|page| model.read(root, page)).collect();
+    for page in 0..4 {
+        write(page, 0);
+    }
+    assert_eq!(
+        roles.check_invariants(),
+        Err(FrameRoleError::InvariantViolation)
+    );
+    for (page, raw) in cleared.into_iter().enumerate() {
+        write(page, raw);
+    }
+    assert_eq!(roles.check_invariants(), Ok(()));
     // A page naming a run before it, or after it, that does not hold it.
     let raw = model.read(root, 9);
     for wrong in [first, second, model.read(root, 12)] {
@@ -797,4 +816,86 @@ fn a_gap_or_a_misplaced_entry_in_an_eager_index_fails_the_invariants() {
     write(9, raw);
     assert_eq!(roles.check_invariants(), Ok(()));
     roles.cancel_object_backing(grant).unwrap();
+}
+
+#[test]
+fn a_backing_being_freed_resolves_for_nobody_and_stays_whole_mid_release() {
+    let (mut roles, model) = small(2048);
+    let mut sizes = std::vec![700, 300, 9, 3, 2];
+    sizes.extend([1; 16]);
+    let _held = holes(&mut roles, &sizes);
+    let initial = roles.available_frames();
+    let pages = 1026;
+    let grant = backing(&mut roles, pages);
+    let backing = grant.identity();
+    let _ = model;
+    assert!(resolve(&roles, backing, 1000).is_ok());
+    // One step: past the 700-page run's first leaf.
+    let (cursor, _, _) = roles.release_index_step(backing, 0, 1).unwrap();
+    assert_eq!(cursor, 512);
+    assert_eq!(
+        roles.role(backing.0),
+        Ok(FrameRoleKind::ObjectBacking(
+            ObjectBackingKind::AllocatorIndexed
+        ))
+    );
+    for page in [cursor, 700, 1000, pages - 1] {
+        assert_eq!(
+            resolve(&roles, backing, page),
+            Err(FrameRoleError::WrongRole),
+            "page {page}"
+        );
+    }
+    assert_eq!(
+        roles.validate_object_range(backing, cursor * PAGE, PAGE, false),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert!(!roles.is_on_demand(backing));
+    assert_eq!(
+        roles.commit_on_demand_page(backing, cursor),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.on_demand_commit_cost(backing, cursor),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.on_demand_commit_range_cost(backing, cursor, 1),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.decommit_on_demand_range(backing, cursor, pages, 64),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.on_demand_frames(backing),
+        Err(FrameRoleError::WrongRole)
+    );
+    // Its entries start past page 0 inside a run, and it is whole.
+    assert_eq!(roles.check_invariants(), Ok(()));
+    // Later steps take it; the final release frees the root.
+    let mut cursor = cursor;
+    while cursor < pages {
+        cursor = roles.release_index_step(backing, cursor, 5).unwrap().0;
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+    roles.cancel_object_backing(grant).unwrap();
+    assert_eq!(roles.available_frames(), initial);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_never_stepped_eager_backing_cancels_whole() {
+    let (mut roles, _) = small(2048);
+    let mut sizes = std::vec![700, 300, 9, 3, 2];
+    sizes.extend([1; 16]);
+    let _held = holes(&mut roles, &sizes);
+    let initial = roles.available_frames();
+    let free = roles.allocator.boot_free_ranges().to_vec();
+    let grant = backing(&mut roles, 1026);
+    assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
+    roles.cancel_object_backing(grant).unwrap();
+    assert_eq!(roles.available_frames(), initial);
+    assert_eq!(roles.allocator.boot_free_ranges(), free.as_slice());
+    assert_eq!(roles.check_invariants(), Ok(()));
 }

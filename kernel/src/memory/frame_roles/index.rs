@@ -70,6 +70,10 @@ pub(super) enum IndexRootState {
     EagerAllocated,
     /// An eager backing, every page held by a run.
     Eager,
+    /// An eager backing being freed in steps: the pages before the release
+    /// cursor have no entries. Nothing resolves it; only its release steps,
+    /// its final release and the invariant check take it.
+    EagerFreeing,
 }
 
 /// The root of an indexed backing.
@@ -87,12 +91,14 @@ pub(super) struct IndexRootLink {
 pub(super) enum RootUse {
     /// On-demand roots only: commit, decommit and their costs.
     OnDemand,
-    /// Zeroed eager roots only.
+    /// Zeroed eager roots, being freed or not: their final release.
     Eager,
     /// Eager roots not yet zeroed only: their zeroing and cancellation.
     Allocated,
-    /// On-demand and zeroed eager roots: lookups and finalization.
+    /// On-demand and zeroed eager roots not being freed: lookups.
     Live,
+    /// On-demand and zeroed eager roots, being freed or not: release steps.
+    Release,
     /// Every root: the invariant check.
     Any,
 }
@@ -102,8 +108,13 @@ impl RootUse {
     const fn accepts(self, state: IndexRootState) -> bool {
         matches!(
             (self, state),
-            (Self::OnDemand | Self::Live, IndexRootState::OnDemand)
-                | (Self::Eager | Self::Live, IndexRootState::Eager)
+            (
+                Self::OnDemand | Self::Live | Self::Release,
+                IndexRootState::OnDemand
+            ) | (
+                Self::Eager | Self::Live | Self::Release,
+                IndexRootState::Eager
+            ) | (Self::Eager | Self::Release, IndexRootState::EagerFreeing)
                 | (Self::Allocated, IndexRootState::EagerAllocated)
                 | (Self::Any, _)
         )
@@ -554,7 +565,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (root_range, root) = self.index_root(head, wanted)?;
         let memory = self.memory()?;
         let mut runs = (root.state != IndexRootState::OnDemand).then_some(RunScan {
-            partial: root.state == IndexRootState::Eager,
+            partial: root.state == IndexRootState::EagerFreeing,
             ..RunScan::default()
         });
         let frames = self.index_count_node(
@@ -655,7 +666,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             starts_here && scan.run_end == page
         } else {
             // The first entry: page 0, unless a stepped release has freed
-            // the pages before it (an `Eager` root only).
+            // the pages before it (a root being freed only).
             scan.partial || (page == 0 && starts_here)
         };
         if !fits {
@@ -736,6 +747,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// §10.12 item 2, §12.10 part 2 item 6): frees its frames and nodes in
     /// object-page order from `cursor`, visiting at most `budget` entries.
     ///
+    /// A zeroed eager root becomes a root being freed on the first step, so
+    /// nothing resolves it from then on.
+    ///
     /// Under an on-demand root a committed page is unlinked and freed and
     /// an absent entry skips its span. Under an eager root the entry at the
     /// cursor names a run: a run that goes on past the cursor's leaf moves
@@ -766,15 +780,30 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         budget: u64,
     ) -> Result<(u64, u64, u64), FrameRoleError> {
         let head = backing.0;
-        let (_, root) = self.index_root(head, RootUse::Live)?;
-        let eager = root.state == IndexRootState::Eager;
+        let (root_range, root) = self.index_root(head, RootUse::Release)?;
+        let eager = root.state != IndexRootState::OnDemand;
+        if root.state == IndexRootState::Eager {
+            // From the first step on, nothing resolves the backing: the
+            // pages before the cursor lose their entries.
+            let slot = self.slot(head)?;
+            self.replace_record(
+                slot,
+                RoleRecord {
+                    range: root_range,
+                    role: FrameRole::IndexRoot(IndexRootLink {
+                        state: IndexRootState::EagerFreeing,
+                        ..root
+                    }),
+                },
+            );
+        }
         let pages = root.pages;
         let memory = self.memory()?;
         let mut cursor = cursor.min(pages);
         let mut freed = 0_u64;
         let mut visited = 0_u64;
         while cursor < pages && visited < budget {
-            let (steps, found) = self.index_walk(head, cursor, RootUse::Live)?;
+            let (steps, found) = self.index_walk(head, cursor, RootUse::Release)?;
             let depth = steps
                 .iter()
                 .rposition(Option::is_some)
@@ -1235,7 +1264,8 @@ pub(super) struct EagerIndex {
 /// What a count of an eager root's entries has seen, in page order.
 #[derive(Clone, Copy, Default)]
 struct RunScan {
-    /// Whether the first entry may lie inside a run, past page 0.
+    /// Whether the root is being freed: its first entry may then lie
+    /// inside a run, past page 0, or there may be none.
     partial: bool,
     seen: bool,
     /// The page after the last entry seen.

@@ -372,7 +372,7 @@ impl FrameRole {
                     FrameRoleKind::ObjectBacking(ObjectBackingKind::OnDemand)
                 }
                 IndexRootState::EagerAllocated => FrameRoleKind::BackingAllocated,
-                IndexRootState::Eager => {
+                IndexRootState::Eager | IndexRootState::EagerFreeing => {
                     FrameRoleKind::ObjectBacking(ObjectBackingKind::AllocatorIndexed)
                 }
             },

@@ -1703,7 +1703,7 @@ mod owed_finalization {
     }
 
     #[test]
-    fn only_on_demand_objects_are_owed() {
+    fn a_chain_backed_object_is_completed_at_once() {
         let mut registry = ObjectRegistry::<1>::new();
         let mut authority = MemoryObjectAuthority::<1, 1>::new();
         let (_, owner) = grant(
@@ -1716,7 +1716,7 @@ mod owed_finalization {
         let finalization = authority.take_finalization(last).unwrap();
         let finalization = authority
             .defer_finalization(finalization)
-            .expect("a page-backed object completes at once");
+            .expect("a chain-backed object completes at once");
         assert!(!authority.finalization_owed());
         let (cleanup, _backing) = into_page_backed_cancellation_parts(finalization);
         let _ = registry.complete_payload_finalization(cleanup);
