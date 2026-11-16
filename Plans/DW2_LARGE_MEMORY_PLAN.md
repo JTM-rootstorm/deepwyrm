@@ -1442,7 +1442,7 @@ The manager loses `free_slots` and gains `first_free: u32` and `first_root: u32`
 
 **Not in 2a.** Where the table lives (2b). The start index (it stays). External roles' own scan at boot.
 
-### 12.4 Step 2b: the grown table in pieces: design (2026-11-15; approved with step 2; built after 2a)
+### 12.4 Step 2b: the grown table in pieces: design (2026-11-15; approved with step 2; built after 2a, with §12.8's notes)
 
 **The problem (§9 R1).** The grown table is one contiguous run, found first-fit at boot: 1.49% of RAM after 2a, about 950 MiB at 64 GiB. A memory map without such a hole stops the boot.
 
@@ -1633,3 +1633,17 @@ Every `unsafe` block added carries its `SAFETY` comment; the count of undocument
   Nothing is near the 5% rule; create and teardown move this much between boots of one build (§12.5).
 - *Not shown.* That the two halts at `arm_current_normal_quantum` were this fault: they logged nothing, and the only evidence is that the failing boot now passes. Whether the fault could be reached on real hardware. The deferred path and the halt record on a target: no boot took either; they rest on the host tests and on reading. Step instruction counts on four CPUs under icount are not compared with anything yet.
 - *Lanes.* `lane/m7-timer-arm` is merged and retired. The diagnostic lanes `lane/m7-diag-base`, `lane/m7-diag-2a` and `lane/m7-diag-halt` still exist with their unmerged throwaway commits; deleting them waits for Mike's word.
+
+### 12.8 Step 2b: what 2a as built changes for it (2026-11-16)
+
+§12.4 is the design and stands. It was written before §12.6's revision of 2a, so the coordinator read it against the code at `18fed40`. These notes add to it; where they differ from §12.4 in a detail, they govern.
+
+1. *The slot accessors.* Every slot read and write in `frame_roles/slot.rs` goes through `self.roles.as_slice()[slot]` or `as_mut_slice()` (27 places), §12.6's narrow readers and the in-place writers `occupy_slot` and `vacate_slot` among them. Those two calls go away. `ChunkedStore` and `GrowableStore` gain `entry(index) -> &T` beside §12.4's `get`, `get_mut` and `set`, so a reader that looks at two fields does not copy 48 bytes. Each accessor finds its slot once. The whole-table scans (`slot_views`, the list checks, the owner scans) walk the chunks with `iter`, not `get` per index.
+2. *The start index.* `starts` is `Option<&'static mut [u32]>` today, used in three helpers; it becomes `Option<ChunkedStore<u32>>`.
+3. *The test shift.* `growth_plan()` is `growth_plan_with(15)`; `growth_plan_with(min_shift)` computes `shift = max(min_shift, bits(slots - 1) - 6)`. Host tests pass a small minimum (3) so that tables of a few hundred slots are cut into many chunks. Production calls only `growth_plan()`.
+4. *The staged runs' slots.* Each staged part is an ordinary allocation and takes one of the 4,096 boot slots, at most 65. A shortage is a staging failure like any other: the staged parts are freed and the boot stops as it does today when growth fails. No code assumes one `RoleTableStorage` record (read: the role appears only in the classification arms and in the one place that writes it).
+5. *Where the pointer's contract lives.* `stage_growth_part` is the `unsafe fn`: its caller promises that `base` maps exactly that part's run, writable, 8-aligned and used by nothing else until the part is abandoned or for ever. Adoption relies on what staging was promised and says so in its `SAFETY` comments.
+6. *`manager.rs` is split.* It is 1,749 lines. The growth code (the plan, staging, adoption, abandoning, the carving helper) and the start index helpers move to a new `frame_roles/storage.rs`. If `manager.rs` is still above 1,500 lines, `check_invariants` and its helpers move too. Nothing else moves.
+7. *The slot-writer test runs on chunks.* §12.6's 6,000-operation differential test of the in-place writers against `store` also runs on a manager grown with the small shift, so occupied and vacated slots cross chunk boundaries.
+8. *Measurement.* Base is main at `18fed40` under `--icount` on one CPU (two boots already taken: runs `1794832872071629475` and `1794833567082471914`, which differ only in the timer fix). The coordinator boots 2b the same way. If map, protect or commit is more than 5% above the base, the work stops there and the worker counts instructions per function as in §12.6, before anything is tuned. The four-CPU icount boot is run as well, now that it passes.
+9. *The log lines.* `frame-role slots=<n>` gains `shift=<n>` and `groups=<n>`. Nothing in Wyrmroot reads these lines (checked: `dev-boot` does not match them).
