@@ -639,6 +639,10 @@ mod live {
         }
         TALLY.write_lines(emit);
         TALLY.write_finalize_lines(now(), emit);
+        let (retries, deferred) = crate::time::timer_arm_counts();
+        emit(format_args!(
+            "timer-arm retries={retries} deferred={deferred}"
+        ));
     }
 
     struct Line {

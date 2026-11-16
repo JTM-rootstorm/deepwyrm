@@ -21,8 +21,8 @@ use crate::sync::IrqSpinMutex;
 use crate::task::BlockWakeKey;
 
 use super::arbiter::{
-    HardwareArmIntent, HardwareStopIntent, LocalDeadlineSource, PhysicalArmSequence,
-    earliest_deadline,
+    HardwareArmIntent, HardwareArmPort, HardwareStopIntent, LocalDeadlineSource,
+    PhysicalArmSequence, earliest_deadline, reconcile_hardware_arm,
 };
 use super::service::TimerServiceSignal;
 use super::{
@@ -721,34 +721,85 @@ fn service_bsp_timer_request() -> Result<(), LiveTimeError> {
     reconcile_bsp_hardware_arm()
 }
 
-/// Programs the one physical BSP one-shot only after dropping the arbiter
-/// state guard, then verifies that no newer logical-source update won.
+/// Tries lost by BSP timer arms to an earlier deadline, and BSP arms that
+/// deferred to the immediate shot. Bumped only on those paths.
+static TIMER_ARM_RETRIES: AtomicU64 = AtomicU64::new(0);
+static TIMER_ARM_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// `(retries, deferred)` for the step report.
+pub(crate) fn timer_arm_counts() -> (u64, u64) {
+    (
+        TIMER_ARM_RETRIES.load(Ordering::Relaxed),
+        TIMER_ARM_DEFERRED.load(Ordering::Relaxed),
+    )
+}
+
+/// The BSP's time state and local APIC as a [`HardwareArmPort`]. Each
+/// operation takes the time lock itself; none holds it across the write.
+struct BspHardwareArm {
+    state: &'static IrqSpinMutex<LiveTimeState>,
+}
+
+struct BspArm {
+    sample: MonotonicSample,
+    intent: HardwareArmIntent,
+}
+
+impl HardwareArmPort for BspHardwareArm {
+    type Arm = BspArm;
+    type Error = LiveTimeError;
+
+    fn prepare_arm(&mut self) -> Result<BspArm, LiveTimeError> {
+        let sample = sample_clock_now()?;
+        let intent = self.state.lock().prepare_hardware_arm(sample)?;
+        Ok(BspArm { sample, intent })
+    }
+
+    fn write_arm(&mut self, arm: &BspArm) -> Result<(), LiveTimeError> {
+        with_bootstrap_local_apic(|controller, registers| {
+            debug_assert_ne!(arm.intent.deadline_ns, 0);
+            controller
+                .program_one_shot_timer(registers, arm.intent.shot.initial_count)
+                .map_err(|_| LiveTimeError::ApicAccess)
+        })
+    }
+
+    fn arm_covers_sources(&mut self, arm: &BspArm) -> bool {
+        let state = self.state.lock();
+        state
+            .hardware_arms
+            .still_covers(&arm.intent, state.next_deadline(arm.sample))
+    }
+
+    fn prepare_immediate_arm(&mut self) -> Result<BspArm, LiveTimeError> {
+        let sample = sample_clock_now()?;
+        let mut state = self.state.lock();
+        let timer_hz = state.apic_timer_hz;
+        let intent = state
+            .hardware_arms
+            .prepare(sample.nanoseconds, sample.nanoseconds, timer_hz)
+            .map_err(|_| LiveTimeError::Deadline)?;
+        Ok(BspArm { sample, intent })
+    }
+}
+
+/// Programs the BSP's one-shot so it fires no later than every source
+/// needs, writing the APIC only with the time lock dropped. Succeeds with
+/// the immediate shot when every try lost to an earlier deadline.
 fn reconcile_bsp_hardware_arm() -> Result<(), LiveTimeError> {
     if installed_current_cpu_index()? != CpuIndex::BOOTSTRAP {
         return Err(LiveTimeError::CpuIdentity);
     }
     let state = live_state().ok_or(LiveTimeError::Clock)?;
-    for _ in 0..8 {
-        let sample = sample_clock_now()?;
-        let intent = {
-            let mut state = state.lock();
-            state.prepare_hardware_arm(sample)?
-        };
-        with_bootstrap_local_apic(|controller, registers| {
-            debug_assert_ne!(intent.deadline_ns, 0);
-            controller
-                .program_one_shot_timer(registers, intent.shot.initial_count)
-                .map_err(|_| LiveTimeError::ApicAccess)
-        })?;
-        let committed = {
-            let state = state.lock();
-            state.hardware_arms.is_current(&intent)
-        };
-        if committed {
-            return Ok(());
-        }
+    let outcome = reconcile_hardware_arm(&mut BspHardwareArm { state })?;
+    let lost_tries = outcome.lost_tries();
+    if lost_tries != 0 {
+        TIMER_ARM_RETRIES.fetch_add(u64::from(lost_tries), Ordering::Relaxed);
     }
-    Err(LiveTimeError::Faulted)
+    if outcome.is_deferred() {
+        TIMER_ARM_DEFERRED.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// e1 receive seam shared with idle-wake/stop rendezvous state.
@@ -771,11 +822,11 @@ pub(crate) fn service_current_rendezvous_latch()
         match BSP_TIMER_SERVICE.take() {
             Ok(true) => {
                 if service_bsp_timer_request().is_err() {
-                    halt_forever();
+                    halt_forever("timer-service-request");
                 }
             }
             Ok(false) => {}
-            Err(_) => halt_forever(),
+            Err(_) => halt_forever("timer-service-signal"),
         }
     }
     Ok(notification)
@@ -1474,7 +1525,7 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
             // forbids returning an error that pretends `old` remained valid.
             // Losing the only timer-service notification is therefore a
             // correctness fault, not a recoverable Timer syscall failure.
-            halt_forever();
+            halt_forever("timer-replace-notify");
         }
         Ok(registration)
     }
@@ -1495,7 +1546,7 @@ impl TimerDeadlineAuthority for LiveTimerDeadlineAuthority {
         if program_local_timer {
             reconcile_bsp_hardware_arm().map_err(|_| TimerDeadlineError::Fault)?;
         } else if request_bsp_timer_service().is_err() {
-            halt_forever();
+            halt_forever("timer-cancel-notify");
         }
         Ok(())
     }
@@ -1653,7 +1704,7 @@ pub(crate) fn register_deadline(
                 let recovered = state
                     .deadlines
                     .cancel(registration)
-                    .unwrap_or_else(|_| halt_forever());
+                    .unwrap_or_else(|_| halt_forever("wait-rollback-after-arm"));
                 state.record_source_mutation();
                 recovered
             };
@@ -1665,7 +1716,7 @@ pub(crate) fn register_deadline(
             let recovered = state
                 .deadlines
                 .cancel(registration)
-                .unwrap_or_else(|_| halt_forever());
+                .unwrap_or_else(|_| halt_forever("wait-rollback-after-notify"));
             state.record_source_mutation();
             recovered
         };
@@ -1839,9 +1890,9 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
         panic!("timer interrupt handler entered with RFLAGS.AC set");
     }
     if !crate::arch::x86_64::idle::live_idle_wake_is_healthy() {
-        halt_forever();
+        halt_forever("irq-idle-wake");
     }
-    let cpu = installed_current_cpu_index().unwrap_or_else(|_| halt_forever());
+    let cpu = installed_current_cpu_index().unwrap_or_else(|_| halt_forever("irq-cpu-identity"));
     if cpu != CpuIndex::BOOTSTRAP {
         let scratch = {
             #[allow(
@@ -1853,23 +1904,24 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
             }
         };
         if scratch.is_some() {
-            halt_forever();
+            halt_forever("irq-ap-outcome-busy");
         }
-        *scratch = reconcile_ap_scheduler_hardware(cpu).unwrap_or_else(|_| halt_forever());
+        *scratch = reconcile_ap_scheduler_hardware(cpu)
+            .unwrap_or_else(|_| halt_forever("irq-ap-reconcile"));
         current_local_apic_slot()
             .and_then(PerCpuLocalApicSlot::end_of_interrupt)
-            .unwrap_or_else(|_| halt_forever());
+            .unwrap_or_else(|_| halt_forever("irq-ap-eoi"));
         if let Some(ticket) = scratch.take() {
             crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
-                .unwrap_or_else(|_| halt_forever());
+                .unwrap_or_else(|_| halt_forever("irq-ap-quantum-expiry"));
         }
         return;
     }
     if BSP_TIMER_SERVICE.ensure_healthy().is_err() {
-        halt_forever();
+        halt_forever("irq-timer-service");
     }
     let Some(state) = live_state() else {
-        halt_forever();
+        halt_forever("irq-time-state");
     };
     #[allow(
         unsafe_code,
@@ -1878,15 +1930,17 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
     let outcome = unsafe { &mut *BSP_INTERRUPT_OUTCOME.0.get() };
     {
         let mut state = state.lock();
-        state.interrupt(outcome).unwrap_or_else(|_| halt_forever());
+        state
+            .interrupt(outcome)
+            .unwrap_or_else(|_| halt_forever("irq-expire"));
     }
-    reconcile_bsp_hardware_arm().unwrap_or_else(|_| halt_forever());
+    reconcile_bsp_hardware_arm().unwrap_or_else(|_| halt_forever("irq-reconcile"));
     current_local_apic_slot()
         .and_then(PerCpuLocalApicSlot::end_of_interrupt)
-        .unwrap_or_else(|_| halt_forever());
+        .unwrap_or_else(|_| halt_forever("irq-eoi"));
     if outcome.wake_count != 0 {
         let Some(binding) = wake_binding() else {
-            halt_forever();
+            halt_forever("irq-wake-binding");
         };
         let wake_count = core::mem::take(&mut outcome.wake_count);
         for key in outcome
@@ -1906,7 +1960,7 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
     }
     if outcome.timer_expiry_count != 0 {
         let Some(binding) = timer_expiry_binding() else {
-            halt_forever();
+            halt_forever("irq-timer-binding");
         };
         let timer_expiry_count = core::mem::take(&mut outcome.timer_expiry_count);
         for token in outcome
@@ -1926,7 +1980,7 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
     }
     if let Some(ticket) = outcome.scheduler_quantum.take() {
         crate::arch::x86_64::syscall::publish_current_quantum_expiry(ticket)
-            .unwrap_or_else(|_| halt_forever());
+            .unwrap_or_else(|_| halt_forever("irq-quantum-expiry"));
     }
     // A wake resolved above only *stages* its runnable-work notification; the
     // e1 IPI that actually reaches a halted target CPU is sent by
@@ -1952,11 +2006,40 @@ fn read_pm_timer(descriptor: PmTimerDescriptor) -> u32 {
     io.read_u32(descriptor.port())
 }
 
+/// Writes `halt reason=<reason>` as one error record, then stops this CPU
+/// with interrupts disabled. The record only tries the output lock, a
+/// bounded number of times, so a held lock cannot keep the CPU from halting.
 #[allow(
     unsafe_code,
     reason = "an impossible F3 interrupt/runtime invariant is fail-stop with interrupts disabled"
 )]
-fn halt_forever() -> ! {
+fn halt_forever(reason: &'static str) -> ! {
+    // Guest-test builds keep their serial records exact.
+    #[cfg(not(feature = "test-support"))]
+    {
+        const PREFIX: &[u8] = b"halt reason=";
+        const RECORD_TRIES: u32 = 64;
+        let mut bytes = [0_u8; 64];
+        let mut len = 0;
+        for (slot, byte) in bytes.iter_mut().zip(PREFIX.iter().chain(reason.as_bytes())) {
+            *slot = *byte;
+            len += 1;
+        }
+        let message = core::str::from_utf8(&bytes[..len]).unwrap_or("halt reason=unprintable");
+        for _ in 0..RECORD_TRIES {
+            let written = crate::debug::emit_early_record(
+                crate::debug::DiagnosticLevel::Error,
+                "time",
+                message,
+            );
+            if written != Err(crate::debug::SerialError::Busy) {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    #[cfg(feature = "test-support")]
+    let _ = reason;
     loop {
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
     }
