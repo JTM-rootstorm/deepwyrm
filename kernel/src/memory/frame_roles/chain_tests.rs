@@ -161,14 +161,15 @@ fn running_out_of_role_slots_frees_every_run_taken() {
     let _held = fragment(&mut roles, &[1, 1, 1, 1, 1]);
     let before = roles.available_frames();
     // Hide all but three free slots: a five-run request takes three runs,
-    // then finds no slot.
+    // then finds no slot. The free list's length is its count (DW2 §12.3),
+    // so the invariants hold again once the count is restored.
     let free_slots = roles.free_slot_count;
     roles.free_slot_count = 3;
     assert_eq!(roles.allocate_backing(5), Err(FrameRoleError::Capacity));
     assert_eq!(roles.available_frames(), before);
     assert_eq!(roles.free_slot_count, 3);
-    assert_eq!(roles.check_invariants(), Ok(()));
     roles.free_slot_count = free_slots;
+    assert_eq!(roles.check_invariants(), Ok(()));
     assert_eq!(backing(&mut roles, 5).run_count(), 5);
 }
 

@@ -430,7 +430,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     pub(super) fn check_chains(&self) -> Result<(), FrameRoleError> {
         let mut linked = 0_u64;
         let mut reached = 0_u64;
-        for (slot, entry) in self.roles.as_slice().iter().enumerate() {
+        for (slot, entry) in self.slot_views() {
             let Some(record) = entry.record else {
                 continue;
             };
@@ -482,9 +482,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn link_next(&mut self, slot: usize, next: u64) {
-        let mut record = self.roles.as_slice()[slot]
-            .record
-            .expect("a linked run is live");
+        let mut record = self.slot_view(slot).record.expect("a linked run is live");
         let FrameRole::BackingAllocated(link) = &mut record.role else {
             panic!("only a run being allocated is linked");
         };
@@ -558,7 +556,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         state: ChainState,
     ) -> Result<ChainRun, FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self.roles.as_slice()[slot]
+        let record = self
+            .slot_view(slot)
             .record
             .ok_or(FrameRoleError::InvalidGrant)?;
         let link = match (state, record.role) {

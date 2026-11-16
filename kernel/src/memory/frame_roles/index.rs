@@ -737,7 +737,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn free_index_slot(&mut self, slot: usize) {
-        let record = self.roles.as_slice()[slot]
+        let record = self
+            .slot_view(slot)
             .record
             .expect("a freed index frame is live");
         self.allocator
@@ -751,7 +752,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     pub(super) fn check_indexes(&self) -> Result<(), FrameRoleError> {
         let mut linked = 0_u64;
         let mut reached = 0_u64;
-        for (slot, entry) in self.roles.as_slice().iter().enumerate() {
+        for (slot, entry) in self.slot_views() {
             let Some(record) = entry.record else {
                 continue;
             };

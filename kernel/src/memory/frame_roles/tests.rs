@@ -736,10 +736,8 @@ fn transition_table_set_import_is_atomic_and_exact() {
     let imported = unsafe { capacity_limited.import_transition_tables::<4>(&[0x20_000]) }.unwrap();
     assert_eq!(imported.len(), 1);
     let record = capacity_limited
-        .roles
-        .as_slice()
-        .iter()
-        .filter_map(|slot| slot.record)
+        .slot_views()
+        .filter_map(|(_, view)| view.record)
         .find(|record| record.range.start == 0x20_000)
         .unwrap();
     assert_eq!(
@@ -761,10 +759,8 @@ fn transition_table_set_import_is_atomic_and_exact() {
     assert_eq!(imported.len(), 2);
     for index in 0..2 {
         let record = roles
-            .roles
-            .as_slice()
-            .iter()
-            .filter_map(|slot| slot.record)
+            .slot_views()
+            .filter_map(|(_, view)| view.record)
             .find(|record| record.range.start == 0x30_000 + (index as u64) * BASE_PAGE_SIZE)
             .unwrap();
         assert_eq!(
