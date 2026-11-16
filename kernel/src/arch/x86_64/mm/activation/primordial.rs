@@ -1135,11 +1135,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
                 ),
                 // Allocated here, zeroed below in steps (DW2 M4b).
-                (Some(page_count), Some(_)) => Some(
-                    user.allocate_backing(page_count)
+                // The call alone is timed for the step report: it is one
+                // hold of P that no step covers (DW2 §12.11 part 1).
+                (Some(page_count), Some(_)) => Some({
+                    let began = step_report::now();
+                    let allocation = user.allocate_backing(page_count);
+                    let ended = step_report::now();
+                    if let Ok(allocation) = &allocation {
+                        step_report::backing_allocated(
+                            began,
+                            ended,
+                            allocation.run_count(),
+                            allocation.pages(),
+                        );
+                    }
+                    allocation
                         .map(EarlyBacking::Unzeroed)
-                        .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
-                ),
+                        .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+                }),
                 _ => None,
             };
             (atomic_pin, pinned, backing)

@@ -177,6 +177,31 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// to `u32::MAX`, so a reader never pairs one backing's runs with
     /// another's pages. Zero while none was made.
     backing_runs: AtomicU64,
+    /// The longest single `allocate_backing` call a create made since boot
+    /// (DW2 §12.11), with the runs and pages of the allocation it returned,
+    /// packed so a reader never pairs one call's duration with another's
+    /// runs or pages: microseconds in the top [`ALLOC_US_BITS`], runs in
+    /// the next [`ALLOC_RUNS_BITS`], pages in the low [`ALLOC_PAGES_BITS`],
+    /// each clamped to its field's maximum. Zero while none was recorded.
+    backing_alloc: AtomicU64,
+}
+
+/// The fields of [`StepTally::backing_allocated`]'s packed record. 24 bits
+/// of microseconds hold 16.7 s (under `--icount`, 16.7 billion guest
+/// instructions); 20 bits of runs or pages hold 1,048,575 (4 GiB of pages).
+/// A value past its field is clamped to the field's maximum: a clamped
+/// duration still ranks above every shorter one, and on a tie between two
+/// clamped durations the first is kept.
+const ALLOC_US_BITS: u32 = 24;
+const ALLOC_RUNS_BITS: u32 = 20;
+const ALLOC_PAGES_BITS: u32 = 20;
+const ALLOC_RUNS_SHIFT: u32 = ALLOC_PAGES_BITS;
+const ALLOC_US_SHIFT: u32 = ALLOC_RUNS_BITS + ALLOC_PAGES_BITS;
+const _: () = assert!(ALLOC_US_BITS + ALLOC_RUNS_BITS + ALLOC_PAGES_BITS == u64::BITS);
+
+/// The largest value a field of `bits` bits holds.
+const fn field_max(bits: u32) -> u64 {
+    (1 << bits) - 1
 }
 
 impl<const CPUS: usize> StepTally<CPUS> {
@@ -202,6 +227,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
             owed_wakes_queue: AtomicU64::new(0),
             owed_wakes_retirement: AtomicU64::new(0),
             backing_runs: AtomicU64::new(0),
+            backing_alloc: AtomicU64::new(0),
         }
     }
 
@@ -214,6 +240,24 @@ impl<const CPUS: usize> StepTally<CPUS> {
             .backing_runs
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
                 (runs > kept >> 32).then_some(packed)
+            });
+    }
+
+    /// A create's `allocate_backing` call ran from `began` to `ended` (ns)
+    /// and returned an allocation of `runs` runs and `pages` pages: it is
+    /// kept if it took more whole microseconds than the one kept, the first
+    /// kept on a tie. The three are one atomic word, replaced whole by one
+    /// `fetch_update`, so the kept duration always comes with its own
+    /// call's runs and pages, whoever calls and whoever reads.
+    pub(crate) fn backing_allocated(&self, began: u64, ended: u64, runs: u64, pages: u64) {
+        let us = (ended.saturating_sub(began) / 1000).min(field_max(ALLOC_US_BITS));
+        let packed = (us << ALLOC_US_SHIFT)
+            | (runs.min(field_max(ALLOC_RUNS_BITS)) << ALLOC_RUNS_SHIFT)
+            | pages.min(field_max(ALLOC_PAGES_BITS));
+        let _ = self
+            .backing_alloc
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
+                (us > kept >> ALLOC_US_SHIFT).then_some(packed)
             });
     }
 
@@ -506,6 +550,13 @@ impl<const CPUS: usize> StepTally<CPUS> {
             kept >> 32,
             kept & u64::from(u32::MAX)
         ));
+        let kept = self.backing_alloc.load(Ordering::Relaxed);
+        line(format_args!(
+            "backing-alloc-longest-us={} runs={} pages={}",
+            kept >> ALLOC_US_SHIFT,
+            (kept >> ALLOC_RUNS_SHIFT) & field_max(ALLOC_RUNS_BITS),
+            kept & field_max(ALLOC_PAGES_BITS)
+        ));
     }
 }
 
@@ -649,6 +700,16 @@ mod live {
         TALLY.backing_made(runs, pages);
     }
 
+    /// A create's `allocate_backing` call, timed with [`now`] read just
+    /// before and just after it, returned an allocation of `runs` runs and
+    /// `pages` pages (see [`StepTally::backing_allocated`]). Not recorded
+    /// when either read found no clock.
+    pub(crate) fn backing_allocated(began: Option<u64>, ended: Option<u64>, runs: u64, pages: u64) {
+        if let (Some(began), Some(ended)) = (began, ended) {
+            TALLY.backing_allocated(began, ended, runs, pages);
+        }
+    }
+
     /// A hold woke the BSP for owed work (see [`StepTally::owed_wake`]).
     pub(crate) fn owed_wake(queue: bool, retirement: bool, sent: bool) {
         TALLY.owed_wake(queue, retirement, sent);
@@ -705,9 +766,10 @@ mod live {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
-    after_safe_point, allow_teardown_step, at_safe_point, backing_made, call_ended,
-    finalize_queued, finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended,
-    report, set_drain_source, step_began, take_teardown_step, timed, timed_nested,
+    after_safe_point, allow_teardown_step, at_safe_point, backing_allocated, backing_made,
+    call_ended, finalize_queued, finalize_stepped, finalize_waited, now, owed, owed_wake,
+    parked_call_ended, report, set_drain_source, step_began, take_teardown_step, timed,
+    timed_nested,
 };
 
 #[cfg(test)]
@@ -738,6 +800,7 @@ mod tests {
                 "call-total-us map=0 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0",
                 "owed-longest-us teardown=0 finalize=0",
                 "backing-runs longest=0 pages=0",
+                "backing-alloc-longest-us=0 runs=0 pages=0",
             ]
         );
     }
@@ -745,7 +808,12 @@ mod tests {
     #[test]
     fn the_backing_with_the_most_runs_is_kept_with_its_pages() {
         let tally = StepTally::<2>::new();
-        let backing_line = |tally: &StepTally<2>| lines(tally).last().cloned().unwrap();
+        let backing_line = |tally: &StepTally<2>| {
+            lines(tally)
+                .into_iter()
+                .find(|line| line.starts_with("backing-runs "))
+                .unwrap()
+        };
         assert_eq!(backing_line(&tally), "backing-runs longest=0 pages=0");
         for (runs, pages) in [(1, 512), (7, 40), (3, 900), (1, 4096)] {
             tally.backing_made(runs, pages);
@@ -756,6 +824,67 @@ mod tests {
         assert_eq!(backing_line(&tally), "backing-runs longest=7 pages=40");
         tally.backing_made(8, 16);
         assert_eq!(backing_line(&tally), "backing-runs longest=8 pages=16");
+    }
+
+    fn alloc_line(tally: &StepTally<2>) -> String {
+        lines(tally).last().cloned().unwrap()
+    }
+
+    #[test]
+    fn the_longest_backing_allocation_is_kept_with_its_runs_and_pages() {
+        let tally = StepTally::<2>::new();
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=0 runs=0 pages=0"
+        );
+        tally.backing_allocated(1_000, 4_000, 2, 600);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=3 runs=2 pages=600"
+        );
+        // A longer call replaces it, with its own runs and pages.
+        tally.backing_allocated(10_000, 19_500, 17, 9_000);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=9 runs=17 pages=9000"
+        );
+        // A shorter one does not, nor an equal one (in whole microseconds).
+        tally.backing_allocated(0, 2_000, 400, 400);
+        tally.backing_allocated(0, 9_000, 1, 1);
+        tally.backing_allocated(0, 9_999, 3, 3);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=9 runs=17 pages=9000"
+        );
+        // A clock that went backwards counts as no time.
+        tally.backing_allocated(50_000, 10_000, 5, 5);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=9 runs=17 pages=9000"
+        );
+    }
+
+    #[test]
+    fn backing_allocation_fields_past_their_width_are_clamped() {
+        let tally = StepTally::<2>::new();
+        tally.backing_allocated(0, 1_000 << 30, 1 << 40, u64::MAX);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=16777215 runs=1048575 pages=1048575"
+        );
+        // A clamped duration ties with another clamped one: the first stays.
+        tally.backing_allocated(0, u64::MAX, 1, 1);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=16777215 runs=1048575 pages=1048575"
+        );
+        // Values that fit are kept exactly beside a clamped neighbour.
+        let tally = StepTally::<2>::new();
+        tally.backing_allocated(0, 16_777_215_000, 1_048_575, 7);
+        assert_eq!(
+            alloc_line(&tally),
+            "backing-alloc-longest-us=16777215 runs=1048575 pages=7"
+        );
     }
 
     #[test]
