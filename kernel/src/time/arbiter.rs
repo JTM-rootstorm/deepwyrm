@@ -178,6 +178,90 @@ impl PhysicalArmSequence {
         self.desired_generation == intent.generation
             && self.source_revision == intent.source_revision
     }
+
+    /// True when `intent` is still the desired arm and fires no later than
+    /// every source now needs: `earliest_deadline_ns`, computed from the
+    /// same clock sample `intent` was prepared with, is not earlier than the
+    /// deadline `intent` was prepared for. Source changes that leave the
+    /// earliest deadline where it was, or move it later, keep the arm.
+    pub(crate) const fn still_covers(
+        &self,
+        intent: &HardwareArmIntent,
+        earliest_deadline_ns: u64,
+    ) -> bool {
+        self.desired_generation == intent.generation && earliest_deadline_ns >= intent.deadline_ns
+    }
+}
+
+/// Tries [`reconcile_hardware_arm`] makes before it defers.
+pub(crate) const HARDWARE_ARM_TRIES: u32 = 8;
+
+/// The operations [`reconcile_hardware_arm`] runs against one CPU's timer
+/// sources and its one-shot timer.
+pub(crate) trait HardwareArmPort {
+    /// A prepared arm, carrying whatever the cover check needs.
+    type Arm;
+    type Error;
+
+    /// Samples the clock and prepares an arm for the earliest deadline.
+    fn prepare_arm(&mut self) -> Result<Self::Arm, Self::Error>;
+    /// Programs the one-shot timer with `arm`.
+    fn write_arm(&mut self, arm: &Self::Arm) -> Result<(), Self::Error>;
+    /// Whether `arm` still fires no later than the sources need
+    /// ([`PhysicalArmSequence::still_covers`]).
+    fn arm_covers_sources(&mut self, arm: &Self::Arm) -> bool;
+    /// Samples the clock and prepares an arm for that instant: the
+    /// smallest count, which is no later than any deadline.
+    fn prepare_immediate_arm(&mut self) -> Result<Self::Arm, Self::Error>;
+}
+
+/// How a successful [`reconcile_hardware_arm`] ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HardwareArmOutcome {
+    /// An arm that covers the sources is in the timer; `lost_tries` tries
+    /// before it were lost to an earlier deadline.
+    Committed { lost_tries: u32 },
+    /// Every try was lost; the timer holds the immediate arm, whose
+    /// interrupt expires what is due and reconciles again.
+    Deferred,
+}
+
+impl HardwareArmOutcome {
+    pub(crate) const fn lost_tries(self) -> u32 {
+        match self {
+            Self::Committed { lost_tries } => lost_tries,
+            Self::Deferred => HARDWARE_ARM_TRIES,
+        }
+    }
+
+    pub(crate) const fn is_deferred(self) -> bool {
+        match self {
+            Self::Committed { .. } => false,
+            Self::Deferred => true,
+        }
+    }
+}
+
+/// Programs the timer so it fires no later than every source needs.
+///
+/// Each try prepares an arm, writes it, and keeps it if it still covers the
+/// sources. After [`HARDWARE_ARM_TRIES`] lost tries it writes the immediate
+/// arm, which needs no recheck, and returns [`HardwareArmOutcome::Deferred`].
+/// At most `HARDWARE_ARM_TRIES + 1` writes. Any preparation or write error
+/// is returned at once.
+pub(crate) fn reconcile_hardware_arm<P: HardwareArmPort>(
+    port: &mut P,
+) -> Result<HardwareArmOutcome, P::Error> {
+    for lost_tries in 0..HARDWARE_ARM_TRIES {
+        let arm = port.prepare_arm()?;
+        port.write_arm(&arm)?;
+        if port.arm_covers_sources(&arm) {
+            return Ok(HardwareArmOutcome::Committed { lost_tries });
+        }
+    }
+    let immediate = port.prepare_immediate_arm()?;
+    port.write_arm(&immediate)?;
+    Ok(HardwareArmOutcome::Deferred)
 }
 
 #[cfg(test)]
@@ -415,5 +499,313 @@ mod tests {
         let bounded = arms.prepare(u64::MAX - 1, 0, u64::MAX).unwrap();
         assert_eq!(bounded.shot.initial_count, u32::MAX);
         assert!(!bounded.shot.reaches_deadline);
+    }
+
+    mod reconcile {
+        extern crate std;
+
+        use super::super::*;
+        use crate::time::{DeadlineQueue, DeadlineRegistration};
+        use std::vec::Vec;
+
+        /// One count per nanosecond, so a shot's count is its delta.
+        const HZ: u64 = 1_000_000_000;
+        const MAINTENANCE_NS: u64 = 1_000_000;
+        /// How far the clock moves between two samples.
+        const CLOCK_STEP_NS: u64 = 100;
+
+        /// The BSP's three sources and its arm sequence, mutated the way the
+        /// live time state mutates them: every accepted change moves the
+        /// source revision.
+        struct Sources {
+            waits: DeadlineQueue<16, u32>,
+            timers: DeadlineQueue<16, u32>,
+            quantum: LocalDeadlineSource<u32>,
+            arms: PhysicalArmSequence,
+            now_ns: u64,
+        }
+
+        impl Sources {
+            fn new() -> Self {
+                Self {
+                    waits: DeadlineQueue::new(),
+                    timers: DeadlineQueue::new(),
+                    quantum: LocalDeadlineSource::new(),
+                    arms: PhysicalArmSequence::initialized(),
+                    now_ns: 1_000,
+                }
+            }
+
+            fn earliest(&self) -> u64 {
+                earliest_deadline(
+                    [
+                        self.waits.earliest(),
+                        self.timers.earliest(),
+                        self.quantum.earliest(),
+                    ],
+                    MAINTENANCE_NS,
+                )
+            }
+
+            fn register_wait(&mut self, deadline_ns: u64) -> DeadlineRegistration {
+                let registration = self.waits.register(deadline_ns, 0).unwrap();
+                self.arms.source_mutated().unwrap();
+                registration
+            }
+
+            fn cancel_wait(&mut self, registration: DeadlineRegistration) {
+                self.waits.cancel(registration).unwrap();
+                self.arms.source_mutated().unwrap();
+            }
+
+            fn register_timer(&mut self, deadline_ns: u64) -> DeadlineRegistration {
+                let registration = self.timers.register(deadline_ns, 0).unwrap();
+                self.arms.source_mutated().unwrap();
+                registration
+            }
+
+            fn sample(&mut self) -> u64 {
+                self.now_ns = self.now_ns.checked_add(CLOCK_STEP_NS).unwrap();
+                self.now_ns
+            }
+        }
+
+        struct TestArm {
+            intent: HardwareArmIntent,
+            sample_ns: u64,
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        enum TestError {
+            Prepare,
+            Write,
+        }
+
+        /// Drives the real arm sequence. `peer` runs inside every write's
+        /// window, between the write and the cover check, with the index
+        /// of that write.
+        struct Port<F: FnMut(&mut Sources, usize)> {
+            sources: Sources,
+            peer: F,
+            /// Initial count of every shot written, in order.
+            writes: Vec<u32>,
+            /// Whether the old revision compare would have kept each arm.
+            revision_current: Vec<bool>,
+            prepares: usize,
+            write_attempts: usize,
+            fail_prepare_at: Option<usize>,
+            fail_write_at: Option<usize>,
+        }
+
+        impl<F: FnMut(&mut Sources, usize)> Port<F> {
+            fn new(sources: Sources, peer: F) -> Self {
+                Self {
+                    sources,
+                    peer,
+                    writes: Vec::new(),
+                    revision_current: Vec::new(),
+                    prepares: 0,
+                    write_attempts: 0,
+                    fail_prepare_at: None,
+                    fail_write_at: None,
+                }
+            }
+
+            fn begin_prepare(&mut self) -> Result<u64, TestError> {
+                let index = self.prepares;
+                self.prepares += 1;
+                if self.fail_prepare_at == Some(index) {
+                    return Err(TestError::Prepare);
+                }
+                Ok(self.sources.sample())
+            }
+        }
+
+        impl<F: FnMut(&mut Sources, usize)> HardwareArmPort for Port<F> {
+            type Arm = TestArm;
+            type Error = TestError;
+
+            fn prepare_arm(&mut self) -> Result<TestArm, TestError> {
+                let sample_ns = self.begin_prepare()?;
+                let deadline_ns = self.sources.earliest();
+                let intent = self
+                    .sources
+                    .arms
+                    .prepare(deadline_ns, sample_ns, HZ)
+                    .map_err(|_| TestError::Prepare)?;
+                Ok(TestArm { intent, sample_ns })
+            }
+
+            fn write_arm(&mut self, arm: &TestArm) -> Result<(), TestError> {
+                let index = self.write_attempts;
+                self.write_attempts += 1;
+                if self.fail_write_at == Some(index) {
+                    return Err(TestError::Write);
+                }
+                self.writes.push(arm.intent.shot.initial_count);
+                (self.peer)(&mut self.sources, index);
+                Ok(())
+            }
+
+            fn arm_covers_sources(&mut self, arm: &TestArm) -> bool {
+                // The maintenance deadline is fixed here, so the earliest
+                // deadline from `arm.sample_ns` is the sources' earliest.
+                assert!(arm.sample_ns <= self.sources.now_ns);
+                self.revision_current
+                    .push(self.sources.arms.is_current(&arm.intent));
+                self.sources
+                    .arms
+                    .still_covers(&arm.intent, self.sources.earliest())
+            }
+
+            fn prepare_immediate_arm(&mut self) -> Result<TestArm, TestError> {
+                let sample_ns = self.begin_prepare()?;
+                let intent = self
+                    .sources
+                    .arms
+                    .prepare(sample_ns, sample_ns, HZ)
+                    .map_err(|_| TestError::Prepare)?;
+                Ok(TestArm { intent, sample_ns })
+            }
+        }
+
+        /// A peer that registers an earlier wait inside every window.
+        fn earlier_every_window(sources: &mut Sources, index: usize) {
+            let index = u64::try_from(index).unwrap();
+            let _ = sources.register_wait(9_000 - 100 * index);
+        }
+
+        #[test]
+        fn source_changes_that_leave_the_earliest_deadline_keep_the_first_arm() {
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut later = Some(sources.register_wait(50_000));
+            let mut port = Port::new(sources, |sources, index| {
+                let index = u64::try_from(index).unwrap();
+                let next = sources.register_wait(60_000 + index);
+                if let Some(previous) = later.replace(next) {
+                    sources.cancel_wait(previous);
+                }
+            });
+
+            assert_eq!(
+                reconcile_hardware_arm(&mut port),
+                Ok(HardwareArmOutcome::Committed { lost_tries: 0 })
+            );
+            assert_eq!(port.writes, [10_000 - 1_100]);
+            // The revision moved inside the window: the revision compare
+            // would have lost this try, and every later one.
+            assert_eq!(port.revision_current, [false]);
+        }
+
+        #[test]
+        fn an_earlier_deadline_registered_once_costs_one_retry() {
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut port = Port::new(sources, |sources, index| {
+                if index == 0 {
+                    let _ = sources.register_timer(5_000);
+                }
+            });
+
+            assert_eq!(
+                reconcile_hardware_arm(&mut port),
+                Ok(HardwareArmOutcome::Committed { lost_tries: 1 })
+            );
+            assert_eq!(port.writes, [10_000 - 1_100, 5_000 - 1_200]);
+            assert_eq!(
+                HardwareArmOutcome::Committed { lost_tries: 1 }.lost_tries(),
+                1
+            );
+        }
+
+        #[test]
+        fn an_earlier_deadline_in_every_window_defers_with_the_immediate_arm() {
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut port = Port::new(sources, earlier_every_window);
+
+            let outcome = reconcile_hardware_arm(&mut port);
+            assert_eq!(outcome, Ok(HardwareArmOutcome::Deferred));
+            let outcome = outcome.unwrap();
+            assert!(outcome.is_deferred());
+            assert_eq!(outcome.lost_tries(), HARDWARE_ARM_TRIES);
+            let tries = usize::try_from(HARDWARE_ARM_TRIES).unwrap();
+            assert_eq!(port.writes.len(), tries + 1);
+            assert_eq!(port.writes.last(), Some(&1));
+            assert!(port.writes[..tries].iter().all(|count| *count > 1));
+            assert_eq!(port.revision_current.len(), tries);
+        }
+
+        #[test]
+        fn cancelling_the_earliest_deadline_keeps_the_early_arm() {
+            let mut sources = Sources::new();
+            let mut earliest = Some(sources.register_wait(10_000));
+            let _ = sources.register_wait(20_000);
+            let mut port = Port::new(sources, |sources, _| {
+                if let Some(registration) = earliest.take() {
+                    sources.cancel_wait(registration);
+                }
+            });
+
+            assert_eq!(
+                reconcile_hardware_arm(&mut port),
+                Ok(HardwareArmOutcome::Committed { lost_tries: 0 })
+            );
+            assert_eq!(port.writes, [10_000 - 1_100]);
+            assert_eq!(port.sources.earliest(), 20_000);
+        }
+
+        #[test]
+        fn preparation_and_write_errors_are_returned_on_a_try_and_on_the_immediate_arm() {
+            let tries = usize::try_from(HARDWARE_ARM_TRIES).unwrap();
+
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut port = Port::new(sources, |_, _| {});
+            port.fail_prepare_at = Some(0);
+            assert_eq!(reconcile_hardware_arm(&mut port), Err(TestError::Prepare));
+            assert!(port.writes.is_empty());
+
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut port = Port::new(sources, |_, _| {});
+            port.fail_write_at = Some(0);
+            assert_eq!(reconcile_hardware_arm(&mut port), Err(TestError::Write));
+            assert!(port.writes.is_empty());
+            assert_eq!(port.prepares, 1);
+
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut port = Port::new(sources, earlier_every_window);
+            port.fail_prepare_at = Some(tries);
+            assert_eq!(reconcile_hardware_arm(&mut port), Err(TestError::Prepare));
+            assert_eq!(port.writes.len(), tries);
+
+            let mut sources = Sources::new();
+            let _ = sources.register_wait(10_000);
+            let mut port = Port::new(sources, earlier_every_window);
+            port.fail_write_at = Some(tries);
+            assert_eq!(reconcile_hardware_arm(&mut port), Err(TestError::Write));
+            assert_eq!(port.writes.len(), tries);
+            assert_eq!(port.prepares, tries + 1);
+        }
+
+        #[test]
+        fn cover_check_needs_the_desired_generation_and_no_earlier_deadline() {
+            let mut arms = PhysicalArmSequence::initialized();
+            let intent = arms.prepare(1_000, 900, HZ).unwrap();
+            assert!(arms.still_covers(&intent, 1_000));
+            assert!(arms.still_covers(&intent, 1_500));
+            assert!(!arms.still_covers(&intent, 999));
+            arms.source_mutated().unwrap();
+            assert!(!arms.is_current(&intent));
+            assert!(arms.still_covers(&intent, 1_000));
+
+            let newer = arms.prepare(2_000, 900, HZ).unwrap();
+            assert!(!arms.still_covers(&intent, 1_000));
+            assert!(!arms.still_covers(&intent, 5_000));
+            assert!(arms.still_covers(&newer, 2_000));
+        }
     }
 }
