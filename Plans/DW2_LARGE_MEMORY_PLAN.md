@@ -1743,7 +1743,7 @@ The stop rule is 5%. The work stopped there, and the worker counted before anyth
 
 - *Read with §12.5's limits.* Nothing passes the 5% rule. Eager create and teardown move 1.6 to 1.8% between two boots of main, so their rows show no settled cost. These are instruction counts on one CPU, not times.
 - *Not shown.* Hardware time, and with it the TLB cost of reaching the table in 2 MiB pages (§9, M8). A boot whose table has more than two pieces, or 4 KiB leaves beyond the tail: host tests cover the map, the check and the manager on such shapes, but `build_table_map` and `grow_frame_roles` are target-only and ran only on the dev-boot guest's map. A machine with 1 GiB of table or more.
-- *Lanes.* `lane/m7-table-map` is merged and retired. Still present with unmerged commits, deletion waiting for Mike's word: `lane/m7-step2b` (`78914b5`), `lane/m7-count-base` (`5740baa`), `lane/m7-count-2b` (`f4fa14a`), and the diagnostic lanes `lane/m7-diag-base`, `lane/m7-diag-2a` and `lane/m7-diag-halt`.
+- *Lanes.* `lane/m7-table-map` is merged and retired. The six throwaway lanes were deleted the same day on Mike's word, each checked clean and at its recorded commit first: `lane/m7-step2b` (`78914b5`), `lane/m7-count-base` (`5740baa`), `lane/m7-count-2b` (`f4fa14a`), `lane/m7-diag-base` (`6ab6259`), `lane/m7-diag-2a` (`54ed5b8`) and `lane/m7-diag-halt` (`f8b7c31`). Their commits are no longer on any branch; what they found is in §12.6, §12.7 and this section. No lane remains.
 
 ### 12.10 Step 3: an index for fragmented eager backings: design (2026-11-16; waits for Mike's approval)
 
