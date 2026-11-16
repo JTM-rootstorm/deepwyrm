@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11). M5's seven steps are built and checked at the development tier (§10.18), and so is step 8, which Mike added on 2026-11-15: the wake that bounds how long owed finalization waits for its next step (§10.19, revision 3 as built). Mike had the probe for the wake built the same day (§10.19, the probe): it shows the wake sent and the gap at about 5 ms against 14 to 22 ms without it. **M5 is done at the development tier: closed by Mike, 2026-11-15** (§10.18), with the check's one-second deadline left as it is and the steps a BSP syscall takes accepted (§9). **M7 is started** (Mike, 2026-11-15): its first step, the buddy allocator, is built and checked at the development tier (§12.2, as built, Deepwyrm `1aeb551`); steps 2 to 4 are not designed yet.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11). M5's seven steps are built and checked at the development tier (§10.18), and so is step 8, which Mike added on 2026-11-15: the wake that bounds how long owed finalization waits for its next step (§10.19, revision 3 as built). Mike had the probe for the wake built the same day (§10.19, the probe): it shows the wake sent and the gap at about 5 ms against 14 to 22 ms without it. **M5 is done at the development tier: closed by Mike, 2026-11-15** (§10.18), with the check's one-second deadline left as it is and the steps a BSP syscall takes accepted (§9). **M7 is started** (Mike, 2026-11-15): its first step, the buddy allocator, is built and checked at the development tier (§12.2, as built, Deepwyrm `1aeb551`); step 2, the role table, is designed in §12.3 and §12.4 and waits for his approval; steps 3 and 4 are not designed yet.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -1250,7 +1250,7 @@ Mike, 2026-11-15: start M7 with the buddy allocator's design; the coordinator re
 Each step is designed here by the coordinator before it is built, approved by Mike, built by an Opus worker, then reviewed by the coordinator (the security review included, since the allocator and the boot path change) and booted with `dev-boot --check --smp --sdk`.
 
 1. **The buddy allocator** (§12.2). **Built 2026-11-15**, Deepwyrm `1aeb551`. Closes §9's R4 (allocation costs runs × free ranges) and §5.3a's R5 (the start index's position lookup scans the initial ranges).
-2. **The role table** (§6.8 item 4, §9's R1): a smaller `RoleSlot`, and storage that is not one contiguous run. Not designed yet.
+2. **The role table** (§6.8 item 4, §9's R1), in two parts built one after the other: 2a, a smaller slot (§12.3); 2b, storage in pieces (§12.4). Designed 2026-11-15; waits for Mike's approval.
 3. **The object index for fragmented eager backings** (§6.8 item 1, §9's R2). Not designed yet.
 4. **Compaction** (§6.8 item 3). Not designed yet.
 
@@ -1357,3 +1357,117 @@ Before adoption every one of these runs today's code, unchanged.
 | commit | 865 to 935 | 948 to 996 | 7 to 10% slower (§9) |
 
 - *Not shown.* Hardware times: these are QEMU TCG. A machine with fragmented memory: the check boots never fragment the allocator much, so the bounded costs rest on the algorithm and the model test. The cost of `free_run`'s tag scan for one very large run, and of `allocate_run_below`'s scan, were not measured. A layout with many initial ranges in one granule exists only in host tests.
+
+### 12.3 Step 2a: a smaller role slot: design (2026-11-15; waits for Mike's approval)
+
+Read for §12.3 and §12.4, at Deepwyrm `fcec7d2`: `memory/frame_roles.rs` (every type), `frame_roles/manager.rs` (every access to a slot, a mark, a table count, a generation and the free-slot stack, found by grep and read in context: construction, `occupy`, `replace_record`, `vacate`, `next_slot`, `free_slot`, the kernel-image staging, the empty-hierarchy proof, `validate_staged_table`, `root_slot_of`, `identity`, `slot`, `validate_owner`, `grown_layout`, `adopt_storage`, `check_invariants`, `dynamic_slot_at`, `validate_external_pages`), the slot accesses in `chain.rs` and `index.rs`, the index's link types, `memory/growable.rs`, `physical/buddy.rs` (all, as merged), and `grow_frame_roles` in `arch/x86_64/mm/activation.rs`. Not read line by line: the rest of `manager.rs`. The design does not depend on it, because every write of a record goes through three functions (`occupy`, `replace_record`, `vacate`) and the design changes those.
+
+**What the slot costs today.** `RoleSlot` is 80 bytes: the record 64 (a 16-byte range and a 48-byte role), the proof mark 8, the generation 4, the table count 4. The role is 48 bytes because of one variant, `PageTable`, which stores an owner key and an optional parent identity with a 64-bit manager domain in each, though every identity in the table belongs to this manager. The mark and the table count are used only on committed page tables. Beside the slots, the free-slot stack costs 4 bytes per slot. With step 1 the grown table is 97 bytes per allocator page (2.37% of RAM).
+
+**Decisions.**
+
+1. *A stored form and a logical form.* The code keeps working with today's `RoleRecord` and `FrameRole`. The table stores a compact `RoleSlot` of 48 bytes and converts at the accessors. So the logic of chains, indexes, tables and proofs does not change; only how a slot is read and written does.
+2. *What the stored form drops.* The manager domain inside records (it is this manager's, checked where the value enters). The range's end (a start and a page count give it; a count fits 32 bits because the allocator has fewer than 2^32 pages, and an external role longer than that is refused with `Capacity`). The `Option` around the record (a free slot has a page count of zero). The mark and the table count as slot fields: they move into the stored page-table variants.
+3. *No free-slot stack.* Free slots are linked through themselves: a free slot's `start` holds the next free slot plus one. The order of use is exactly today's (slot 0 first at boot; after growth the new slots lowest first, above the boot table's free ones), so issued slot numbers do not change.
+4. *The duplicate-root check stops scanning the table.* Today every PML4 commit, which is every address space created, scans every slot for another PML4 of the same owner: 506,570 slots in the 2 GiB guest and one per page of RAM on a large machine. The slots of PML4 level (candidates and committed roots) are instead kept on a singly linked list threaded through their stored variants, and the check walks that list, which is as long as the number of address spaces.
+
+**Data** (`frame_roles.rs`).
+
+```rust
+/// One slot as stored: 48 bytes (asserted at compile time).
+#[derive(Clone, Copy)] #[repr(C)]
+struct RoleSlot {
+    generation: u32,
+    /// The run's pages; 0 if the slot is free.
+    pages: u32,
+    /// The run's physical start; in a free slot, the next free slot plus one (0 = none).
+    start: u64,
+    role: StoredRole,
+}
+
+/// A role as stored: 32 bytes (asserted at compile time). Identities and
+/// owners are raw values in this manager's domain.
+#[derive(Clone, Copy)]
+enum StoredRole {
+    Free,
+    AllocatedUninitialized,
+    Zeroed,
+    BackingAllocated(ChainLink),
+    ObjectBacking(ChainLink),
+    ArchitectureBootstrap(ArchitectureBootstrapKind),
+    /// A PML4 candidate; `next_root` is the next slot of the root list plus one.
+    RootCandidate { owner: u64, next_root: u32 },
+    TableCandidate { owner: u64, level: TableLevel },
+    /// A committed PML4.
+    Root { owner: u64, mark: u64, tables: u32, next_root: u32 },
+    /// A committed table below a PML4; `parent` is its parent's raw identity.
+    PageTable { owner: u64, parent: u64, mark: u64, tables: u32, level: TableLevel },
+    External(ExternalFrameRole),
+    ExternalImmutableModule { module_index: u32 },
+    ExternalDeviceMmio,
+    RoleTableStorage,
+    IndexRoot(IndexRootLink),
+    IndexNode(IndexEntryLink),
+    ObjectPage(IndexEntryLink),
+}
+```
+
+The manager loses `free_slots` and gains `first_free: u32` and `first_root: u32` (slot plus one, 0 = none); `free_slot_count` stays as a count. If the compiler does not lay `StoredRole` out in 32 bytes, the assertion fails the build and the worker stops and reports; the design does not fall back to a larger slot silently.
+
+**Accessors** (`manager.rs`; the only code that touches a `RoleSlot`'s fields).
+
+- `slot_view(slot) -> SlotView { generation, record: Option<RoleRecord>, mark, tables }` unpacks one slot: the range is `start .. start + pages × 4096`; `Root` unpacks to `PageTable { owner, level: Pml4, parent: None }`, `RootCandidate` to `TableCandidate { owner, level: Pml4 }`, and owners and parents get this manager's domain back. `mark` and `tables` are zero unless the slot is a committed table. Every `self.roles.as_slice()[slot]` read becomes this.
+- `slot_views()` iterates all slots as `(slot, SlotView)`, for the scans that remain (`check_invariants`, the chain and index checks, `validate_external_pages`, `dynamic_slot_at` before growth, the start index's rebuild at adoption).
+- `store(slot, generation, Option<RoleRecord>)` is the one writer of a record, called by `occupy`, `replace_record` and `vacate`. It packs the record and keeps three things right by comparing what the slot held with what it will hold:
+  - *mark and table count:* kept when a committed table stays a committed table, zero otherwise (today `occupy` and `vacate` zero them and `replace_record` keeps them, which is the same thing);
+  - *the root list:* a slot that becomes a PML4 candidate or root is pushed on the list; one that stops being either is unlinked by a walk from `first_root`; one that goes from candidate to root keeps its link;
+  - *the free list:* `vacate` pushes the slot unless its generation is spent, and `occupy` pops it, still asserting that it is the first free slot.
+  Packing refuses what cannot be stored, by a panic that names it, since each is a kernel bug and not an input: an owner or a parent of another domain, a committed table below PML4 with no parent, a PML4 with one, a page count above `u32::MAX` on a dynamic role. Before the build the worker lists every place a record with an owner or a parent is created and shows that each validates the domain first (`validate_owner`, `slot`); if one does not, it stops and reports.
+- `set_mark(slot, epoch)`, `set_tables(slot, count)`: write the field of a committed table; on any other slot they panic (the callers have validated the table).
+- `free_slot(depth)` walks `depth` links from `first_free` (depth is at most 2, in the kernel-image staging) and returns the slot and its next generation, as today.
+- The duplicate-root check in `validate_staged_table` walks the root list and returns `DuplicateTableRoot` if a slot other than the staged one has the same owner.
+
+**Growth.** `RoleTableLayout` loses the free-slot stack. `adopt_storage` links the new slots onto the free list in the order above instead of filling the stack. The root list needs no rebuilding: it lives in the slots, which are copied. The grown table becomes 48 + 4 (start index) + 8 + 1 (buddy) = 61 bytes per allocator page, 1.49% of RAM, from 97 (2.37%) now and 104 before M7.
+
+**Invariants added to `check_invariants`.** The free list reaches exactly the free slots whose generation is not spent, each once, and `free_slot_count` is its length. The root list reaches exactly the slots of PML4 level, each once. No owner has two slots on the root list.
+
+**Tests (host, behaviour).** Every existing test passes unchanged except those that construct a `RoleSlot` or read the free-slot stack directly, which move to the accessors. New: a record of every role kind survives a store and a read unchanged, with ranges at the limits (one page; `u32::MAX` pages refused on a dynamic role); a table's mark and count survive a role change from table to table and are zero after any other; slots are issued in the same order as before, at boot and after growth (compare slot numbers against a recorded sequence produced by the code before this change, kept as literal numbers in the test); a spent generation retires its slot and the free list skips it; the kernel-image staging still sees the three next slots; a second PML4 for an owner is refused whether the first is a candidate or committed, and accepted after the first is reclaimed; the root list survives growth; `check_invariants` fails on a corrupted free list, a corrupted root list and two roots of one owner. Each new check is shown to fail against a real fault (at least: the mark dropped on a table-to-table change, the root not unlinked at reclaim, the free list pushed in the wrong order at growth).
+
+**Checks and measurement.** The four kernel commands; then three interleaved pairs of `dev-boot --check --smp --sdk`, base against this, and one boot on one CPU. Report the mean step time of map, protect, unmap, commit, create and teardown, the check's seconds, and the `[memory]` lines. Expected, to be confirmed or refuted by the numbers: commit no slower than the base of step 1 (a commit now pops a list and writes 48 bytes where it read a stack and wrote 80), and process creation faster (no table scan). If map, protect or commit is more than 5% slower in all three pairs, stop and report.
+
+**Not in 2a.** Where the table lives (2b). The start index (it stays). External roles' own scan at boot.
+
+### 12.4 Step 2b: the grown table in pieces: design (2026-11-15; waits for Mike's approval; built after 2a)
+
+**The problem (§9 R1).** The grown table is one contiguous run, found first-fit at boot: 1.49% of RAM after 2a, about 950 MiB at 64 GiB. A memory map without such a hole stops the boot.
+
+**Decisions.**
+
+1. *Fixed-size chunks, the same for every array.* The four arrays that grow with memory (slots, start index, buddy links, buddy tags) are each cut into chunks of 2^`shift` entries, and an entry is found by `index >> shift` and `index & mask`: one more load than a slice, no search. `shift = max(15, bits(slots - 1) - 6)`, so no array has more than 64 chunks. Considered and not taken: one piece per initial range (free for lookups by address, but the buddy lists link pages by position and the slots are not per page), and a virtually contiguous mapping (no cost in the accessors, but new kernel page tables and changes to the activation proofs).
+2. *One run per chunk group.* Group `k` is one contiguous run holding chunk `k` of each array (61 bytes per entry): 2 MiB at the smallest shift, 32 MiB at 64 GiB. A small *directory* run holds the four arrays of chunk slices, the buddy's `bases` and its `hints`. So growth allocates at most 65 runs. A group is less than 1/32 of the table, 0.05% of RAM. Only a map whose ranges are nearly all smaller than that could fail to hold the groups, and the sanitizer's limit of 128 usable ranges rules it out: such ranges together hold under 7% of RAM, and the rest lies in ranges that each hold several groups.
+3. *Staged, then adopted at once.* `grow_frame_roles` allocates and maps the parts one by one and hands each to the manager, which only records it; nothing is used until all are there. Then adoption checks everything and switches in one step that cannot fail. If any allocation fails first, the staged parts are freed and the manager is as it was. This keeps `adopt_storage`'s rule (every check before any change) without an array of grants on the boot stack.
+
+**Data.**
+
+- `memory/growable.rs` gains `ChunkedStore<T>`: `chunks: &'static mut [&'static mut [T]]` (every chunk full except possibly the last), `shift`, `len`; methods `len`, `get(index) -> T`, `get_mut(index) -> &mut T`, `set`, `iter`, and `segments(range) -> impl Iterator<Item = &[T]>` (the contiguous pieces of an index range, in order, for scans such as the buddy's tag scan). Out-of-range indexes panic, as a slice's do. `GrowableStore<T, N>` becomes the inline array or a `ChunkedStore`, with the same methods, so the manager's accessors from 2a call `get` and `set` and do not know which. Its module comment is rewritten (§9).
+- `BuddyStorage` carries `tags` and `links` as `ChunkedStore`s; `bases` and `hints` stay slices. In `buddy.rs` every `self.tags[position]` and `self.links[position]` becomes `get`, `get_mut` or `set`; `any_tag` and the interior check of `check` take `segments`; the test-only block iterator uses `get`. Seeding no longer clears the tags and links: adoption has just written them (the double write noted in §12.2 goes).
+- The start index becomes a `ChunkedStore<u32>`.
+- The manager gains a fixed array of staged parts, `[Option<StagedPart>; 65]`, where a part is its run's identity and range, its base address and its length.
+
+**Protocol** (`manager.rs`, `activation.rs`).
+
+- `growth_plan() -> Result<GrowthPlan, FrameRoleError>` replaces `grown_layout`: the slot count (boot slots plus one per allocator page), the page count, the shift, the number of groups, and for each part its pages and the offsets of its arrays inside it (8-aligned, as today). Part 0 is the directory.
+- `stage_growth_part(plan, index, grant, base) -> Result<(), GrantTransitionError<AllocationGrant>>` records one part. It refuses a part out of order, a run shorter than the part, a base that is not 8-aligned, and any part once the table is grown. The run keeps the role it was allocated with.
+- `adopt_storage(plan)` requires every part staged and the buddy storage acceptable (2a's and step 1's checks, restated for the chunked arrays), then, with nothing left that can fail: carves the directory and each group, writes every element, copies the boot slots to the same indexes, links the new slots onto the free list (2a), gives every part's run the permanent `RoleTableStorage` role, adopts the buddy storage, and rebuilds the start index.
+- `abandon_growth()` frees every staged run and clears the staging; the manager is as before the first part.
+- `grow_frame_roles` loops over the plan's parts: allocate (`roles.allocate`), take the direct map's address, stage; on any failure abandon and return the error (the boot then panics as it does today). Then adopt.
+
+Every `unsafe` block added carries its `SAFETY` comment; the count of undocumented blocks does not rise. The carving stays in one helper.
+
+**Invariants added.** Every chunk but the last of an array has 2^`shift` entries, and the lengths sum to the array's length. The `RoleTableStorage` runs are exactly the staged parts. The buddy's and the manager's existing invariants are checked through the chunked accessors.
+
+**Tests (host, behaviour).** `ChunkedStore`: `get`, `set`, `iter` and `segments` agree with a plain vector over lengths below, at and above chunk boundaries, with a last chunk that is short and one that is full. The buddy tests and the model test run on storage cut into several small chunks (a test-only shift well below 15), so every scan crosses chunk boundaries; they must pass unchanged in what they assert. Growth: a manager grown from a plan with several groups passes the grown-phase tests of §12.2; staging refuses each bad part; a failure at each position in the sequence, followed by `abandon_growth`, leaves `available_frames`, the free blocks and `check_invariants` as before the first part; growth succeeds on a boot map whose largest free range is smaller than the whole table but larger than one group, which fails on the code before this change. Each new check is shown to fail against a real fault (at least: `segments` dropping the piece after a boundary, the abandon leaving one run staged, a group one entry short).
+
+**Checks and measurement.** As for 2a, base against this, with the same stop rule at 5% on map, protect and commit: the extra load on every slot and start-index access is the cost to watch. The `[memory]` lines gain the shift and the number of groups.
+
+**Not in 2b.** A slot per page no longer indexed through the start index (a larger redesign, with the allocator's metadata folded into it; a candidate for a later stage, not scheduled). External roles' boot-time scans.
