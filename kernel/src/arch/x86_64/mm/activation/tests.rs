@@ -3493,11 +3493,20 @@ mod table_map_graph {
         fixture: &mut GraphFixture,
         map: Option<&'static TableMap>,
     ) -> Result<(), InactiveGraphError<()>> {
+        validate_with_scratch_at(fixture, map, FIXTURE_SCRATCH)
+    }
+
+    /// [`validate`] with the scratch window's first page at `window_page`.
+    fn validate_with_scratch_at(
+        fixture: &mut GraphFixture,
+        map: Option<&'static TableMap>,
+        window_page: u64,
+    ) -> Result<(), InactiveGraphError<()>> {
         let mut pending = std::boxed::Box::new([None; MAX_DEEP_TABLE_FRAMES]);
         let mut visited = std::boxed::Box::new([0; MAX_DEEP_TABLE_FRAMES]);
         let scratch = PerCpuScratchBindings::new(DeepScratchBinding {
-            window_page: FIXTURE_SCRATCH,
-            control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+            window_page,
+            control_page: window_page + PAGE_SIZE,
             pt: fixture.scratch_pt,
         });
         validate_inactive_graph_with_workspace(
@@ -3750,6 +3759,34 @@ mod table_map_graph {
         assert_eq!(
             validate(&mut fixture, Some(map)),
             Err(InactiveGraphError::MappingMismatch)
+        );
+    }
+
+    #[test]
+    fn a_segment_or_scratch_page_in_the_table_maps_slots_is_refused() {
+        // A text segment of one page at the map's base. Every other layout
+        // rule holds: it ends below the read-only segment and holds no
+        // scratch page.
+        let mut fixture = staged_fixture();
+        let bound = map(&fixture, true);
+        install(&mut fixture, bound);
+        fixture.segments[0].start = TABLE_MAP_BASE;
+        fixture.segments[0].end = TABLE_MAP_BASE + PAGE_SIZE;
+        assert_eq!(
+            validate(&mut fixture, Some(bound)),
+            Err(InactiveGraphError::InvalidSegmentLayout)
+        );
+        // The scratch window in slot 385, past everything the map holds; it
+        // is 2 MiB-aligned, so its slots fit one page table as the layout
+        // requires.
+        let mut fixture = staged_fixture();
+        let bound = map(&fixture, true);
+        install(&mut fixture, bound);
+        let window_page = TABLE_MAP_BASE + (1 << 39);
+        assert!(window_page >= TABLE_MAP_BASE + bound.mapped_bytes());
+        assert_eq!(
+            validate_with_scratch_at(&mut fixture, Some(bound), window_page),
+            Err(InactiveGraphError::InvalidSegmentLayout)
         );
     }
 }
