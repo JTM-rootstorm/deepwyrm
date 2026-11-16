@@ -248,6 +248,17 @@ impl StoredRole {
     }
 }
 
+impl RoleSlot {
+    /// The run a live slot holds: its start and page count.
+    #[inline]
+    fn run(&self) -> PageRange {
+        PageRange {
+            start: self.start,
+            end: self.start + u64::from(self.pages) * BASE_PAGE_SIZE,
+        }
+    }
+}
+
 /// Whether `role` is of PML4 level: a PML4 candidate or a committed PML4.
 const fn is_pml4_level(role: FrameRole) -> bool {
     matches!(
@@ -342,6 +353,145 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             | StoredRole::IndexNode(_)
             | StoredRole::ObjectPage(_) => None,
         }
+    }
+
+    /// The run of slot `slot` if it is live; `None` for a free or retired
+    /// slot. No [`FrameRole`] is built.
+    #[inline]
+    pub(super) fn run_at(&self, slot: usize) -> Option<PageRange> {
+        let entry = &self.roles.as_slice()[slot];
+        match entry.role {
+            StoredRole::Free => None,
+            StoredRole::AllocatedUninitialized
+            | StoredRole::Zeroed
+            | StoredRole::BackingAllocated(_)
+            | StoredRole::ObjectBacking(_)
+            | StoredRole::ArchitectureBootstrap(_)
+            | StoredRole::RootCandidate { .. }
+            | StoredRole::TableCandidate { .. }
+            | StoredRole::Root { .. }
+            | StoredRole::PageTable { .. }
+            | StoredRole::External(_)
+            | StoredRole::ExternalImmutableModule { .. }
+            | StoredRole::ExternalDeviceMmio
+            | StoredRole::RoleTableStorage
+            | StoredRole::IndexRoot(_)
+            | StoredRole::IndexNode(_)
+            | StoredRole::ObjectPage(_) => Some(entry.run()),
+        }
+    }
+
+    /// Which kind of backing head slot `slot` holds; [`HeadKind::Other`]
+    /// for any other role and for a free slot. No [`FrameRole`] is built.
+    #[inline]
+    pub(super) fn head_kind_at(&self, slot: usize) -> HeadKind {
+        match self.roles.as_slice()[slot].role {
+            StoredRole::ObjectBacking(_) => HeadKind::ObjectBacking,
+            StoredRole::BackingAllocated(_) => HeadKind::BackingAllocated,
+            StoredRole::ExternalDeviceMmio => HeadKind::DeviceMmio,
+            StoredRole::ExternalImmutableModule { .. } => HeadKind::ImmutableModule,
+            StoredRole::IndexRoot(_) => HeadKind::IndexRoot,
+            StoredRole::Free
+            | StoredRole::AllocatedUninitialized
+            | StoredRole::Zeroed
+            | StoredRole::ArchitectureBootstrap(_)
+            | StoredRole::RootCandidate { .. }
+            | StoredRole::TableCandidate { .. }
+            | StoredRole::Root { .. }
+            | StoredRole::PageTable { .. }
+            | StoredRole::External(_)
+            | StoredRole::RoleTableStorage
+            | StoredRole::IndexNode(_)
+            | StoredRole::ObjectPage(_) => HeadKind::Other,
+        }
+    }
+
+    /// The facts of slot `slot` as a run of a chain: an allocator-owned
+    /// run with its link, or an external backing. `None` for any other role
+    /// and for a free slot. No [`FrameRole`] is built.
+    #[inline]
+    pub(super) fn chain_at(&self, slot: usize) -> Option<ChainFacts> {
+        let entry = &self.roles.as_slice()[slot];
+        let source = match entry.role {
+            StoredRole::BackingAllocated(link) => ChainSource::Allocated(link),
+            StoredRole::ObjectBacking(link) => ChainSource::Backing(link),
+            StoredRole::ExternalImmutableModule { .. } => ChainSource::Module,
+            StoredRole::ExternalDeviceMmio => ChainSource::Device,
+            StoredRole::Free
+            | StoredRole::AllocatedUninitialized
+            | StoredRole::Zeroed
+            | StoredRole::ArchitectureBootstrap(_)
+            | StoredRole::RootCandidate { .. }
+            | StoredRole::TableCandidate { .. }
+            | StoredRole::Root { .. }
+            | StoredRole::PageTable { .. }
+            | StoredRole::External(_)
+            | StoredRole::RoleTableStorage
+            | StoredRole::IndexRoot(_)
+            | StoredRole::IndexNode(_)
+            | StoredRole::ObjectPage(_) => return None,
+        };
+        Some(ChainFacts {
+            range: entry.run(),
+            source,
+        })
+    }
+
+    /// The run and link of slot `slot` if it holds the root of an
+    /// on-demand backing; `None` otherwise. No [`FrameRole`] is built.
+    #[inline]
+    pub(super) fn index_root_at(&self, slot: usize) -> Option<(PageRange, IndexRootLink)> {
+        let entry = &self.roles.as_slice()[slot];
+        match entry.role {
+            StoredRole::IndexRoot(link) => Some((entry.run(), link)),
+            StoredRole::Free
+            | StoredRole::AllocatedUninitialized
+            | StoredRole::Zeroed
+            | StoredRole::BackingAllocated(_)
+            | StoredRole::ObjectBacking(_)
+            | StoredRole::ArchitectureBootstrap(_)
+            | StoredRole::RootCandidate { .. }
+            | StoredRole::TableCandidate { .. }
+            | StoredRole::Root { .. }
+            | StoredRole::PageTable { .. }
+            | StoredRole::External(_)
+            | StoredRole::ExternalImmutableModule { .. }
+            | StoredRole::ExternalDeviceMmio
+            | StoredRole::RoleTableStorage
+            | StoredRole::IndexNode(_)
+            | StoredRole::ObjectPage(_) => None,
+        }
+    }
+
+    /// The facts of slot `slot` if it holds an index node or a committed
+    /// on-demand page; `None` otherwise. No [`FrameRole`] is built.
+    #[inline]
+    pub(super) fn index_entry_at(&self, slot: usize) -> Option<IndexEntryFacts> {
+        let entry = &self.roles.as_slice()[slot];
+        let (node, link) = match entry.role {
+            StoredRole::IndexNode(link) => (true, link),
+            StoredRole::ObjectPage(link) => (false, link),
+            StoredRole::Free
+            | StoredRole::AllocatedUninitialized
+            | StoredRole::Zeroed
+            | StoredRole::BackingAllocated(_)
+            | StoredRole::ObjectBacking(_)
+            | StoredRole::ArchitectureBootstrap(_)
+            | StoredRole::RootCandidate { .. }
+            | StoredRole::TableCandidate { .. }
+            | StoredRole::Root { .. }
+            | StoredRole::PageTable { .. }
+            | StoredRole::External(_)
+            | StoredRole::ExternalImmutableModule { .. }
+            | StoredRole::ExternalDeviceMmio
+            | StoredRole::RoleTableStorage
+            | StoredRole::IndexRoot(_) => return None,
+        };
+        Some(IndexEntryFacts {
+            range: entry.run(),
+            node,
+            link,
+        })
     }
 
     /// Slot `slot`, unpacked.

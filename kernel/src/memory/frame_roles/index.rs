@@ -116,7 +116,7 @@ struct IndexStep {
 /// The steps an index walk took, and the committed page it reached, if any.
 type IndexWalk = (
     [Option<IndexStep>; INDEX_MAX_LEVELS as usize],
-    Option<(FrameRoleIdentity, RoleRecord)>,
+    Option<(FrameRoleIdentity, PageRange)>,
 );
 impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>
@@ -164,24 +164,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     fn index_root(
         &self,
         head: FrameRoleIdentity,
-    ) -> Result<(RoleRecord, IndexRootLink), FrameRoleError> {
-        let record = self.record(head)?;
-        match record.role {
-            FrameRole::IndexRoot(root) if head.domain == self.domain => Ok((record, root)),
-            FrameRole::IndexRoot(_)
-            | FrameRole::AllocatedUninitialized
-            | FrameRole::Zeroed
-            | FrameRole::BackingAllocated(_)
-            | FrameRole::ObjectBacking(_)
-            | FrameRole::ArchitectureBootstrap(_)
-            | FrameRole::TableCandidate { .. }
-            | FrameRole::PageTable { .. }
-            | FrameRole::External(_)
-            | FrameRole::ExternalImmutableModule { .. }
-            | FrameRole::ExternalDeviceMmio
-            | FrameRole::RoleTableStorage
-            | FrameRole::IndexNode(_)
-            | FrameRole::ObjectPage(_) => Err(FrameRoleError::WrongRole),
+    ) -> Result<(PageRange, IndexRootLink), FrameRoleError> {
+        match self.index_root_at(self.slot(head)?) {
+            Some(root) if head.domain == self.domain => Ok(root),
+            Some(_) | None => Err(FrameRoleError::WrongRole),
         }
     }
 
@@ -228,33 +214,33 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         raw: u64,
         node: bool,
         place: u64,
-    ) -> Result<(FrameRoleIdentity, RoleRecord, IndexEntryLink), FrameRoleError> {
+    ) -> Result<(FrameRoleIdentity, PageRange, IndexEntryLink), FrameRoleError> {
         let identity = FrameRoleIdentity {
             domain: self.domain,
             raw,
         };
-        let record = self.record(identity)?;
-        let link = match (node, record.role) {
-            (true, FrameRole::IndexNode(link)) | (false, FrameRole::ObjectPage(link)) => link,
-            _ => return Err(FrameRoleError::WrongRole),
-        };
-        if link.owner != owner.raw || link.place != place || record.range.page_count() != 1 {
+        let facts = self
+            .index_entry_at(self.slot(identity)?)
+            .filter(|facts| facts.node == node)
+            .ok_or(FrameRoleError::WrongRole)?;
+        let link = facts.link;
+        if link.owner != owner.raw || link.place != place || facts.range.page_count() != 1 {
             return Err(FrameRoleError::WrongRole);
         }
-        Ok((identity, record, link))
+        Ok((identity, facts.range, link))
     }
 
     /// Walks from the root of `head` towards `page`. Returns the steps taken
     /// down to the deepest node that exists, and the committed page if the
     /// walk reached it.
     fn index_walk(&self, head: FrameRoleIdentity, page: u64) -> Result<IndexWalk, FrameRoleError> {
-        let (root_record, root) = self.index_root(head)?;
+        let (root_range, root) = self.index_root(head)?;
         if page >= root.pages {
             return Err(FrameRoleError::WrongRole);
         }
         let memory = self.memory()?;
         let mut steps = [None; INDEX_MAX_LEVELS as usize];
-        let mut node = root_record.range.start;
+        let mut node = root_range.start;
         let mut node_first = 0_u64;
         for (depth, level) in (0..root.levels).rev().enumerate() {
             let span = entry_span(level);
@@ -271,12 +257,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 return Ok((steps, None));
             }
             if level == 0 {
-                let (identity, record, _) = self.index_entry(head, raw, false, page)?;
-                return Ok((steps, Some((identity, record))));
+                let (identity, range, _) = self.index_entry(head, raw, false, page)?;
+                return Ok((steps, Some((identity, range))));
             }
-            let (_, record, _) =
+            let (_, range, _) =
                 self.index_entry(head, raw, true, node_place(first_page, level - 1))?;
-            node = record.range.start;
+            node = range.start;
             node_first = first_page;
         }
         Err(FrameRoleError::InvariantViolation)
@@ -290,7 +276,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         page: u64,
     ) -> Result<(FrameRoleIdentity, u64), FrameRoleError> {
         match self.index_walk(head, page)? {
-            (_, Some((identity, record))) => Ok((identity, record.range.start)),
+            (_, Some((identity, range))) => Ok((identity, range.start)),
             (_, None) => Err(FrameRoleError::Absent),
         }
     }
@@ -368,9 +354,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<OnDemandCommit, FrameRoleError> {
         let head = backing.0;
         let (steps, found) = self.index_walk(head, page)?;
-        if let Some((_, record)) = found {
+        if let Some((_, range)) = found {
             return Ok(OnDemandCommit {
-                physical_start: record.range.start,
+                physical_start: range.start,
                 frames: 0,
             });
         }
@@ -482,12 +468,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Counts every node and committed page below the root of `head`,
     /// checking each.
     fn index_count(&self, head: FrameRoleIdentity) -> Result<u64, FrameRoleError> {
-        let (root_record, root) = self.index_root(head)?;
+        let (root_range, root) = self.index_root(head)?;
         let memory = self.memory()?;
         self.index_count_node(
             memory,
             head,
-            root_record.range.start,
+            root_range.start,
             root.levels - 1,
             0,
             root.pages,
@@ -517,12 +503,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             if level == 0 {
                 self.index_entry(head, raw, false, entry_first)?;
             } else {
-                let (_, record, _) =
+                let (_, range, _) =
                     self.index_entry(head, raw, true, node_place(entry_first, level - 1))?;
                 frames += self.index_count_node(
                     memory,
                     head,
-                    record.range.start,
+                    range.start,
                     level - 1,
                     entry_first,
                     pages,
@@ -696,9 +682,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// page.
     pub(super) fn release_index(&mut self, head: FrameRoleIdentity) -> Result<(), FrameRoleError> {
         self.index_count(head)?;
-        let (root_record, root) = self.index_root(head)?;
+        let (root_range, root) = self.index_root(head)?;
         let memory = self.memory()?;
-        self.index_free_node(memory, head, root_record.range.start, root.levels - 1, 0);
+        self.index_free_node(memory, head, root_range.start, root.levels - 1, 0);
         let root_slot = self.slot(head)?;
         self.free_index_slot(root_slot);
         Ok(())
@@ -725,11 +711,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             } else {
                 node_place(entry_first, level - 1)
             };
-            let (identity, record, _) = self
+            let (identity, range, _) = self
                 .index_entry(head, raw, level != 0, place)
                 .expect("a checked index stays whole while it is freed");
             if level != 0 {
-                self.index_free_node(memory, head, record.range.start, level - 1, entry_first);
+                self.index_free_node(memory, head, range.start, level - 1, entry_first);
             }
             let slot = self.slot(identity).expect("a checked entry is live");
             self.free_index_slot(slot);
@@ -737,9 +723,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn free_index_slot(&mut self, slot: usize) {
-        let record = self.record_at(slot).expect("a freed index frame is live");
+        let range = self.run_at(slot).expect("a freed index frame is live");
         self.allocator
-            .free_run(record.range)
+            .free_run(range)
             .expect("a live run frees: the boot free list is sized by the role slots (M1), and the buddy allocator links every page");
         self.vacate(slot);
     }

@@ -894,3 +894,137 @@ fn live_generation_is_none_for_a_free_and_a_retired_slot() {
     // Past the table.
     assert_eq!(roles.live_generation(roles.roles.len()), None);
 }
+
+/// The answers of the five narrow readers of DW2 §12.6, side by side.
+type Readers = (
+    Option<PageRange>,
+    HeadKind,
+    Option<ChainFacts>,
+    Option<(PageRange, IndexRootLink)>,
+    Option<IndexEntryFacts>,
+);
+
+/// What every narrow reader must answer for a slot whose record is
+/// `record`, derived from the record alone.
+fn expected_readers(record: Option<RoleRecord>) -> Readers {
+    let Some(RoleRecord { range, role }) = record else {
+        return (None, HeadKind::Other, None, None, None);
+    };
+    let chain = |source| Some(ChainFacts { range, source });
+    let (head, chain, root, entry) = match role {
+        FrameRole::ObjectBacking(link) => (
+            HeadKind::ObjectBacking,
+            chain(ChainSource::Backing(link)),
+            None,
+            None,
+        ),
+        FrameRole::BackingAllocated(link) => (
+            HeadKind::BackingAllocated,
+            chain(ChainSource::Allocated(link)),
+            None,
+            None,
+        ),
+        FrameRole::ExternalDeviceMmio => {
+            (HeadKind::DeviceMmio, chain(ChainSource::Device), None, None)
+        }
+        FrameRole::ExternalImmutableModule { .. } => (
+            HeadKind::ImmutableModule,
+            chain(ChainSource::Module),
+            None,
+            None,
+        ),
+        FrameRole::IndexRoot(link) => (HeadKind::IndexRoot, None, Some((range, link)), None),
+        FrameRole::IndexNode(link) => (
+            HeadKind::Other,
+            None,
+            None,
+            Some(IndexEntryFacts {
+                range,
+                node: true,
+                link,
+            }),
+        ),
+        FrameRole::ObjectPage(link) => (
+            HeadKind::Other,
+            None,
+            None,
+            Some(IndexEntryFacts {
+                range,
+                node: false,
+                link,
+            }),
+        ),
+        FrameRole::AllocatedUninitialized
+        | FrameRole::Zeroed
+        | FrameRole::ArchitectureBootstrap(_)
+        | FrameRole::TableCandidate { .. }
+        | FrameRole::PageTable { .. }
+        | FrameRole::External(_)
+        | FrameRole::RoleTableStorage => (HeadKind::Other, None, None, None),
+    };
+    (Some(range), head, chain, root, entry)
+}
+
+fn readers(roles: &TestManager, slot: usize) -> Readers {
+    (
+        roles.run_at(slot),
+        roles.head_kind_at(slot),
+        roles.chain_at(slot),
+        roles.index_root_at(slot),
+        roles.index_entry_at(slot),
+    )
+}
+
+/// DW2 §12.6 item 1: each narrow reader answers exactly what `record_at`'s
+/// record implies, for a slot of every role kind (PML4 candidates and
+/// roots and tables below them included), a free slot and a retired one.
+#[test]
+fn the_narrow_readers_agree_with_record_at_for_every_role_kind_and_a_free_and_a_retired_slot() {
+    let mut roles = manager(BASE_PAGE_SIZE, 64);
+    let free = roles.next_slot().unwrap().0;
+    assert_eq!(readers(&roles, free), expected_readers(None));
+    assert_eq!(roles.record_at(free), None);
+
+    // Every kind, at one page and at the most a slot stores.
+    for range in [
+        pages(BASE_PAGE_SIZE, 1),
+        pages(
+            (1 << 52) - u64::from(u32::MAX) * BASE_PAGE_SIZE,
+            u64::from(u32::MAX),
+        ),
+    ] {
+        for role in every_role(&roles) {
+            let slot = occupy_next(&mut roles, RoleRecord { range, role });
+            let record = roles.record_at(slot);
+            assert_eq!(record, Some(RoleRecord { range, role }));
+            assert_eq!(readers(&roles, slot), expected_readers(record), "{role:?}");
+            roles.vacate(slot);
+            assert_eq!(readers(&roles, slot), expected_readers(None), "{role:?}");
+        }
+    }
+
+    // Committed tables reached the ordinary way, with a mark and a count.
+    let (root, child) = root_with_child(&mut roles);
+    let _proof = roles.begin_empty_table_hierarchy(root).unwrap();
+    for identity in [root.role, child.role] {
+        let slot = roles.slot(identity).unwrap();
+        assert_eq!(
+            readers(&roles, slot),
+            expected_readers(roles.record_at(slot))
+        );
+    }
+
+    // A retired slot: its last generation used, then vacated.
+    let grant = roles.allocate(1).unwrap();
+    let slot = slot_number(grant.identity);
+    roles.cancel_allocation(grant).unwrap();
+    roles.test_set_generation(slot, u32::MAX - 1);
+    let last = roles.allocate(1).unwrap();
+    assert_eq!(slot_number(last.identity), slot);
+    assert_eq!(readers(&roles, slot).0, Some(last.range));
+    roles.cancel_allocation(last).unwrap();
+    assert_eq!(roles.slot_view(slot).generation, u32::MAX);
+    assert_eq!(roles.record_at(slot), None);
+    assert_eq!(readers(&roles, slot), expected_readers(None));
+    assert_eq!(roles.check_invariants(), Ok(()));
+}

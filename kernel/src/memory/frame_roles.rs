@@ -474,6 +474,51 @@ struct TableFacts {
     tables: u32,
 }
 
+/// Which kind of backing head a slot holds: the one question the object
+/// paths ask of a head before they walk it (DW2 §12.6), read without
+/// building a [`FrameRole`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadKind {
+    ObjectBacking,
+    BackingAllocated,
+    DeviceMmio,
+    ImmutableModule,
+    IndexRoot,
+    /// Every other role, and a free slot.
+    Other,
+}
+
+/// What a slot that can be a run of a chain says about it (DW2 §12.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChainFacts {
+    range: PageRange,
+    source: ChainSource,
+}
+
+/// The role a chain run holds: a run of an allocator-owned chain with its
+/// link, or an external backing, which is a chain of its one run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChainSource {
+    /// `BackingAllocated`.
+    Allocated(ChainLink),
+    /// `ObjectBacking`.
+    Backing(ChainLink),
+    /// `ExternalImmutableModule`.
+    Module,
+    /// `ExternalDeviceMmio`.
+    Device,
+}
+
+/// What a slot holding an index node or a committed on-demand page says
+/// about it (DW2 §12.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexEntryFacts {
+    range: PageRange,
+    /// True for an index node, false for a committed page.
+    node: bool,
+    link: IndexEntryLink,
+}
+
 /// Allocator pages per role slot the grown table adds beyond the boot table:
 /// one per page, so slots cannot run out before pages do, since every run
 /// takes one slot and at least one page (DW2 M3 §6.7).

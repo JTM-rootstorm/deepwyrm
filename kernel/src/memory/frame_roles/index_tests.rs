@@ -442,3 +442,128 @@ fn nodes_left_empty_by_a_decommit_are_freed() {
     roles.cancel_object_backing(grant).unwrap();
     assert_eq!(roles.available_frames(), initial);
 }
+
+/// DW2 §12.6 item 2: the root and each entry are read through
+/// `index_root_at` and `index_entry_at`, and keep every error of the full
+/// record read: foreign, stale, the wrong role, a node where a page is
+/// due and the reverse, and an entry of more than one page.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test corrupts the model's node pages and attests a zeroed backing"
+)]
+fn the_index_readers_keep_their_errors() {
+    let (mut roles, model) = manager(32);
+    // Two levels: the root and one leaf node per 512 pages.
+    let grant = roles.allocate_on_demand_backing(513).unwrap();
+    let backing = grant.identity();
+    let head = backing.0;
+    roles.commit_on_demand_page(backing, 0).unwrap();
+    let root = grant.physical_start();
+    let node_raw = model.read(root, 0);
+    let node = roles
+        .record(FrameRoleIdentity {
+            domain: roles.domain,
+            raw: node_raw,
+        })
+        .unwrap();
+    let page_raw = model.read(node.range.start, 0);
+
+    // The root: foreign, a chain backing, a node and a page are not roots.
+    let foreign = BackingIdentity(FrameRoleIdentity {
+        domain: roles.domain + 1,
+        raw: head.raw,
+    });
+    assert_eq!(
+        roles.on_demand_frames(foreign),
+        Err(FrameRoleError::ForeignManager)
+    );
+    assert!(!roles.is_on_demand(foreign));
+    let allocation = roles.allocate_backing(1).unwrap();
+    // SAFETY: the host model never dereferences the synthetic run.
+    let chain = unsafe { roles.assume_backing_zeroed(allocation) }.unwrap();
+    for not_a_root in [chain.identity().0.raw, node_raw, page_raw] {
+        let identity = BackingIdentity(FrameRoleIdentity {
+            domain: roles.domain,
+            raw: not_a_root,
+        });
+        assert_eq!(
+            roles.on_demand_frames(identity),
+            Err(FrameRoleError::WrongRole)
+        );
+        assert_eq!(
+            roles.commit_on_demand_page(identity, 0),
+            Err(FrameRoleError::WrongRole)
+        );
+        assert!(!roles.is_on_demand(identity));
+    }
+    // An on-demand root is not a chain.
+    assert_eq!(
+        roles.object_segments(backing, 0, PAGE, false).err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.release_chain(head, ChainState::Backing, 513, 1),
+        Err(FrameRoleError::WrongRole)
+    );
+
+    // Entries: a page where a node is due, a node where a page is due, a
+    // live run of another role, a stale identity, and a page of two
+    // frames at the right place.
+    // SAFETY: the model's pages are plain memory.
+    unsafe { model.write(root, 1, page_raw) };
+    assert_eq!(page(&roles, &grant, 512), Err(FrameRoleError::WrongRole));
+    // SAFETY: as above.
+    unsafe { model.write(root, 1, 0) };
+    // SAFETY: as above.
+    unsafe { model.write(node.range.start, 1, node_raw) };
+    assert_eq!(page(&roles, &grant, 1), Err(FrameRoleError::WrongRole));
+    // SAFETY: as above.
+    unsafe { model.write(node.range.start, 1, chain.identity().0.raw) };
+    assert_eq!(page(&roles, &grant, 1), Err(FrameRoleError::WrongRole));
+    let gone = roles.allocate(1).unwrap();
+    let gone_raw = gone.identity.raw;
+    roles.cancel_allocation(gone).unwrap();
+    // SAFETY: as above.
+    unsafe { model.write(node.range.start, 1, gone_raw) };
+    assert_eq!(page(&roles, &grant, 1), Err(FrameRoleError::InvalidGrant));
+    let (slot, generation) = roles.next_slot().unwrap();
+    let wide = roles.allocator.allocate_run(2).unwrap();
+    let wide_identity = roles.identity(slot, generation).unwrap();
+    roles.occupy(
+        slot,
+        generation,
+        RoleRecord {
+            range: wide,
+            role: FrameRole::ObjectPage(IndexEntryLink {
+                owner: head.raw,
+                place: 1,
+            }),
+        },
+    );
+    // SAFETY: as above.
+    unsafe { model.write(node.range.start, 1, wide_identity.raw) };
+    assert_eq!(page(&roles, &grant, 1), Err(FrameRoleError::WrongRole));
+    // Restored, the index reads and frees whole.
+    // SAFETY: as above.
+    unsafe { model.write(node.range.start, 1, 0) };
+    assert_eq!(page(&roles, &grant, 0), Ok(model_page(&roles, page_raw)));
+    roles.allocator.free_run(wide).unwrap();
+    roles.vacate(slot);
+    roles.check_invariants().unwrap();
+    roles.cancel_object_backing(grant).unwrap();
+    roles.cancel_object_backing(chain).unwrap();
+    roles.check_invariants().unwrap();
+}
+
+/// The physical page the committed page `raw` holds.
+fn model_page(roles: &Manager, raw: u64) -> u64 {
+    roles
+        .record(FrameRoleIdentity {
+            domain: roles.domain,
+            raw,
+        })
+        .unwrap()
+        .range
+        .start
+}
