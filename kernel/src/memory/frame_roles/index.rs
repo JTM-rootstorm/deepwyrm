@@ -1260,3 +1260,7 @@ impl RunScan {
 #[cfg(test)]
 #[path = "index_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "indexed_tests.rs"]
+mod indexed_tests;
