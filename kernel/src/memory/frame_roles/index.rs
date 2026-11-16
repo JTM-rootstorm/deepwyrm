@@ -33,7 +33,7 @@ pub(crate) const INDEX_RUN_THRESHOLD: u64 = 16;
 /// §12.11 part 2 item 3)...
 pub(crate) const BUILD_STEP_RUNS: u64 = 512;
 /// ...or this many pages, or the request is covered.
-pub(crate) const BUILD_STEP_PAGES: u64 = 65_536;
+pub(crate) const BUILD_STEP_PAGES: u64 = 32_768;
 /// The most pages one run linked into a building index holds: the size of
 /// a zeroing step. A longer run of the first hold is split.
 pub(crate) const RUN_CAP: u64 = 4096;

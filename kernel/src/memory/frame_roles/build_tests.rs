@@ -368,7 +368,7 @@ fn a_step_links_at_most_512_runs() {
 }
 
 #[test]
-fn a_step_links_at_most_65536_pages_splitting_long_runs_from_their_end() {
+fn a_step_stops_at_its_page_limit_splitting_long_runs_from_their_end() {
     // The first hold takes the 80,000-page hole and 15 of the 5,000s, the
     // 16th holding the root, the leaves and the last 3,000 pages.
     let mut sizes = std::vec![5000; 16];
@@ -388,7 +388,10 @@ fn a_step_links_at_most_65536_pages_splitting_long_runs_from_their_end() {
         steps.push((allocation.linked, allocation.runs));
     }
     assert_eq!(steps, rule_steps(&lengths));
-    assert_eq!(steps[0], (13 * 5000 + 4096, 27));
+    // The first step stops at the run that takes it to its page limit.
+    assert!(steps.len() > 2);
+    assert!(steps[0].0 >= BUILD_STEP_PAGES && steps[0].1 < BUILD_STEP_RUNS);
+    assert!(steps[0].0 - lengths[steps[0].1 as usize - 1] < BUILD_STEP_PAGES);
     let mut place = 0;
     let expected: Vec<(u64, u64)> = lengths
         .iter()
