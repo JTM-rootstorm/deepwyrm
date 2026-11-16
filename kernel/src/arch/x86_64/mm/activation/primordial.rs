@@ -3433,6 +3433,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .roles
                 .allocate_zeroed_backing(page_count, &mut zero)
         }
+        .inspect(user_access::backing_made)
         .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)
     }
 

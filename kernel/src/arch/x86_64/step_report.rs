@@ -172,6 +172,11 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// with teardown owed (one wake can have both).
     owed_wakes_queue: AtomicU64,
     owed_wakes_retirement: AtomicU64,
+    /// The eager backing with the most runs made since boot (DW2 §12.10):
+    /// its runs in the high half, its pages in the low half, each clamped
+    /// to `u32::MAX`, so a reader never pairs one backing's runs with
+    /// another's pages. Zero while none was made.
+    backing_runs: AtomicU64,
 }
 
 impl<const CPUS: usize> StepTally<CPUS> {
@@ -196,7 +201,20 @@ impl<const CPUS: usize> StepTally<CPUS> {
             owed_wakes_unsent: AtomicU64::new(0),
             owed_wakes_queue: AtomicU64::new(0),
             owed_wakes_retirement: AtomicU64::new(0),
+            backing_runs: AtomicU64::new(0),
         }
+    }
+
+    /// An eager backing of `runs` runs and `pages` pages was made: it is
+    /// kept if it has more runs than the one kept, the first kept on a tie.
+    pub(crate) fn backing_made(&self, runs: u64, pages: u64) {
+        let runs = runs.min(u64::from(u32::MAX));
+        let packed = (runs << 32) | pages.min(u64::from(u32::MAX));
+        let _ = self
+            .backing_runs
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
+                (runs > kept >> 32).then_some(packed)
+            });
     }
 
     /// A hold woke the BSP for owed work (`sent`), or could not, for a
@@ -482,6 +500,12 @@ impl<const CPUS: usize> StepTally<CPUS> {
         line(format_args!(
             "owed-longest-us teardown={teardown} finalize={finalize}"
         ));
+        let kept = self.backing_runs.load(Ordering::Relaxed);
+        line(format_args!(
+            "backing-runs longest={} pages={}",
+            kept >> 32,
+            kept & u64::from(u32::MAX)
+        ));
     }
 }
 
@@ -620,6 +644,11 @@ mod live {
         TALLY.timed(cpu, call, now, step)
     }
 
+    /// An eager backing was made (see [`StepTally::backing_made`]).
+    pub(crate) fn backing_made(runs: u64, pages: u64) {
+        TALLY.backing_made(runs, pages);
+    }
+
     /// A hold woke the BSP for owed work (see [`StepTally::owed_wake`]).
     pub(crate) fn owed_wake(queue: bool, retirement: bool, sent: bool) {
         TALLY.owed_wake(queue, retirement, sent);
@@ -676,9 +705,9 @@ mod live {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
-    after_safe_point, allow_teardown_step, at_safe_point, call_ended, finalize_queued,
-    finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended, report,
-    set_drain_source, step_began, take_teardown_step, timed, timed_nested,
+    after_safe_point, allow_teardown_step, at_safe_point, backing_made, call_ended,
+    finalize_queued, finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended,
+    report, set_drain_source, step_began, take_teardown_step, timed, timed_nested,
 };
 
 #[cfg(test)]
@@ -708,8 +737,25 @@ mod tests {
                 "call-steps map=0 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0",
                 "call-total-us map=0 unmap=0 protect=0 fill=0 commit=0 create=0 teardown=0 release=0 finalize=0",
                 "owed-longest-us teardown=0 finalize=0",
+                "backing-runs longest=0 pages=0",
             ]
         );
+    }
+
+    #[test]
+    fn the_backing_with_the_most_runs_is_kept_with_its_pages() {
+        let tally = StepTally::<2>::new();
+        let backing_line = |tally: &StepTally<2>| lines(tally).last().cloned().unwrap();
+        assert_eq!(backing_line(&tally), "backing-runs longest=0 pages=0");
+        for (runs, pages) in [(1, 512), (7, 40), (3, 900), (1, 4096)] {
+            tally.backing_made(runs, pages);
+        }
+        assert_eq!(backing_line(&tally), "backing-runs longest=7 pages=40");
+        // An equal run count later does not replace it.
+        tally.backing_made(7, 2000);
+        assert_eq!(backing_line(&tally), "backing-runs longest=7 pages=40");
+        tally.backing_made(8, 16);
+        assert_eq!(backing_line(&tally), "backing-runs longest=8 pages=16");
     }
 
     #[test]

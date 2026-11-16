@@ -1221,6 +1221,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // SAFETY: `zero` clears each exclusively owned page of the new
         // backing through the authenticated scratch mapping, or fails.
         unsafe { self.roles.allocate_zeroed_backing(page_count, &mut zero) }
+            .inspect(backing_made)
             .map_err(|_| LiveUserAccessError::MissingOrInvalid)
     }
 
@@ -1278,8 +1279,10 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         allocation: crate::memory::frame_roles::BackingAllocation,
     ) -> ObjectBackingGrant {
         // SAFETY: the caller zeroed every page, per this function's contract.
-        unsafe { self.roles.assume_backing_zeroed(allocation) }
-            .unwrap_or_else(|_| panic!("a zeroed backing allocation becomes a backing"))
+        let backing = unsafe { self.roles.assume_backing_zeroed(allocation) }
+            .unwrap_or_else(|_| panic!("a zeroed backing allocation becomes a backing"));
+        backing_made(&backing);
+        backing
     }
 
     /// Frees an allocation that will not become a backing.
@@ -1494,4 +1497,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::FA
         LiveProcessAddressSpace::release_atomic_u32(self, pin)
             .unwrap_or_else(|_| panic!("live atomic pin release lost its owner"));
     }
+}
+
+/// Records a new eager backing's runs and pages in the step report (DW2
+/// §12.10).
+pub(super) fn backing_made(backing: &ObjectBackingGrant) {
+    crate::arch::x86_64::step_report::backing_made(
+        backing.run_count(),
+        backing.byte_len() / crate::memory::physical::BASE_PAGE_SIZE,
+    );
 }
