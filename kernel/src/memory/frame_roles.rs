@@ -29,6 +29,8 @@ mod chain;
 mod index;
 #[path = "frame_roles/manager.rs"]
 mod manager;
+#[path = "frame_roles/slot.rs"]
+mod slot;
 use chain::ChainState;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use index::OnDemandCommit;
@@ -370,25 +372,152 @@ struct RoleRecord {
     role: FrameRole,
 }
 
+/// One slot as stored (DW2 §12.3): 48 bytes. Only the accessors in
+/// `frame_roles/slot.rs` read or write its fields; the rest of the manager
+/// works with the [`SlotView`] they unpack and the [`RoleRecord`] they pack.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct RoleSlot {
     generation: u32,
+    /// The run's pages; 0 if the slot is free.
+    pages: u32,
+    /// The run's physical start; in a free slot, the next free slot plus one
+    /// (0 = none).
+    start: u64,
+    role: StoredRole,
+}
+
+/// A role as stored: 32 bytes. Identities and owners are raw values in this
+/// manager's domain. The proof mark and the table count live in the two
+/// committed-table variants, the only roles that use them.
+#[derive(Clone, Copy)]
+enum StoredRole {
+    Free,
+    AllocatedUninitialized,
+    Zeroed,
+    BackingAllocated(ChainLink),
+    ObjectBacking(ChainLink),
+    ArchitectureBootstrap(ArchitectureBootstrapKind),
+    /// A PML4 candidate; `next_root` is the next slot of the root list plus
+    /// one (0 = none).
+    RootCandidate {
+        owner: u64,
+        next_root: u32,
+    },
+    TableCandidate {
+        owner: u64,
+        level: TableLevel,
+    },
+    /// A committed PML4.
+    Root {
+        owner: u64,
+        mark: u64,
+        tables: u32,
+        next_root: u32,
+    },
+    /// A committed table below a PML4; `parent` is its parent's raw identity.
+    PageTable {
+        owner: u64,
+        parent: u64,
+        mark: u64,
+        tables: u32,
+        level: TableLevel,
+    },
+    External(ExternalFrameRole),
+    ExternalImmutableModule {
+        module_index: u32,
+    },
+    ExternalDeviceMmio,
+    RoleTableStorage,
+    IndexRoot(IndexRootLink),
+    IndexNode(IndexEntryLink),
+    ObjectPage(IndexEntryLink),
+}
+
+const _: () = assert!(core::mem::size_of::<RoleSlot>() == 48);
+const _: () = assert!(core::mem::size_of::<StoredRole>() == 32);
+
+const EMPTY_ROLE_SLOT: RoleSlot = RoleSlot {
+    generation: 0,
+    pages: 0,
+    start: 0,
+    role: StoredRole::Free,
+};
+
+/// One slot unpacked into the types the manager's logic works with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SlotView {
+    generation: u32,
     record: Option<RoleRecord>,
-    /// The epoch of the last empty-hierarchy proof that observed this table.
+    /// On a committed table: the epoch of the last empty-hierarchy proof
+    /// that observed it. Zero on any other slot.
     mark: u64,
     /// On a committed PML4: how many committed tables below it its owner
     /// has. On any other committed table: how many committed child tables
     /// name it as their parent (DW2 §10.14 revision 2 item 2), so a table
-    /// can be freed alone only once none does.
+    /// can be freed alone only once none does. Zero on any other slot.
     tables: u32,
 }
 
-const EMPTY_ROLE_SLOT: RoleSlot = RoleSlot {
-    generation: 0,
-    record: None,
-    mark: 0,
-    tables: 0,
-};
+/// What a committed table's slot says about it: the questions the page
+/// walk and the empty-hierarchy proof ask, read without building a
+/// [`FrameRole`]. Owners and parents are raw values in this manager's
+/// domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TableFacts {
+    start: u64,
+    owner: u64,
+    level: TableLevel,
+    /// The parent's raw identity; 0 on a PML4.
+    parent: u64,
+    mark: u64,
+    tables: u32,
+}
+
+/// Which kind of backing head a slot holds: the one question the object
+/// paths ask of a head before they walk it (DW2 §12.6), read without
+/// building a [`FrameRole`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadKind {
+    ObjectBacking,
+    BackingAllocated,
+    DeviceMmio,
+    ImmutableModule,
+    IndexRoot,
+    /// Every other role, and a free slot.
+    Other,
+}
+
+/// What a slot that can be a run of a chain says about it (DW2 §12.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChainFacts {
+    range: PageRange,
+    source: ChainSource,
+}
+
+/// The role a chain run holds: a run of an allocator-owned chain with its
+/// link, or an external backing, which is a chain of its one run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChainSource {
+    /// `BackingAllocated`.
+    Allocated(ChainLink),
+    /// `ObjectBacking`.
+    Backing(ChainLink),
+    /// `ExternalImmutableModule`.
+    Module,
+    /// `ExternalDeviceMmio`.
+    Device,
+}
+
+/// What a slot holding an index node or a committed on-demand page says
+/// about it (DW2 §12.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexEntryFacts {
+    range: PageRange,
+    /// True for an index node, false for a committed page.
+    node: bool,
+    link: IndexEntryLink,
+}
 
 /// Allocator pages per role slot the grown table adds beyond the boot table:
 /// one per page, so slots cannot run out before pages do, since every run
@@ -668,8 +797,7 @@ impl StagedTableCommit {
 ///
 /// It starts with `ROLE_CAPACITY` slots and an allocator with `RANGE_CAPACITY`
 /// free ranges, held inline. Once the direct map is active,
-/// [`Self::adopt_storage`] moves the slots and the free-slot stack into one
-/// run of RAM sized from installed memory, adds an index from each allocator
+/// [`Self::adopt_storage`] moves the slots into one run of RAM sized from installed memory, adds an index from each allocator
 /// page to the role starting there (DW2 large-memory plan, M2 §5.3), and
 /// switches the allocator to a buddy allocator whose per-page metadata lives
 /// in the same run (M7 §12.2).
@@ -677,10 +805,16 @@ pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPAC
     domain: u64,
     allocator: PhysicalFrameAllocator<RANGE_CAPACITY>,
     roles: GrowableStore<RoleSlot, ROLE_CAPACITY>,
-    /// Free slot numbers; the last of the first `free_slot_count` is used
-    /// next. A slot whose generation is spent is never returned to it.
-    free_slots: GrowableStore<u32, ROLE_CAPACITY>,
+    /// The first free slot plus one (0 = none): the head of the free list
+    /// threaded through the free slots' `start`. A slot whose generation is
+    /// spent is never returned to it.
+    first_free: u32,
+    /// The free list's length.
     free_slot_count: usize,
+    /// The first slot of PML4 level (a candidate or a committed root) plus
+    /// one (0 = none): the head of the root list threaded through those
+    /// slots' stored roles.
+    first_root: u32,
     /// After growth: for each allocator page, in initial-range order, one
     /// plus the slot of the dynamic role starting at that page, or zero.
     starts: Option<&'static mut [u32]>,
@@ -696,7 +830,6 @@ pub(crate) struct FrameRoleManager<const RANGE_CAPACITY: usize, const ROLE_CAPAC
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RoleTableLayout {
     slots: usize,
-    free_slots_offset: usize,
     starts_offset: usize,
     starts: usize,
     links_offset: usize,
@@ -756,3 +889,11 @@ mod tests;
 #[cfg(test)]
 #[path = "frame_roles/grown_tests.rs"]
 mod grown_tests;
+
+#[cfg(test)]
+#[path = "frame_roles/slot_tests.rs"]
+mod slot_tests;
+
+#[cfg(test)]
+#[path = "frame_roles/slot_writer_tests.rs"]
+mod slot_writer_tests;

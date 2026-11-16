@@ -296,23 +296,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .filter(|count| *count != 0)
             .ok_or(FrameRoleError::WrongRole)?;
         let end = first.checked_add(count).ok_or(FrameRoleError::WrongRole)?;
-        match self.record(backing.0)?.role {
-            FrameRole::ObjectBacking(_) | FrameRole::ExternalDeviceMmio => {}
-            FrameRole::ExternalImmutableModule { .. } if writable => {
+        match self.head_kind_at(self.slot(backing.0)?) {
+            HeadKind::ObjectBacking | HeadKind::DeviceMmio => {}
+            HeadKind::ImmutableModule if writable => {
                 return Err(FrameRoleError::ReadOnlyBacking);
             }
-            FrameRole::ExternalImmutableModule { .. } => {}
-            FrameRole::AllocatedUninitialized
-            | FrameRole::Zeroed
-            | FrameRole::BackingAllocated(_)
-            | FrameRole::ArchitectureBootstrap(_)
-            | FrameRole::TableCandidate { .. }
-            | FrameRole::PageTable { .. }
-            | FrameRole::External(_)
-            | FrameRole::RoleTableStorage
-            | FrameRole::IndexRoot(_)
-            | FrameRole::IndexNode(_)
-            | FrameRole::ObjectPage(_) => return Err(FrameRoleError::WrongRole),
+            HeadKind::ImmutableModule => {}
+            HeadKind::BackingAllocated | HeadKind::IndexRoot | HeadKind::Other => {
+                return Err(FrameRoleError::WrongRole);
+            }
         }
         let (total, _) = self.chain_totals(backing.0, ChainState::Backing)?;
         if end > total {
@@ -349,8 +341,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         let page = offset / BASE_PAGE_SIZE;
         let head = cursor.head;
-        match self.record(head)?.role {
-            FrameRole::IndexRoot(_) => {
+        match self.head_kind_at(self.slot(head)?) {
+            HeadKind::IndexRoot => {
                 let (run, physical_start) = self.index_resolve(head, page)?;
                 return Ok(ObjectSegment {
                     run,
@@ -359,21 +351,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     byte_len: BASE_PAGE_SIZE,
                 });
             }
-            FrameRole::ObjectBacking(_) | FrameRole::ExternalDeviceMmio => {}
-            FrameRole::ExternalImmutableModule { .. } if writable => {
+            HeadKind::ObjectBacking | HeadKind::DeviceMmio => {}
+            HeadKind::ImmutableModule if writable => {
                 return Err(FrameRoleError::ReadOnlyBacking);
             }
-            FrameRole::ExternalImmutableModule { .. } => {}
-            FrameRole::AllocatedUninitialized
-            | FrameRole::Zeroed
-            | FrameRole::BackingAllocated(_)
-            | FrameRole::ArchitectureBootstrap(_)
-            | FrameRole::TableCandidate { .. }
-            | FrameRole::PageTable { .. }
-            | FrameRole::External(_)
-            | FrameRole::RoleTableStorage
-            | FrameRole::IndexNode(_)
-            | FrameRole::ObjectPage(_) => return Err(FrameRoleError::WrongRole),
+            HeadKind::ImmutableModule => {}
+            HeadKind::BackingAllocated | HeadKind::Other => {
+                return Err(FrameRoleError::WrongRole);
+            }
         }
         if page < cursor.run_page {
             *cursor = BackingCursor::new(BackingIdentity(head));
@@ -415,8 +400,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         runs: u64,
     ) -> Result<(), FrameRoleError> {
         if !matches!(
-            self.record(head)?.role,
-            FrameRole::BackingAllocated(_) | FrameRole::ObjectBacking(_)
+            self.head_kind_at(self.slot(head)?),
+            HeadKind::BackingAllocated | HeadKind::ObjectBacking
         ) || self.chain_totals(head, state)? != (pages, runs)
         {
             return Err(FrameRoleError::WrongRole);
@@ -430,7 +415,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     pub(super) fn check_chains(&self) -> Result<(), FrameRoleError> {
         let mut linked = 0_u64;
         let mut reached = 0_u64;
-        for (slot, entry) in self.roles.as_slice().iter().enumerate() {
+        for (slot, entry) in self.slot_views() {
             let Some(record) = entry.record else {
                 continue;
             };
@@ -482,9 +467,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn link_next(&mut self, slot: usize, next: u64) {
-        let mut record = self.roles.as_slice()[slot]
-            .record
-            .expect("a linked run is live");
+        let mut record = self.record_at(slot).expect("a linked run is live");
         let FrameRole::BackingAllocated(link) = &mut record.role else {
             panic!("only a run being allocated is linked");
         };
@@ -558,20 +541,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         state: ChainState,
     ) -> Result<ChainRun, FrameRoleError> {
         let slot = self.slot(identity)?;
-        let record = self.roles.as_slice()[slot]
-            .record
-            .ok_or(FrameRoleError::InvalidGrant)?;
-        let link = match (state, record.role) {
-            (ChainState::Allocated, FrameRole::BackingAllocated(link))
-            | (ChainState::Backing, FrameRole::ObjectBacking(link)) => link,
-            (
-                ChainState::Backing,
-                FrameRole::ExternalImmutableModule { .. } | FrameRole::ExternalDeviceMmio,
-            ) if identity == head => ChainLink {
-                head: head.raw,
-                object_page: 0,
-                next: 0,
-            },
+        let facts = self.chain_at(slot).ok_or(FrameRoleError::WrongRole)?;
+        let link = match (state, facts.source) {
+            (ChainState::Allocated, ChainSource::Allocated(link))
+            | (ChainState::Backing, ChainSource::Backing(link)) => link,
+            (ChainState::Backing, ChainSource::Module | ChainSource::Device)
+                if identity == head =>
+            {
+                ChainLink {
+                    head: head.raw,
+                    object_page: 0,
+                    next: 0,
+                }
+            }
             _ => return Err(FrameRoleError::WrongRole),
         };
         if head.domain != self.domain || link.head != head.raw || link.object_page != object_page {
@@ -579,7 +561,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
         Ok(ChainRun {
             slot,
-            range: record.range,
+            range: facts.range,
             link,
         })
     }

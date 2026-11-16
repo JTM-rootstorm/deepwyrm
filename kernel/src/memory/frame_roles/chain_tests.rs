@@ -161,14 +161,15 @@ fn running_out_of_role_slots_frees_every_run_taken() {
     let _held = fragment(&mut roles, &[1, 1, 1, 1, 1]);
     let before = roles.available_frames();
     // Hide all but three free slots: a five-run request takes three runs,
-    // then finds no slot.
+    // then finds no slot. The free list's length is its count (DW2 §12.3),
+    // so the invariants hold again once the count is restored.
     let free_slots = roles.free_slot_count;
     roles.free_slot_count = 3;
     assert_eq!(roles.allocate_backing(5), Err(FrameRoleError::Capacity));
     assert_eq!(roles.available_frames(), before);
     assert_eq!(roles.free_slot_count, 3);
-    assert_eq!(roles.check_invariants(), Ok(()));
     roles.free_slot_count = free_slots;
+    assert_eq!(roles.check_invariants(), Ok(()));
     assert_eq!(backing(&mut roles, 5).run_count(), 5);
 }
 
@@ -491,5 +492,193 @@ fn a_backing_whose_later_zeroing_step_fails_is_cancelled_whole() {
     assert!(!roles.zero_backing_pages(&allocation, 2, 2, &mut |page| page != whole[3]));
     roles.cancel_backing_allocation(allocation).unwrap();
     assert_eq!(roles.available_frames(), free);
+    assert_eq!(roles.check_invariants(), Ok(()));
+}
+
+/// DW2 §12.6 item 2: the object paths read a head through `head_kind_at`
+/// and a run through `chain_at`, and keep every error of the full record
+/// read, in the same order: the offset first, then the identity (foreign,
+/// then stale), then the role, then a writable use of a module.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "metadata-only boot module and BAR imports, and a host-model zeroing attestation"
+)]
+fn the_object_paths_keep_their_errors_and_their_order() {
+    let mut roles = manager(64);
+    let grant = backing(&mut roles, 2);
+    let head = grant.identity();
+    let foreign = BackingIdentity(FrameRoleIdentity {
+        domain: roles.domain + 1,
+        raw: head.0.raw,
+    });
+    let mut cursor = BackingCursor::new(foreign);
+
+    // A misaligned offset is refused before the head is read.
+    assert_eq!(
+        roles.object_segments(foreign, 1, PAGE, false).err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.resolve_at(&mut cursor, 1, false).err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    // A foreign head.
+    assert_eq!(
+        roles.object_segments(foreign, 0, PAGE, false).err(),
+        Some(FrameRoleError::ForeignManager)
+    );
+    assert_eq!(
+        roles.resolve_at(&mut cursor, 0, false).err(),
+        Some(FrameRoleError::ForeignManager)
+    );
+    assert_eq!(
+        roles.release_chain(foreign.0, ChainState::Backing, 2, 1),
+        Err(FrameRoleError::ForeignManager)
+    );
+
+    // Heads of the wrong role: a plain allocation, a zeroed page, a run
+    // being allocated, and a run that is not its chain's head.
+    let plain = roles.allocate(1).unwrap();
+    let plain_identity = plain.identity;
+    let zeroed = roles.allocate(1).unwrap();
+    // SAFETY: the host model never dereferences the synthetic run.
+    let zeroed = unsafe { roles.assume_zeroed(zeroed) }.unwrap();
+    let allocation = roles.allocate_backing(1).unwrap();
+    let wrong = [plain_identity, zeroed.identity, allocation.head];
+    for identity in wrong {
+        let backing = BackingIdentity(identity);
+        assert_eq!(
+            roles.object_segments(backing, 0, PAGE, false).err(),
+            Some(FrameRoleError::WrongRole)
+        );
+        for writable in [false, true] {
+            assert_eq!(
+                roles.resolve_object_page(backing, 0, writable).err(),
+                Some(FrameRoleError::WrongRole)
+            );
+        }
+    }
+    for identity in [plain_identity, zeroed.identity] {
+        for state in [ChainState::Allocated, ChainState::Backing] {
+            assert_eq!(
+                roles.release_chain(identity, state, 1, 1),
+                Err(FrameRoleError::WrongRole)
+            );
+        }
+    }
+    // A head of the right kind for the other state passes the head check
+    // and fails on its run.
+    assert_eq!(
+        roles.release_chain(allocation.head, ChainState::Backing, 1, 1),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles.release_chain(head.0, ChainState::Allocated, 2, 1),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles
+            .chain_run(head.0, head.0, 0, ChainState::Allocated)
+            .err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles
+            .chain_run(allocation.head, allocation.head, 0, ChainState::Backing)
+            .err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    // A run of another role named as a chain's run.
+    assert_eq!(
+        roles
+            .chain_run(head.0, plain_identity, 0, ChainState::Backing)
+            .err(),
+        Some(FrameRoleError::WrongRole)
+    );
+
+    // External heads: a module is a chain of its one run, read-only; a
+    // module or a BAR named as a run of another chain is refused, and
+    // neither is released as a chain.
+    let module = PhysicalRange::new(0x100_0000, PAGE).unwrap();
+    // SAFETY: metadata-only host model with disjoint synthetic provenance.
+    let module = unsafe { roles.import_immutable_module(module, 0) }.unwrap();
+    let bar = PhysicalRange::new(0x200_0000, PAGE).unwrap();
+    // SAFETY: as above.
+    let bar = unsafe { roles.import_device_mmio(bar) }.unwrap();
+    assert_eq!(
+        roles.resolve_object_page(module.identity(), 0, true).err(),
+        Some(FrameRoleError::ReadOnlyBacking)
+    );
+    // The offset is still checked first.
+    assert_eq!(
+        roles.resolve_object_page(module.identity(), 1, true).err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    assert_eq!(
+        roles
+            .object_segments(module.identity(), 1, PAGE, true)
+            .err(),
+        Some(FrameRoleError::WrongRole)
+    );
+    for external in [module.identity().0, bar.identity().0] {
+        assert_eq!(
+            roles
+                .chain_run(head.0, external, 0, ChainState::Backing)
+                .err(),
+            Some(FrameRoleError::WrongRole)
+        );
+        assert!(
+            roles
+                .chain_run(external, external, 0, ChainState::Backing)
+                .is_ok()
+        );
+        assert_eq!(
+            roles
+                .chain_run(external, external, 0, ChainState::Allocated)
+                .err(),
+            Some(FrameRoleError::WrongRole)
+        );
+        for state in [ChainState::Allocated, ChainState::Backing] {
+            assert_eq!(
+                roles.release_chain(external, state, 1, 1),
+                Err(FrameRoleError::WrongRole)
+            );
+        }
+    }
+
+    // A cursor aimed at a run of another role, or at an external backing,
+    // restarts from its head and resolves the head's own page.
+    let own = segments(&roles, &grant)[0];
+    for aimed_at in [plain_identity, module.identity().0, bar.identity().0] {
+        let mut aimed = BackingCursor::new(head);
+        aimed.run = aimed_at;
+        let resolved = roles.resolve_at(&mut aimed, 0, true).unwrap();
+        assert_eq!(resolved.physical_start, own.physical_start);
+        assert_eq!(resolved.run, head.0);
+    }
+
+    // A stale head, after its backing is freed.
+    roles.cancel_object_backing(grant).unwrap();
+    let mut stale = BackingCursor::new(head);
+    assert_eq!(
+        roles.object_segments(head, 0, PAGE, false).err(),
+        Some(FrameRoleError::InvalidGrant)
+    );
+    assert_eq!(
+        roles.resolve_at(&mut stale, 0, false).err(),
+        Some(FrameRoleError::InvalidGrant)
+    );
+    assert_eq!(
+        roles.release_chain(head.0, ChainState::Backing, 2, 1),
+        Err(FrameRoleError::InvalidGrant)
+    );
+    assert_eq!(
+        roles
+            .chain_run(head.0, head.0, 0, ChainState::Backing)
+            .err(),
+        Some(FrameRoleError::InvalidGrant)
+    );
+    roles.cancel_backing_allocation(allocation).unwrap();
     assert_eq!(roles.check_invariants(), Ok(()));
 }

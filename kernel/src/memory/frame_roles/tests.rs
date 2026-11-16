@@ -736,10 +736,8 @@ fn transition_table_set_import_is_atomic_and_exact() {
     let imported = unsafe { capacity_limited.import_transition_tables::<4>(&[0x20_000]) }.unwrap();
     assert_eq!(imported.len(), 1);
     let record = capacity_limited
-        .roles
-        .as_slice()
-        .iter()
-        .filter_map(|slot| slot.record)
+        .slot_views()
+        .filter_map(|(_, view)| view.record)
         .find(|record| record.range.start == 0x20_000)
         .unwrap();
     assert_eq!(
@@ -761,10 +759,8 @@ fn transition_table_set_import_is_atomic_and_exact() {
     assert_eq!(imported.len(), 2);
     for index in 0..2 {
         let record = roles
-            .roles
-            .as_slice()
-            .iter()
-            .filter_map(|slot| slot.record)
+            .slot_views()
+            .filter_map(|(_, view)| view.record)
             .find(|record| record.range.start == 0x30_000 + (index as u64) * BASE_PAGE_SIZE)
             .unwrap();
         assert_eq!(
@@ -988,7 +984,7 @@ fn a_freed_slot_is_reused_with_the_next_generation_and_a_spent_one_retires() {
     roles.cancel_allocation(second).unwrap();
 
     // A slot at its last generation is used once more, then never again.
-    roles.roles.as_mut_slice()[slot].generation = u32::MAX - 1;
+    roles.test_set_generation(slot, u32::MAX - 1);
     let last = roles.allocate(1).unwrap();
     assert_eq!(slot_number(last.identity), slot);
     roles.cancel_allocation(last).unwrap();
