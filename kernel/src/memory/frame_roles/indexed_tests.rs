@@ -901,3 +901,84 @@ fn a_never_stepped_eager_backing_cancels_whole() {
     assert_eq!(roles.allocator.boot_free_ranges(), free.as_slice());
     assert_eq!(roles.check_invariants(), Ok(()));
 }
+
+/// Releases a `pages`-page eager backing laid out as `runs` (first page,
+/// pages) in steps of `budget`, checking each step's visits and cursor
+/// against what it freed. Returns each step's (cursor, freed, visited).
+fn release_counting<const R: usize, const S: usize>(
+    roles: &mut FrameRoleManager<R, S>,
+    grant: ObjectBackingGrant,
+    runs: &[(u64, u64)],
+    budget: u64,
+) -> Vec<(u64, u64, u64)> {
+    let backing = grant.identity();
+    let pages = grant.byte_len() / PAGE;
+    let mut cursor = 0;
+    let mut released = 0;
+    let mut steps = Vec::new();
+    while cursor < pages {
+        let (next, freed, visited) = roles.release_index_step(backing, cursor, budget).unwrap();
+        assert!(next > cursor, "a step makes progress");
+        if next < pages {
+            assert!(
+                visited >= budget,
+                "budget {budget}: a step short of the end used its budget"
+            );
+        }
+        assert!(visited < budget + u64::from(INDEX_MAX_LEVELS));
+        released += freed;
+        // The cursor is past only what was released, and the start of a
+        // run still live across it.
+        let live = runs
+            .iter()
+            .find(|(first, count)| *first < next && next < first + count);
+        assert_eq!(
+            released,
+            live.map_or(next, |(first, _)| *first),
+            "budget {budget}"
+        );
+        steps.push((next, freed, visited));
+        cursor = next;
+    }
+    assert_eq!(released, pages);
+    roles.cancel_object_backing(grant).unwrap();
+    steps
+}
+
+#[test]
+fn a_release_step_counts_a_visit_per_leaf_passed_and_freed_and_per_entry_cleared() {
+    // Runs: 5,300 pages (leaves 0 to 9 whole, ending 180 pages into leaf
+    // 10), 300 pages (inside leaf 10), then 16 one-page runs: 5,616 pages,
+    // 18 runs, two levels with 11 leaves. Twelve more one-page holes hold
+    // the root and the leaves.
+    let mut sizes = std::vec![5300, 300];
+    sizes.extend([1; 28]);
+    let pages = 5616;
+    for (budget, first) in [
+        // 10 leaves passed (1 visit each) and freed by the cascade (1 each),
+        // then the 180 entries of leaf 10 cleared (1 each) and the run
+        // freed: 20 + 180 = 200 visits, exactly the budget.
+        (200, (5300, 5300, 200)),
+        // As above (200), then the 300-page run's entries cleared (300),
+        // then 12 one-page runs (1 each) reach the budget: 512 visits,
+        // cursor 5,612, 5,612 pages freed.
+        (512, (5612, 5612, 512)),
+        // Leaf 0 passed (1), its cascade (1), leaf 1 passed (1), its
+        // cascade (1), leaf 2 passed (1): 5 visits, cursor at 1,536 and
+        // the step ends after leaf 2's cascade (1), 6 visits, nothing freed.
+        (5, (1536, 0, 6)),
+    ] {
+        let (mut roles, model) = small(8192);
+        let _held = holes(&mut roles, &sizes);
+        let initial = roles.available_frames();
+        let runs = chain_runs(&mut roles, model, pages);
+        assert_eq!(runs.len(), 18);
+        assert_eq!(&runs[..2], &[(0, 5300), (5300, 300)]);
+        let grant = backing(&mut roles, pages);
+        assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
+        let steps = release_counting(&mut roles, grant, &runs, budget);
+        assert_eq!(steps[0], first, "budget {budget}");
+        assert_eq!(roles.available_frames(), initial);
+        assert_eq!(roles.check_invariants(), Ok(()));
+    }
+}
