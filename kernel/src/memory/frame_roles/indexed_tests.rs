@@ -786,10 +786,12 @@ fn a_gap_or_a_misplaced_entry_in_an_eager_index_fails_the_invariants() {
         write(page, raw);
         assert_eq!(roles.check_invariants(), Ok(()));
     }
-    // The first run's entries cleared, as a stepped release would leave
-    // them: an `Eager` root that no release has stepped is not whole.
-    let cleared: Vec<u64> = (0..4).map(|page| model.read(root, page)).collect();
-    for page in 0..4 {
+    // The first two entries of the first run cleared, as a release step
+    // that ended inside the run would leave them: the run is still reached
+    // from page 2, but an `Eager` root that no release has stepped must
+    // start at page 0.
+    let cleared: Vec<u64> = (0..2).map(|page| model.read(root, page)).collect();
+    for page in 0..2 {
         write(page, 0);
     }
     assert_eq!(
