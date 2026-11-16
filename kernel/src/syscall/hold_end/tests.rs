@@ -530,3 +530,19 @@ fn the_state_round_trips_through_its_bits() {
     assert_eq!(OwedHoldState::from_bits(state.bits()), state);
     assert_eq!(OwedHoldState::from_bits(0), OwedHoldState::default());
 }
+
+/// DW2 §12.11 part 2 item 11: a hold may take one step. The first take in
+/// a hold is allowed, every later one refused; the end reports the steps
+/// taken and starts the next hold with its own step.
+#[test]
+fn a_hold_step_budget_allows_one_step_per_hold() {
+    let mut budget = HoldStepBudget::new();
+    assert_eq!(budget.end(), 0, "a hold that took nothing took no step");
+    assert!(budget.take(), "the first step of a hold is allowed");
+    assert!(!budget.take(), "a second step in the same hold is refused");
+    assert!(!budget.take(), "and every later one");
+    assert_eq!(budget.end(), 1, "the hold took one step");
+    assert_eq!(budget.end(), 0, "the end cleared the count");
+    assert!(budget.take(), "the next hold has its own step");
+    assert_eq!(budget.end(), 1);
+}

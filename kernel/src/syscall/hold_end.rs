@@ -145,6 +145,36 @@ pub(crate) fn settle_hold_queues<const CAPACITY: usize, const CPUS: usize>(
     }
 }
 
+/// How many steps of one kind of owed work a hold may take: one (DW2
+/// §12.11 part 2 item 11). The first [`Self::take`] in a hold allows its
+/// step and every later one refuses; the hold's end reads the count with
+/// [`Self::end`], which starts the next hold afresh.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct HoldStepBudget {
+    taken: bool,
+}
+
+impl HoldStepBudget {
+    pub(crate) const fn new() -> Self {
+        Self { taken: false }
+    }
+
+    /// Whether the hold may take a step now: `true` only the first time.
+    pub(crate) const fn take(&mut self) -> bool {
+        let allowed = !self.taken;
+        self.taken = true;
+        allowed
+    }
+
+    /// At the hold's end: how many steps it took through [`Self::take`]
+    /// (0 or 1), and a fresh budget for the next hold.
+    pub(crate) const fn end(&mut self) -> u32 {
+        let steps = self.taken as u32;
+        self.taken = false;
+        steps
+    }
+}
+
 /// What a hold did to one queue of owed work (DW2 §10.19 revision 3): it
 /// queued into it while it was empty, and the queue was still non-empty
 /// when the hold ended.
