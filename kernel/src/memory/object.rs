@@ -221,7 +221,10 @@ pub(crate) fn complete_memory_finalization<
     );
     let mut parent_release = None;
     match (kind, backing.kind()) {
-        (MemoryObjectKind::PageBacked, ObjectBackingKind::AllocatorOwned)
+        (
+            MemoryObjectKind::PageBacked,
+            ObjectBackingKind::AllocatorOwned | ObjectBackingKind::AllocatorIndexed,
+        )
         | (MemoryObjectKind::OnDemand, ObjectBackingKind::OnDemand) => {
             if let Err(error) = roles.cancel_object_backing(backing) {
                 panic!(
@@ -1153,7 +1156,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             (kind, backing.kind()),
             (
                 MemoryObjectKind::PageBacked,
-                ObjectBackingKind::AllocatorOwned
+                ObjectBackingKind::AllocatorOwned | ObjectBackingKind::AllocatorIndexed
             ) | (
                 MemoryObjectKind::ImmutableBootModule,
                 ObjectBackingKind::ImmutableModule { .. }
@@ -1301,17 +1304,23 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         self.owed_len != 0
     }
 
-    /// Queues an on-demand object's finalization to be done in steps (DW2
-    /// §10.12 item 1), in a free slot (the one `take_finalization` just
-    /// emptied, at least, is free); any other kind is returned to be
-    /// completed at once.
+    /// Queues the finalization of an on-demand object, or of a page-backed
+    /// object whose backing is indexed, to be done in steps (DW2 §10.12
+    /// item 1, §12.10 part 2 item 6), in a free slot (the one
+    /// `take_finalization` just emptied, at least, is free); any other kind
+    /// is returned to be completed at once.
     pub(crate) fn defer_finalization(
         &mut self,
         finalization: MemoryObjectFinalization,
     ) -> Option<MemoryObjectFinalization> {
-        if finalization.kind != MemoryObjectKind::OnDemand
-            || finalization.backing.kind() != ObjectBackingKind::OnDemand
-        {
+        if !matches!(
+            (finalization.kind, finalization.backing.kind()),
+            (MemoryObjectKind::OnDemand, ObjectBackingKind::OnDemand)
+                | (
+                    MemoryObjectKind::PageBacked,
+                    ObjectBackingKind::AllocatorIndexed
+                )
+        ) {
             return Some(finalization);
         }
         let slot = self
@@ -1337,7 +1346,9 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     /// first: at most `budget` index entries are visited, the budget left
     /// by an object that completes going on to the next (step-6 review R3),
     /// less the root's entries its completion reads.
-    /// Each step lowers the object's weight by the frames it freed; an
+    /// Each step lowers the object's weight by what it freed of what the
+    /// object is charged: an on-demand object's frames, an eager object's
+    /// run pages, not its index nodes (DW2 §12.10 part 2 item 8); an
     /// object whose index is empty is completed. `true` if any remain.
     #[cfg(deepwyrm_integrated)]
     pub(crate) fn finalize_owed_step<
@@ -1404,7 +1415,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             self.owed_head = (self.owed_head + 1) % OBJECTS;
             self.owed_len -= 1;
             let parent = complete_memory_finalization(registry, roles, owed.finalization);
-            assert!(parent.is_none(), "an on-demand object has no parent");
+            assert!(parent.is_none(), "an owed object has no parent");
             // Completion re-reads the root's entries to check the index
             // empty before freeing it: charged in full (second security
             // pass D-2).

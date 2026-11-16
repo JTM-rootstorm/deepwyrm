@@ -173,7 +173,7 @@ fn pages(start: u64, count: u64) -> PageRange {
 
 /// One role of every kind, with owners and parents of `roles`' domain and
 /// links at their limits.
-fn every_role(roles: &TestManager) -> [FrameRole; 18] {
+fn every_role(roles: &TestManager) -> [FrameRole; 20] {
     let owner = TableOwnerKey {
         domain: roles.domain,
         raw: u64::MAX,
@@ -227,6 +227,17 @@ fn every_role(roles: &TestManager) -> [FrameRole; 18] {
         FrameRole::IndexRoot(IndexRootLink {
             pages: u64::MAX,
             levels: 4,
+            state: IndexRootState::OnDemand,
+        }),
+        FrameRole::IndexRoot(IndexRootLink {
+            pages: u64::MAX,
+            levels: 4,
+            state: IndexRootState::EagerAllocated,
+        }),
+        FrameRole::IndexRoot(IndexRootLink {
+            pages: 1,
+            levels: 1,
+            state: IndexRootState::Eager,
         }),
         FrameRole::IndexNode(entry),
         FrameRole::ObjectPage(entry),

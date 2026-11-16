@@ -199,7 +199,22 @@ fn running_out_of_memory_mid_backing_frees_every_run_taken() {
     assert_eq!(free_blocks(&roles), blocks);
     assert_eq!(roles.check_invariants(), Ok(()));
 
-    // The same memory is still usable whole, one page per run.
+    // Held as an index (more than 16 runs), the same memory has no room
+    // for its nodes: the allocation fails and frees all it took (DW2
+    // §12.10 part 2 item 4).
+    assert_eq!(
+        roles.allocate_backing(before),
+        Err(FrameRoleError::Physical(
+            PhysicalMemoryError::NoFramesAvailable
+        ))
+    );
+    assert_eq!(roles.available_frames(), before);
+    assert_eq!(free_blocks(&roles), blocks);
+    assert_eq!(roles.check_invariants(), Ok(()));
+
+    // Without index memory, the same memory is still usable whole, one
+    // page per run.
+    roles.index_memory = None;
     let grant = backing(&mut roles, before);
     assert_eq!(grant.run_count(), before);
     assert_eq!(roles.available_frames(), 0);

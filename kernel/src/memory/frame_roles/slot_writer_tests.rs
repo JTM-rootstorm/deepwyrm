@@ -233,6 +233,7 @@ impl Driver {
             11 => FrameRole::IndexRoot(IndexRootLink {
                 pages: 1 + self.rng.below(512),
                 levels: 1,
+                state: IndexRootState::OnDemand,
             }),
             12 => FrameRole::IndexNode(entry),
             13 => FrameRole::ObjectPage(entry),
