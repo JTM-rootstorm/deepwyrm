@@ -1702,6 +1702,183 @@ mod owed_finalization {
         assert_eq!(roles.available_frames(), initial);
     }
 
+    type Holed = FrameRoleManager<64, 128>;
+
+    /// A manager whose free memory is 48 single pages.
+    fn holed() -> Holed {
+        let mut roles = synthetic_frame_role_manager::<64, 128>(0x1000, 96);
+        roles.set_index_memory(Box::leak(Box::<Model>::default()));
+        let mut gaps = std::vec::Vec::new();
+        for _ in 0..48 {
+            gaps.push(roles.allocate(1).unwrap());
+            roles.allocate(1).unwrap();
+        }
+        for gap in gaps {
+            roles.cancel_allocation(gap).unwrap();
+        }
+        roles
+    }
+
+    fn tag(group: crate::object::ObjectId) -> ChargeTag {
+        let mut tag = ChargeTag::EMPTY;
+        assert!(tag.push(group));
+        tag
+    }
+
+    /// DW2 §12.11 part 2 items 6 to 8: an abandoned create's backing at
+    /// each stage that owes one (building with runs linked, complete and
+    /// not zeroed, rolled back after zeroing) is freed by owed steps, its
+    /// reservation falling by the run pages freed and ending with its root,
+    /// and every frame comes back.
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the host model never dereferences synthetic physical memory"
+    )]
+    fn an_abandoned_backing_is_freed_in_owed_steps_its_reservation_falling() {
+        for stage in 0..3 {
+            let mut roles = holed();
+            let initial = roles.available_frames();
+            let mut registry = ObjectRegistry::<4>::new();
+            let group = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+            let thread = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+            let mut authority = MemoryObjectAuthority::<1, 1>::new();
+            let pages = 40;
+            assert!(registry.reserve_pages(thread, tag(group), pages));
+            let owed = match stage {
+                0 => {
+                    let mut allocation = roles.begin_backing(pages).unwrap();
+                    roles.extend_backing_runs(&mut allocation, 5).unwrap();
+                    roles.abandon_backing(allocation)
+                }
+                1 => {
+                    let allocation = roles.allocate_backing(pages).unwrap();
+                    roles.abandon_backing(allocation)
+                }
+                _ => {
+                    let allocation = roles.allocate_backing(pages).unwrap();
+                    // SAFETY: the host model never dereferences the runs.
+                    let grant = unsafe { roles.assume_backing_zeroed(allocation) }.unwrap();
+                    // The rolled-back create's hold ended its Thread's
+                    // reservation before the adapter ran.
+                    registry.release_reserved_pages(thread);
+                    roles.abandon_object_backing(grant)
+                }
+            }
+            .expect("an index with runs linked is owed");
+            let owed_pages = owed.pages();
+            assert_eq!(owed_pages, if stage == 0 { 5 } else { pages });
+            if stage == 2 {
+                assert!(registry.reserve_owed_backing_pages(owed.key(), tag(group), owed_pages));
+            } else {
+                assert!(registry.rekey_reservation_to_owed_backing(thread, owed.key(), owed_pages));
+            }
+            authority.queue_owed_backing(owed);
+            assert!(authority.finalization_owed());
+            assert_eq!(registry.charged_pages(group), owed_pages as usize);
+            roles.check_invariants().unwrap();
+            // The runs linked and the root are all it still holds.
+            assert_eq!(roles.available_frames(), initial - owed_pages - 1);
+
+            let mut charged = owed_pages as usize;
+            let mut steps = 0;
+            loop {
+                let held = roles.available_frames();
+                let owed = authority.finalize_owed_step(&mut registry, &mut roles, 3);
+                steps += 1;
+                roles.check_invariants().unwrap();
+                let back = usize::try_from(roles.available_frames() - held).unwrap();
+                if !owed {
+                    // The last step frees the root too, never charged.
+                    assert_eq!(back, charged + 1, "stage {stage}");
+                    assert_eq!(registry.charged_pages(group), 0);
+                    break;
+                }
+                assert_eq!(registry.charged_pages(group), charged - back);
+                charged -= back;
+            }
+            assert!(steps > 1, "stage {stage}: several steps");
+            assert_eq!(authority.owed_backing_count(), 0);
+            assert_eq!(roles.available_frames(), initial);
+            // The reservation ended: its slot takes a new one.
+            assert!(registry.reserve_pages(thread, tag(group), 1));
+            assert_eq!(registry.charged_pages(group), 1);
+        }
+    }
+
+    /// DW2 §12.11 part 2 item 7: owed backings are served after the owed
+    /// objects, from what the same step's budget leaves.
+    #[test]
+    fn owed_backings_are_freed_after_the_owed_objects_from_the_same_budget() {
+        let mut roles = holed();
+        let initial = roles.available_frames();
+        let mut registry = ObjectRegistry::<4>::new();
+        let objects = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let backings = registry.create(DW_OBJECT_TYPE_EVENT).unwrap().id();
+        let mut authority = MemoryObjectAuthority::<1, 1>::new();
+        // An owed on-demand object of 600 pages, two committed.
+        let backing = roles.allocate_on_demand_backing(600).unwrap();
+        for page in [0, 599] {
+            roles
+                .commit_on_demand_page(backing.identity(), page)
+                .unwrap();
+        }
+        let frames = roles.on_demand_frames(backing.identity()).unwrap();
+        let creation = registry.create(DW_OBJECT_TYPE_MEMORY_OBJECT).unwrap();
+        authority
+            .grant_backing(
+                &creation,
+                backing,
+                600 * PAGE_SIZE,
+                MemoryObjectKind::OnDemand,
+                MemoryProtection::READ_WRITE,
+            )
+            .unwrap();
+        let owner = registry.creation_into_internal(creation).unwrap();
+        registry.set_charge_tag(owner.id(), tag(objects)).unwrap();
+        registry.set_charge_pages(owner.id(), frames).unwrap();
+        finalize(&mut authority, &mut registry, owner);
+        // An owed backing of 20 pages.
+        let allocation = roles.allocate_backing(20).unwrap();
+        let owed = roles.abandon_backing(allocation).unwrap();
+        assert!(registry.reserve_owed_backing_pages(owed.key(), tag(backings), 20));
+        authority.queue_owed_backing(owed);
+
+        let mut shared = false;
+        loop {
+            let objects_before = registry.charged_pages(objects);
+            let backing_before = registry.charged_pages(backings);
+            let mut completed = false;
+            let owed = authority.finalize_owed_step_observed(
+                &mut registry,
+                &mut roles,
+                600,
+                |_, _, done| completed |= done,
+            );
+            roles.check_invariants().unwrap();
+            let backing_after = registry.charged_pages(backings);
+            if authority.owed_slots().count() != 0 {
+                // The object is not done: the backing waits.
+                assert!(registry.charged_pages(objects) < objects_before);
+                assert_eq!(backing_after, backing_before);
+            } else if completed && backing_after < backing_before {
+                // The object completed and the backing went on in the
+                // budget it left.
+                shared = true;
+            }
+            if !owed {
+                break;
+            }
+        }
+        assert!(
+            shared,
+            "one step completed the object and freed backing pages"
+        );
+        assert_eq!(registry.charged_pages(objects), 0);
+        assert_eq!(registry.charged_pages(backings), 0);
+        assert_eq!(roles.available_frames(), initial);
+    }
+
     #[test]
     fn a_chain_backed_object_is_completed_at_once() {
         let mut registry = ObjectRegistry::<1>::new();

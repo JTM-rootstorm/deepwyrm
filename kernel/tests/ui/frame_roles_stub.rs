@@ -38,6 +38,9 @@ pub(crate) mod frame_roles {
         }
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    pub(crate) struct OwedBacking;
+
     #[derive(Debug)]
     pub(crate) struct GrantTransitionError<G>(pub(crate) G);
 
