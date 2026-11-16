@@ -1,9 +1,11 @@
 //! Fixed inline storage that is replaced, once, by a larger slice.
 //!
-//! The frame-role manager and the frame allocator start with arrays sized for
-//! boot. Once the kernel's direct map is active they move into one run carved
-//! from RAM and sized from installed memory (DW2 large-memory plan, M2 §5.3).
-//! The inline array is kept but no longer used after that.
+//! The frame-role manager starts with its role slots in an array sized for
+//! boot. Once the deep root is active they move into RAM sized from installed
+//! memory, reached through the table map (DW2 large-memory plan, M2 §5.3 and
+//! M7 §12.9). The inline array is kept but no longer used after that. The
+//! frame allocator does not use this store: its boot free list stays inline,
+//! and its buddy metadata is handed to it as slices of the same RAM.
 
 /// `N` inline elements until [`Self::adopt`] switches to a larger slice.
 pub(super) struct GrowableStore<T: 'static, const N: usize> {

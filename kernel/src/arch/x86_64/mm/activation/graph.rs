@@ -77,6 +77,9 @@ pub(super) enum InactiveGraphError<E> {
     InvalidScratchPath,
     /// The direct map's leaves do not cover its ranges exactly.
     DirectMapCoverage,
+    /// The table map's leaves do not cover its pieces exactly, or its
+    /// pieces are not the role manager's staged runs.
+    TableMapCoverage,
 }
 
 /// What one present entry in the direct map's slots is.
@@ -126,6 +129,51 @@ pub(super) fn validate_direct_entry<E>(
         return Ok(DirectEntry::Leaf(span));
     }
     if !map.overlaps(physical, span) {
+        return Err(InactiveGraphError::ExtraTable);
+    }
+    Ok(DirectEntry::Table)
+}
+
+/// Checks one present entry at `depth` (3 for the PML4) that maps
+/// `virtual_page` in the table map's slots (DW2 M7 §12.9): a leaf must have
+/// exactly the leaf flags for its size, a 1 GiB page only when the CPU has
+/// them, map exactly what `translate` gives for its address, aligned for its
+/// size, and end inside its piece; a table must cover some mapped address.
+pub(super) fn validate_table_map_entry<E>(
+    map: &crate::arch::x86_64::mm::table_map::TableMap,
+    entry: u64,
+    depth: u8,
+    virtual_page: u64,
+    capabilities: PagingCapabilities,
+) -> Result<DirectEntry, InactiveGraphError<E>> {
+    use crate::arch::x86_64::mm::direct_map::{DIRECT_MAP_LARGE_FLAGS, DIRECT_MAP_PAGE_FLAGS};
+    use crate::arch::x86_64::mm::table_map::TABLE_MAP_BASE;
+    let span = PAGE_SIZE << (9 * u32::from(depth));
+    if depth == 0 || entry & HUGE != 0 {
+        let flags = match depth {
+            0 => DIRECT_MAP_PAGE_FLAGS,
+            1 => DIRECT_MAP_LARGE_FLAGS,
+            2 if map.gigabyte_pages() => DIRECT_MAP_LARGE_FLAGS,
+            _ => return Err(InactiveGraphError::InvalidEntry),
+        };
+        if entry & !(physical_mask(capabilities) | HARDWARE_MUTABLE) != flags {
+            return Err(InactiveGraphError::InvalidEntry);
+        }
+        let (physical, left) = map
+            .translate(virtual_page)
+            .ok_or(InactiveGraphError::ExtraLeaf)?;
+        if entry & physical_mask(capabilities) != physical || !physical.is_multiple_of(span) {
+            return Err(InactiveGraphError::MappingMismatch);
+        }
+        if span > left {
+            return Err(InactiveGraphError::ExtraLeaf);
+        }
+        return Ok(DirectEntry::Leaf(span));
+    }
+    let mapped = virtual_page
+        .checked_sub(TABLE_MAP_BASE)
+        .is_some_and(|offset| offset < map.mapped_bytes());
+    if !mapped {
         return Err(InactiveGraphError::ExtraTable);
     }
     Ok(DirectEntry::Table)
@@ -777,7 +825,31 @@ pub(super) fn validate_inactive_graph_with_workspace<
     {
         return Err(InactiveGraphError::InvalidSegmentLayout);
     }
+    use crate::arch::x86_64::mm::table_map::{TABLE_MAP_BASE, TABLE_MAP_SPAN, in_table_map_region};
+    const TABLE_MAP_END: u64 = TABLE_MAP_BASE + TABLE_MAP_SPAN;
+    let table = scratch.table;
+    if let Some(map) = table {
+        if segments
+            .iter()
+            .any(|segment| segment.start < TABLE_MAP_END && segment.end > TABLE_MAP_BASE)
+            || scratch_slots
+                .iter()
+                .any(|slot| in_table_map_region(slot.window_page))
+        {
+            return Err(InactiveGraphError::InvalidSegmentLayout);
+        }
+        // The map's pieces are exactly the manager's staged runs, in order.
+        if !map
+            .pieces()
+            .iter()
+            .map(|piece| (piece.physical, piece.bytes / PAGE_SIZE))
+            .eq(roles.staged_growth_parts())
+        {
+            return Err(InactiveGraphError::TableMapCoverage);
+        }
+    }
     let mut direct_bytes = 0_u64;
+    let mut table_bytes = 0_u64;
     let ap_trampoline_page = if let Some(ap_trampoline) = ap_trampoline {
         roles
             .validate_architecture_bootstrap(ap_trampoline)
@@ -849,13 +921,22 @@ pub(super) fn validate_inactive_graph_with_workspace<
                 continue;
             }
             let virtual_page = entry_virtual_address(node.virtual_prefix, index, depth);
-            let direct_table = match direct {
-                Some(map)
+            let direct_table = match (direct, table) {
+                (Some(map), _)
                     if crate::arch::x86_64::mm::direct_map::in_direct_map_region(virtual_page) =>
                 {
                     match validate_direct_entry(map, entry, depth, virtual_page, capabilities)? {
                         DirectEntry::Leaf(bytes) => {
                             direct_bytes += bytes;
+                            continue;
+                        }
+                        DirectEntry::Table => true,
+                    }
+                }
+                (_, Some(map)) if in_table_map_region(virtual_page) => {
+                    match validate_table_map_entry(map, entry, depth, virtual_page, capabilities)? {
+                        DirectEntry::Leaf(bytes) => {
+                            table_bytes += bytes;
                             continue;
                         }
                         DirectEntry::Table => true,
@@ -938,6 +1019,9 @@ pub(super) fn validate_inactive_graph_with_workspace<
 
     if direct.is_some_and(|map| direct_bytes != map.mapped_bytes()) {
         return Err(InactiveGraphError::DirectMapCoverage);
+    }
+    if table.is_some_and(|map| table_bytes != map.mapped_bytes()) {
+        return Err(InactiveGraphError::TableMapCoverage);
     }
     for slot in scratch_slots {
         validate_scratch_path(

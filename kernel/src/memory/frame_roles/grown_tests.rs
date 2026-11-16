@@ -10,7 +10,7 @@ use super::*;
 use std::boxed::Box;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
-use std::{vec, vec::Vec};
+use std::vec::Vec;
 
 const PAGE: u64 = BASE_PAGE_SIZE;
 const THREE_LEVELS: u64 = 512 * 512 + 1;
@@ -53,12 +53,8 @@ impl IndexMemory for Model {
     }
 }
 
-/// A manager over three initial ranges, grown into a leaked buffer, with
-/// index memory set.
-#[allow(
-    unsafe_code,
-    reason = "the host model hands the manager a leaked buffer as its grown run"
-)]
+/// A manager over three initial ranges, grown from three staged runs in a
+/// leaked buffer, with index memory set.
 fn grown() -> Manager {
     let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
     let candidates = [
@@ -68,15 +64,8 @@ fn grown() -> Manager {
     ];
     let allocator = PhysicalFrameAllocator::from_candidates(&candidates, limit, []).unwrap();
     let mut roles = Manager::new(allocator).unwrap();
-    let layout = roles.grown_layout().unwrap();
-    let grant = roles.allocate(layout.page_count()).unwrap();
-    let words = usize::try_from((layout.page_count() * PAGE).div_ceil(8)).unwrap();
-    let base = Box::leak(vec![0_u64; words].into_boxed_slice())
-        .as_mut_ptr()
-        .cast();
-    // SAFETY: the leaked buffer is 8-aligned, the run's size, and used by
-    // nothing else.
-    unsafe { roles.adopt_storage(grant, base) }.unwrap();
+    let (_, runs) = test_support::grow_in_leaked_runs(&mut roles, 3);
+    assert_eq!(runs.len(), 3);
     let model: &'static Model = Box::leak(Box::default());
     roles.set_index_memory(model);
     assert_eq!(roles.check_invariants(), Ok(()));

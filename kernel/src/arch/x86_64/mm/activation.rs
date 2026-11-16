@@ -215,6 +215,10 @@ pub(super) struct PerCpuScratchBindings {
     /// The kernel's direct map, once the deep root has one (DW2 M2). Live
     /// targets reach allocator frames through it instead of a scratch leaf.
     direct: Option<&'static crate::arch::x86_64::mm::direct_map::DirectMap>,
+    /// The grown role table's mapping, once the deep root has one (DW2 M7
+    /// §12.9): the graph check holds its leaves to it, and growth adopts the
+    /// table at its base.
+    table: Option<&'static crate::arch::x86_64::mm::table_map::TableMap>,
 }
 
 /// One CPU-private scratch leaf/control pair.  It is deliberately distinct
@@ -232,7 +236,11 @@ impl PerCpuScratchBindings {
     const SLOT_PAGES: u64 = 2 + PER_CPU_SCRATCH_MMIO_LEAF_COUNT;
 
     fn new(base: DeepScratchBinding) -> Self {
-        Self { base, direct: None }
+        Self {
+            base,
+            direct: None,
+            table: None,
+        }
     }
 
     fn with_direct_map(
@@ -241,6 +249,13 @@ impl PerCpuScratchBindings {
     ) -> Self {
         Self {
             direct: Some(direct),
+            ..self
+        }
+    }
+
+    fn with_table_map(self, table: &'static crate::arch::x86_64::mm::table_map::TableMap) -> Self {
+        Self {
+            table: Some(table),
             ..self
         }
     }
@@ -337,6 +352,7 @@ pub(crate) enum DeepRootBuildError {
     Transition,
     Root(AddressError),
     DirectMap(crate::arch::x86_64::mm::direct_map::DirectMapError),
+    TableMap(crate::arch::x86_64::mm::table_map::TableMapError),
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1742,12 +1758,14 @@ fn read_physical_bytes_with_scratch<I: ActiveScratchIo>(
     Ok(())
 }
 
-/// What growing the frame-role table left: its slots, and the allocator's
-/// free pages and largest free block, in pages, right after the move.
+/// What growing the frame-role table left: its slots, the runs of RAM it
+/// lives in, and the allocator's free pages and largest free block, in
+/// pages, right after the move.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameRoleGrowth {
     pub(crate) slots: usize,
+    pub(crate) pieces: usize,
     pub(crate) free_pages: u64,
     pub(crate) largest_free_pages: u64,
 }
@@ -1876,49 +1894,52 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .virtual_address(frame.address(), PAGE_SIZE)
     }
 
-    /// Moves the frame-role table into a run of RAM sized from installed
-    /// memory, reached through the direct map (DW2 M2 §5.3), which also
-    /// switches the frame allocator to the buddy allocator (DW2 M7 §12.2),
-    /// and returns the slot count and the free memory after the move. The
-    /// early BSP is the only CPU running.
+    /// Moves the frame-role table into the runs of RAM staged for it while
+    /// the deep root was built, at the table map's one virtual range (DW2 M7
+    /// §12.9), which also switches the frame allocator to the buddy
+    /// allocator (DW2 M7 §12.2), and returns the slot count, the runs, and
+    /// the free memory after the move. The early BSP is the only CPU
+    /// running.
     #[allow(
         unsafe_code,
-        reason = "the direct map is the role table's only mapping of the run the manager allocated"
+        reason = "the table map is the role table's mapping of the runs the manager staged"
     )]
     pub(crate) fn grow_frame_roles(&mut self) -> Result<FrameRoleGrowth, LiveActiveTargetError> {
+        use crate::arch::x86_64::mm::table_map::TABLE_MAP_BASE;
         let roles = &mut *self.target.roles;
         let layout = roles
             .grown_layout()
             .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
-        let grant = roles
-            .allocate(layout.page_count())
-            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
-        let Some(base) =
-            self.target.scratch_bindings.direct.and_then(|direct| {
-                direct.virtual_address(grant.physical_start(), grant.byte_len())
-            })
-        else {
-            roles
-                .cancel_allocation(grant)
-                .unwrap_or_else(|_| panic!("role table rollback lost allocation authority"));
+        let Some(table) = self.target.scratch_bindings.table else {
             return Err(LiveActiveTargetError::InvalidIndex);
         };
-        // SAFETY: the direct map maps the whole run read-write at `base`
-        // (page-aligned), and the run is this fresh allocation, which the
-        // manager keeps for good; nothing else maps or uses it.
-        unsafe { roles.adopt_storage(grant, base as *mut u8) }.map_err(|failure| {
-            roles
-                .cancel_allocation(failure.into_grant())
-                .unwrap_or_else(|_| panic!("role table rollback lost allocation authority"));
-            LiveActiveTargetError::InvalidIndex
-        })?;
-        // On-demand backings reach their index pages through the same map
+        if !table
+            .pieces()
+            .iter()
+            .map(|piece| (piece.physical, piece.bytes / PAGE_SIZE))
+            .eq(roles.staged_growth_parts())
+        {
+            return Err(LiveActiveTargetError::InvalidIndex);
+        }
+        // SAFETY: the active root passed the inactive graph check with this
+        // table map bound (DW2 M7 §12.9 item 5): its leaves map exactly the
+        // map's pieces, back to back from `TABLE_MAP_BASE` (page-aligned),
+        // read-write and supervisor-only, and the pieces are the manager's
+        // staged runs in staging order (checked there and again above).
+        // Every other root copies the kernel half, so the mapping is the same
+        // in every address space and never changes. The runs are the
+        // manager's own allocations, which it keeps for good; nothing hands
+        // out another address for them.
+        unsafe { roles.adopt_storage(TABLE_MAP_BASE as *mut u8) }
+            .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
+        // On-demand backings reach their index pages through the direct map
         // (DW2 M6 §8.3).
         if let Some(direct) = self.target.scratch_bindings.direct {
             roles.set_index_memory(DIRECT_MAP_INDEX_MEMORY.init(DirectMapIndexMemory(direct)));
         }
         Ok(FrameRoleGrowth {
             slots: layout.slot_count(),
+            pieces: table.pieces().len(),
             free_pages: roles.available_frames(),
             largest_free_pages: roles.largest_free_pages(),
         })

@@ -40,6 +40,7 @@ const _: () = {
     // (slot 510) and the kernel image (slot 511).
     assert!(DIRECT_MAP_BASE + DIRECT_MAP_SPAN <= TABLE_MAP_BASE);
     assert!(384 + TABLE_MAP_PML4_SLOTS <= 510);
+    assert!(TABLE_MAP_CAPACITY == crate::memory::frame_roles::MAX_GROWTH_PARTS);
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

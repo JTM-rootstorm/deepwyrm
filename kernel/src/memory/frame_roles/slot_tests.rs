@@ -34,18 +34,10 @@ fn grown_run(bytes: u64) -> *mut u8 {
         .cast()
 }
 
-#[allow(
-    unsafe_code,
-    reason = "the host model hands the manager a leaked buffer as its grown run"
-)]
+/// Grows from one staged run, as the recorded issue order was taken.
 fn grow(roles: &mut TestManager) -> (RoleTableLayout, usize) {
-    let layout = roles.grown_layout().unwrap();
-    let grant = roles.allocate(layout.page_count()).unwrap();
-    let slot = slot_number(grant.identity);
-    // SAFETY: the leaked buffer is 8-aligned, at least the run's size, and
-    // used by nothing else.
-    unsafe { roles.adopt_storage(grant, grown_run(layout.page_count() * BASE_PAGE_SIZE)) }.unwrap();
-    (layout, slot)
+    let (layout, slots) = test_support::grow_in_leaked_runs(roles, 1);
+    (layout, slots[0])
 }
 
 /// The three slots the kernel-image staging would occupy next.

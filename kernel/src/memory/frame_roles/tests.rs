@@ -954,17 +954,9 @@ fn grown_run(bytes: u64) -> *mut u8 {
         .cast()
 }
 
-#[allow(
-    unsafe_code,
-    reason = "the host model hands the manager a leaked buffer as its grown run"
-)]
+/// Grows from three staged runs.
 fn grow(roles: &mut TestManager) -> RoleTableLayout {
-    let layout = roles.grown_layout().unwrap();
-    let grant = roles.allocate(layout.page_count()).unwrap();
-    // SAFETY: the leaked buffer is 8-aligned, at least the run's size, and
-    // used by nothing else.
-    unsafe { roles.adopt_storage(grant, grown_run(layout.page_count() * BASE_PAGE_SIZE)) }.unwrap();
-    layout
+    test_support::grow_in_leaked_runs(roles, 3).0
 }
 
 /// The slot an identity names.
@@ -1097,33 +1089,38 @@ fn a_grown_manager_survives_far_more_holes_than_the_boot_list_holds() {
 #[test]
 #[allow(
     unsafe_code,
-    reason = "the host model offers the manager runs it must refuse"
+    reason = "the host model offers the manager ranges it must refuse"
 )]
-fn growth_refuses_a_short_run_a_misaligned_base_and_a_second_move() {
+fn growth_refuses_short_staging_a_misaligned_base_and_a_second_move() {
     // 32 MiB: the start index alone needs several pages.
     let mut roles = manager(BASE_PAGE_SIZE, 8192);
     let layout = roles.grown_layout().unwrap();
     assert!(layout.page_count() > 1);
-    let short = roles.allocate(layout.page_count() - 1).unwrap();
     let base = grown_run(layout.page_count() * BASE_PAGE_SIZE);
-    // SAFETY: the buffer is large enough; the grant is too short.
-    let short = unsafe { roles.adopt_storage(short, base) }.unwrap_err();
-    assert_eq!(short.error(), FrameRoleError::WrongRole);
-    roles.cancel_allocation(short.into_grant()).unwrap();
-
-    let grant = roles.allocate(layout.page_count()).unwrap();
+    // SAFETY: refused before any write: nothing is staged.
+    let refused = unsafe { roles.adopt_storage(base) };
+    assert_eq!(refused, Err(FrameRoleError::WrongRole));
+    let first = roles.allocate(layout.page_count() - 1).unwrap();
+    roles.stage_growth_part(first).unwrap();
+    // SAFETY: refused before any write: the staged runs are a page short.
+    let refused = unsafe { roles.adopt_storage(base) };
+    assert_eq!(refused, Err(FrameRoleError::WrongRole));
+    let last = roles.allocate(1).unwrap();
+    roles.stage_growth_part(last).unwrap();
     // SAFETY: refused before any write: the base is not 8-aligned.
-    let misaligned = unsafe { roles.adopt_storage(grant, base.wrapping_add(4)) }.unwrap_err();
-    assert_eq!(misaligned.error(), FrameRoleError::WrongRole);
-    let grant = misaligned.into_grant();
-    // SAFETY: an 8-aligned buffer of the run's size, used by nothing else.
-    unsafe { roles.adopt_storage(grant, base) }.unwrap();
+    let refused = unsafe { roles.adopt_storage(base.wrapping_add(4)) };
+    assert_eq!(refused, Err(FrameRoleError::WrongRole));
+    // SAFETY: an 8-aligned buffer of the staged runs' size, used by nothing
+    // else.
+    unsafe { roles.adopt_storage(base) }.unwrap();
 
-    let again = roles.allocate(layout.page_count()).unwrap();
-    // SAFETY: refused before any write: the table already moved.
-    let again = unsafe { roles.adopt_storage(again, grown_run(layout.bytes)) }.unwrap_err();
+    let again = roles.allocate(1).unwrap();
+    let again = roles.stage_growth_part(again).unwrap_err();
     assert_eq!(again.error(), FrameRoleError::WrongRole);
     roles.cancel_allocation(again.into_grant()).unwrap();
+    // SAFETY: refused before any write: the table already moved.
+    let refused = unsafe { roles.adopt_storage(grown_run(layout.bytes)) };
+    assert_eq!(refused, Err(FrameRoleError::WrongRole));
     assert_eq!(roles.check_invariants(), Ok(()));
 }
 
@@ -1169,10 +1166,6 @@ fn a_role_change_during_a_hierarchy_proof_invalidates_it() {
 }
 
 #[test]
-#[allow(
-    unsafe_code,
-    reason = "the host model hands the manager a leaked buffer as its grown run"
-)]
 fn growth_succeeds_on_a_small_machine() {
     // A boot free list of 64 ranges and 2 MiB of allocator RAM.
     let mut roles: FrameRoleManager<64, 16> = {
@@ -1181,10 +1174,7 @@ fn growth_succeeds_on_a_small_machine() {
         let allocator = PhysicalFrameAllocator::from_candidates(&[candidate], limit, []).unwrap();
         FrameRoleManager::new(allocator).unwrap()
     };
-    let layout = roles.grown_layout().unwrap();
-    let grant = roles.allocate(layout.page_count()).unwrap();
-    // SAFETY: an 8-aligned leaked buffer of the run's size, used by nothing else.
-    unsafe { roles.adopt_storage(grant, grown_run(layout.page_count() * BASE_PAGE_SIZE)) }.unwrap();
+    let (layout, _) = test_support::grow_in_leaked_runs(&mut roles, 3);
     assert_eq!(roles.check_invariants(), Ok(()));
     assert_eq!(roles.available_frames(), 512 - layout.page_count());
     let run = roles.allocate(3).unwrap();

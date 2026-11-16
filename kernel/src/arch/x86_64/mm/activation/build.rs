@@ -166,6 +166,94 @@ fn build_direct_map<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     Ok(map)
 }
 
+/// Takes the RAM of the grown role table in pieces, stages each with the
+/// role manager, fills the table map from the staged runs, and maps every
+/// one of its leaves into the inactive root (DW2 M7 §12.9 item 2).
+///
+/// First pieces aligned to 2 MiB whose lengths are multiples of 2 MiB, each
+/// the largest the allocator has, until less than 2 MiB is left or no
+/// aligned free run remains; then the rest at any page alignment, largest
+/// first. Any failure is a failed root build, which stops the boot, so the
+/// staged runs are never given back.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "the one-shot table-map storage is zero-filled in place, a valid empty map"
+)]
+fn build_table_map<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    mapper: &mut LiveTransitionMapper,
+    roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    owner: TableOwnerKey,
+    root: TableIdentity,
+    edges: &mut [Option<BuildEdge>; MAX_DEEP_TABLE_FRAMES],
+    edge_count: &mut usize,
+) -> Result<&'static crate::arch::x86_64::mm::table_map::TableMap, DeepRootBuildError> {
+    use crate::arch::x86_64::mm::direct_map::{self, TWO_MIB};
+    use crate::arch::x86_64::mm::table_map::{TABLE_MAP, TableMap};
+    use crate::memory::physical::PhysicalMemoryError;
+    const TWO_MIB_PAGES: u64 = TWO_MIB / PAGE_SIZE;
+    let mut left = roles
+        .grown_layout()
+        .map_err(DeepRootBuildError::FrameRole)?
+        .page_count();
+    let mut aligned = true;
+    while left > 0 {
+        let request = if aligned && left >= TWO_MIB_PAGES {
+            roles.allocate_largest_aligned(left / TWO_MIB_PAGES * TWO_MIB_PAGES, TWO_MIB_PAGES)
+        } else {
+            aligned = false;
+            roles.allocate_largest_aligned(left, 1)
+        };
+        let grant = match request {
+            Ok(grant) => grant,
+            Err(FrameRoleError::Physical(PhysicalMemoryError::NoFramesAvailable)) if aligned => {
+                aligned = false;
+                continue;
+            }
+            Err(error) => return Err(DeepRootBuildError::FrameRole(error)),
+        };
+        left = left
+            .checked_sub(grant.byte_len() / PAGE_SIZE)
+            .ok_or(DeepRootBuildError::Capacity)?;
+        roles.stage_growth_part(grant).map_err(|failure| {
+            let error = failure.error();
+            let _retained_allocation = failure.into_grant();
+            DeepRootBuildError::FrameRole(error)
+        })?;
+    }
+    let slot = TABLE_MAP.take();
+    // SAFETY: every field of `TableMap` is an integer or a bool, so all
+    // zeros is a valid, empty map; the slot is this storage's one owner's.
+    let map: &'static mut TableMap = unsafe {
+        core::ptr::write_bytes(slot.as_mut_ptr(), 0, 1);
+        slot.assume_init_mut()
+    };
+    map.fill(
+        roles.staged_growth_parts(),
+        direct_map::cpu_has_gigabyte_pages(),
+    )
+    .map_err(DeepRootBuildError::TableMap)?;
+    let map: &'static TableMap = map;
+    for leaf in map.leaves() {
+        let page = leaf.virtual_address;
+        let table = ensure_table(
+            mapper, roles, owner, root, page, leaf.level, edges, edge_count,
+        )?;
+        let index = ((page >> (12 + 9 * u32::from(leaf.level))) & 0x1ff) as usize;
+        if mapper
+            .read_owned_table_entry(roles, table, index)
+            .map_err(|_| DeepRootBuildError::Transition)?
+            != 0
+        {
+            return Err(DeepRootBuildError::MappingMismatch);
+        }
+        mapper
+            .write_owned_table_entry(roles, table, index, leaf.entry())
+            .map_err(|_| DeepRootBuildError::Transition)?;
+    }
+    Ok(map)
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn map_owned_leaf<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     mapper: &mut LiveTransitionMapper,
@@ -493,7 +581,15 @@ pub(super) fn build_and_bind_deep_root<
             edges,
             &mut edge_count,
         )?;
-        scratch = scratch.with_direct_map(direct);
+        let table = build_table_map(
+            &mut mapper,
+            roles,
+            owner,
+            root_identity,
+            edges,
+            &mut edge_count,
+        )?;
+        scratch = scratch.with_direct_map(direct).with_table_map(table);
 
         // SAFETY: every table is allocator-owned, fully zeroed, typed to this
         // one owner, and reachable only from the still-inactive root built by

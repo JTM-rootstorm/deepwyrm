@@ -19,6 +19,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             free_slot_count: 0,
             first_root: 0,
             starts: None,
+            staged: [const { None }; MAX_GROWTH_PARTS],
             next_table_owner: 1,
             next_epoch: 1,
             version: 0,
@@ -105,6 +106,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             core::ptr::addr_of_mut!((*destination).free_slot_count).write(0);
             core::ptr::addr_of_mut!((*destination).first_root).write(0);
             core::ptr::addr_of_mut!((*destination).starts).write(None);
+            let staged =
+                core::ptr::addr_of_mut!((*destination).staged).cast::<Option<AllocationGrant>>();
+            for index in 0..MAX_GROWTH_PARTS {
+                staged.add(index).write(None);
+            }
             core::ptr::addr_of_mut!((*destination).next_table_owner).write(1);
             core::ptr::addr_of_mut!((*destination).next_epoch).write(1);
             core::ptr::addr_of_mut!((*destination).version).write(0);
@@ -118,6 +124,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 free_slot_count: _,
                 first_root: _,
                 starts: _,
+                staged: _,
                 next_table_owner: _,
                 next_epoch: _,
                 version: _,
@@ -1248,168 +1255,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.allocator.initial_ranges()
     }
 
-    /// The run the grown role table needs: one slot per page of allocator
-    /// RAM beyond the boot slots, a start index entry
-    /// per allocator page (DW2 M2 §5.3), and the buddy allocator's metadata:
-    /// a link pair and a tag per allocator page, a base per initial range and
-    /// a range-lookup hint per granule (DW2 M7 §12.2).
-    pub(crate) fn grown_layout(&self) -> Result<RoleTableLayout, FrameRoleError> {
-        let frames = self.allocator.initial_frames();
-        let slots = usize::try_from(frames.div_ceil(GROWN_SLOT_PAGES))
-            .ok()
-            .and_then(|extra| ROLE_CAPACITY.checked_add(extra))
-            .filter(|slots| u32::try_from(*slots).is_ok_and(|slots| slots < u32::MAX))
-            .ok_or(FrameRoleError::Capacity)?;
-        let starts = usize::try_from(frames).map_err(|_| FrameRoleError::Capacity)?;
-        let bases = self.allocator.initial_range_count();
-        let align = |offset: usize| offset.checked_next_multiple_of(8);
-        let after = |offset: usize, count: usize, size: usize| {
-            count
-                .checked_mul(size)
-                .and_then(|bytes| offset.checked_add(bytes))
-                .and_then(align)
-        };
-        let starts_offset =
-            after(0, slots, core::mem::size_of::<RoleSlot>()).ok_or(FrameRoleError::Capacity)?;
-        let links_offset = after(starts_offset, starts, core::mem::size_of::<u32>())
-            .ok_or(FrameRoleError::Capacity)?;
-        let bases_offset = after(links_offset, starts, core::mem::size_of::<FreeLink>())
-            .ok_or(FrameRoleError::Capacity)?;
-        let hints = self.allocator.range_hint_count();
-        let hints_offset = after(bases_offset, bases, core::mem::size_of::<u64>())
-            .ok_or(FrameRoleError::Capacity)?;
-        let tags_offset = after(hints_offset, hints, core::mem::size_of::<u32>())
-            .ok_or(FrameRoleError::Capacity)?;
-        let bytes = after(tags_offset, starts, core::mem::size_of::<u8>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(FrameRoleError::Capacity)?;
-        Ok(RoleTableLayout {
-            slots,
-            starts_offset,
-            starts,
-            links_offset,
-            bases_offset,
-            bases,
-            hints_offset,
-            hints,
-            tags_offset,
-            bytes,
-        })
-    }
-
-    /// Moves the role table into the run `grant` names, which `base` maps, builds the start index there (DW2 M2 §5.3),
-    /// and hands the allocator its buddy metadata there, which switches it to
-    /// the buddy allocator (DW2 M7 §12.2). Slot numbers and generations are
-    /// kept, so every issued identity stays valid. The run itself takes a
-    /// permanent role. Every check, the allocator's acceptance of the buddy
-    /// storage included, happens before anything changes; on an error the
-    /// grant comes back and the manager is as it was.
-    ///
-    /// # Safety
-    ///
-    /// `base` must be the start of a writable, 8-byte-aligned mapping of
-    /// exactly the run `grant` names, used by nothing else for the rest of
-    /// the kernel's life.
-    #[allow(
-        unsafe_code,
-        reason = "the grown role table lives in RAM the caller maps; the manager carves typed slices from it"
-    )]
-    pub(crate) unsafe fn adopt_storage(
-        &mut self,
-        grant: AllocationGrant,
-        base: *mut u8,
-    ) -> Result<(), GrantTransitionError<AllocationGrant>> {
-        let layout = match self.grown_layout() {
-            Ok(layout) => layout,
-            Err(error) => return Err(GrantTransitionError::new(error, grant)),
-        };
-        let valid = self.validate_allocation(&grant).is_ok()
-            && grant.byte_len() >= layout.bytes
-            && !self.roles.is_adopted()
-            && self.starts.is_none()
-            && layout.slots > ROLE_CAPACITY
-            && self.allocator.accepts_buddy_storage(
-                layout.starts,
-                layout.starts,
-                layout.bases,
-                layout.hints,
-            )
-            && (base as usize).is_multiple_of(8);
-        if !valid {
-            return Err(GrantTransitionError::new(FrameRoleError::WrongRole, grant));
-        }
-        let slot = self
-            .slot(grant.identity)
-            .expect("a validated allocation has a live slot");
-        // SAFETY: the caller maps `grant`'s whole run at `base`, writable and
-        // unused; every part lies inside `layout.bytes`, at most its length,
-        // and starts 8-aligned. Each part is fully written before a slice of
-        // it is made.
-        let (slots, starts, buddy) = unsafe {
-            (
-                Self::carve(base, 0, layout.slots, EMPTY_ROLE_SLOT),
-                Self::carve(base, layout.starts_offset, layout.starts, 0_u32),
-                BuddyStorage {
-                    links: Self::carve(base, layout.links_offset, layout.starts, FreeLink::EMPTY),
-                    bases: Self::carve(base, layout.bases_offset, layout.bases, 0_u64),
-                    hints: Self::carve(base, layout.hints_offset, layout.hints, 0_u32),
-                    tags: Self::carve(base, layout.tags_offset, layout.starts, 0_u8),
-                },
-            )
-        };
-        self.replace_record(
-            slot,
-            RoleRecord {
-                range: grant.range,
-                role: FrameRole::RoleTableStorage,
-            },
-        );
-        self.roles
-            .adopt(slots, EMPTY_ROLE_SLOT)
-            .unwrap_or_else(|_| panic!("the checked role table adoption failed"));
-        // The new slots go on top of the free ones, lowest on top. The root
-        // list needs nothing: it lives in the slots, which were copied.
-        self.link_free_slots(ROLE_CAPACITY, layout.slots);
-        self.allocator
-            .adopt_buddy(buddy)
-            .unwrap_or_else(|_| panic!("the checked buddy adoption failed"));
-        self.starts = Some(starts);
-        for slot in 0..self.roles.len() {
-            if let Some(record) = self.record_at(slot) {
-                self.set_start(record, slot);
-            }
-        }
-        Ok(())
-    }
-
-    /// Writes `count` copies of `fill` at `base + offset` and returns them
-    /// as a slice.
-    ///
-    /// # Safety
-    ///
-    /// `[base + offset, + count * size_of::<T>())` must be writable,
-    /// aligned for `T`, unused by anything else, and live for ever.
-    #[allow(
-        unsafe_code,
-        reason = "carves one typed part of the grown role table's run"
-    )]
-    unsafe fn carve<T: Copy>(
-        base: *mut u8,
-        offset: usize,
-        count: usize,
-        fill: T,
-    ) -> &'static mut [T] {
-        // SAFETY: the caller guarantees the range is writable, aligned for `T`,
-        // unused and live for ever, so `count` writes and the slice stay in it.
-        unsafe {
-            let start = base.add(offset).cast::<T>();
-            for index in 0..count {
-                start.add(index).write(fill);
-            }
-            core::slice::from_raw_parts_mut(start, count)
-        }
-    }
-
     pub(crate) fn available_frames(&self) -> u64 {
         self.allocator.available_frames()
     }
@@ -1417,47 +1262,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// Pages in the largest run one allocation can take now.
     pub(crate) fn largest_free_pages(&self) -> u64 {
         self.allocator.largest_free_pages()
-    }
-
-    pub(crate) fn check_invariants(&self) -> Result<(), FrameRoleError> {
-        let mut dynamic_pages = 0_u64;
-        for (left_index, left) in self.slot_views() {
-            let Some(left) = left.record else {
-                continue;
-            };
-            for right in self
-                .slot_views()
-                .skip(left_index + 1)
-                .filter_map(|(_, view)| view.record)
-            {
-                if left.range.overlaps(right.range) {
-                    return Err(FrameRoleError::InvariantViolation);
-                }
-            }
-            if left.role.is_dynamic() {
-                if !self.allocator.contains_initial(left.range)
-                    || self.allocator.overlaps_free(left.range)
-                {
-                    return Err(FrameRoleError::InvariantViolation);
-                }
-                dynamic_pages = dynamic_pages
-                    .checked_add(left.range.page_count())
-                    .ok_or(FrameRoleError::InvariantViolation)?;
-            } else if self.allocator.overlaps_initial(left.range) {
-                return Err(FrameRoleError::InvariantViolation);
-            }
-        }
-        if self.allocator.available_frames().checked_add(dynamic_pages)
-            != Some(self.allocator.initial_frames())
-        {
-            return Err(FrameRoleError::InvariantViolation);
-        }
-        self.allocator
-            .check_buddy()
-            .map_err(|_| FrameRoleError::InvariantViolation)?;
-        self.check_slot_lists()?;
-        self.check_chains()?;
-        self.check_indexes()
     }
 
     fn transition(
@@ -1598,55 +1402,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let (start, dynamic) = self.vacate_slot(slot);
         self.clear_start(start, dynamic);
         self.version = self.version.wrapping_add(1);
-    }
-
-    /// The start index position of `physical_start`, a page of allocator RAM.
-    fn start_position(&self, physical_start: u64) -> Option<usize> {
-        self.allocator.page_position(physical_start)
-    }
-
-    fn set_start(&mut self, record: RoleRecord, slot: usize) {
-        if !record.role.is_dynamic() {
-            return;
-        }
-        let Some(position) = self.start_position(record.range.start) else {
-            return;
-        };
-        if let Some(starts) = self.starts.as_deref_mut() {
-            starts[position] = slot as u32 + 1;
-        }
-    }
-
-    /// Clears the start index entry of a role that started at `start`;
-    /// nothing for a role that is not `dynamic`.
-    fn clear_start(&mut self, start: u64, dynamic: bool) {
-        if !dynamic {
-            return;
-        }
-        let Some(position) = self.start_position(start) else {
-            return;
-        };
-        if let Some(starts) = self.starts.as_deref_mut() {
-            starts[position] = 0;
-        }
-    }
-
-    /// The slot of the dynamic role starting at `physical_start`: through
-    /// the start index once grown, by scanning the boot table before.
-    fn dynamic_slot_at(&self, physical_start: u64) -> Option<usize> {
-        match self.starts.as_deref() {
-            Some(starts) => {
-                let position = self.start_position(physical_start)?;
-                (starts[position] as usize).checked_sub(1)
-            }
-            None => self.slot_views().find_map(|(slot, view)| {
-                view.record
-                    .is_some_and(|record| {
-                        record.role.is_dynamic() && record.range.start == physical_start
-                    })
-                    .then_some(slot)
-            }),
-        }
     }
 
     pub(super) fn identity(

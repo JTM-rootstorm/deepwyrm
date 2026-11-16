@@ -437,11 +437,17 @@ impl GraphFixture {
     }
 }
 
+fn graph_fixture() -> GraphFixture {
+    graph_fixture_over(0x8000, 28)
+}
+
+/// The graph fixture over allocator RAM of `page_count` pages at
+/// `physical_start`, which must lie clear of the fixture's image.
 #[allow(
     unsafe_code,
     reason = "synthetic host graph models typed page-table and kernel-image provenance"
 )]
-fn graph_fixture() -> GraphFixture {
+fn graph_fixture_over(physical_start: u64, page_count: u64) -> GraphFixture {
     let ist = test_ist_layout(FIXTURE_DATA + PAGE_SIZE);
     let privilege_entry = crate::memory::kernel_stack::KernelStackBounds::new(
         FIXTURE_DATA + 16 * PAGE_SIZE,
@@ -467,7 +473,7 @@ fn graph_fixture() -> GraphFixture {
         },
     ];
     let capabilities = PagingCapabilities::validate(40, true, true, true).unwrap();
-    let mut roles = synthetic_frame_role_manager::<1, 32>(0x8000, 28);
+    let mut roles = synthetic_frame_role_manager::<1, 32>(physical_start, page_count);
     let owner = roles.create_table_owner().unwrap();
     let root = commit_table(&mut roles, owner, TableLevel::Pml4, None);
     let kernel_pdpt = commit_table(&mut roles, owner, TableLevel::Pdpt, Some(root));
@@ -3404,5 +3410,346 @@ mod direct_map_access {
         assert!(!touched_the_window(&target));
         let device = FrameAddress::new(0xfee0_0000, fixture.capabilities.physical_limit()).unwrap();
         assert!(target.install_mmio_frame(device).is_ok());
+    }
+}
+
+mod table_map_graph {
+    //! The graph check over the table map (DW2 M7 §12.9 item 5): the
+    //! builder's exact shape is accepted and every drift is refused.
+
+    use super::*;
+    use crate::arch::x86_64::mm::direct_map::{ONE_GIB, TWO_MIB};
+    use crate::arch::x86_64::mm::table_map::{TABLE_MAP_BASE, TableMap};
+
+    /// The fixture over RAM from 16 pages below 1 GiB, with two runs staged:
+    /// one from 1 GiB of 1 GiB, 2 MiB and three pages, then, past a spacer,
+    /// one of five pages. Its eight tables take the first eight pages.
+    fn staged_fixture() -> GraphFixture {
+        let mut fixture = graph_fixture_over(
+            ONE_GIB - 16 * PAGE_SIZE,
+            (ONE_GIB + 8 * TWO_MIB) / PAGE_SIZE,
+        );
+        let pad = fixture.roles.allocate(8).unwrap();
+        assert_eq!(pad.physical_start() + pad.byte_len(), ONE_GIB);
+        let large = fixture
+            .roles
+            .allocate((ONE_GIB + TWO_MIB) / PAGE_SIZE + 3)
+            .unwrap();
+        fixture.roles.stage_growth_part(large).unwrap();
+        let _spacer = fixture.roles.allocate(1).unwrap();
+        let small = fixture.roles.allocate(5).unwrap();
+        fixture.roles.stage_growth_part(small).unwrap();
+        fixture
+    }
+
+    /// The map of the fixture's staged runs.
+    fn map(fixture: &GraphFixture, gigabyte_pages: bool) -> &'static TableMap {
+        let mut map = TableMap::empty();
+        map.fill(fixture.roles.staged_growth_parts(), gigabyte_pages)
+            .unwrap();
+        std::boxed::Box::leak(std::boxed::Box::new(map))
+    }
+
+    /// Writes `map`'s leaves into the fixture's root as the builder does,
+    /// committing each table it needs, and returns the leaf entries' cells.
+    fn install(fixture: &mut GraphFixture, map: &TableMap) -> Vec<((u64, usize), u64)> {
+        let owner = fixture.root.owner();
+        let mut tables: BTreeMap<(u64, usize), TableIdentity> = BTreeMap::new();
+        let mut cells = Vec::new();
+        for leaf in map.leaves() {
+            let mut parent = fixture.root;
+            for level in (usize::from(leaf.level) + 1..=3).rev() {
+                let index = page_index(leaf.virtual_address, level);
+                let key = (parent.physical_start(), index);
+                parent = match tables.get(&key) {
+                    Some(table) => *table,
+                    None => {
+                        let child = commit_table(
+                            &mut fixture.roles,
+                            owner,
+                            parent.level().child().unwrap(),
+                            Some(parent),
+                        );
+                        fixture
+                            .access
+                            .inactive
+                            .insert(key, child.physical_start() | PRESENT | WRITABLE);
+                        tables.insert(key, child);
+                        child
+                    }
+                };
+            }
+            let cell = (
+                parent.physical_start(),
+                page_index(leaf.virtual_address, usize::from(leaf.level)),
+            );
+            fixture.access.inactive.insert(cell, leaf.entry());
+            cells.push((cell, leaf.entry()));
+        }
+        cells
+    }
+
+    fn validate(
+        fixture: &mut GraphFixture,
+        map: Option<&'static TableMap>,
+    ) -> Result<(), InactiveGraphError<()>> {
+        let mut pending = std::boxed::Box::new([None; MAX_DEEP_TABLE_FRAMES]);
+        let mut visited = std::boxed::Box::new([0; MAX_DEEP_TABLE_FRAMES]);
+        let scratch = PerCpuScratchBindings::new(DeepScratchBinding {
+            window_page: FIXTURE_SCRATCH,
+            control_page: FIXTURE_SCRATCH + PAGE_SIZE,
+            pt: fixture.scratch_pt,
+        });
+        validate_inactive_graph_with_workspace(
+            &mut fixture.access,
+            &fixture.roles,
+            &fixture.staged,
+            None,
+            fixture.root,
+            FrameAddress::new(
+                fixture.transition_tables[0],
+                fixture.capabilities.physical_limit(),
+            )
+            .unwrap(),
+            match map {
+                Some(map) => scratch.with_table_map(map),
+                None => scratch,
+            },
+            &fixture.segments,
+            fixture.ist,
+            &[],
+            fixture.privilege_entry,
+            fixture.capabilities,
+            &mut pending,
+            &mut visited,
+        )
+    }
+
+    /// The cell of the leaf that maps `virtual_address`.
+    fn cell_of(
+        cells: &[((u64, usize), u64)],
+        map: &TableMap,
+        virtual_address: u64,
+    ) -> ((u64, usize), u64) {
+        let index = map
+            .leaves()
+            .position(|leaf| leaf.virtual_address == virtual_address)
+            .unwrap();
+        cells[index]
+    }
+
+    #[test]
+    fn the_builders_shape_is_accepted_with_and_without_gigabyte_pages() {
+        for gigabyte_pages in [true, false] {
+            let mut fixture = staged_fixture();
+            let map = map(&fixture, gigabyte_pages);
+            let cells = install(&mut fixture, map);
+            let levels: Vec<u8> = map.leaves().map(|leaf| leaf.level).collect();
+            if gigabyte_pages {
+                // 1 GiB, 2 MiB, then 4 KiB leaves to the end of the second
+                // run, which joins the first at an unaligned offset.
+                assert_eq!(levels, [2, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+            } else {
+                assert_eq!(levels.iter().filter(|level| **level == 1).count(), 513);
+            }
+            assert_eq!(cells.len(), levels.len());
+            assert_eq!(validate(&mut fixture, Some(map)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn table_map_tables_are_extra_when_the_root_has_no_map() {
+        let mut fixture = staged_fixture();
+        let map = map(&fixture, true);
+        install(&mut fixture, map);
+        assert_eq!(
+            validate(&mut fixture, None),
+            Err(InactiveGraphError::ExtraTable)
+        );
+    }
+
+    #[test]
+    fn a_gigabyte_leaf_is_refused_when_the_cpu_lacks_them() {
+        let mut fixture = staged_fixture();
+        let map = map(&fixture, true);
+        install(&mut fixture, map);
+        let without: &'static TableMap =
+            std::boxed::Box::leak(std::boxed::Box::new(map.with_gigabyte_pages(false)));
+        assert_eq!(
+            validate(&mut fixture, Some(without)),
+            Err(InactiveGraphError::InvalidEntry)
+        );
+    }
+
+    #[test]
+    fn a_user_or_executable_leaf_is_refused() {
+        for (index, drift, clear) in [
+            (0, USER, 0),
+            (1, USER, 0),
+            (9, USER, 0),
+            (0, 0, NO_EXECUTE),
+            (1, 0, NO_EXECUTE),
+            (9, 0, NO_EXECUTE),
+            (9, 0, WRITABLE),
+            (9, CACHE_DISABLE, 0),
+        ] {
+            let mut fixture = staged_fixture();
+            let map = map(&fixture, true);
+            let cells = install(&mut fixture, map);
+            let (cell, entry) = cells[index];
+            fixture
+                .access
+                .inactive
+                .insert(cell, (entry | drift) & !clear);
+            assert_eq!(
+                validate(&mut fixture, Some(map)),
+                Err(InactiveGraphError::InvalidEntry),
+                "leaf {index} drift {drift:#x} clear {clear:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_mapping_another_frame_is_refused() {
+        // The first page of the second run, mapped one page into it.
+        let mut fixture = staged_fixture();
+        let map = map(&fixture, true);
+        let cells = install(&mut fixture, map);
+        let (cell, entry) = cells[5];
+        fixture.access.inactive.insert(cell, entry + PAGE_SIZE);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::MappingMismatch)
+        );
+        // The 2 MiB leaf over the wrong 2 MiB of RAM.
+        let mut fixture = staged_fixture();
+        let cells = install(&mut fixture, map);
+        let (cell, entry) = cells[1];
+        fixture.access.inactive.insert(cell, entry + TWO_MIB);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::MappingMismatch)
+        );
+    }
+
+    #[test]
+    fn a_leaf_running_past_its_piece_is_refused() {
+        // A 2 MiB leaf where the first run has three pages left.
+        let mut fixture = staged_fixture();
+        let map = map(&fixture, true);
+        let cells = install(&mut fixture, map);
+        let virtual_address = TABLE_MAP_BASE + ONE_GIB + TWO_MIB;
+        let ((pt, _), _) = cell_of(&cells, map, virtual_address);
+        let pd_cell = fixture
+            .access
+            .inactive
+            .iter()
+            .find(|(_, entry)| **entry & !0xfff == pt && **entry & HUGE == 0)
+            .map(|(cell, _)| *cell)
+            .unwrap();
+        fixture.access.inactive.insert(
+            pd_cell,
+            (2 * ONE_GIB + TWO_MIB) | HUGE | PRESENT | WRITABLE | NO_EXECUTE,
+        );
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::ExtraLeaf)
+        );
+    }
+
+    #[test]
+    fn a_table_over_nothing_mapped_is_refused() {
+        let mut fixture = staged_fixture();
+        let map = map(&fixture, true);
+        install(&mut fixture, map);
+        // PML4 slot 385 holds nothing of the map.
+        fixture.access.inactive.insert(
+            (fixture.root.physical_start(), 385),
+            fixture.extra_pdpt.physical_start() | PRESENT | WRITABLE,
+        );
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::ExtraTable)
+        );
+    }
+
+    #[test]
+    fn a_missing_leaf_leaves_the_map_short() {
+        let mut fixture = staged_fixture();
+        let map = map(&fixture, true);
+        let cells = install(&mut fixture, map);
+        fixture.access.inactive.remove(&cells[7].0);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::TableMapCoverage)
+        );
+    }
+
+    #[test]
+    fn pieces_that_are_not_the_staged_runs_are_refused() {
+        let mut fixture = staged_fixture();
+        let staged: Vec<(u64, u64)> = fixture.roles.staged_growth_parts().collect();
+        let full = map(&fixture, true);
+        install(&mut fixture, full);
+        let leak = |pieces: &[(u64, u64)]| -> &'static TableMap {
+            let mut map = TableMap::empty();
+            map.fill(pieces.iter().copied(), true).unwrap();
+            std::boxed::Box::leak(std::boxed::Box::new(map))
+        };
+        // One run missing, the runs in the other order, an unstaged piece
+        // added, and a run one page short.
+        let short = [staged[0], (staged[1].0, staged[1].1 - 1)];
+        let extra = [staged[0], staged[1], (8 * ONE_GIB, 1)];
+        for pieces in [&staged[..1], &[staged[1], staged[0]], &extra, &short] {
+            assert_eq!(
+                validate(&mut fixture, Some(leak(pieces))),
+                Err(InactiveGraphError::TableMapCoverage),
+                "{pieces:?}"
+            );
+        }
+        assert_eq!(validate(&mut fixture, Some(full)), Ok(()));
+    }
+
+    #[test]
+    fn a_large_leaf_over_ram_not_aligned_for_it_is_refused() {
+        // A one-page run, then a 2 MiB-aligned run of 4 MiB that therefore
+        // starts 4 KiB into the map: it is mapped in 4 KiB leaves.
+        let mut fixture = graph_fixture_over(
+            ONE_GIB - 16 * PAGE_SIZE,
+            (ONE_GIB + 8 * TWO_MIB) / PAGE_SIZE,
+        );
+        let _pad = fixture.roles.allocate(8).unwrap();
+        let first = fixture.roles.allocate(1).unwrap();
+        assert_eq!(first.physical_start(), ONE_GIB);
+        fixture.roles.stage_growth_part(first).unwrap();
+        let _spacer = fixture.roles.allocate(511).unwrap();
+        let second = fixture.roles.allocate(1024).unwrap();
+        assert_eq!(second.physical_start(), ONE_GIB + TWO_MIB);
+        fixture.roles.stage_growth_part(second).unwrap();
+        let map = map(&fixture, true);
+        let cells = install(&mut fixture, map);
+        assert!(map.leaves().all(|leaf| leaf.level == 0));
+        assert_eq!(validate(&mut fixture, Some(map)), Ok(()));
+        // One 2 MiB leaf over the same bytes, at the address `translate`
+        // gives, which is 4 KiB short of a 2 MiB boundary.
+        let virtual_address = TABLE_MAP_BASE + TWO_MIB;
+        let (physical, left) = map.translate(virtual_address).unwrap();
+        assert!(left >= TWO_MIB && !physical.is_multiple_of(TWO_MIB));
+        let ((pt, _), _) = cell_of(&cells, map, virtual_address);
+        let pd_cell = fixture
+            .access
+            .inactive
+            .iter()
+            .find(|(_, entry)| **entry & !0xfff == pt && **entry & HUGE == 0)
+            .map(|(cell, _)| *cell)
+            .unwrap();
+        fixture
+            .access
+            .inactive
+            .insert(pd_cell, physical | HUGE | PRESENT | WRITABLE | NO_EXECUTE);
+        assert_eq!(
+            validate(&mut fixture, Some(map)),
+            Err(InactiveGraphError::MappingMismatch)
+        );
     }
 }
