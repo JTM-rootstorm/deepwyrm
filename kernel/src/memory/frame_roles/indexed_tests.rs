@@ -1,6 +1,6 @@
-//! Eager backings held as an index (DW2 §12.10 part 2): conversion,
-//! lookup, zeroing, stepped release, and the on-demand entry points that
-//! must refuse them.
+//! Eager backings held as an index (DW2 §12.10 part 2, built in steps by
+//! §12.11 part 2): lookup, zeroing, stepped release, and the on-demand entry
+//! points that must refuse them.
 
 extern crate std;
 
@@ -183,30 +183,6 @@ fn resolve<const R: usize, const S: usize>(
         .map(|segment| segment.physical_start)
 }
 
-/// The frame of every page of a `pages`-page backing made as a chain from
-/// the manager's present state, which is restored afterwards.
-fn chain_frames<const R: usize, const S: usize>(
-    roles: &mut FrameRoleManager<R, S>,
-    model: &'static Model,
-    pages: u64,
-) -> Vec<u64> {
-    roles.index_memory = None;
-    let grant = backing(roles, pages);
-    assert_eq!(grant.kind(), ObjectBackingKind::AllocatorOwned);
-    let mut cursor = BackingCursor::new(grant.identity());
-    let frames = (0..pages)
-        .map(|page| {
-            roles
-                .resolve_at(&mut cursor, page * PAGE, true)
-                .unwrap()
-                .physical_start
-        })
-        .collect();
-    roles.cancel_object_backing(grant).unwrap();
-    roles.set_index_memory(model);
-    frames
-}
-
 /// The runs of a backing made as a chain from the manager's present state,
 /// as (first object page, pages); the state is restored afterwards.
 fn chain_runs<const R: usize, const S: usize>(
@@ -226,40 +202,99 @@ fn chain_runs<const R: usize, const S: usize>(
     runs
 }
 
-/// A `pages`-page backing allocated as a chain, the frame of each of its
-/// pages read from that chain, and then converted as `allocate_backing`
-/// converts it and zeroed: the same allocation before and after.
-fn converted<const R: usize, const S: usize>(
-    roles: &mut FrameRoleManager<R, S>,
-    model: &'static Model,
-    pages: u64,
-) -> (Vec<u64>, ObjectBackingGrant) {
-    roles.index_memory = None;
-    let chain = roles.allocate_backing(pages).unwrap();
-    assert!(!chain.indexed);
-    let frames = roles
-        .backing_allocation_segments(&chain)
-        .unwrap()
-        .flat_map(|segment| {
-            (0..segment.byte_len / PAGE).map(move |page| segment.physical_start + page * PAGE)
+/// Every free page, from the buddy blocks once grown, else the boot free
+/// ranges.
+fn free_pages<const R: usize, const S: usize>(roles: &FrameRoleManager<R, S>) -> BTreeSet<u64> {
+    let buddy = roles
+        .allocator
+        .free_blocks()
+        .flat_map(|(start, order)| (0..1_u64 << order).map(move |page| start + page * PAGE));
+    let boot = roles
+        .allocator
+        .boot_free_ranges()
+        .iter()
+        .flat_map(|range| (range.start..range.end).step_by(PAGE as usize));
+    if roles.allocator.free_blocks().next().is_some() {
+        buddy.collect()
+    } else {
+        boot.collect()
+    }
+}
+
+/// The runs the index of `backing` names, as (first object page, frames),
+/// in object order, from their `ObjectPage` records, not the index.
+fn index_layout<const R: usize, const S: usize>(
+    roles: &FrameRoleManager<R, S>,
+    backing: BackingIdentity,
+) -> Vec<(u64, PageRange)> {
+    let mut runs: Vec<(u64, PageRange)> = roles
+        .slot_views()
+        .filter_map(|(_, view)| match view.record {
+            Some(RoleRecord {
+                range,
+                role: FrameRole::ObjectPage(link),
+            }) if link.owner == backing.0.raw => Some((link.place, range)),
+            _ => None,
         })
         .collect();
-    roles.set_index_memory(model);
-    let root = roles.index_allocation(chain.head, pages).unwrap().unwrap();
-    let allocation = BackingAllocation {
-        head: root,
-        indexed: true,
-        ..chain
-    };
+    runs.sort_unstable_by_key(|(place, _)| *place);
+    runs
+}
+
+/// [`index_layout`] as (first object page, pages).
+fn index_runs<const R: usize, const S: usize>(
+    roles: &FrameRoleManager<R, S>,
+    backing: BackingIdentity,
+) -> Vec<(u64, u64)> {
+    index_layout(roles, backing)
+        .into_iter()
+        .map(|(place, range)| (place, range.page_count()))
+        .collect()
+}
+
+/// The frame of every page of `backing`, from its runs' records.
+fn layout_frames<const R: usize, const S: usize>(
+    roles: &FrameRoleManager<R, S>,
+    backing: BackingIdentity,
+) -> Vec<u64> {
+    let mut frames = Vec::new();
+    for (place, range) in index_layout(roles, backing) {
+        assert_eq!(place, frames.len() as u64, "runs are gapless");
+        frames.extend((range.start..range.end).step_by(PAGE as usize));
+    }
+    frames
+}
+
+/// A `pages`-page backing allocated as an index in steps, and the frame
+/// of each of its pages in object order, as its zeroing reached them, each
+/// a distinct page that was free before (DW2 §12.11 part 2: object order
+/// no longer follows the chain's).
+fn indexed<const R: usize, const S: usize>(
+    roles: &mut FrameRoleManager<R, S>,
+    pages: u64,
+) -> (Vec<u64>, ObjectBackingGrant) {
+    let free = free_pages(roles);
+    let allocation = roles.allocate_backing(pages).unwrap();
+    assert!(allocation.indexed);
+    let mut frames = Vec::new();
+    assert!(
+        roles.zero_backing_pages(&allocation, 0, pages, &mut |page| {
+            frames.push(page);
+            true
+        })
+    );
+    let distinct: BTreeSet<u64> = frames.iter().copied().collect();
+    assert_eq!(distinct.len() as u64, pages, "a frame per page");
+    assert!(distinct.is_subset(&free), "every frame was free");
     (frames, zeroed(roles, allocation))
 }
 
 #[test]
-fn an_indexed_backing_resolves_every_page_to_its_chain_s_frame_in_two_node_reads() {
+fn an_indexed_backing_resolves_every_page_to_its_zeroed_frame_in_two_node_reads() {
     let (mut roles, model, _held) = fragmented(4400);
     let pages = 3000;
     let before = roles.available_frames();
-    let (frames, grant) = converted(&mut roles, model, pages);
+    let (frames, grant) = indexed(&mut roles, pages);
     assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
     assert_eq!(grant.run_count(), pages, "thousands of one-page runs");
     assert_eq!(grant.byte_len(), pages * PAGE);
@@ -320,9 +355,7 @@ fn seventeen_runs_resolve_in_one_node_read_and_runs_of_many_pages_at_their_offse
     let pages = sizes.iter().sum::<u64>() - 1;
     let runs = chain_runs(&mut roles, model, pages);
     assert_eq!(runs.len(), 17);
-    // The range allocator gives the same runs again from the same state.
-    let frames = chain_frames(&mut roles, model, pages);
-    let grant = backing(&mut roles, pages);
+    let (frames, grant) = indexed(&mut roles, pages);
     assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
     assert_eq!(grant.run_count(), 17);
     assert_eq!(roles.check_invariants(), Ok(()));
@@ -331,8 +364,17 @@ fn seventeen_runs_resolve_in_one_node_read_and_runs_of_many_pages_at_their_offse
         assert_eq!(resolve(&roles, grant.identity(), page as u64), Ok(*frame));
         assert_eq!(model.reads() - reads, 1, "the root is the leaf");
     }
-    // Pages inside a run lie at their offset in it.
-    assert_eq!(frames[299], frames[0] + 299 * PAGE);
+    // Pages inside a run lie at their offset in it: the 300-page run,
+    // linked from the remainder's tail after its 12 single pages, the 3,
+    // the 9 and the 120 (DW2 §12.11 part 2 item 3).
+    let layout = index_runs(&roles, grant.identity());
+    assert_eq!(layout.len(), 17);
+    let (place, count) = *layout.iter().find(|(_, count)| *count == 300).unwrap();
+    assert_eq!(place, 12 + 3 + 9 + 120);
+    assert_eq!(
+        frames[(place + count - 1) as usize],
+        frames[place as usize] + 299 * PAGE
+    );
     roles.cancel_object_backing(grant).unwrap();
     assert_eq!(roles.check_invariants(), Ok(()));
 }
@@ -340,16 +382,18 @@ fn seventeen_runs_resolve_in_one_node_read_and_runs_of_many_pages_at_their_offse
 #[test]
 fn a_three_level_index_resolves_every_page_in_three_node_reads() {
     // 17 holes of 16,500 pages: the backing takes 16 whole and part of the
-    // last, whose rest holds the root, 2 middle nodes and 516 leaves.
+    // last, whose rest holds the root, 2 middle nodes and 516 leaves. Each
+    // of the 16 is linked as four runs of 4,096 pages split from its end
+    // and its first 116 pages; the last 100 pages are one more run (DW2
+    // §12.11 part 2 item 3).
     let (mut roles, model) = sized::<640>(17 * 16_501 + 64);
     let _held = holes(&mut roles, &[16_500; 17]);
     let pages = 16 * 16_500 + 100;
     assert!(pages > 512 * 512);
-    let frames = chain_frames(&mut roles, model, pages);
     let before = roles.available_frames();
-    let grant = backing(&mut roles, pages);
+    let (frames, grant) = indexed(&mut roles, pages);
     assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
-    assert_eq!(grant.run_count(), 17);
+    assert_eq!(grant.run_count(), 16 * 5 + 1);
     assert_eq!(roles.available_frames(), before - pages - 1 - 2 - 516);
     assert_eq!(roles.check_invariants(), Ok(()));
     for page in (0..pages).step_by(97).chain([pages - 1, 16_499, 16_500]) {
@@ -491,10 +535,12 @@ fn zeroing_by_ranges_inside_runs_zeroes_each_page_once_and_only_then_resolves() 
     let _held = holes(&mut roles, &sizes);
     // 17 runs, and the root and three leaves from the holes left.
     let pages = 1025;
-    let frames = chain_frames(&mut roles, model, pages);
+    let _ = model;
     let allocation = roles.allocate_backing(pages).unwrap();
     assert!(allocation.indexed);
     let root = BackingIdentity(allocation.head);
+    let frames = layout_frames(&roles, root);
+    assert_eq!(frames.len() as u64, pages);
     // Not yet zeroed: nobody resolves it, and it is not on demand.
     assert_eq!(resolve(&roles, root, 0), Err(FrameRoleError::WrongRole));
     assert!(roles.validate_object_range(root, 0, PAGE, false).is_err());
@@ -600,7 +646,7 @@ fn release_in_steps<const R: usize, const S: usize>(
 #[test]
 fn a_stepped_release_frees_every_run_and_node_across_runs_and_leaves() {
     // Runs of 700 pages (across a leaf boundary), 300 (inside a leaf),
-    // smaller ones, and single pages in the last leaf.
+    // smaller ones, and single pages.
     let mut sizes = std::vec![700, 300, 9, 3, 2];
     sizes.extend([1; 16]);
     // 17 runs, and the root and three leaves from the last four holes.
@@ -610,11 +656,13 @@ fn a_stepped_release_frees_every_run_and_node_across_runs_and_leaves() {
         let _held = holes(&mut roles, &sizes);
         let initial = roles.available_frames();
         let free = roles.allocator.boot_free_ranges().to_vec();
-        let runs = chain_runs(&mut roles, model, pages);
-        assert_eq!(runs[0], (0, 700));
-        assert_eq!(runs[1], (700, 300));
+        let _ = model;
         let grant = backing(&mut roles, pages);
         assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
+        // Linked from the remainder's tail: the 700 is last but one, across
+        // leaves 0 and 1; the 300 lies inside leaf 0.
+        let runs = index_runs(&roles, grant.identity());
+        assert_eq!(&runs[14..], &[(25, 300), (325, 700), (1025, 1)]);
         let (freed, ends) = release_in_steps(&mut roles, grant, &runs, budget);
         assert_eq!(freed, pages, "budget {budget}: each run's pages once");
         assert_eq!(roles.available_frames(), initial);
@@ -832,8 +880,14 @@ fn a_backing_being_freed_resolves_for_nobody_and_stays_whole_mid_release() {
     let backing = grant.identity();
     let _ = model;
     assert!(resolve(&roles, backing, 1000).is_ok());
+    // The 700-page run is linked last but one, at page 325, after the
+    // remainder's 11 single pages, the 2, the 3, the 9 and the 300 (DW2
+    // §12.11 part 2 item 3): a step of their 325 entries reaches it.
+    assert_eq!(index_runs(&roles, backing)[15], (325, 700));
+    let (cursor, _, _) = roles.release_index_step(backing, 0, 325).unwrap();
+    assert_eq!(cursor, 325);
     // One step: past the 700-page run's first leaf.
-    let (cursor, _, _) = roles.release_index_step(backing, 0, 1).unwrap();
+    let (cursor, _, _) = roles.release_index_step(backing, cursor, 1).unwrap();
     assert_eq!(cursor, 512);
     assert_eq!(
         roles.role(backing.0),
@@ -947,35 +1001,39 @@ fn release_counting<const R: usize, const S: usize>(
 
 #[test]
 fn a_release_step_counts_a_visit_per_leaf_passed_and_freed_and_per_entry_cleared() {
-    // Runs: 5,300 pages (leaves 0 to 9 whole, ending 180 pages into leaf
-    // 10), 300 pages (inside leaf 10), then 16 one-page runs: 5,616 pages,
-    // 18 runs, two levels with 11 leaves. Twelve more one-page holes hold
-    // the root and the leaves.
+    // The first hold takes the 5,300-page hole, the 300 and 14 single
+    // pages; the root and the leaves come from 12 more single pages. The
+    // steps link the remainder from its tail (DW2 §12.11 part 2 item 3):
+    // the 14 single pages at pages 0 to 13, the 300 at 14, the 5,300 split
+    // into its last 4,096 pages at 314 (leaves 0 to 8, ending 314 pages
+    // into leaf 8) and its first 1,204 at 4,410, then two single pages from
+    // the allocator: 5,616 pages, 19 runs, two levels with 11 leaves.
     let mut sizes = std::vec![5300, 300];
     sizes.extend([1; 28]);
     let pages = 5616;
+    let mut layout: Vec<(u64, u64)> = (0..14).map(|page| (page, 1)).collect();
+    layout.extend([(14, 300), (314, 4096), (4410, 1204), (5614, 1), (5615, 1)]);
     for (budget, first) in [
-        // 10 leaves passed (1 visit each) and freed by the cascade (1 each),
-        // then the 180 entries of leaf 10 cleared (1 each) and the run
-        // freed: 20 + 180 = 200 visits, exactly the budget.
-        (200, (5300, 5300, 200)),
-        // As above (200), then the 300-page run's entries cleared (300),
-        // then 12 one-page runs (1 each) reach the budget: 512 visits,
-        // cursor 5,612, 5,612 pages freed.
-        (512, (5612, 5612, 512)),
-        // Leaf 0 passed (1), its cascade (1), leaf 1 passed (1), its
-        // cascade (1), leaf 2 passed (1): 5 visits, cursor at 1,536 and
-        // the step ends after leaf 2's cascade (1), 6 visits, nothing freed.
-        (5, (1536, 0, 6)),
+        // The 14 single pages (1 visit each), then 186 entries of the 300
+        // cleared: 200 visits, exactly the budget, 14 pages freed.
+        (200, (200, 14, 200)),
+        // The 14 single pages (14), the 300's entries cleared (300) and it
+        // freed; then the 4,096-page run's leaves 0 to 7 each passed (1
+        // visit) and freed by the cascade (1): 330 visits, cursor 4,096;
+        // then 182 of its entries in leaf 8 cleared: 512 visits, cursor
+        // 4,278, 314 pages freed.
+        (512, (4278, 314, 512)),
+        // Five single pages, a visit each.
+        (5, (5, 5, 5)),
     ] {
-        let (mut roles, model) = small(8192);
+        let (mut roles, _) = small(8192);
         let _held = holes(&mut roles, &sizes);
         let initial = roles.available_frames();
-        let runs = chain_runs(&mut roles, model, pages);
-        assert_eq!(runs.len(), 18);
-        assert_eq!(&runs[..2], &[(0, 5300), (5300, 300)]);
         let grant = backing(&mut roles, pages);
         assert_eq!(grant.kind(), ObjectBackingKind::AllocatorIndexed);
+        let runs = index_runs(&roles, grant.identity());
+        assert_eq!(runs, layout);
+        assert_eq!(grant.run_count(), 19);
         let steps = release_counting(&mut roles, grant, &runs, budget);
         assert_eq!(steps[0], first, "budget {budget}");
         assert_eq!(roles.available_frames(), initial);

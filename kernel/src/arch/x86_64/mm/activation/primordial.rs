@@ -1123,8 +1123,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 }
             };
             let backing = match (backing_pages, &pinned) {
-                // Refused by quota: no frames. Should the adapter admit after
-                // all (usage fell in between), the request fails, not panics.
+                // Refused by quota, or every reservation slot is held (owed
+                // backings hold them too, DW2 §12.11 part 2 item 8): no
+                // frames. Should the adapter admit after all (usage fell in
+                // between), the request fails, not panics.
                 (Some(_), Some(_)) if !quota_allows => {
                     Some(Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
                 }
@@ -1134,12 +1136,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         .map(EarlyBacking::Ready)
                         .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
                 ),
-                // Allocated here, zeroed below in steps (DW2 M4b).
-                // The call alone is timed for the step report: it is one
-                // hold of P that no step covers (DW2 §12.11 part 1).
+                // The first hold of its allocation here: at most 16 runs,
+                // and an index root if they do not cover it. The rest is
+                // built on, then zeroed, in steps below (DW2 M4b, §12.11
+                // part 2). The call alone is timed for the step report: it
+                // is one hold of P that no step covers (§12.11 part 1).
                 (Some(page_count), Some(_)) => Some({
                     let began = step_report::now();
-                    let allocation = user.allocate_backing(page_count);
+                    let allocation = user.begin_backing(page_count);
                     let ended = step_report::now();
                     if let Ok(allocation) = &allocation {
                         step_report::backing_allocated(
@@ -1157,8 +1161,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             (atomic_pin, pinned, backing)
         };
-        // An eager backing is zeroed in steps, which may yield (DW2 §10.8).
-        let (phase, root, process, backing) = match backing {
+        // An eager backing is built on and zeroed in steps, which may yield
+        // (DW2 §10.8, §12.11 part 2 item 5).
+        let (phase, root, process, backing, abandoned) = match backing {
             Some(Ok(EarlyBacking::Unzeroed(allocation))) => {
                 match self.zero_backing_in_steps(phase, root, process, allocation, 0) {
                     Zeroing::Done {
@@ -1166,7 +1171,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         root,
                         process,
                         backing,
-                    } => (phase, root, process, Some(backing)),
+                    } => {
+                        let (backing, abandoned) = settled_backing(backing);
+                        (phase, root, process, Some(backing), abandoned)
+                    }
                     Zeroing::Yielded { allocation, first } => {
                         self.discard_deferred_pins(root, process, pinned);
                         return Some(Ok(self.park_call(ParkedCall::Create(ParkedCreate {
@@ -1183,9 +1191,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                 }
             }
-            Some(Ok(EarlyBacking::Ready(grant))) => (phase, root, process, Some(Ok(grant))),
-            Some(Err(status)) => (phase, root, process, Some(Err(status))),
-            None => (phase, root, process, None),
+            Some(Ok(EarlyBacking::Ready(grant))) => (phase, root, process, Some(Ok(grant)), None),
+            Some(Err(status)) => (phase, root, process, Some(Err(status)), None),
+            None => (phase, root, process, None, None),
         };
         Some(Ok(self.finish_deferred_output(
             request,
@@ -1195,12 +1203,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pinned,
             ranges,
             backing_pages,
-            backing,
+            (backing, abandoned),
         )))
     }
 
     /// The last hold of a family-B call, then its pins' settlement with P
-    /// alone (D1 commit 6): steps 3 and 4 of `handle_deferred_output`.
+    /// alone (D1 commit 6): steps 3 and 4 of `handle_deferred_output`. A
+    /// create's backing that failed a building or zeroing step
+    /// (`abandoned`), and one the adapter rolled back, are abandoned in
+    /// that hold, with P beneath T, so an index among them is owed and
+    /// stays charged (DW2 §12.11 part 2 items 5 to 8).
     #[allow(
         clippy::too_many_arguments,
         reason = "the family-B state built before the last hold, in one place"
@@ -1214,18 +1226,28 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         pinned: Option<[Option<user_access::OwnedLiveUserOutput>; 3]>,
         ranges: [Option<UserRange>; 3],
         backing_pages: Option<u64>,
-        backing: Option<Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>>,
+        (backing, abandoned): (
+            Option<Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>>,
+            Option<crate::memory::frame_roles::BackingAllocation>,
+        ),
     ) -> crate::syscall::native::ReturnReady {
         let pin_taken = matches!(atomic_pin, Some(Ok(_)));
         let mut deferred =
             crate::memory::usercopy::DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));
-        let mut rollback = None;
         let (ready, released_pin) = {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
+            let thread = runtime.own.scheduled().thread;
+            // A failed step's allocation: its reservation passes to it if
+            // it is owed.
+            if let Some(allocation) = abandoned {
+                runtime.settle_abandoned_call(thread, Some(allocation));
+            }
             // The adapter admits again, against the others' reservations.
-            let thread = runtime.own.scheduled().thread.object_id();
-            runtime.core.registry.release_reserved_pages(thread);
+            runtime
+                .core
+                .registry
+                .release_reserved_pages(thread.object_id());
             let (status, released_pin) = match (request, atomic_pin) {
                 (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
                     let mut access = crate::syscall::DeferredMemoryObjectAccess::new(
@@ -1239,7 +1261,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     let status = runtime.run_deferred_output_with(request, &mut access);
                     let (output, unused) = access.into_parts();
                     deferred = output;
-                    rollback = unused;
+                    if let Some(grant) = unused {
+                        runtime.abandon_rolled_back_backing(grant);
+                    }
                     (status, None)
                 }
                 (
@@ -1270,17 +1294,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pin_taken,
             "a deferred atomic pin was not returned for release"
         );
-        if released_pin.is_some() || pinned.is_some() || rollback.is_some() {
+        if released_pin.is_some() || pinned.is_some() {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut user = paging
                 .guard_free_value()
                 .usercopy_process_address_space(root, process);
-            if let Some(grant) = rollback {
-                crate::syscall::MemoryObjectBackingAccess::rollback_object_backing(
-                    &mut user, grant,
-                );
-            }
             if let Some(pin) = released_pin {
                 crate::syscall::FAtomicUserAccess::release_atomic_u32(&mut user, pin);
             }
@@ -1323,8 +1342,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Ends a create that will not finish (stopped, or its output gone on
-    /// resume): under T, frees its unzeroed backing with P beneath and ends
-    /// its quota reservation.
+    /// resume): under T, abandons its unzeroed backing with P beneath, and
+    /// ends its quota reservation or passes it to the backing it owes (DW2
+    /// §12.11 part 2 item 6).
     fn abandon_create(&mut self, allocation: crate::memory::frame_roles::BackingAllocation) {
         let mut guard = self.runtime.lock();
         let mut runtime = guard.on(&mut self.owned);
@@ -2482,16 +2502,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// Zeroes a new MemoryObject's backing one step at a time from page
-    /// `first`, taking P for each step and releasing it between them, then
-    /// makes it the object's backing (DW2 M4b). Its frames are reachable
-    /// only through `allocation`, held in this frame or a parked record, so
-    /// nothing touches them between steps. A page that fails frees the
-    /// whole allocation. Between steps is a safe point (DW2 §10.8): a Stop
-    /// returns the allocation for the caller to free, and an expired
-    /// quantum returns it with the pages left, to park. Each safe point
-    /// commits the phase held so far and takes a fresh one and a fresh user
-    /// root; the first step runs on the caller's.
+    /// Builds a new MemoryObject's backing on until its allocation is
+    /// complete, one building step at a time (DW2 §12.11 part 2 item 5),
+    /// then zeroes it one step at a time from page `first`, taking P for
+    /// each step and releasing it between them, then makes it the object's
+    /// backing (DW2 M4b). Its frames are reachable only through
+    /// `allocation`, held in this frame or a parked record, so nothing
+    /// touches them between steps. A building or zeroing step that fails
+    /// returns the allocation, for the caller's last hold to abandon under
+    /// T. Between steps is a safe point (DW2 §10.8): a Stop returns the
+    /// allocation for the caller to abandon, and an expired quantum returns
+    /// it with the pages left to zero (`first` stays 0 while it is still
+    /// being built), to park. Each safe point commits the phase held so far
+    /// and takes a fresh one and a fresh user root; the first step runs on
+    /// the caller's. Building and zeroing steps are each a create step.
     #[allow(
         unsafe_code,
         reason = "every page was zeroed by the steps before the allocation becomes a backing"
@@ -2502,18 +2526,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
         root: super::UserCopyRoot,
         process: ProcessKey,
-        allocation: crate::memory::frame_roles::BackingAllocation,
+        mut allocation: crate::memory::frame_roles::BackingAllocation,
         mut first: u64,
     ) -> Zeroing {
         let step_pages = PRIMORDIAL_MAX_USER_MAPPING_PAGES as u64;
         let mut phase = Some(phase);
         let (mut root, mut process) = (root, process);
-        let mut zeroed = true;
+        // Whether every step so far succeeded.
+        let mut stepped_well = true;
         let mut stepped = false;
         let cpu = self.cpu;
         // The first step has no safe point before it.
         step_report::step_began(cpu.index());
-        while zeroed && first < allocation.pages() {
+        while stepped_well && (!allocation.is_complete() || first < allocation.pages()) {
             if stepped {
                 let previous = phase.take();
                 match self.at_step_safe_point(true, StepCall::Create, |runtime, yielding| {
@@ -2540,31 +2565,35 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     }
                 }
             }
-            let count = step_pages.min(allocation.pages() - first);
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut user = paging
                 .guard_free_value()
                 .usercopy_process_address_space(root, process);
-            zeroed = user.zero_backing_pages(&allocation, first, count);
-            first += count;
+            if allocation.is_complete() {
+                let count = step_pages.min(allocation.pages() - first);
+                stepped_well = user.zero_backing_pages(&allocation, first, count);
+                first += count;
+            } else {
+                stepped_well = user.extend_backing(&mut allocation);
+            }
             stepped = true;
         }
         // The last zeroing step, if any, ends here; with none, the timing
         // begun above ends untaken.
         step_report::call_ended(cpu.index(), stepped.then_some(StepCall::Create));
         let phase = phase.expect("every safe point that ran took a fresh phase");
-        let mut access = self.paging.guard_free_access(self.runtime.guard_free());
-        let mut paging = access.lock();
-        let mut user = paging
-            .guard_free_value()
-            .usercopy_process_address_space(root, process);
-        let backing = if zeroed {
-            // SAFETY: the loop zeroed every page of the allocation.
+        let backing = if stepped_well {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut user = paging
+                .guard_free_value()
+                .usercopy_process_address_space(root, process);
+            // SAFETY: the loop built the allocation whole and zeroed every
+            // page of it.
             Ok(unsafe { user.finish_zeroed_backing(allocation) })
         } else {
-            user.cancel_backing(allocation);
-            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+            Err(allocation)
         };
         Zeroing::Done {
             phase,
@@ -4160,25 +4189,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// is no field to reselect (TSV row 85).
     const fn cpu(&self) -> crate::cpu::CpuIndex {
         self.owned.owner.cpu()
-    }
-}
-
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::syscall::MemoryObjectBackingAccess
-    for user_access::LiveProcessAddressSpace<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
-{
-    fn allocate_zeroed_backing(
-        &mut self,
-        page_count: u64,
-    ) -> Result<ObjectBackingGrant, deepwyrm_abi::DwStatus> {
-        user_access::LiveProcessAddressSpace::allocate_zeroed_backing(self, page_count)
-            .map_err(|_| DW_STATUS_NO_RESOURCES)
-    }
-
-    fn rollback_object_backing(&mut self, backing: ObjectBackingGrant) {
-        self.roles
-            .cancel_object_backing(backing)
-            .unwrap_or_else(|_| panic!("live MemoryObject backing rollback drifted"));
     }
 }
 
@@ -6691,24 +6701,81 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Settles the resources of `thread`'s call that will not finish (DW2
-    /// §10.8 item 5): its create's quota reservation ends and its unzeroed
-    /// backing, if it had one, is freed with P beneath T.
+    /// §10.8 item 5): its create's unzeroed backing, if it had one, is
+    /// abandoned with P beneath T (DW2 §12.11 part 2 item 6). An index
+    /// with runs linked is owed: `thread`'s reservation passes to it, in
+    /// place, charged the pages it holds, and it is queued for the finalize
+    /// step. Otherwise the reservation ends.
     fn settle_abandoned_call(
         &mut self,
         thread: crate::task::ThreadKey,
         allocation: Option<crate::memory::frame_roles::BackingAllocation>,
     ) {
-        self.core
-            .registry
-            .release_reserved_pages(thread.object_id());
-        if let Some(allocation) = allocation {
+        let owed = allocation.and_then(|allocation| {
             let mut paging = self.paging.lock();
-            paging
-                .target
-                .roles
-                .cancel_backing_allocation(allocation)
-                .unwrap_or_else(|_| panic!("an abandoned create's backing did not free"));
+            paging.target.roles.abandon_backing(allocation)
+        });
+        let Some(owed) = owed else {
+            self.core
+                .registry
+                .release_reserved_pages(thread.object_id());
+            return;
+        };
+        // A create holds its reservation from its first hold until its
+        // last, and only an eager create holds an allocation.
+        assert!(
+            self.core.registry.rekey_reservation_to_owed_backing(
+                thread.object_id(),
+                owed.key(),
+                owed.pages()
+            ),
+            "an abandoned create's Thread holds its reservation"
+        );
+        self.queue_owed_backing(owed);
+    }
+
+    /// Abandons the backing a create's adapter rolled back, with P beneath
+    /// T (DW2 §12.11 part 2 item 6): an indexed one is owed and charged to
+    /// the creating process's groups, since its Thread's reservation ended
+    /// earlier in this hold; any other kind is freed whole.
+    fn abandon_rolled_back_backing(&mut self, grant: ObjectBackingGrant) {
+        let owed = {
+            let mut paging = self.paging.lock();
+            paging.target.roles.abandon_object_backing(grant)
+        };
+        let Some(owed) = owed else {
+            return;
+        };
+        // The tag `reserve_memory_object_pages` charged for this create;
+        // the process is the one running, so it has one.
+        let process = self.own.scheduled().process;
+        let tag = self
+            .core
+            .tasks
+            .charge_tag(process)
+            .unwrap_or(crate::object::charge::ChargeTag::EMPTY);
+        // The frames are held already: a slot is needed, not admission.
+        // The Thread's slot ended in this hold, so one is free.
+        assert!(
+            self.core
+                .registry
+                .reserve_owed_backing_pages(owed.key(), tag, owed.pages()),
+            "a rolled-back create's reservation slot, ended in this hold, is free"
+        );
+        self.queue_owed_backing(owed);
+    }
+
+    /// Queues an owed backing, charged in this hold, for the finalize step
+    /// (DW2 §12.11 part 2 item 7); from an empty queue the hold's end wakes
+    /// the BSP for it (DW2 §10.19).
+    fn queue_owed_backing(&mut self, owed: crate::memory::frame_roles::OwedBacking) {
+        if !self.core.memory.finalization_owed() {
+            crate::time::mark_bsp_owed_event(
+                self.cpu(),
+                crate::syscall::BspOwedEvent::FinalizationFromEmpty,
+            );
         }
+        self.core.memory.queue_owed_backing(owed);
     }
 
     /// Settles every call parked by a Thread that has since ended (DW2
@@ -7725,11 +7792,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// Continues a create parked while zeroing (DW2 §10.8): takes a fresh
-    /// phase and user root, pins its outputs again, zeroes on from its next
-    /// page and finishes as `handle_deferred_output` does. If an output can
-    /// no longer be pinned, the create fails as its first preflight would
-    /// have, with `BAD_ADDRESS`, its backing freed and reservation ended.
+    /// Continues a create parked while building or zeroing (DW2 §10.8,
+    /// §12.11 part 2 item 5): takes a fresh phase and user root, pins its
+    /// outputs again, builds on and zeroes on from where it was and
+    /// finishes as `handle_deferred_output` does. If an output can no
+    /// longer be pinned, the create fails as its first preflight would
+    /// have, with `BAD_ADDRESS`, its backing abandoned and its reservation
+    /// ended or passed to the backing it owes.
     #[inline(never)]
     fn resume_create(
         &mut self,
@@ -7793,14 +7862,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.abandon_create(allocation);
             return Ok(self.return_status_with_phase(phase, deepwyrm_abi::DW_STATUS_BAD_ADDRESS));
         };
-        let (phase, root, process, backing) =
+        let (phase, root, process, backing, abandoned) =
             match self.zero_backing_in_steps(phase, root, process, allocation, first) {
                 Zeroing::Done {
                     phase,
                     root,
                     process,
                     backing,
-                } => (phase, root, process, backing),
+                } => {
+                    let (backing, abandoned) = settled_backing(backing);
+                    (phase, root, process, backing, abandoned)
+                }
                 Zeroing::Yielded { allocation, first } => {
                     self.discard_deferred_pins(root, process, Some(pinned));
                     return Ok(self.park_call(ParkedCall::Create(ParkedCreate {
@@ -7824,7 +7896,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Some(pinned),
             ranges,
             Some(backing_pages),
-            Some(backing),
+            (Some(backing), abandoned),
         ))
     }
 
@@ -11909,9 +11981,11 @@ enum FillCursor {
     Dma { next: Option<u64> },
 }
 
-/// A create parked while zeroing: the pages from `first` on are still to
-/// be zeroed. Its quota reservation stays in the registry under its
-/// Thread; its output pins were let go and are taken again on resume.
+/// A create parked while building or zeroing its backing: an allocation
+/// not yet complete is built on first (`first` is then 0), and the pages
+/// from `first` on are still to be zeroed. Its quota reservation stays in
+/// the registry under its Thread; its output pins were let go and are taken
+/// again on resume.
 struct ParkedCreate {
     request: NativeSyscallRequest,
     allocation: crate::memory::frame_roles::BackingAllocation,
@@ -11919,23 +11993,40 @@ struct ParkedCreate {
     backing_pages: u64,
 }
 
-/// How a create's zeroing in steps ended (DW2 M4b, §10.8).
+/// How a create's building and zeroing in steps ended (DW2 M4b, §10.8,
+/// §12.11 part 2 item 5).
 enum Zeroing {
-    /// Every step ran: the backing, or the status that failed it, with the
-    /// phase and user root of the last safe point.
+    /// Every step ran: the backing, or the allocation of a step that
+    /// failed, to abandon in the last hold, with the phase and user root of
+    /// the last safe point.
     Done {
         phase: crate::arch::x86_64::syscall::RuntimePhaseReservation,
         root: super::UserCopyRoot,
         process: ProcessKey,
-        backing: Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>,
+        backing: Result<ObjectBackingGrant, crate::memory::frame_roles::BackingAllocation>,
     },
-    /// The quantum expired: the pages from `first` on are left.
+    /// The quantum expired: the allocation is still being built, or its
+    /// pages from `first` on are left to zero.
     Yielded {
         allocation: crate::memory::frame_roles::BackingAllocation,
         first: u64,
     },
     /// A Stop landed at a safe point.
     Stopped(crate::memory::frame_roles::BackingAllocation),
+}
+
+/// What [`Zeroing::Done`] hands the last hold: the backing, or a failed
+/// step's status with its allocation to abandon there.
+fn settled_backing(
+    backing: Result<ObjectBackingGrant, crate::memory::frame_roles::BackingAllocation>,
+) -> (
+    Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>,
+    Option<crate::memory::frame_roles::BackingAllocation>,
+) {
+    match backing {
+        Ok(grant) => (Ok(grant), None),
+        Err(allocation) => (Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES), Some(allocation)),
+    }
 }
 
 /// A family-B call's outputs, as (address, length, alignment), or `None` for

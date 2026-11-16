@@ -14880,6 +14880,98 @@ fn concurrent_create_reservations_share_the_limit() {
     assert!(memory_object_quota_allows(&registry, &tasks, process, 4));
 }
 
+/// DW2 §12.11 part 2 item 8: an abandoned create's frames stay charged.
+/// Its Thread's reservation passes, in place with its slot and tag, to the
+/// owed backing, which usage counts as it counts a Thread's; the Thread
+/// reserving again does not disturb it; it falls as pages are freed and
+/// ends with the root. With every slot held, a create is refused.
+#[test]
+fn an_owed_backing_keeps_its_create_s_reservation_until_freed() {
+    use crate::object::charge::ChargeTag;
+    use crate::object::{ObjectRegistryError, RESERVATION_THREADS};
+    let (mut registry, mut tasks, root, jobs, process, _) = limited_fixture();
+    tasks
+        .lower_group_limit(jobs, deepwyrm_abi::DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 10)
+        .unwrap();
+    let thread = crate::task::ThreadKey::from_object_id(root.object_id());
+    let allows = |registry: &ObjectRegistry<32>, tasks: &Tasks, pages| {
+        memory_object_quota_allows(registry, tasks, process, pages)
+    };
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        6,
+        thread
+    ));
+    // Re-keyed to the backing, charged the 4 pages it holds.
+    assert!(registry.rekey_reservation_to_owed_backing(thread.object_id(), 77, 4));
+    assert!(!registry.rekey_reservation_to_owed_backing(thread.object_id(), 78, 1));
+    assert!(allows(&registry, &tasks, 6) && !allows(&registry, &tasks, 7));
+    // The Thread reserves again; ending its reservation leaves the owed one.
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        5,
+        thread
+    ));
+    assert!(allows(&registry, &tasks, 1) && !allows(&registry, &tasks, 2));
+    registry.release_reserved_pages(thread.object_id());
+    assert!(allows(&registry, &tasks, 6) && !allows(&registry, &tasks, 7));
+    // Lowered as its pages are freed, and ended with its root.
+    registry.lower_owed_backing_pages(77, 3).unwrap();
+    assert!(allows(&registry, &tasks, 9) && !allows(&registry, &tasks, 10));
+    assert_eq!(
+        registry.lower_owed_backing_pages(77, 2),
+        Err(ObjectRegistryError::ReferenceCountUnderflow)
+    );
+    assert_eq!(
+        registry.lower_owed_backing_pages(78, 1),
+        Err(ObjectRegistryError::StaleReference)
+    );
+    registry.end_owed_backing_reservation(77);
+    assert!(allows(&registry, &tasks, 10));
+    // A rolled-back create's backing reserves with the creator's tag and
+    // is not refused by the limit: its frames are already held.
+    let tag = tasks.charge_tag(process).unwrap();
+    assert!(registry.reserve_owed_backing_pages(79, tag, 12));
+    assert!(!allows(&registry, &tasks, 1));
+    registry.end_owed_backing_reservation(79);
+    // Every slot but one held by owed backings: the Thread takes the last,
+    // and re-keying it needs no other slot.
+    for key in 1..RESERVATION_THREADS as u64 {
+        assert!(registry.reserve_owed_backing_pages(1000 + key, ChargeTag::EMPTY, 0));
+    }
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        1,
+        thread
+    ));
+    assert!(registry.rekey_reservation_to_owed_backing(thread.object_id(), 2000, 1));
+    // Every slot held: a create is refused until one ends.
+    assert!(!registry.reserve_owed_backing_pages(3000, ChargeTag::EMPTY, 0));
+    assert!(!reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        1,
+        thread
+    ));
+    registry.end_owed_backing_reservation(1001);
+    assert!(reserve_memory_object_pages(
+        &mut registry,
+        &tasks,
+        process,
+        1,
+        thread
+    ));
+    // The re-keyed reservation kept its tag: still charged to the jobs.
+    assert!(allows(&registry, &tasks, 8) && !allows(&registry, &tasks, 9));
+}
+
 /// DW2 M5: the TaskGroup memory topic reports a group's own MEMORY_PAGES
 /// limit, its usage as admission counts it, and the least headroom at and
 /// above it. Only the root group's record asks for free frames, so a job

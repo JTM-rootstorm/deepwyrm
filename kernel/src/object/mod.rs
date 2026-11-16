@@ -245,11 +245,24 @@ const EMPTY_SLOT: ObjectSlot = ObjectSlot {
     generation: 0,
     state: SlotState::Vacant,
 };
-/// Threads that may each hold one create's page reservation; at least the
-/// kernel's thread-stack capacity, which bounds live threads (asserted in
-/// `lib.rs`). Keyed by thread, not CPU, since a create can yield between
-/// reserving and creating and resume elsewhere (DW2 M5 §10.8 D1).
+/// Page reservations the registry holds at once: each held by a Thread for
+/// its create in flight, or by an owed backing for the frames it holds
+/// until freed (DW2 §12.11 part 2 item 8). At least the kernel's
+/// thread-stack capacity, which bounds live threads (asserted in `lib.rs`).
+/// Keyed by thread, not CPU, since a create can yield between reserving and
+/// creating and resume elsewhere (DW2 M5 §10.8 D1). Owed backings hold
+/// slots too, so a create can find every slot held: it is then refused.
 pub(crate) const RESERVATION_THREADS: usize = 64;
+
+/// What holds a page reservation (DW2 §12.11 part 2 item 8).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReservationHolder {
+    /// A Thread's create in flight.
+    Thread(ObjectId),
+    /// An owed backing, by its root's raw identity: the frames of an
+    /// abandoned create, charged until freed.
+    OwedBacking(u64),
+}
 
 pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     domain: u64,
@@ -263,8 +276,10 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     /// allocating its frames outside the global lock, charged to its tag
     /// until the hold that creates the object (DW2 §7.3 R7). Concurrent
     /// creates see each other's, so they cannot together allocate past a
-    /// limit.
-    reserved: [Option<(ObjectId, charge::ChargeTag, u64)>; RESERVATION_THREADS],
+    /// limit. A create abandoned with frames still held passes its
+    /// reservation to its owed backing, which keeps it until they are freed
+    /// (DW2 §12.11 part 2 item 8).
+    reserved: [Option<(ReservationHolder, charge::ChargeTag, u64)>; RESERVATION_THREADS],
     /// MemoryObject slots whose last handle is gone while internal
     /// references remain, noted at each such release for the release-on-
     /// unmap step (DW2 §10.9 item 4). A slot is queued at most once: its
@@ -361,7 +376,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
 
     /// Charges `pages` to `tag` for `thread`'s create in flight, replacing
     /// any reservation that thread held. `false` when every slot is held by
-    /// another thread, which the thread capacity rules out.
+    /// another thread or by an owed backing: the create is then refused.
     #[must_use]
     pub(crate) fn reserve_pages(
         &mut self,
@@ -370,19 +385,100 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         pages: u64,
     ) -> bool {
         self.release_reserved_pages(thread);
-        match self.reserved.iter_mut().find(|slot| slot.is_none()) {
-            Some(slot) => {
-                *slot = Some((thread, tag, pages));
+        self.reserve_for(ReservationHolder::Thread(thread), tag, pages)
+    }
+
+    /// Ends `thread`'s reservation, if it holds one. An owed backing's,
+    /// even one re-keyed from this thread, is not touched.
+    pub(crate) fn release_reserved_pages(&mut self, thread: ObjectId) {
+        self.end_reservation(ReservationHolder::Thread(thread));
+    }
+
+    /// Passes `thread`'s reservation, in place with its slot and tag, to
+    /// the owed backing `backing` (a root's raw identity), now charged
+    /// `pages`: the frames of `thread`'s abandoned create (DW2 §12.11 part
+    /// 2 item 8). `false` if `thread` holds none.
+    #[must_use]
+    pub(crate) fn rekey_reservation_to_owed_backing(
+        &mut self,
+        thread: ObjectId,
+        backing: u64,
+        pages: u64,
+    ) -> bool {
+        match self
+            .reserved
+            .iter_mut()
+            .flatten()
+            .find(|(holder, _, _)| *holder == ReservationHolder::Thread(thread))
+        {
+            Some(reservation) => {
+                reservation.0 = ReservationHolder::OwedBacking(backing);
+                reservation.2 = pages;
                 true
             }
             None => false,
         }
     }
 
-    /// Ends `thread`'s reservation, if it holds one.
-    pub(crate) fn release_reserved_pages(&mut self, thread: ObjectId) {
+    /// Charges `pages` to `tag` for the owed backing `backing` when the
+    /// Thread whose create held its frames no longer holds a reservation
+    /// in this hold (a create rolled back). The frames are already held,
+    /// so no limit refuses it; `false` only when no slot is free.
+    #[must_use]
+    pub(crate) fn reserve_owed_backing_pages(
+        &mut self,
+        backing: u64,
+        tag: charge::ChargeTag,
+        pages: u64,
+    ) -> bool {
+        self.reserve_for(ReservationHolder::OwedBacking(backing), tag, pages)
+    }
+
+    /// Lowers the owed backing `backing`'s reservation by `pages` its
+    /// release freed. Refuses one it does not hold, or a reservation
+    /// smaller than `pages`.
+    pub(crate) fn lower_owed_backing_pages(
+        &mut self,
+        backing: u64,
+        pages: u64,
+    ) -> Result<(), ObjectRegistryError> {
+        let reservation = self
+            .reserved
+            .iter_mut()
+            .flatten()
+            .find(|(holder, _, _)| *holder == ReservationHolder::OwedBacking(backing))
+            .ok_or(ObjectRegistryError::StaleReference)?;
+        reservation.2 = reservation
+            .2
+            .checked_sub(pages)
+            .ok_or(ObjectRegistryError::ReferenceCountUnderflow)?;
+        Ok(())
+    }
+
+    /// Ends the owed backing `backing`'s reservation once its root is
+    /// freed.
+    pub(crate) fn end_owed_backing_reservation(&mut self, backing: u64) {
+        self.end_reservation(ReservationHolder::OwedBacking(backing));
+    }
+
+    fn reserve_for(
+        &mut self,
+        holder: ReservationHolder,
+        tag: charge::ChargeTag,
+        pages: u64,
+    ) -> bool {
+        match self.reserved.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => {
+                *slot = Some((holder, tag, pages));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn end_reservation(&mut self, holder: ReservationHolder) {
         for slot in &mut self.reserved {
-            if slot.is_some_and(|(owner, _, _)| owner == thread) {
+            if slot.is_some_and(|(owner, _, _)| owner == holder) {
                 *slot = None;
             }
         }

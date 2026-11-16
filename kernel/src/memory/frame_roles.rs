@@ -23,6 +23,8 @@ use super::physical::{
     PhysicalRange,
 };
 
+#[path = "frame_roles/build.rs"]
+mod build;
 #[path = "frame_roles/chain.rs"]
 mod chain;
 #[path = "frame_roles/index.rs"]
@@ -33,6 +35,8 @@ mod manager;
 mod slot;
 #[path = "frame_roles/storage.rs"]
 mod storage;
+#[path = "frame_roles/tables.rs"]
+mod tables;
 use chain::ChainState;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use index::OnDemandCommit;
@@ -371,7 +375,9 @@ impl FrameRole {
                 IndexRootState::OnDemand => {
                     FrameRoleKind::ObjectBacking(ObjectBackingKind::OnDemand)
                 }
-                IndexRootState::EagerAllocated => FrameRoleKind::BackingAllocated,
+                IndexRootState::EagerBuilding | IndexRootState::EagerAllocated => {
+                    FrameRoleKind::BackingAllocated
+                }
                 IndexRootState::Eager | IndexRootState::EagerFreeing => {
                     FrameRoleKind::ObjectBacking(ObjectBackingKind::AllocatorIndexed)
                 }
@@ -697,22 +703,41 @@ impl ObjectBackingGrant {
     }
 }
 
-/// Move-only ownership of a backing's runs before they are zeroed: the
-/// chain [`FrameRoleManager::allocate_backing`] made (DW2 M3 §6.3), or the
-/// index it became (DW2 §12.10 part 2).
+/// Move-only ownership of a backing's runs before they are zeroed (DW2 M3
+/// §6.3): the chain [`FrameRoleManager::begin_backing`] made whole, or an
+/// index being built in steps (DW2 §12.11 part 2), complete once every page
+/// is linked. Only a complete allocation is zeroed or becomes a backing.
 #[derive(Debug, Eq, PartialEq)]
-#[must_use = "a backing allocation must be zeroed into a backing or cancelled"]
+#[must_use = "a backing allocation must be zeroed into a backing, or abandoned or cancelled"]
 pub(crate) struct BackingAllocation {
     /// The chain's head run, or the index's root.
     head: FrameRoleIdentity,
+    /// The pages wanted.
     pages: u64,
+    /// A chain's runs, or the runs linked into the index.
     runs: u64,
     /// Whether the runs are held through an index.
     indexed: bool,
+    /// The pages held: a chain's, or those linked into the index, from
+    /// object page 0. Equal to `pages` once complete.
+    linked: u64,
+    /// An index's runs not yet linked: the chain the first hold took, a
+    /// valid allocated chain after every step.
+    remainder: Option<RemainderChain>,
+}
+
+/// The chain of runs an index allocation took in its first hold and has
+/// not yet linked (DW2 §12.11 part 2 item 2).
+#[derive(Debug, Eq, PartialEq)]
+struct RemainderChain {
+    head: FrameRoleIdentity,
+    pages: u64,
+    runs: u64,
 }
 
 impl BackingAllocation {
-    /// The pages allocated.
+    /// The pages allocated, once complete; the pages wanted while an
+    /// index is being built.
     pub(crate) const fn pages(&self) -> u64 {
         self.pages
     }
@@ -721,8 +746,46 @@ impl BackingAllocation {
         self.pages * BASE_PAGE_SIZE
     }
 
+    /// The runs held: linked, and in the remainder.
     pub(crate) const fn run_count(&self) -> u64 {
-        self.runs
+        match &self.remainder {
+            Some(remainder) => self.runs + remainder.runs,
+            None => self.runs,
+        }
+    }
+
+    /// Whether every page is held and linked: only then is the allocation
+    /// zeroed or made a backing.
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.linked == self.pages && self.remainder.is_none()
+    }
+}
+
+/// Move-only ownership of an abandoned eager index (DW2 §12.11 part 2
+/// items 6 and 7): its root, being freed, and the pages its runs hold.
+/// Its runs and nodes are freed in owed steps
+/// ([`FrameRoleManager::release_index_step`]) and its root by
+/// [`FrameRoleManager::release_owed_backing`]. Nothing resolves it.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "an owed backing must be queued and freed in steps"]
+pub(crate) struct OwedBacking {
+    root: FrameRoleIdentity,
+    pages: u64,
+}
+
+impl OwedBacking {
+    pub(crate) const fn identity(&self) -> BackingIdentity {
+        BackingIdentity(self.root)
+    }
+
+    /// The pages its runs hold, which stay charged until freed.
+    pub(crate) const fn pages(&self) -> u64 {
+        self.pages
+    }
+
+    /// The root's raw identity: what its reservation is keyed by.
+    pub(crate) const fn key(&self) -> u64 {
+        self.root.raw
     }
 }
 

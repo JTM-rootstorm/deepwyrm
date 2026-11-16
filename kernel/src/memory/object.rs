@@ -13,9 +13,12 @@
 use super::address_region::{AddressSpaceKey, RegionKey, mint_authority_domain};
 use crate::handle::ResolvedHandle;
 use crate::memory::frame_roles::{
-    BackingIdentity, FrameRoleManager, ObjectBackingGrant, ObjectBackingKind,
+    BackingIdentity, FrameRoleManager, ObjectBackingGrant, ObjectBackingKind, OwedBacking,
 };
-use crate::object::{CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry};
+use crate::object::{
+    CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry,
+    RESERVATION_THREADS,
+};
 use deepwyrm_abi::{
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_EXECUTE, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_WRITE,
 };
@@ -945,6 +948,14 @@ pub(crate) struct MemoryObjectAuthority<const OBJECTS: usize, const LEASES: usiz
     owed_order: [usize; OBJECTS],
     owed_head: usize,
     owed_len: usize,
+    /// Eager backings of abandoned creates, freed in owed steps after the
+    /// owed objects (DW2 §12.11 part 2 item 7), each with its release
+    /// cursor: a ring of `backings_len` from `backings_head`, oldest first.
+    /// Each holds one of the registry's reservation slots, so there are
+    /// never more than it has.
+    owed_backings: [Option<(OwedBacking, u64)>; RESERVATION_THREADS],
+    backings_head: usize,
+    backings_len: usize,
 }
 
 /// A finalization owed in steps, and how far its index has been freed.
@@ -968,6 +979,9 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             owed_order: [0; OBJECTS],
             owed_head: 0,
             owed_len: 0,
+            owed_backings: core::array::from_fn(|_| None),
+            backings_head: 0,
+            backings_len: 0,
         }
     }
 
@@ -1299,9 +1313,37 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
         object_range(record, offset, byte_len)
     }
 
-    /// Whether any finalization is owed (DW2 §10.12).
+    /// Whether any finalization is owed (DW2 §10.12): of an object, or of
+    /// an abandoned create's backing (DW2 §12.11 part 2 item 7).
     pub(crate) fn finalization_owed(&self) -> bool {
-        self.owed_len != 0
+        self.owed_len != 0 || self.backings_len != 0
+    }
+
+    /// Queues an abandoned create's backing to be freed in owed steps
+    /// after the owed objects (DW2 §12.11 part 2 item 7). The caller has
+    /// given it a reservation slot in the same hold.
+    ///
+    /// # Panics
+    ///
+    /// If the queue is full: every owed backing holds one of the
+    /// registry's [`RESERVATION_THREADS`] slots, so it cannot be.
+    pub(crate) fn queue_owed_backing(&mut self, backing: OwedBacking) {
+        assert!(
+            self.backings_len < RESERVATION_THREADS,
+            "every owed backing holds a reservation slot, so no more than RESERVATION_THREADS are owed"
+        );
+        let index = (self.backings_head + self.backings_len) % RESERVATION_THREADS;
+        assert!(
+            self.owed_backings[index].is_none(),
+            "the owed backings' ring has a free entry past its last"
+        );
+        self.owed_backings[index] = Some((backing, 0));
+        self.backings_len += 1;
+    }
+
+    /// How many owed backings are queued.
+    pub(crate) fn owed_backing_count(&self) -> usize {
+        self.backings_len
     }
 
     /// Queues the finalization of an on-demand object, or of a page-backed
@@ -1349,7 +1391,11 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
     /// Each step lowers the object's weight by what it freed of what the
     /// object is charged: an on-demand object's frames, an eager object's
     /// run pages, not its index nodes (DW2 §12.10 part 2 item 8); an
-    /// object whose index is empty is completed. `true` if any remain.
+    /// object whose index is empty is completed. Owed backings are served
+    /// after the objects from the same budget, each step lowering the
+    /// backing's reservation by the run pages it freed; at its index's end
+    /// its root is freed and its reservation ends (DW2 §12.11 part 2 items
+    /// 7 and 8). `true` if any remain.
     #[cfg(deepwyrm_integrated)]
     pub(crate) fn finalize_owed_step<
         const REGISTRY_OBJECTS: usize,
@@ -1421,7 +1467,60 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
             // pass D-2).
             left = left.saturating_sub(crate::memory::frame_roles::INDEX_FANOUT);
         }
-        self.owed_len != 0
+        if self.owed_len == 0 {
+            self.release_owed_backings(registry, roles, left);
+        }
+        self.finalization_owed()
+    }
+
+    /// The owed backings' share of a finalize step: the loop
+    /// [`Self::finalize_owed_step_observed`] runs for objects, with the
+    /// backing's reservation in place of an object's charge. Not reported
+    /// per backing.
+    #[cfg(deepwyrm_integrated)]
+    fn release_owed_backings<
+        const REGISTRY_OBJECTS: usize,
+        const RANGE_CAPACITY: usize,
+        const ROLE_CAPACITY: usize,
+    >(
+        &mut self,
+        registry: &mut ObjectRegistry<REGISTRY_OBJECTS>,
+        roles: &mut FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+        mut left: u64,
+    ) {
+        while left != 0 && self.backings_len != 0 {
+            let (backing, cursor) = self.owed_backings[self.backings_head]
+                .as_mut()
+                .expect("a queued owed backing is held");
+            let pages = backing.pages();
+            let key = backing.key();
+            let (next, freed, visited) = roles
+                .release_index_step(backing.identity(), *cursor, left)
+                .unwrap_or_else(|error| panic!("an owed backing did not free: {error:?}"));
+            *cursor = next;
+            if freed != 0 {
+                registry
+                    .lower_owed_backing_pages(key, freed)
+                    .unwrap_or_else(|error| {
+                        panic!("an owed backing's reservation did not fall: {error:?}")
+                    });
+            }
+            left = left.saturating_sub(visited.max(1));
+            if next < pages {
+                break;
+            }
+            let (backing, _) = self.owed_backings[self.backings_head]
+                .take()
+                .expect("a queued owed backing is held");
+            self.backings_head = (self.backings_head + 1) % RESERVATION_THREADS;
+            self.backings_len -= 1;
+            roles
+                .release_owed_backing(backing)
+                .unwrap_or_else(|_| panic!("an owed backing's root did not free"));
+            registry.end_owed_backing_reservation(key);
+            // As an object's completion: the root's entries are read.
+            left = left.saturating_sub(crate::memory::frame_roles::INDEX_FANOUT);
+        }
     }
 
     pub(crate) fn take_finalization(
