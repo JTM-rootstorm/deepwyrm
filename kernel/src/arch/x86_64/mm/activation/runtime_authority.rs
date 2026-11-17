@@ -61,6 +61,24 @@ pub(super) trait HoldEndCheck {
     /// left that must not be done under it (DW2 §10.19 revision 3: the
     /// BSP's wake for owed work). It sees no guarded state.
     fn after_release() {}
+
+    /// The step report's clock, read for T's timing (DW2 §13.5): once the
+    /// ticket is taken, and just before the release store. The default, for
+    /// every guarded value but the live runtime's, reads none, so the
+    /// lock's host tests see the lock alone.
+    #[inline(always)]
+    fn timing_now() -> Option<u64> {
+        None
+    }
+
+    /// CPU slot `cpu` was served T, having taken its ticket at `ticketed`.
+    #[inline(always)]
+    fn hold_served(_cpu: u32, _ticketed: Option<u64>) {}
+
+    /// CPU slot `cpu` released T at `released`, read just before the
+    /// release store.
+    #[inline(always)]
+    fn hold_released(_cpu: u32, _released: Option<u64>) {}
 }
 
 /// Coarse DW0-H transaction boundary for the still-monolithic live authority
@@ -149,11 +167,17 @@ impl<T> RuntimeAuthorityLock<T> {
         if self.handles_taken.swap(true, Ordering::AcqRel) {
             panic!("runtime authority handles were minted twice");
         }
-        core::array::from_fn(|_| RuntimeAuthorityHandle { lock: self })
+        // The handle at index `cpu` is CPU slot `cpu`'s: the live kernel
+        // hands handle `n` to the carrier facade of `CpuIndex` `n`, the index
+        // the step report keys its per-CPU records by.
+        core::array::from_fn(|cpu| RuntimeAuthorityHandle {
+            lock: self,
+            cpu: u32::try_from(cpu).unwrap_or(u32::MAX),
+        })
     }
 
     #[track_caller]
-    fn lock(&self) -> RuntimeAuthorityGuard<'_, T>
+    fn lock(&self, cpu: u32) -> RuntimeAuthorityGuard<'_, T>
     where
         T: HoldEndCheck,
     {
@@ -173,14 +197,17 @@ impl<T> RuntimeAuthorityLock<T> {
                 Err(current) => observed = current,
             }
         };
+        let ticketed = T::timing_now();
         while self.tickets.serving.load(Ordering::Acquire) != ticket {
             (self.spin_service)();
             core::hint::spin_loop();
         }
+        T::hold_served(cpu, ticketed);
         RuntimeAuthorityGuard {
             lock: self,
             ticket,
             owns_lock: true,
+            cpu,
             taken,
             _handle: PhantomData,
         }
@@ -192,6 +219,9 @@ impl<T> RuntimeAuthorityLock<T> {
 /// CPU, and it is that CPU's only way to acquire the lock.
 pub(super) struct RuntimeAuthorityHandle<'a, T> {
     lock: &'a RuntimeAuthorityLock<T>,
+    /// The CPU slot this handle was minted for, for the step report's T
+    /// timing (DW2 §13.5).
+    cpu: u32,
 }
 
 impl<T> RuntimeAuthorityHandle<'_, T> {
@@ -202,7 +232,7 @@ impl<T> RuntimeAuthorityHandle<'_, T> {
     where
         T: HoldEndCheck,
     {
-        self.lock.lock()
+        self.lock.lock(self.cpu)
     }
 
     /// Certifies that this CPU holds no runtime-authority guard. Refused by
@@ -220,6 +250,8 @@ pub(super) struct RuntimeAuthorityGuard<'a, T: HoldEndCheck> {
     lock: &'a RuntimeAuthorityLock<T>,
     ticket: u64,
     owns_lock: bool,
+    /// The CPU slot of the handle that took this hold.
+    cpu: u32,
     /// Where this hold began, named if it ends breaking the hold-end rule.
     taken: &'static core::panic::Location<'static>,
     _handle: PhantomData<&'a mut ()>,
@@ -249,10 +281,12 @@ impl<T: HoldEndCheck> Drop for RuntimeAuthorityGuard<'_, T> {
         if self.owns_lock {
             // SAFETY: as in `deref`; the ticket is still held here.
             unsafe { &*self.lock.value.get() }.check_hold_end(self.taken);
+            let released = T::timing_now();
             self.lock
                 .tickets
                 .serving
                 .store(self.ticket + 1, Ordering::Release);
+            T::hold_released(self.cpu, released);
             T::after_release();
         }
     }

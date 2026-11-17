@@ -77,6 +77,48 @@ pub(crate) enum DrainSource {
 }
 
 const SOURCES: usize = 5;
+const SOURCE_NAMES: [&str; SOURCES] = ["gate", "syscall", "fault", "idle", "other"];
+
+/// A point of one pass of the inner fault serve, stamped on its CPU (DW2
+/// §13.5 line 1). A pass begins at [`StepTally::fault_pass_began`]; these
+/// are the points after it, in order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FaultStamp {
+    /// Just before the admission.
+    AdmitBegan = 0,
+    /// The admission returned.
+    AdmitEnded = 1,
+    /// The page's commit returned (frames and index nodes taken and zeroed),
+    /// or, for a page already committed, the point it would have.
+    CommitEnded = 2,
+    /// The inner serve is about to return `Served`.
+    ServeEnded = 3,
+}
+
+/// The pass's start and the four [`FaultStamp`]s.
+const FAULT_STAMPS: usize = 5;
+
+/// How one pass of the fault gate's serve loop ended: the wrapper's
+/// outcome (DW2 §13.5 line 1, `fault-passes`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FaultPass {
+    Served = 0,
+    AlreadyPresent = 1,
+    Released = 2,
+    Retry = 3,
+    Unserved = 4,
+    Exhausted = 5,
+}
+
+const FAULT_PASSES: usize = 6;
+
+/// The parts of a served fault's time, in the line's order: sync, lookup,
+/// admit, commit, tables, return.
+const FAULT_PARTS: usize = 6;
+
+/// A T acquisition's figures, per CPU and drain source: count, wait sum,
+/// wait longest, held sum, held longest.
+const T_LOCK_FIGURES: usize = 5;
 
 impl DrainSource {
     fn from_index(index: u8) -> Self {
@@ -187,6 +229,38 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// the next [`ALLOC_RUNS_BITS`], pages in the low [`ALLOC_PAGES_BITS`],
     /// each clamped to its field's maximum. Zero while none was recorded.
     backing_alloc: AtomicU64,
+    /// Per CPU, when the fault gate entered for the fault it is serving, in
+    /// ns plus one; zero when that CPU's gate is not timing one (DW2 §13.5).
+    fault_entry: [AtomicU64; CPUS],
+    /// Per CPU, the current serve pass's start and its [`FaultStamp`]s, in
+    /// ns plus one; zero where not stamped.
+    fault_stamps: [[AtomicU64; FAULT_STAMPS]; CPUS],
+    /// Served faults sampled, their total time and longest total, and the
+    /// sums of their parts, in ns.
+    faults_served: AtomicU64,
+    fault_total: AtomicU64,
+    fault_longest: AtomicU64,
+    fault_parts: [AtomicU64; FAULT_PARTS],
+    /// The gate's serve passes by outcome, and the fill-in's serves.
+    fault_passes: [AtomicU64; FAULT_PASSES],
+    fill_in_serves: AtomicU64,
+    /// Per CPU, the current T hold's served time in ns plus one (zero when
+    /// not timed) and its wait in ns: one hold per CPU at a time.
+    t_lock_served: [AtomicU64; CPUS],
+    t_lock_wait: [AtomicU64; CPUS],
+    /// Per CPU and drain source, [`T_LOCK_FIGURES`] in ns (count aside).
+    t_lock: [[[AtomicU64; T_LOCK_FIGURES]; SOURCES]; CPUS],
+    /// Registry scans by `charged_pages` and by `charged`, and the capacity
+    /// of the registry scanned.
+    page_scans: AtomicU64,
+    object_scans: AtomicU64,
+    scan_slots: AtomicU64,
+    /// Commit steps timed, and the sums of their admission, frame take and
+    /// zeroing, and the rest, in ns.
+    commit_steps: AtomicU64,
+    commit_admit: AtomicU64,
+    commit_take: AtomicU64,
+    commit_rest: AtomicU64,
 }
 
 /// The fields of [`StepTally::backing_allocated`]'s packed record. 24 bits
@@ -232,7 +306,279 @@ impl<const CPUS: usize> StepTally<CPUS> {
             owed_wakes_retirement: AtomicU64::new(0),
             backing_runs: AtomicU64::new(0),
             backing_alloc: AtomicU64::new(0),
+            fault_entry: [const { AtomicU64::new(0) }; CPUS],
+            fault_stamps: [const { [const { AtomicU64::new(0) }; FAULT_STAMPS] }; CPUS],
+            faults_served: AtomicU64::new(0),
+            fault_total: AtomicU64::new(0),
+            fault_longest: AtomicU64::new(0),
+            fault_parts: [const { AtomicU64::new(0) }; FAULT_PARTS],
+            fault_passes: [const { AtomicU64::new(0) }; FAULT_PASSES],
+            fill_in_serves: AtomicU64::new(0),
+            t_lock_served: [const { AtomicU64::new(0) }; CPUS],
+            t_lock_wait: [const { AtomicU64::new(0) }; CPUS],
+            t_lock: [const { [const { [const { AtomicU64::new(0) }; T_LOCK_FIGURES] }; SOURCES] };
+                CPUS],
+            page_scans: AtomicU64::new(0),
+            object_scans: AtomicU64::new(0),
+            scan_slots: AtomicU64::new(0),
+            commit_steps: AtomicU64::new(0),
+            commit_admit: AtomicU64::new(0),
+            commit_take: AtomicU64::new(0),
+            commit_rest: AtomicU64::new(0),
         }
+    }
+
+    /// The fault gate entered on `cpu` at `now` (`None`: no clock, and the
+    /// fault is not timed). Clears any record a gate left that did not end
+    /// (a Stop polled in its loop).
+    pub(crate) fn fault_entered(&self, cpu: usize, now: Option<u64>) {
+        if let Some(entry) = self.fault_entry.get(cpu) {
+            entry.store(
+                now.map_or(0, |now| now.saturating_add(1)),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Whether `cpu`'s fault gate is timing a fault: the inner serve stamps
+    /// only then, so a fill-in's serves take no clock reads.
+    pub(crate) fn fault_timing(&self, cpu: usize) -> bool {
+        self.fault_entry
+            .get(cpu)
+            .is_some_and(|entry| entry.load(Ordering::Relaxed) != 0)
+    }
+
+    /// `cpu`'s fault gate is not timing a fault from here (an exit that does
+    /// not return, or a syscall's fill-in).
+    pub(crate) fn fault_untimed(&self, cpu: usize) {
+        self.fault_entered(cpu, None);
+    }
+
+    /// A pass of the inner serve began on `cpu` at `now`: the stamps of any
+    /// earlier pass are cleared, so a pass's sample never mixes two passes.
+    pub(crate) fn fault_pass_began(&self, cpu: usize, now: Option<u64>) {
+        if let Some(stamps) = self.fault_stamps.get(cpu) {
+            let [began, rest @ ..] = stamps;
+            began.store(
+                now.map_or(0, |now| now.saturating_add(1)),
+                Ordering::Relaxed,
+            );
+            for stamp in rest {
+                stamp.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `cpu`'s current pass reached `stamp` at `now`.
+    pub(crate) fn fault_stamped(&self, cpu: usize, stamp: FaultStamp, now: Option<u64>) {
+        if let Some(slot) = self
+            .fault_stamps
+            .get(cpu)
+            .and_then(|stamps| stamps.get(stamp as usize + 1))
+        {
+            slot.store(
+                now.map_or(0, |now| now.saturating_add(1)),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// One pass of the gate's serve loop ended as `pass`.
+    pub(crate) fn fault_pass(&self, pass: FaultPass) {
+        self.fault_passes[pass as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A syscall's fill-in called the inner serve once.
+    pub(crate) fn fill_in_served(&self) {
+        self.fill_in_serves.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `cpu`'s gate authorised its return at `now`, after a fault whose
+    /// final pass was `served`: a served fault with every stamp of its last
+    /// pass and of the gate's entry is one sample. The CPU's record is
+    /// cleared either way.
+    pub(crate) fn fault_returned(&self, cpu: usize, served: bool, now: Option<u64>) {
+        let (Some(entry), Some(stamps)) = (self.fault_entry.get(cpu), self.fault_stamps.get(cpu))
+        else {
+            return;
+        };
+        let entry = entry.swap(0, Ordering::Relaxed);
+        let stamps = stamps
+            .each_ref()
+            .map(|stamp| stamp.swap(0, Ordering::Relaxed));
+        let (true, Some(now)) = (served, now) else {
+            return;
+        };
+        if entry == 0 || stamps.contains(&0) {
+            return;
+        }
+        let [began, admit_began, admit_ended, commit_ended, serve_ended] =
+            stamps.map(|stamp| stamp - 1);
+        let points = [
+            entry - 1,
+            began,
+            admit_began,
+            admit_ended,
+            commit_ended,
+            serve_ended,
+            now,
+        ];
+        let total = now.saturating_sub(entry - 1);
+        self.faults_served.fetch_add(1, Ordering::Relaxed);
+        self.fault_total.fetch_add(total, Ordering::Relaxed);
+        self.fault_longest.fetch_max(total, Ordering::Relaxed);
+        for (part, pair) in self.fault_parts.iter().zip(points.windows(2)) {
+            part.fetch_add(pair[1].saturating_sub(pair[0]), Ordering::Relaxed);
+        }
+    }
+
+    /// `cpu` was served T at `served`, having taken its ticket at
+    /// `ticketed`. Nothing is kept unless both were read.
+    pub(crate) fn t_lock_served(&self, cpu: usize, ticketed: Option<u64>, served: Option<u64>) {
+        let (Some(slot), Some(wait)) = (self.t_lock_served.get(cpu), self.t_lock_wait.get(cpu))
+        else {
+            return;
+        };
+        if let (Some(ticketed), Some(served)) = (ticketed, served) {
+            wait.store(served.saturating_sub(ticketed), Ordering::Relaxed);
+            slot.store(served.saturating_add(1), Ordering::Relaxed);
+        } else {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// `cpu` released T at `released`, draining as `source`: the hold, if
+    /// its service was timed, is one acquisition of the CPU and source.
+    pub(crate) fn t_lock_released(&self, cpu: usize, source: DrainSource, released: Option<u64>) {
+        let (Some(slot), Some(wait), Some(figures)) = (
+            self.t_lock_served.get(cpu),
+            self.t_lock_wait.get(cpu),
+            self.t_lock.get(cpu),
+        ) else {
+            return;
+        };
+        let served = slot.swap(0, Ordering::Relaxed);
+        let Some(released) = released else {
+            return;
+        };
+        if served == 0 {
+            return;
+        }
+        let wait = wait.load(Ordering::Relaxed);
+        let held = released.saturating_sub(served - 1);
+        let [count, wait_sum, wait_longest, held_sum, held_longest] = &figures[source as usize];
+        count.fetch_add(1, Ordering::Relaxed);
+        wait_sum.fetch_add(wait, Ordering::Relaxed);
+        wait_longest.fetch_max(wait, Ordering::Relaxed);
+        held_sum.fetch_add(held, Ordering::Relaxed);
+        held_longest.fetch_max(held, Ordering::Relaxed);
+    }
+
+    /// `ObjectRegistry::charged_pages` scanned a registry of `slots` slots.
+    pub(crate) fn page_scanned(&self, slots: usize) {
+        self.page_scans.fetch_add(1, Ordering::Relaxed);
+        self.scan_slots.store(slots as u64, Ordering::Relaxed);
+    }
+
+    /// `ObjectRegistry::charged` scanned a registry of `slots` slots.
+    pub(crate) fn object_scanned(&self, slots: usize) {
+        self.object_scans.fetch_add(1, Ordering::Relaxed);
+        self.scan_slots.store(slots as u64, Ordering::Relaxed);
+    }
+
+    /// A commit step began at `began`, admitted from `admit_began` to
+    /// `admit_ended`, took and zeroed its frames until `taken`, and ended at
+    /// `ended` (ns): its admission, its take, and the rest (before the
+    /// admission and after the take).
+    pub(crate) fn commit_step(
+        &self,
+        began: u64,
+        admit_began: u64,
+        admit_ended: u64,
+        taken: u64,
+        ended: u64,
+    ) {
+        self.commit_steps.fetch_add(1, Ordering::Relaxed);
+        self.commit_admit
+            .fetch_add(admit_ended.saturating_sub(admit_began), Ordering::Relaxed);
+        self.commit_take
+            .fetch_add(taken.saturating_sub(admit_ended), Ordering::Relaxed);
+        self.commit_rest.fetch_add(
+            admit_began
+                .saturating_sub(began)
+                .saturating_add(ended.saturating_sub(taken)),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Writes the first-touch measurement's lines (DW2 §13.5): served
+    /// faults, the gate's passes, T per CPU and source (a line only for a
+    /// nonzero count), admission's scans with `reservations`, the
+    /// reservation capacity, and commit steps.
+    pub(crate) fn write_measure_lines(
+        &self,
+        reservations: usize,
+        mut line: impl FnMut(core::fmt::Arguments<'_>),
+    ) {
+        let us = |value: &AtomicU64| value.load(Ordering::Relaxed) / 1000;
+        let [sync, lookup, admit, commit, tables, ret] = self.fault_parts.each_ref().map(us);
+        line(format_args!(
+            "faults served={} total-us={} longest-us={} sync-us={sync} lookup-us={lookup} admit-us={admit} commit-us={commit} tables-us={tables} return-us={ret}",
+            self.faults_served.load(Ordering::Relaxed),
+            us(&self.fault_total),
+            us(&self.fault_longest),
+        ));
+        let [served, present, released, retry, unserved, exhausted] = self
+            .fault_passes
+            .each_ref()
+            .map(|count| count.load(Ordering::Relaxed));
+        line(format_args!(
+            "fault-passes served={served} already-present={present} released={released} retry={retry} unserved={unserved} exhausted={exhausted} fill-in-serves={}",
+            self.fill_in_serves.load(Ordering::Relaxed)
+        ));
+        for (cpu, sources) in self.t_lock.iter().enumerate() {
+            for (name, figures) in SOURCE_NAMES.iter().zip(sources) {
+                let count = figures[0].load(Ordering::Relaxed);
+                if count == 0 {
+                    continue;
+                }
+                let [_, wait, wait_longest, held, held_longest] = figures.each_ref().map(us);
+                line(format_args!(
+                    "t-lock cpu={cpu} source={name} count={count} wait-us={wait} wait-longest-us={wait_longest} held-us={held} held-longest-us={held_longest}"
+                ));
+            }
+        }
+        line(format_args!(
+            "admission page-scans={} object-scans={} slots={} reservations={reservations}",
+            self.page_scans.load(Ordering::Relaxed),
+            self.object_scans.load(Ordering::Relaxed),
+            self.scan_slots.load(Ordering::Relaxed),
+        ));
+        line(format_args!(
+            "commit-steps count={} admit-us={} take-us={} rest-us={}",
+            self.commit_steps.load(Ordering::Relaxed),
+            us(&self.commit_admit),
+            us(&self.commit_take),
+            us(&self.commit_rest),
+        ));
+    }
+
+    /// Writes the whole report's line bodies in order: the step lines, the
+    /// finalization lines, the measurement's lines, then the closing lines,
+    /// whose values `closing` reads only once every line before them is
+    /// written (see [`write_closing_lines`]).
+    pub(crate) fn write_report(
+        &self,
+        now: Option<u64>,
+        reservations: usize,
+        closing: impl FnOnce() -> ((u64, u64), u64),
+        mut line: impl FnMut(core::fmt::Arguments<'_>),
+    ) {
+        self.write_lines(&mut line);
+        self.write_finalize_lines(now, &mut line);
+        self.write_measure_lines(reservations, &mut line);
+        let (timer_arm, records_dropped) = closing();
+        write_closing_lines(timer_arm, records_dropped, line);
     }
 
     /// An eager backing of `runs` runs and `pages` pages was made: it is
@@ -766,13 +1112,102 @@ mod live {
                 );
             }
         }
-        TALLY.write_lines(emit);
-        TALLY.write_finalize_lines(now(), emit);
-        super::write_closing_lines(
-            crate::time::timer_arm_counts(),
-            crate::debug::records_dropped(),
+        TALLY.write_report(
+            now(),
+            crate::object::RESERVATION_THREADS,
+            || {
+                (
+                    crate::time::timer_arm_counts(),
+                    crate::debug::records_dropped(),
+                )
+            },
             emit,
         );
+    }
+
+    /// The fault gate entered on `cpu` (DW2 §13.5): one clock read.
+    pub(crate) fn fault_entered(cpu: usize) {
+        TALLY.fault_entered(cpu, now());
+    }
+
+    /// `cpu`'s gate stops timing without a sample, or a fill-in begins.
+    pub(crate) fn fault_untimed(cpu: usize) {
+        TALLY.fault_untimed(cpu);
+    }
+
+    /// The inner serve began a pass on `cpu`: one clock read, only while
+    /// the CPU's fault gate is timing a fault.
+    pub(crate) fn fault_pass_began(cpu: usize) {
+        if TALLY.fault_timing(cpu) {
+            TALLY.fault_pass_began(cpu, now());
+        }
+    }
+
+    /// The inner serve reached `stamp` on `cpu`: one clock read, only while
+    /// the CPU's fault gate is timing a fault.
+    pub(crate) fn fault_stamped(cpu: usize, stamp: super::FaultStamp) {
+        if TALLY.fault_timing(cpu) {
+            TALLY.fault_stamped(cpu, stamp, now());
+        }
+    }
+
+    /// One pass of the gate's serve loop ended as `pass`.
+    pub(crate) fn fault_pass(pass: super::FaultPass) {
+        TALLY.fault_pass(pass);
+    }
+
+    /// A syscall's fill-in called the inner serve.
+    pub(crate) fn fill_in_served() {
+        TALLY.fill_in_served();
+    }
+
+    /// `cpu`'s gate authorised its return (see
+    /// [`StepTally::fault_returned`]): one clock read for a timed fault
+    /// that was served, none otherwise.
+    pub(crate) fn fault_returned(cpu: usize, served: bool) {
+        let now = if served && TALLY.fault_timing(cpu) {
+            now()
+        } else {
+            None
+        };
+        TALLY.fault_returned(cpu, served, now);
+    }
+
+    /// `cpu` was served T, having taken its ticket at `ticketed`: one clock
+    /// read.
+    pub(crate) fn t_lock_served(cpu: usize, ticketed: Option<u64>) {
+        TALLY.t_lock_served(cpu, ticketed, now());
+    }
+
+    /// `cpu` released T at `released`, read just before the release store.
+    pub(crate) fn t_lock_released(cpu: usize, released: Option<u64>) {
+        TALLY.t_lock_released(cpu, drain_source(cpu), released);
+    }
+
+    /// `ObjectRegistry::charged_pages` scanned `slots` slots.
+    pub(crate) fn page_scanned(slots: usize) {
+        TALLY.page_scanned(slots);
+    }
+
+    /// `ObjectRegistry::charged` scanned `slots` slots.
+    pub(crate) fn object_scanned(slots: usize) {
+        TALLY.object_scanned(slots);
+    }
+
+    /// A commit step's five stamps (see [`StepTally::commit_step`]); not
+    /// recorded when any read found no clock.
+    pub(crate) fn commit_step(
+        began: Option<u64>,
+        admit_began: Option<u64>,
+        admit_ended: Option<u64>,
+        taken: Option<u64>,
+        ended: Option<u64>,
+    ) {
+        if let (Some(began), Some(admit_began), Some(admit_ended), Some(taken), Some(ended)) =
+            (began, admit_began, admit_ended, taken, ended)
+        {
+            TALLY.commit_step(began, admit_began, admit_ended, taken, ended);
+        }
     }
 
     struct Line {
@@ -807,9 +1242,11 @@ mod live {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
     after_safe_point, allow_teardown_step, at_safe_point, backing_allocated, backing_made,
-    call_ended, finalize_hold_ended, finalize_queued, finalize_stepped, finalize_waited, now, owed,
-    owed_wake, parked_call_ended, report, set_drain_source, step_began, take_teardown_step, timed,
-    timed_nested,
+    call_ended, commit_step, fault_entered, fault_pass, fault_pass_began, fault_returned,
+    fault_stamped, fault_untimed, fill_in_served, finalize_hold_ended, finalize_queued,
+    finalize_stepped, finalize_waited, now, object_scanned, owed, owed_wake, page_scanned,
+    parked_call_ended, report, set_drain_source, step_began, t_lock_released, t_lock_served,
+    take_teardown_step, timed, timed_nested,
 };
 
 #[cfg(test)]
@@ -1378,6 +1815,333 @@ mod tests {
         assert_eq!(
             lines[2],
             "parked-ended map=0 unmap=0 protect=0 fill=1 commit=1 create=0"
+        );
+    }
+
+    fn measure_lines(tally: &StepTally<2>) -> Vec<String> {
+        let mut out = Vec::new();
+        tally.write_measure_lines(64, |arguments| out.push(std::fmt::format(arguments)));
+        out
+    }
+
+    /// One gate pass on `cpu` that runs the inner serve to `Served`, with
+    /// its stamps in µs: entry, pass start, admit start and end, commit end,
+    /// serve end, and the return's authorisation.
+    fn served_fault(tally: &StepTally<2>, cpu: usize, us: [u64; 7]) {
+        let [
+            entry,
+            began,
+            admit_began,
+            admit_ended,
+            commit_ended,
+            serve_ended,
+            returned,
+        ] = us.map(|us| Some(us * 1000));
+        tally.fault_entered(cpu, entry);
+        assert!(tally.fault_timing(cpu));
+        tally.fault_pass_began(cpu, began);
+        tally.fault_stamped(cpu, FaultStamp::AdmitBegan, admit_began);
+        tally.fault_stamped(cpu, FaultStamp::AdmitEnded, admit_ended);
+        tally.fault_stamped(cpu, FaultStamp::CommitEnded, commit_ended);
+        tally.fault_stamped(cpu, FaultStamp::ServeEnded, serve_ended);
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_returned(cpu, true, returned);
+        assert!(!tally.fault_timing(cpu));
+    }
+
+    #[test]
+    fn nothing_measured_reports_zero_and_no_t_lock_line() {
+        let tally = StepTally::<2>::new();
+        assert_eq!(
+            measure_lines(&tally),
+            [
+                "faults served=0 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
+                "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0",
+                "admission page-scans=0 object-scans=0 slots=0 reservations=64",
+                "commit-steps count=0 admit-us=0 take-us=0 rest-us=0",
+            ]
+        );
+    }
+
+    #[test]
+    fn served_faults_sum_their_parts_and_keep_the_longest_total() {
+        let tally = StepTally::<2>::new();
+        // Total 100 µs: sync 10, lookup 5, admit 20, commit 40, tables 15,
+        // return 10.
+        served_fault(&tally, 0, [0, 10, 15, 35, 75, 90, 100]);
+        // On the other CPU, total 30 µs: 1, 2, 3, 4, 5, 15.
+        served_fault(&tally, 1, [1_000, 1_001, 1_003, 1_006, 1_010, 1_015, 1_030]);
+        let lines = measure_lines(&tally);
+        assert_eq!(
+            lines[0],
+            "faults served=2 total-us=130 longest-us=100 sync-us=11 lookup-us=7 admit-us=23 commit-us=44 tables-us=20 return-us=25"
+        );
+        assert_eq!(
+            lines[1],
+            "fault-passes served=2 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0"
+        );
+        // A shorter fault later keeps the longest.
+        served_fault(&tally, 0, [2_000, 2_001, 2_002, 2_003, 2_004, 2_005, 2_006]);
+        assert_eq!(
+            measure_lines(&tally)[0],
+            "faults served=3 total-us=136 longest-us=100 sync-us=12 lookup-us=8 admit-us=24 commit-us=45 tables-us=21 return-us=26"
+        );
+    }
+
+    #[test]
+    fn only_the_final_serving_pass_is_a_sample() {
+        let tally = StepTally::<2>::new();
+        let us = |us: u64| Some(us * 1000);
+        tally.fault_entered(0, us(0));
+        // A first pass stamps up to its admission and is refused: Retry.
+        tally.fault_pass_began(0, us(5));
+        tally.fault_stamped(0, FaultStamp::AdmitBegan, us(6));
+        tally.fault_stamped(0, FaultStamp::AdmitEnded, us(7));
+        tally.fault_pass(FaultPass::Retry);
+        // A pass that never reached the inner serve: Retry again.
+        tally.fault_pass(FaultPass::Retry);
+        // The final pass serves.
+        tally.fault_pass_began(0, us(50));
+        tally.fault_stamped(0, FaultStamp::AdmitBegan, us(52));
+        tally.fault_stamped(0, FaultStamp::AdmitEnded, us(55));
+        tally.fault_stamped(0, FaultStamp::CommitEnded, us(60));
+        tally.fault_stamped(0, FaultStamp::ServeEnded, us(70));
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_returned(0, true, us(80));
+        assert_eq!(
+            measure_lines(&tally)[..2],
+            [
+                // The earlier passes are in the final pass's sync.
+                "faults served=1 total-us=80 longest-us=80 sync-us=50 lookup-us=2 admit-us=3 commit-us=5 tables-us=10 return-us=10",
+                "fault-passes served=1 already-present=0 released=0 retry=2 unserved=0 exhausted=0 fill-in-serves=0",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pass_that_is_not_served_changes_only_the_pass_counts() {
+        let tally = StepTally::<2>::new();
+        let us = |us: u64| Some(us * 1000);
+        // Each pass, and whether the gate returns after it (the others end
+        // the process).
+        for (pass, returns) in [
+            (FaultPass::AlreadyPresent, true),
+            (FaultPass::Released, true),
+            (FaultPass::Unserved, false),
+            (FaultPass::Exhausted, false),
+        ] {
+            tally.fault_entered(1, us(0));
+            tally.fault_pass_began(1, us(1));
+            tally.fault_stamped(1, FaultStamp::AdmitBegan, us(2));
+            tally.fault_stamped(1, FaultStamp::AdmitEnded, us(3));
+            tally.fault_stamped(1, FaultStamp::CommitEnded, us(4));
+            tally.fault_pass(pass);
+            if returns {
+                tally.fault_returned(1, false, us(9));
+            } else {
+                tally.fault_untimed(1);
+            }
+            assert!(!tally.fault_timing(1));
+        }
+        tally.fill_in_served();
+        tally.fill_in_served();
+        let lines = measure_lines(&tally);
+        assert_eq!(
+            lines[0],
+            "faults served=0 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0"
+        );
+        assert_eq!(
+            lines[1],
+            "fault-passes served=0 already-present=1 released=1 retry=0 unserved=1 exhausted=1 fill-in-serves=2"
+        );
+    }
+
+    #[test]
+    fn a_served_fault_missing_a_stamp_is_no_sample() {
+        let tally = StepTally::<2>::new();
+        let us = |us: u64| Some(us * 1000);
+        // No clock at the gate's entry: the fault is not timed at all.
+        tally.fault_entered(0, None);
+        assert!(!tally.fault_timing(0));
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_returned(0, true, us(9));
+        // A stamp left unread in the serving pass.
+        tally.fault_entered(0, us(0));
+        tally.fault_pass_began(0, us(1));
+        tally.fault_stamped(0, FaultStamp::AdmitBegan, us(2));
+        tally.fault_stamped(0, FaultStamp::AdmitEnded, None);
+        tally.fault_stamped(0, FaultStamp::CommitEnded, us(4));
+        tally.fault_stamped(0, FaultStamp::ServeEnded, us(5));
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_returned(0, true, us(9));
+        // A stamp left by an earlier pass is cleared by the next pass.
+        tally.fault_entered(0, us(0));
+        tally.fault_pass_began(0, us(1));
+        tally.fault_stamped(0, FaultStamp::AdmitBegan, us(2));
+        tally.fault_stamped(0, FaultStamp::AdmitEnded, us(3));
+        tally.fault_stamped(0, FaultStamp::CommitEnded, us(4));
+        tally.fault_stamped(0, FaultStamp::ServeEnded, us(5));
+        tally.fault_pass(FaultPass::Retry);
+        tally.fault_pass_began(0, us(6));
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_returned(0, true, us(9));
+        // Only a whole pass is a sample.
+        served_fault(&tally, 1, [0, 1, 2, 3, 4, 5, 6]);
+        let lines = measure_lines(&tally);
+        assert_eq!(
+            lines[0],
+            "faults served=1 total-us=6 longest-us=6 sync-us=1 lookup-us=1 admit-us=1 commit-us=1 tables-us=1 return-us=1"
+        );
+        tally.fault_entered(1, us(0));
+        tally.fault_pass_began(1, us(1));
+        tally.fault_returned(1, true, None);
+        // No clock at the return.
+        assert_eq!(measure_lines(&tally)[0], lines[0]);
+        // A CPU past the table is ignored.
+        tally.fault_entered(5, us(0));
+        assert!(!tally.fault_timing(5));
+        tally.fault_returned(5, true, us(1));
+        assert_eq!(measure_lines(&tally)[0], lines[0]);
+    }
+
+    #[test]
+    fn t_lock_holds_are_kept_by_cpu_and_source_with_longest_values() {
+        let tally = StepTally::<2>::new();
+        let us = |us: u64| Some(us * 1000);
+        // CPU 0 in a syscall: wait 3 µs, held 10; then wait 7, held 4.
+        tally.t_lock_served(0, us(0), us(3));
+        tally.t_lock_released(0, DrainSource::Syscall, us(13));
+        tally.t_lock_served(0, us(20), us(27));
+        tally.t_lock_released(0, DrainSource::Syscall, us(31));
+        // CPU 1 in a fault: wait 0, held 2.
+        tally.t_lock_served(1, us(5), us(5));
+        tally.t_lock_released(1, DrainSource::Fault, us(7));
+        // CPU 0 idle: wait 1, held 1.
+        tally.t_lock_served(0, us(40), us(41));
+        tally.t_lock_released(0, DrainSource::Idle, us(42));
+        // Untimed holds: no clock when ticketed, when served, or when
+        // released; and a release with no hold timed.
+        tally.t_lock_served(1, None, us(50));
+        tally.t_lock_released(1, DrainSource::Gate, us(60));
+        tally.t_lock_served(1, us(50), None);
+        tally.t_lock_released(1, DrainSource::Gate, us(60));
+        tally.t_lock_served(1, us(50), us(51));
+        tally.t_lock_released(1, DrainSource::Gate, None);
+        tally.t_lock_released(1, DrainSource::Gate, us(70));
+        // A CPU past the table.
+        tally.t_lock_served(4, us(0), us(1));
+        tally.t_lock_released(4, DrainSource::Gate, us(2));
+        let lines = measure_lines(&tally);
+        assert_eq!(
+            lines[2..5],
+            [
+                "t-lock cpu=0 source=syscall count=2 wait-us=10 wait-longest-us=7 held-us=14 held-longest-us=10",
+                "t-lock cpu=0 source=idle count=1 wait-us=1 wait-longest-us=1 held-us=1 held-longest-us=1",
+                "t-lock cpu=1 source=fault count=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
+            ]
+        );
+        assert!(lines[5].starts_with("admission "));
+    }
+
+    #[test]
+    fn admission_scans_are_counted_with_the_registry_capacity() {
+        let tally = StepTally::<2>::new();
+        for _ in 0..5 {
+            tally.page_scanned(640);
+        }
+        tally.object_scanned(640);
+        tally.object_scanned(640);
+        assert_eq!(
+            measure_lines(&tally)[2],
+            "admission page-scans=5 object-scans=2 slots=640 reservations=64"
+        );
+    }
+
+    #[test]
+    fn commit_steps_split_into_admission_take_and_rest() {
+        let tally = StepTally::<2>::new();
+        // Began at 0, admitted 10 to 30, took until 530, ended at 540.
+        tally.commit_step(0, 10_000, 30_000, 530_000, 540_000);
+        tally.commit_step(1_000_000, 1_001_000, 1_002_000, 1_102_000, 1_105_000);
+        assert_eq!(
+            measure_lines(&tally)[3],
+            "commit-steps count=2 admit-us=21 take-us=600 rest-us=24"
+        );
+    }
+
+    #[test]
+    fn measure_lines_stay_under_a_records_message_limit() {
+        let tally = StepTally::<2>::new();
+        let big = 9_999_999_999_000; // ten digits of microseconds
+        for slot in [
+            &tally.faults_served,
+            &tally.fill_in_serves,
+            &tally.page_scans,
+        ] {
+            slot.store(9_999_999_999, Ordering::Relaxed);
+        }
+        for slot in [&tally.fault_total, &tally.fault_longest]
+            .into_iter()
+            .chain(&tally.fault_parts)
+            .chain([&tally.commit_admit, &tally.commit_take, &tally.commit_rest])
+        {
+            slot.store(big, Ordering::Relaxed);
+        }
+        for slot in &tally.fault_passes {
+            slot.store(9_999_999_999, Ordering::Relaxed);
+        }
+        tally.object_scans.store(9_999_999_999, Ordering::Relaxed);
+        tally.scan_slots.store(99_999, Ordering::Relaxed);
+        tally.commit_steps.store(9_999_999_999, Ordering::Relaxed);
+        let [count, rest @ ..] = &tally.t_lock[1][DrainSource::Syscall as usize];
+        count.store(9_999_999_999, Ordering::Relaxed);
+        for slot in rest {
+            slot.store(big, Ordering::Relaxed);
+        }
+        let lines = measure_lines(&tally);
+        assert_eq!(lines.len(), 5);
+        for line in &lines {
+            assert!(line.len() < 190, "{} bytes: {line}", line.len());
+        }
+    }
+
+    /// The whole report, in order: the measurement's lines come after the
+    /// finalization lines and the closing lines are still last, with their
+    /// values read after every line before them.
+    #[test]
+    fn the_report_ends_with_the_closing_lines_after_the_measurement() {
+        let tally = StepTally::<2>::new();
+        tally.t_lock_served(1, Some(0), Some(1_000));
+        tally.t_lock_released(1, DrainSource::Gate, Some(3_000));
+        let mut out: Vec<String> = Vec::new();
+        let written = core::cell::Cell::new(0);
+        tally.write_report(
+            None,
+            64,
+            || {
+                // Every line before the closing lines is written by now.
+                assert_eq!(written.get(), 9 + 6 + 5);
+                ((2, 3), 0)
+            },
+            |arguments| {
+                written.set(written.get() + 1);
+                out.push(std::fmt::format(arguments));
+            },
+        );
+        assert_eq!(out.len(), 9 + 6 + 5 + 2);
+        assert_eq!(out[8], "backing-alloc-longest-us=0 runs=0 pages=0");
+        assert_eq!(out[14], "owed-wakes=0 unsent=0 queue=0 retirement=0");
+        assert!(out[15].starts_with("faults served="));
+        assert!(out[16].starts_with("fault-passes "));
+        assert_eq!(
+            out[17],
+            "t-lock cpu=1 source=gate count=1 wait-us=1 wait-longest-us=1 held-us=2 held-longest-us=2"
+        );
+        assert!(out[18].starts_with("admission "));
+        assert!(out[19].starts_with("commit-steps "));
+        assert_eq!(
+            out[20..],
+            ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
     }
 
