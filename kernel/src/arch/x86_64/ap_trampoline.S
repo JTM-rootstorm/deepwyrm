@@ -67,14 +67,19 @@ __dw_ap_trampoline_long_entry:
     jmp *%rax
 
 .balign 8
+    # The trampoline page is identity-mapped present and executable but not
+    # writable when the AP turns on paging and CR0.WP. A CPU that loads a
+    # segment whose descriptor has the accessed bit clear writes that bit into
+    # this table, which would then page-fault (a triple fault, with no IDT).
+    # Every descriptor therefore carries the accessed bit in the template.
 .Lgdt:
 .globl __dw_ap_trampoline_gdt
 .hidden __dw_ap_trampoline_gdt
 __dw_ap_trampoline_gdt:
     .quad 0x0000000000000000
-    .quad 0x00cf9a000000ffff
-    .quad 0x00cf92000000ffff
-    .quad 0x00af9a000000ffff
+    .quad 0x00cf9b000000ffff
+    .quad 0x00cf93000000ffff
+    .quad 0x00af9b000000ffff
 .Lgdt_end:
 .Lgdt_pointer:
     .word .Lgdt_end - .Lgdt - 1
