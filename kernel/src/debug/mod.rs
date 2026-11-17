@@ -10,9 +10,12 @@
 /// Reset-card R1B structured liveness snapshot: lock-free per-CPU identity
 /// mirroring plus the runtime-authority address host GDB needs.
 pub(crate) mod liveness;
+/// The COM1 output gate: one record at a time across every CPU.
+mod output_gate;
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
+
+use output_gate::{BoundedWait, ContendedWait, OutputGate, OutputHold, WriterId};
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::panic::PanicInfo;
@@ -267,30 +270,77 @@ fn with_current_cpu_identity<'a>(
     }
 }
 
-static EARLY_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The one gate every COM1 record passes through.
+static OUTPUT_GATE: OutputGate = OutputGate::new();
 
-struct OutputGuard;
+/// How long a record waits for another CPU's record, in TSC ticks: about a
+/// tenth of a second on the reference machine. It is sized against the UART's
+/// pace under KVM, where every byte is a port-I/O exit and three whole records
+/// (a few hundred bytes each) take a few milliseconds, so the bound is far
+/// longer than any record a running CPU is writing; it ends only the wait for
+/// a CPU stopped in the middle of one.
+const OUTPUT_WAIT_TSC_TICKS: u64 = 1 << 29;
 
-impl OutputGuard {
-    fn acquire() -> Option<Self> {
-        EARLY_OUTPUT_ACTIVE
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| Self)
-    }
+/// The wait's iteration backstop, for a TSC that does not advance. Each
+/// iteration reads the TSC, executes `pause` and retries a locked
+/// compare-exchange, at least tens of cycles together, so with an advancing
+/// TSC the tick bound always ends the wait first.
+const OUTPUT_WAIT_SPIN_CAP: u64 = 1 << 25;
+
+/// This CPU's identity in the output gate: its initial APIC ID from `cpuid`
+/// leaf 1, which needs no per-CPU state and so works from an AP's first
+/// record.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn current_writer() -> WriterId {
+    // EBX[31:24] of leaf 1 is the initial APIC ID; the shift leaves 8 bits.
+    let apic_id = (core::arch::x86_64::__cpuid(1).ebx >> 24) as u8;
+    WriterId::from_initial_apic_id(apic_id)
 }
 
-impl Drop for OutputGuard {
-    fn drop(&mut self) {
-        EARLY_OUTPUT_ACTIVE.store(false, Ordering::Release);
-    }
+/// Off the target there is one writer.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+fn current_writer() -> WriterId {
+    WriterId::from_initial_apic_id(0)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(
+    unsafe_code,
+    reason = "RDTSC reads a counter and has no memory or privilege effect"
+)]
+fn read_tsc() -> u64 {
+    // SAFETY: RDTSC is available on every x86_64 CPU and only reads the
+    // time-stamp counter.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// The wait for another CPU's record: the TSC bound on the target, the
+/// iteration backstop alone off it.
+fn output_wait() -> BoundedWait<impl FnMut() -> u64> {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    let clock = read_tsc;
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    let clock = || 0;
+    BoundedWait::new(clock, OUTPUT_WAIT_TSC_TICKS, OUTPUT_WAIT_SPIN_CAP)
+}
+
+/// Takes the global gate for one ordinary record (see [`OutputGate::acquire`]).
+fn acquire_output() -> Option<OutputHold<'static>> {
+    OUTPUT_GATE.acquire(current_writer(), &mut output_wait())
+}
+
+/// Records the output gate has refused since boot: a record inside a record
+/// on one CPU, or a wait for another CPU's record that reached its bound.
+pub(crate) fn records_dropped() -> u64 {
+    OUTPUT_GATE.dropped()
 }
 
 /// Emits one bounded structured diagnostic record.
 ///
-/// A concurrent or recursive writer returns immediately rather than spinning
-/// in an already-failing path. Serial timeouts likewise stop the record rather
-/// than blocking panic handling indefinitely.
+/// A writer waits, bounded, while another CPU writes a record, then writes
+/// its own whole; a record inside a record on the same CPU is refused at once.
+/// A refusal is counted in [`records_dropped`]. Serial timeouts stop the
+/// record rather than blocking panic handling indefinitely.
 #[cfg_attr(
     all(feature = "test-support", target_os = "none"),
     allow(
@@ -304,7 +354,35 @@ fn emit_record<P: BytePortIo>(
     subsystem: &str,
     message: &str,
 ) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    emit_record_through(
+        &OUTPUT_GATE,
+        current_writer(),
+        &mut output_wait(),
+        serial,
+        level,
+        subsystem,
+        message,
+    )
+}
+
+/// [`emit_record`] through a given gate, writer and wait.
+#[cfg_attr(
+    all(feature = "test-support", target_os = "none"),
+    allow(
+        dead_code,
+        reason = "production diagnostics are omitted from test images"
+    )
+)]
+fn emit_record_through<P: BytePortIo>(
+    gate: &OutputGate,
+    writer: WriterId,
+    wait: &mut impl ContendedWait,
+    serial: &mut Com1<P>,
+    level: DiagnosticLevel,
+    subsystem: &str,
+    message: &str,
+) -> Result<(), SerialError> {
+    let _hold = gate.acquire(writer, wait).ok_or(SerialError::Busy)?;
     write!(serial, "[DW0][{}][", level.label()).map_err(|_| SerialError::TransmitTimeout)?;
     write_limited(serial, subsystem.as_bytes(), MAX_SUBSYSTEM_BYTES)?;
     serial
@@ -331,7 +409,7 @@ fn emit_bootstrap_completion_record<P: BytePortIo>(
     detail: u32,
     exit: Option<(&str, u32)>,
 ) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let _hold = acquire_output().ok_or(SerialError::Busy)?;
     write!(serial, "[DW0][{}][primordial] bootstrap ", level.label())
         .map_err(|_| SerialError::TransmitTimeout)?;
     write_limited(serial, cause.as_bytes(), MAX_DIAGNOSTIC_MESSAGE_BYTES)?;
@@ -372,7 +450,7 @@ fn emit_capacity_record<P: BytePortIo>(
     resource: &str,
     site: u8,
 ) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let _hold = acquire_output().ok_or(SerialError::Busy)?;
     serial
         .write_str("[DW0][ERROR][mm] capacity-exhausted resource=")
         .map_err(|_| SerialError::TransmitTimeout)?;
@@ -404,7 +482,7 @@ fn emit_process_retirement_record<P: BytePortIo>(
     reason: u32,
     primordial_live: bool,
 ) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let _hold = acquire_output().ok_or(SerialError::Busy)?;
     let primordial = if primordial_live { "live" } else { "retired" };
     write!(
         serial,
@@ -421,7 +499,7 @@ fn emit_process_retirement_record<P: BytePortIo>(
 /// the last Process has exited, so a transcript can tell a machine that shut
 /// itself down from one whose power was cut.
 fn emit_system_empty_record<P: BytePortIo>(serial: &mut Com1<P>) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let _hold = acquire_output().ok_or(SerialError::Busy)?;
     serial
         .write_str("[DW0][INFO][task] no process remains; powering off\n")
         .map_err(|_| SerialError::TransmitTimeout)
@@ -433,7 +511,7 @@ fn emit_cpu_state_record<P: BytePortIo>(
     local_apic_id: u8,
     state: &str,
 ) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let _hold = acquire_output().ok_or(SerialError::Busy)?;
     write!(
         serial,
         "[DW0][INFO][smp] cpu={cpu_index} apic={local_apic_id} state="
@@ -448,6 +526,12 @@ fn emit_cpu_state_record<P: BytePortIo>(
 /// Emits one bounded panic record. Every field is written in every build:
 /// COM1 is the trusted diagnostic channel, and a production crash must say
 /// what failed, where, and on which CPU.
+///
+/// The panic record is never refused: it waits for another CPU's record like
+/// any other, and after the bound, or at once when the panic is inside a
+/// record on this CPU, it takes the output gate by force (see
+/// [`OutputGate::acquire_for_panic`]). A CPU stopped in the middle of a record
+/// must not silence a panic. A forced take is not counted as dropped.
 #[cfg_attr(
     test,
     allow(dead_code, reason = "target wrapper exercises the renderer indirectly")
@@ -456,8 +540,89 @@ fn emit_panic_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     record: &PanicRecord<'_>,
 ) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    emit_panic_record_through(
+        &OUTPUT_GATE,
+        current_writer(),
+        &mut output_wait(),
+        serial,
+        record,
+    )
+}
+
+/// [`emit_panic_record`] through a given gate, writer and wait.
+fn emit_panic_record_through<P: BytePortIo>(
+    gate: &OutputGate,
+    writer: WriterId,
+    wait: &mut impl ContendedWait,
+    serial: &mut Com1<P>,
+    record: &PanicRecord<'_>,
+) -> Result<(), SerialError> {
+    let _hold = gate.acquire_for_panic(writer, wait);
     render_panic_record(serial, record)
+}
+
+/// `halt line=<line>`, built without allocation, for a fail-stop site that
+/// names the line that called it.
+#[cfg_attr(
+    all(feature = "test-support", target_os = "none"),
+    allow(
+        dead_code,
+        reason = "production halt records are omitted from test images"
+    )
+)]
+pub(crate) struct HaltLineMessage {
+    bytes: [u8; HALT_LINE_PREFIX.len() + 10],
+    len: usize,
+}
+
+#[cfg_attr(
+    all(feature = "test-support", target_os = "none"),
+    allow(
+        dead_code,
+        reason = "production halt records are omitted from test images"
+    )
+)]
+const HALT_LINE_PREFIX: &[u8] = b"halt line=";
+
+#[cfg_attr(
+    all(feature = "test-support", target_os = "none"),
+    allow(
+        dead_code,
+        reason = "production halt records are omitted from test images"
+    )
+)]
+impl HaltLineMessage {
+    pub(crate) fn new(line: u32) -> Self {
+        let mut bytes = [0; HALT_LINE_PREFIX.len() + 10];
+        bytes[..HALT_LINE_PREFIX.len()].copy_from_slice(HALT_LINE_PREFIX);
+        // A u32 has at most ten decimal digits; write them backwards.
+        let mut digits = [0_u8; 10];
+        let mut count = 0;
+        let mut rest = line;
+        loop {
+            digits[count] = b'0' + (rest % 10) as u8;
+            count += 1;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        for (slot, digit) in bytes[HALT_LINE_PREFIX.len()..]
+            .iter_mut()
+            .zip(digits[..count].iter().rev())
+        {
+            *slot = *digit;
+        }
+        Self {
+            bytes,
+            len: HALT_LINE_PREFIX.len() + count,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // Only ASCII is ever written.
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("halt line=unprintable")
+    }
 }
 
 fn render_panic_record<P: BytePortIo>(
@@ -753,7 +918,7 @@ fn halt_after_early_panic() -> ! {
 /// it; it does not expose a general hardware-port operation to callers.
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
-    let _guard = OutputGuard::acquire().ok_or(SerialError::Busy)?;
+    let _hold = acquire_output().ok_or(SerialError::Busy)?;
     let mut serial = Com1::new(X86PortIo);
     write_bounded_raw_record(&mut serial, record)
 }
@@ -784,3 +949,6 @@ fn write_bounded_test_evidence_record<P: BytePortIo, const BYTES: usize>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::{drop_one_record_for_test, lock_output_for_test};

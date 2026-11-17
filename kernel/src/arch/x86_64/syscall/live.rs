@@ -2620,6 +2620,11 @@ pub(crate) fn first_run_thread_entry_rip() -> u64 {
     dw_x86_64_first_run_thread_entry as *const () as usize as u64
 }
 
+/// Out of line because `xtask kernel-check` resolves this function's indirect
+/// call into the carrier's trampoline by its symbol; inlined into its one
+/// caller (as happened once `halt_forever` took a line), the stack bound
+/// would lose that edge and the check fails closed.
+#[inline(never)]
 #[allow(
     dead_code,
     unsafe_code,
@@ -2899,11 +2904,37 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_syscall_dispatch(frame: *mut RawS
     // current-Process mapping validation. Assembly fails stopped otherwise.
 }
 
+/// Writes `halt line=<line>`, the caller's line in this file, as one error
+/// record, then stops this CPU with interrupts disabled. `#[track_caller]`
+/// names the call site, including one inside a closure such as
+/// `unwrap_or_else(|| halt_forever())`, so no call site passes anything.
+#[track_caller]
+fn halt_forever() -> ! {
+    halt_at_line(core::panic::Location::caller().line())
+}
+
+/// [`halt_forever`]'s body, out of line so each call site stays one call
+/// with its line number. The record waits for another CPU's record only up
+/// to the output gate's bound, so it cannot keep the CPU from halting.
+#[cold]
+#[inline(never)]
 #[allow(
     unsafe_code,
     reason = "invalid E4 entry state is terminal with interrupts disabled"
 )]
-fn halt_forever() -> ! {
+fn halt_at_line(line: u32) -> ! {
+    // Guest-test builds keep their serial records exact.
+    #[cfg(not(feature = "test-support"))]
+    {
+        let message = crate::debug::HaltLineMessage::new(line);
+        let _ = crate::debug::emit_early_record(
+            crate::debug::DiagnosticLevel::Error,
+            "syscall",
+            message.as_str(),
+        );
+    }
+    #[cfg(feature = "test-support")]
+    let _ = line;
     loop {
         // SAFETY: [ASM] CLI then HLT, with nothing after it; neither touches memory or the stack.
         unsafe {
