@@ -861,7 +861,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// index entries: a committed page, or an absent entry, whose whole span
     /// is skipped at once. Nodes stay. Returns the first page not examined,
     /// the pages freed and the entries visited (DW2 §10.9 item 5). An eager
-    /// root is refused.
+    /// root is refused. A leaf is walked to once, and its entries from the
+    /// cursor are read from it directly (DW2 §12.12 item 5).
     ///
     /// The caller guarantees no mapping, TLB, device or kernel access can
     /// still reach a page of the range.
@@ -881,34 +882,63 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut visited = 0_u64;
         while cursor < end && visited < budget {
             let (steps, found) = self.index_walk(head, cursor, RootUse::OnDemand)?;
-            let deepest = *steps
+            let mut deepest = *steps
                 .iter()
                 .flatten()
                 .last()
                 .ok_or(FrameRoleError::InvariantViolation)?;
-            visited += 1;
-            match found {
-                Some((identity, _, _)) => {
-                    #[allow(
-                        unsafe_code,
-                        reason = "the manager owns its index nodes exclusively under `&mut self`"
-                    )]
-                    // SAFETY: `deepest.node` is a node of this backing, which
-                    // the manager owns exclusively under `&mut self`.
-                    unsafe {
-                        memory.write(deepest.node, deepest.entry, 0)
-                    };
-                    let slot = self.slot(identity)?;
-                    self.free_index_slot(slot);
-                    freed += 1;
-                    cursor += 1;
+            // The leaf the walk reached, if it reached one: its entries from
+            // the cursor are handled from this one walk, each read and
+            // checked as the walk's last level checks it, until the leaf or
+            // the range ends or the budget is spent (DW2 §12.12 item 5).
+            let leaf_first = deepest.first_page - deepest.entry as u64;
+            let leaf_end = leaf_first
+                .checked_add(INDEX_FANOUT)
+                .ok_or(FrameRoleError::InvariantViolation)?
+                .min(end);
+            let mut found = found.map(|(identity, _, _)| identity);
+            loop {
+                visited += 1;
+                match found {
+                    Some(identity) => {
+                        #[allow(
+                            unsafe_code,
+                            reason = "the manager owns its index nodes exclusively under `&mut self`"
+                        )]
+                        // SAFETY: `deepest.node` is a node of this backing, which
+                        // the manager owns exclusively under `&mut self`.
+                        unsafe {
+                            memory.write(deepest.node, deepest.entry, 0)
+                        };
+                        let slot = self.slot(identity)?;
+                        self.free_index_slot(slot);
+                        freed += 1;
+                        cursor += 1;
+                    }
+                    None => {
+                        cursor = deepest
+                            .first_page
+                            .checked_add(entry_span(deepest.level))
+                            .ok_or(FrameRoleError::InvariantViolation)?;
+                    }
                 }
-                None => {
-                    cursor = deepest
-                        .first_page
-                        .checked_add(entry_span(deepest.level))
-                        .ok_or(FrameRoleError::InvariantViolation)?;
+                if deepest.level != 0 || cursor >= leaf_end || visited >= budget {
+                    break;
                 }
+                // `deepest` becomes the cursor's entry in the leaf.
+                let entry = (cursor - leaf_first) as usize;
+                deepest = IndexStep {
+                    entry,
+                    first_page: cursor,
+                    ..deepest
+                };
+                let raw = memory.read(deepest.node, entry);
+                found = if raw == 0 {
+                    None
+                } else {
+                    let (identity, _, _) = self.index_entry(head, raw, false, cursor, false)?;
+                    Some(identity)
+                };
             }
         }
         Ok((cursor.min(end.max(start)), freed, visited))
@@ -1443,3 +1473,7 @@ mod place_tests;
 #[cfg(test)]
 #[path = "release_step_tests.rs"]
 mod release_step_tests;
+
+#[cfg(test)]
+#[path = "decommit_step_tests.rs"]
+mod decommit_step_tests;
