@@ -1318,6 +1318,7 @@ fn commit_initialize<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     let tsc_check = measure_tsc_window(&mut pm)?;
     let verdict = super::tsc::TscVerdict::new(invariant_tsc_reported(), tsc_calibration, tsc_check);
     report_clock_choice(verdict);
+    MEASURED_TSC_HZ.store(verdict.hz.unwrap_or(0), Ordering::Relaxed);
     let final_tsc = read_tsc();
     let final_sample = pm
         .sample(read_pm_timer(pm_descriptor))
@@ -1431,6 +1432,25 @@ fn invariant_tsc_reported() -> bool {
         0
     };
     super::tsc::reports_invariant_tsc(max_extended, power)
+}
+
+/// The TSC rate measured at this boot's clock calibration (`tsc-hz=`), kept
+/// whether or not the TSC was chosen as the clock; zero until measured or
+/// when the measurement failed. The step report converts its TSC stamps
+/// with it (DW2 §13.5).
+static MEASURED_TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// The TSC rate this boot measured, in Hz; zero when none was.
+pub(crate) fn measured_tsc_hz() -> u64 {
+    MEASURED_TSC_HZ.load(Ordering::Relaxed)
+}
+
+/// A raw read of this CPU's time-stamp counter: no lock, no MSR, no per-CPU
+/// lookup. Its values compare only with other reads on the same CPU (DW2
+/// §13.5's stamps).
+#[inline(always)]
+pub(crate) fn raw_tsc() -> u64 {
+    read_tsc()
 }
 
 fn read_tsc() -> u64 {

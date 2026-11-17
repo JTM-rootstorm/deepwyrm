@@ -4139,11 +4139,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
         }
     }
 
-    /// T's timing for the step report (DW2 §13.5): three clock reads an
-    /// acquisition.
+    /// T's timing for the step report (DW2 §13.5): raw TSC reads, three
+    /// for an acquisition that spins and two for one served at once.
     #[inline(always)]
     fn timing_now() -> Option<u64> {
-        step_report::now()
+        Some(step_report::ticks())
     }
 
     #[inline(always)]
@@ -4153,7 +4153,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
 
     #[inline(always)]
     fn hold_released(cpu: u32, released: Option<u64>) {
-        step_report::t_lock_released(cpu as usize, released);
+        if let Some(released) = released {
+            step_report::t_lock_released(cpu as usize, released);
+        }
     }
 }
 
@@ -10692,7 +10694,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<bool, deepwyrm_abi::DwStatus> {
         // The step report's commit-step stamps (DW2 §13.5): a step that
         // reaches its end is one sample.
-        let began = step_report::now();
+        let began = step_report::ticks();
         let process = self.own.scheduled().process;
         let Some((backing, object)) = crate::syscall::memory_object_commit_target(
             &mut self.core.registry,
@@ -10731,7 +10733,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         // The whole step, or else the longest start of it the quota admits,
         // so a commit still fills the quota exactly: at most ten admissions.
-        let admit_began = step_report::now();
+        let admit_began = step_report::ticks();
         let (admitted, cost, mut result) = match admit(count) {
             Ok(cost) => (count, cost, Ok(())),
             Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
@@ -10748,7 +10750,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             Err(status) => return Err(status),
         };
-        let admit_ended = step_report::now();
+        let admit_ended = step_report::ticks();
         let mut frames = 0;
         for page in first..first + admitted {
             match session.commit_on_demand_page(backing, page) {
@@ -10767,13 +10769,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             *next += page_size;
         }
-        let taken = step_report::now();
+        let taken = step_report::ticks();
         // What was taken stays committed and charged, even after a failure.
         debug_assert!(frames <= cost, "a commit step took more than it admitted");
         if frames != 0 {
             crate::syscall::record_charged_pages(&mut self.core.registry, object, frames);
         }
-        step_report::commit_step(began, admit_began, admit_ended, taken, step_report::now());
+        step_report::commit_step(began, admit_began, admit_ended, taken, step_report::ticks());
         result.map(|()| *next >= end)
     }
 

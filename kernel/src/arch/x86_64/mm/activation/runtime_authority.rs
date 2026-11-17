@@ -62,16 +62,18 @@ pub(super) trait HoldEndCheck {
     /// BSP's wake for owed work). It sees no guarded state.
     fn after_release() {}
 
-    /// The step report's clock, read for T's timing (DW2 §13.5): once the
-    /// ticket is taken, and just before the release store. The default, for
-    /// every guarded value but the live runtime's, reads none, so the
-    /// lock's host tests see the lock alone.
+    /// The step report's counter, read for T's timing (DW2 §13.5): when an
+    /// acquisition's first check of its ticket fails and it must spin, and
+    /// just before the release store. The default, for every guarded value
+    /// but the live runtime's, reads none, so the lock's host tests see the
+    /// lock alone.
     #[inline(always)]
     fn timing_now() -> Option<u64> {
         None
     }
 
-    /// CPU slot `cpu` was served T, having taken its ticket at `ticketed`.
+    /// CPU slot `cpu` was served T, having begun to spin at `ticketed`
+    /// (`None`: served at its first check, or no counter).
     #[inline(always)]
     fn hold_served(_cpu: u32, _ticketed: Option<u64>) {}
 
@@ -197,8 +199,13 @@ impl<T> RuntimeAuthorityLock<T> {
                 Err(current) => observed = current,
             }
         };
-        let ticketed = T::timing_now();
+        // Stamped only once the first check fails: an acquisition served at
+        // once reads no counter here, and its wait is zero.
+        let mut ticketed = None;
         while self.tickets.serving.load(Ordering::Acquire) != ticket {
+            if ticketed.is_none() {
+                ticketed = T::timing_now();
+            }
             (self.spin_service)();
             core::hint::spin_loop();
         }
