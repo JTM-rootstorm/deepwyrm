@@ -22,6 +22,8 @@ pub(super) struct Model {
     zeroed: Mutex<BTreeSet<u64>>,
     entries: Mutex<BTreeMap<(u64, usize), u64>>,
     reads: AtomicU64,
+    /// Reads of each entry.
+    entry_reads: Mutex<BTreeMap<(u64, usize), u64>>,
     zeroes: AtomicU64,
     /// The zeroing, counted from 0, that fails.
     fail_zero_at: Mutex<Option<u64>>,
@@ -30,6 +32,12 @@ pub(super) struct Model {
 impl IndexMemory for Model {
     fn read(&self, node: u64, entry: usize) -> u64 {
         self.reads.fetch_add(1, Ordering::Relaxed);
+        *self
+            .entry_reads
+            .lock()
+            .unwrap()
+            .entry((node, entry))
+            .or_default() += 1;
         if let Some(value) = self.entries.lock().unwrap().get(&(node, entry)) {
             return *value;
         }
@@ -73,6 +81,21 @@ impl IndexMemory for Model {
 impl Model {
     pub(super) fn reads(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Reads of entry `entry` of the node page at `node` so far.
+    pub(super) fn reads_of(&self, node: u64, entry: usize) -> u64 {
+        self.entry_reads
+            .lock()
+            .unwrap()
+            .get(&(node, entry))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every entry written, nonzero or not.
+    pub(super) fn written(&self) -> BTreeMap<(u64, usize), u64> {
+        self.entries.lock().unwrap().clone()
     }
 }
 
