@@ -494,6 +494,7 @@ mod aligned {
             links: Box::leak(vec![FreeLink::EMPTY; frames].into_boxed_slice()),
             bases: Box::leak(vec![0_u64; allocator.initial_range_count()].into_boxed_slice()),
             hints: Box::leak(vec![0_u32; allocator.range_hint_count()].into_boxed_slice()),
+            free_bits: Box::leak(vec![0_u64; frames.div_ceil(64)].into_boxed_slice()),
         };
         assert!(allocator.adopt_buddy(storage).is_ok());
         let available = allocator.available_frames();

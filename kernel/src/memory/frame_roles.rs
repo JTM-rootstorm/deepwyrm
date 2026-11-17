@@ -926,6 +926,9 @@ pub(crate) struct RoleTableLayout {
     hints_offset: usize,
     hints: usize,
     tags_offset: usize,
+    free_bits_offset: usize,
+    /// Words of the buddy allocator's free bitmap.
+    free_bits: usize,
     bytes: u64,
 }
 

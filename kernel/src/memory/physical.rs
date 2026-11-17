@@ -254,13 +254,16 @@ impl FreeLink {
 
 /// The buddy allocator's per-page and per-range metadata, carved from the
 /// grown role table's run: `tags` and `links` have one entry per allocator
-/// page, `bases` one per initial range, and `hints` one per granule of the
-/// range lookup ([`PhysicalFrameAllocator::range_hint_count`]).
+/// page, `bases` one per initial range, `hints` one per granule of the
+/// range lookup ([`PhysicalFrameAllocator::range_hint_count`]), and
+/// `free_bits` one bit per allocator page, `tags.len().div_ceil(64)` words
+/// (DW2 large-memory plan, M7 §12.12).
 pub(super) struct BuddyStorage {
     pub(super) tags: &'static mut [u8],
     pub(super) links: &'static mut [FreeLink],
     pub(super) bases: &'static mut [u64],
     pub(super) hints: &'static mut [u32],
+    pub(super) free_bits: &'static mut [u64],
 }
 
 /// The frame allocator over sanitized, already-reserved physical ranges, in
@@ -411,6 +414,10 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// lowest that fits at boot, and after growth the first `page_count`
     /// pages of the most recently freed block of the smallest sufficient
     /// order, the rest of the block returned at once.
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn allocate_run(
         &mut self,
         page_count: u64,
@@ -422,7 +429,10 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             .checked_mul(BASE_PAGE_SIZE)
             .ok_or(PhysicalMemoryError::AddressOverflow)?;
         if let Some(buddy) = self.buddy.as_mut() {
-            return buddy.allocate_run(&self.initial[..self.initial_len], page_count);
+            // SAFETY: `initial` and `initial_len` are written only in the
+            // constructors, before a buddy can exist, so this is the slice the
+            // buddy was seeded with.
+            return unsafe { buddy.allocate_run(&self.initial[..self.initial_len], page_count) };
         }
         let index = self.free[..self.free_len]
             .iter()
@@ -450,6 +460,10 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// ceiling is also supported: every returned whole page is still strictly
     /// below it. Selection and all arithmetic complete before the free list is
     /// changed, so an error leaves allocator state untouched.
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn allocate_run_below(
         &mut self,
         page_count: u64,
@@ -463,11 +477,12 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             .ok_or(PhysicalMemoryError::AddressOverflow)?;
         let ceiling = exclusive_ceiling.min(self.limit.exclusive());
         if let Some(buddy) = self.buddy.as_mut() {
-            return buddy.allocate_run_below(
-                &self.initial[..self.initial_len],
-                page_count,
-                ceiling,
-            );
+            // SAFETY: `initial` and `initial_len` are written only in the
+            // constructors, before a buddy can exist, so this is the slice the
+            // buddy was seeded with.
+            return unsafe {
+                buddy.allocate_run_below(&self.initial[..self.initial_len], page_count, ceiling)
+            };
         }
         let index = self.free[..self.free_len]
             .iter()
@@ -556,10 +571,18 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
 
     /// Returns one previously allocated contiguous run. Callers above this
     /// mechanism must prove that no live role still owns the run.
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn free_run(&mut self, range: PageRange) -> Result<(), PhysicalMemoryError> {
         self.validate_candidate(range)?;
         if let Some(buddy) = self.buddy.as_mut() {
-            return buddy.free_run(&self.initial[..self.initial_len], range);
+            // SAFETY: `initial` and `initial_len` are written only in the
+            // constructors, before a buddy can exist, so this is the slice the
+            // buddy was seeded with. `validate_candidate` just checked that
+            // `range` is non-empty and page-aligned.
+            return unsafe { buddy.free_run(&self.initial[..self.initial_len], range) };
         }
         if !self.initial[..self.initial_len]
             .iter()
@@ -579,13 +602,15 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// Whether [`Self::adopt_buddy`] accepts storage of these lengths: this
     /// is the first adoption, `tags` and `links` hold one entry per initial
     /// frame, that count is below `u32::MAX`, `bases` holds one entry per
-    /// initial range, and `hints` [`Self::range_hint_count`] entries.
+    /// initial range, `hints` [`Self::range_hint_count`] entries, and
+    /// `free_bits` one bit per initial frame, `tags.div_ceil(64)` words.
     pub(super) fn accepts_buddy_storage(
         &self,
         tags: usize,
         links: usize,
         bases: usize,
         hints: usize,
+        free_bits: usize,
     ) -> bool {
         self.buddy.is_none()
             && tags == links
@@ -593,6 +618,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             && u32::try_from(tags).is_ok_and(|tags| tags < u32::MAX)
             && bases == self.initial_len
             && hints == self.range_hint_count()
+            && free_bits == tags.div_ceil(64)
     }
 
     /// The hints the buddy allocator's range lookup needs: one per granule
@@ -605,20 +631,31 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// Switches to the buddy allocator over `storage` (DW2 M7 §12.2), seeded
     /// from the boot free list in order. Refuses, returning `storage`, unless
     /// [`Self::accepts_buddy_storage`] holds; nothing fails after that check.
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn adopt_buddy(&mut self, storage: BuddyStorage) -> Result<(), BuddyStorage> {
         if !self.accepts_buddy_storage(
             storage.tags.len(),
             storage.links.len(),
             storage.bases.len(),
             storage.hints.len(),
+            storage.free_bits.len(),
         ) {
             return Err(storage);
         }
-        self.buddy = Some(Buddy::seed(
-            storage,
-            &self.initial[..self.initial_len],
-            &self.free[..self.free_len],
-        ));
+        // SAFETY: the initial ranges are page-aligned, in address order and
+        // never touch (the constructors build them from validated candidates
+        // and covered reservations), and `accepts_buddy_storage` just
+        // accepted the storage's lengths for them.
+        self.buddy = Some(unsafe {
+            Buddy::seed(
+                storage,
+                &self.initial[..self.initial_len],
+                &self.free[..self.free_len],
+            )
+        });
         Ok(())
     }
 
@@ -647,11 +684,18 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         None
     }
 
-    /// Checks the buddy allocator's invariants I1 to I6 (DW2 M7 §12.2); `Ok`
+    /// Checks the buddy allocator's invariants I1 to I7 (DW2 M7 §12.2); `Ok`
     /// before adoption. Linear in the allocator pages.
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn check_buddy(&self) -> Result<(), PhysicalMemoryError> {
         self.buddy.as_ref().map_or(Ok(()), |buddy| {
-            buddy.check(&self.initial[..self.initial_len])
+            // SAFETY: `initial` and `initial_len` are written only in the
+            // constructors, before a buddy can exist, so this is the slice the
+            // buddy was seeded with.
+            unsafe { buddy.check(&self.initial[..self.initial_len]) }
         })
     }
 
@@ -664,10 +708,17 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// The free buddy blocks in address order, as (physical start, order);
     /// empty before adoption.
     #[cfg(test)]
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn free_blocks(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
-        self.buddy
-            .iter()
-            .flat_map(|buddy| buddy.free_blocks(&self.initial[..self.initial_len]))
+        self.buddy.iter().flat_map(|buddy| {
+            // SAFETY: `initial` and `initial_len` are written only in the
+            // constructors, before a buddy can exist, so this is the slice the
+            // buddy was seeded with.
+            unsafe { buddy.free_blocks(&self.initial[..self.initial_len]) }
+        })
     }
 
     /// Pages in the largest free range (the largest free block after
@@ -723,9 +774,16 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             .any(|initial| initial.overlaps(range))
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "the buddy's paths need the initial ranges it was seeded with, which only the constructors write"
+    )]
     pub(super) fn overlaps_free(&self, range: PageRange) -> bool {
         if let Some(buddy) = self.buddy.as_ref() {
-            return buddy.overlaps_free(&self.initial[..self.initial_len], range);
+            // SAFETY: `initial` and `initial_len` are written only in the
+            // constructors, before a buddy can exist, so this is the slice the
+            // buddy was seeded with.
+            return unsafe { buddy.overlaps_free(&self.initial[..self.initial_len], range) };
         }
         self.free[..self.free_len]
             .iter()

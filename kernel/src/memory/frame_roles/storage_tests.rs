@@ -243,6 +243,65 @@ fn adoption_refuses_each_bad_staging_and_changes_nothing() {
     refuse(&mut roles, 0);
 }
 
+/// The buddy allocator's free bitmap is the grown table's last part
+/// (DW2 M7 §12.12): 8-aligned after the tags, one bit per allocator page in
+/// `div_ceil(64)` words, ending the table's bytes inside its pages, whether
+/// or not the page count is a multiple of 64. Adoption carves it there,
+/// writes nothing past the pages, and the allocator's check finds I7 over
+/// it, its length included.
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the host model hands the manager a leaked buffer as the table map and reads the bytes after it"
+)]
+fn the_grown_layout_holds_the_free_bitmap_inside_its_pages() {
+    for page_count in [3000_u64, 3008, 4096, 4097] {
+        let mut roles = manager(page_count);
+        let frames = usize::try_from(roles.allocator.initial_frames()).unwrap();
+        assert_eq!(frames as u64, page_count);
+        let layout = roles.grown_layout().unwrap();
+        assert_eq!(layout.starts, frames);
+        assert_eq!(layout.free_bits, frames.div_ceil(64));
+        assert!(layout.free_bits_offset.is_multiple_of(8));
+        assert!(layout.free_bits_offset >= layout.tags_offset + frames);
+        let end = layout.free_bits_offset + layout.free_bits * 8;
+        assert_eq!(
+            u64::try_from(end).unwrap(),
+            layout.bytes,
+            "{page_count} pages"
+        );
+        assert!(layout.bytes <= layout.page_count() * PAGE);
+
+        // Adopt into exactly the table's pages, marked bytes after them.
+        let total = layout.page_count();
+        let run = roles.allocate(total).unwrap();
+        roles.stage_growth_part(run).unwrap();
+        let bytes = usize::try_from(total * PAGE).unwrap();
+        let base = leaked_run(total * PAGE + 64);
+        // SAFETY: the 64 bytes after the table's pages lie inside the leaked
+        // buffer, which nothing else uses.
+        unsafe { base.add(bytes).write_bytes(0xa5, 64) };
+        // SAFETY: a leaked 8-aligned buffer of the staged run's pages and
+        // more, used by nothing else, for ever.
+        unsafe { roles.adopt_storage(base) }.unwrap();
+        // SAFETY: as for the write above; nothing writes them now.
+        let after = unsafe { core::slice::from_raw_parts(base.add(bytes), 64) };
+        assert!(after.iter().all(|byte| *byte == 0xa5), "{page_count} pages");
+        assert_eq!(roles.check_invariants(), Ok(()));
+
+        // The bitmap tracks allocations and frees through the manager.
+        let mut held = Vec::new();
+        for count in [1, 5, 64, 3, 130] {
+            held.push(roles.allocate(count).unwrap());
+            assert_eq!(roles.check_invariants(), Ok(()));
+        }
+        for grant in held.into_iter().rev() {
+            roles.cancel_allocation(grant).unwrap();
+            assert_eq!(roles.check_invariants(), Ok(()));
+        }
+    }
+}
+
 #[test]
 fn growth_succeeds_where_no_free_range_holds_the_whole_table() {
     // 96 ranges of 24 pages: the table is longer than any of them.
