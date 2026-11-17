@@ -577,6 +577,22 @@ impl<const CPUS: usize> StepTally<CPUS> {
     }
 }
 
+/// The report's last lines, after the tally's: the timer's arm counts, then
+/// the records the COM1 output gate has dropped, which is the report's last
+/// line. `records_dropped` is read before any of these lines is written, so a
+/// drop of one of them is not in it (a check that requires the line sees that
+/// drop as the line missing).
+fn write_closing_lines(
+    (retries, deferred): (u64, u64),
+    records_dropped: u64,
+    mut line: impl FnMut(core::fmt::Arguments<'_>),
+) {
+    line(format_args!(
+        "timer-arm retries={retries} deferred={deferred}"
+    ));
+    line(format_args!("records-dropped={records_dropped}"));
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live {
     use super::{DrainSource, StepCall, StepTally};
@@ -752,10 +768,11 @@ mod live {
         }
         TALLY.write_lines(emit);
         TALLY.write_finalize_lines(now(), emit);
-        let (retries, deferred) = crate::time::timer_arm_counts();
-        emit(format_args!(
-            "timer-arm retries={retries} deferred={deferred}"
-        ));
+        super::write_closing_lines(
+            crate::time::timer_arm_counts(),
+            crate::debug::records_dropped(),
+            emit,
+        );
     }
 
     struct Line {
@@ -1362,5 +1379,37 @@ mod tests {
             lines[2],
             "parked-ended map=0 unmap=0 protect=0 fill=1 commit=1 create=0"
         );
+    }
+
+    /// DW2 §13.4 item 1: the report ends with the dropped-records count, after
+    /// the timer's arm counts, so a check can require `records-dropped=0`.
+    #[test]
+    fn the_report_ends_with_the_dropped_records_count() {
+        let closing = |records_dropped| {
+            let mut out = Vec::new();
+            write_closing_lines((4, 1), records_dropped, |arguments| {
+                out.push(std::fmt::format(arguments));
+            });
+            out
+        };
+        assert_eq!(
+            closing(0),
+            ["timer-arm retries=4 deferred=1", "records-dropped=0"]
+        );
+        assert_eq!(closing(17).last().unwrap(), "records-dropped=17");
+    }
+
+    /// The count the live report prints is the output gate's own: a record
+    /// the gate refuses raises it.
+    #[test]
+    fn the_report_prints_the_output_gates_count() {
+        let _output = crate::debug::lock_output_for_test();
+        let before = crate::debug::records_dropped();
+        crate::debug::drop_one_record_for_test();
+        let mut last = String::new();
+        write_closing_lines((0, 0), crate::debug::records_dropped(), |arguments| {
+            last = std::fmt::format(arguments);
+        });
+        assert_eq!(last, std::format!("records-dropped={}", before + 1));
     }
 }

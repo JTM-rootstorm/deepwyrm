@@ -1,14 +1,29 @@
 extern crate std;
 
 use super::*;
+use core::cell::{Cell, RefCell};
+use output_gate::ContendedWait;
+use std::string::String;
 use std::sync::{Mutex, MutexGuard};
+use std::vec::Vec;
 
 static TEST_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
 
-fn lock_output_guard_test() -> MutexGuard<'static, ()> {
+/// Serialises the host tests that use the global output gate: off the target
+/// every writer has the same identity, so two tests holding it at once would
+/// see a record inside a record.
+pub(crate) fn lock_output_for_test() -> MutexGuard<'static, ()> {
     TEST_OUTPUT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Has the global gate refuse one record (a record inside a record), which
+/// adds one to [`records_dropped`]. The caller holds [`lock_output_for_test`].
+pub(crate) fn drop_one_record_for_test() {
+    let hold = acquire_output().expect("the test owns diagnostic output");
+    assert!(acquire_output().is_none());
+    drop(hold);
 }
 
 struct FakePort {
@@ -258,18 +273,277 @@ fn panic_reason_buffer_is_utf8_valid_and_bounded() {
     assert!(reason.as_str().starts_with("panic-\u{00e9}"));
 }
 
+/// The global gate refuses a record inside a record at once and counts it;
+/// once the outer record ends the gate is free again.
 #[test]
-fn reentrant_output_fails_fast() {
-    let _test_lock = lock_output_guard_test();
-    let guard = OutputGuard::acquire().expect("test owns diagnostic output");
-    assert!(OutputGuard::acquire().is_none());
-    drop(guard);
-    assert!(OutputGuard::acquire().is_some());
+fn reentrant_output_fails_fast_and_is_counted() {
+    let _test_lock = lock_output_for_test();
+    let before = records_dropped();
+    let hold = acquire_output().expect("test owns diagnostic output");
+    assert!(acquire_output().is_none());
+    assert_eq!(records_dropped(), before + 1);
+    drop(hold);
+    assert!(acquire_output().is_some());
+    assert_eq!(records_dropped(), before + 1);
+}
+
+/// A COM1 shared by every modelled CPU: always ready, every byte appended to
+/// one wire in the order written.
+struct SharedPort<'a>(&'a RefCell<Vec<u8>>);
+
+impl crate::arch::x86_64::io_port::BytePortIo for SharedPort<'_> {
+    fn read_u8(&mut self, port: u16) -> u8 {
+        assert_eq!(port, COM1_BASE + LINE_STATUS);
+        LINE_STATUS_THR_EMPTY | LINE_STATUS_TRANSMITTER_EMPTY
+    }
+
+    fn write_u8(&mut self, port: u16, value: u8) {
+        assert_eq!(port, COM1_BASE + DATA);
+        self.0.borrow_mut().push(value);
+    }
+}
+
+fn wire_text(wire: &RefCell<Vec<u8>>) -> String {
+    String::from_utf8(wire.borrow().clone()).unwrap()
+}
+
+/// A wait that must not be reached.
+fn no_wait() -> impl FnMut() -> bool {
+    || -> bool { panic!("this acquire must not wait") }
+}
+
+/// A wait over a fake clock that advances `step` ticks per read, bounded at
+/// `ticks`, with an iteration backstop of `spin_cap`.
+fn fake_clock_wait(
+    clock: &Cell<u64>,
+    step: u64,
+    ticks: u64,
+    spin_cap: u64,
+) -> BoundedWait<impl FnMut() -> u64 + '_> {
+    BoundedWait::new(
+        move || {
+            let now = clock.get();
+            clock.set(now + step);
+            now
+        },
+        ticks,
+        spin_cap,
+    )
+}
+
+/// DW2 §13.4 item 1: CPU 1's record, arriving while CPU 0 is halfway through
+/// its own, waits, and is written whole after CPU 0's; neither is lost and
+/// the two do not interleave. The old guard refused CPU 1 at once.
+#[test]
+fn a_second_cpus_record_waits_and_follows_the_first_whole() {
+    let gate = OutputGate::new();
+    let wire = RefCell::new(Vec::new());
+    let cpu0 = WriterId::from_initial_apic_id(0);
+    let cpu1 = WriterId::from_initial_apic_id(1);
+
+    let mut first = Com1::new(SharedPort(&wire));
+    let mut held = Some(gate.acquire(cpu0, &mut no_wait()).unwrap());
+    first.write_bytes(b"[DW0][INFO][smp] cpu=1 ").unwrap();
+
+    let mut waits = 0;
+    let mut wait = || {
+        waits += 1;
+        if waits == 3 {
+            // CPU 0 finishes its record while CPU 1 waits.
+            first.write_bytes(b"apic=1 state=parked\n").unwrap();
+            held = None;
+        }
+        true
+    };
+    let mut second = Com1::new(SharedPort(&wire));
+    emit_record_through(
+        &gate,
+        cpu1,
+        &mut wait,
+        &mut second,
+        DiagnosticLevel::Info,
+        "x86",
+        "smep and smap on",
+    )
+    .unwrap();
+
+    assert!(held.is_none());
+    assert_eq!(waits, 3);
+    assert_eq!(
+        wire_text(&wire),
+        "[DW0][INFO][smp] cpu=1 apic=1 state=parked\r\n[DW0][INFO][x86] smep and smap on\r\n"
+    );
+    assert_eq!(gate.dropped(), 0);
+}
+
+/// A record inside a record on one CPU (a fault interrupting one) is refused
+/// at once, without waiting, writes nothing and is counted.
+#[test]
+fn a_record_inside_a_record_on_one_cpu_is_refused_at_once_and_counted() {
+    let gate = OutputGate::new();
+    let wire = RefCell::new(Vec::new());
+    let cpu0 = WriterId::from_initial_apic_id(0);
+    let _outer = gate.acquire(cpu0, &mut no_wait()).unwrap();
+
+    let mut serial = Com1::new(SharedPort(&wire));
+    assert_eq!(
+        emit_record_through(
+            &gate,
+            cpu0,
+            &mut no_wait(),
+            &mut serial,
+            DiagnosticLevel::Error,
+            "time",
+            "inner",
+        ),
+        Err(SerialError::Busy)
+    );
+    assert!(wire.borrow().is_empty());
+    assert_eq!(gate.dropped(), 1);
+}
+
+/// A holder that never releases is outwaited to the tick bound, then the
+/// record is refused and counted once.
+#[test]
+fn a_holder_that_never_releases_is_outwaited_to_the_bound_and_counted_once() {
+    let gate = OutputGate::new();
+    let wire = RefCell::new(Vec::new());
+    let _stalled = gate
+        .acquire(WriterId::from_initial_apic_id(2), &mut no_wait())
+        .unwrap();
+
+    let clock = Cell::new(1_000);
+    let mut wait = fake_clock_wait(&clock, 10, 100, 1_000_000);
+    let mut serial = Com1::new(SharedPort(&wire));
+    assert_eq!(
+        emit_record_through(
+            &gate,
+            WriterId::from_initial_apic_id(1),
+            &mut wait,
+            &mut serial,
+            DiagnosticLevel::Info,
+            "steps",
+            "records-dropped=0",
+        ),
+        Err(SerialError::Busy)
+    );
+    // It read the clock until 100 ticks had passed since its first read.
+    assert_eq!(clock.get(), 1_000 + 110);
+    assert!(wire.borrow().is_empty());
+    assert_eq!(gate.dropped(), 1);
+}
+
+/// With a clock that never advances, the iteration backstop ends the wait.
+#[test]
+fn a_stuck_clock_is_bounded_by_the_iteration_backstop() {
+    let gate = OutputGate::new();
+    let _stalled = gate
+        .acquire(WriterId::from_initial_apic_id(2), &mut no_wait())
+        .unwrap();
+    let clock = Cell::new(7);
+    let mut wait = fake_clock_wait(&clock, 0, 100, 5);
+    let mut reads = 0;
+    let mut counted = || {
+        reads += 1;
+        wait.wait()
+    };
+    assert!(
+        gate.acquire(WriterId::from_initial_apic_id(1), &mut counted)
+            .is_none()
+    );
+    // Five spins, then the sixth wait reports the bound.
+    assert_eq!(reads, 6);
+    assert_eq!(gate.dropped(), 1);
+}
+
+/// The panic path waits out the bound like any record, then takes the gate
+/// from the stalled CPU by force and writes its whole record; it is not
+/// counted. Its release frees the gate, and the stalled CPU's own release, if
+/// it ever comes, does not free a gate another CPU has taken since.
+#[test]
+fn the_panic_path_takes_the_gate_after_the_bound_and_is_not_counted() {
+    let gate = OutputGate::new();
+    let stalled = gate
+        .acquire(WriterId::from_initial_apic_id(0), &mut no_wait())
+        .unwrap();
+
+    let clock = Cell::new(0);
+    let mut wait = fake_clock_wait(&clock, 25, 100, 1_000_000);
+    let mut serial = Com1::new(FakePort::ready());
+    let record = PanicRecord {
+        reason: "stalled holder",
+        cpu_id: Some(1),
+        instruction_pointer: None,
+        fault_address: None,
+        backtrace_frames: &[],
+    };
+    emit_panic_record_through(
+        &gate,
+        WriterId::from_initial_apic_id(1),
+        &mut wait,
+        &mut serial,
+        &record,
+    )
+    .unwrap();
+    assert!(clock.get() > 100, "the panic waited out the bound first");
+    let port = serial.io;
+    let bytes = port.bytes();
+    let text = core::str::from_utf8(&bytes[..port.write_count]).unwrap();
+    assert!(text.starts_with("[DW0][PANIC][kernel] reason=stalled holder\r\n"));
+    assert!(text.ends_with("frames=\r\n"));
+    assert_eq!(gate.dropped(), 0);
+
+    // The panic's release freed the gate: CPU 2 takes it without waiting.
+    let later = gate
+        .acquire(WriterId::from_initial_apic_id(2), &mut no_wait())
+        .unwrap();
+    // The stalled CPU resumes and releases; CPU 2 still holds the gate.
+    drop(stalled);
+    assert!(
+        gate.acquire(WriterId::from_initial_apic_id(3), &mut || false)
+            .is_none()
+    );
+    drop(later);
+    assert!(
+        gate.acquire(WriterId::from_initial_apic_id(3), &mut no_wait())
+            .is_some()
+    );
+}
+
+/// A panic inside a record on its own CPU takes the gate at once, without
+/// waiting, and is not counted.
+#[test]
+fn a_panic_inside_its_own_cpus_record_forces_the_gate_at_once() {
+    let gate = OutputGate::new();
+    let cpu0 = WriterId::from_initial_apic_id(0);
+    let _outer = gate.acquire(cpu0, &mut no_wait()).unwrap();
+    let mut serial = Com1::new(FakePort::ready());
+    let record = PanicRecord {
+        reason: "fault inside a record",
+        cpu_id: Some(0),
+        instruction_pointer: None,
+        fault_address: None,
+        backtrace_frames: &[],
+    };
+    emit_panic_record_through(&gate, cpu0, &mut no_wait(), &mut serial, &record).unwrap();
+    assert!(serial.io.write_count > 0);
+    assert_eq!(gate.dropped(), 0);
+}
+
+/// DW2 §13.4 item 3: the syscall layer's fail-stop record names the line.
+#[test]
+fn halt_line_messages_carry_the_whole_line_number() {
+    assert_eq!(HaltLineMessage::new(0).as_str(), "halt line=0");
+    assert_eq!(HaltLineMessage::new(2906).as_str(), "halt line=2906");
+    assert_eq!(
+        HaltLineMessage::new(u32::MAX).as_str(),
+        "halt line=4294967295"
+    );
 }
 
 #[test]
 fn ordinary_records_have_bounded_fields() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     let long = "x".repeat(MAX_DIAGNOSTIC_MESSAGE_BYTES + 1);
     emit_record(&mut serial, DiagnosticLevel::Info, "boot", &long).unwrap();
@@ -288,7 +562,7 @@ fn ordinary_records_have_bounded_fields() {
 /// nine revisions building.
 #[test]
 fn bootstrap_completion_records_carry_the_cause_and_its_detail() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_bootstrap_completion_record(
         &mut serial,
@@ -315,7 +589,7 @@ fn bootstrap_completion_records_carry_the_cause_and_its_detail() {
 /// handle-resolution boundary that has no typed error left to classify.
 #[test]
 fn a_capacity_record_names_the_resource_and_the_site() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_capacity_record(&mut serial, "page-table-frames", 0x06).unwrap();
     let port = serial.io;
@@ -331,7 +605,7 @@ fn a_capacity_record_names_the_resource_and_the_site() {
 /// capacity failure happened" rather than "we could not name it".
 #[test]
 fn an_unclassified_capacity_record_still_renders() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_capacity_record(&mut serial, "unclassified", 0x01).unwrap();
     let port = serial.io;
@@ -351,7 +625,7 @@ fn an_unclassified_capacity_record_still_renders() {
 /// independent.
 #[test]
 fn a_bootstrap_completion_renders_a_secondary_exit_observation() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_bootstrap_completion_record(
         &mut serial,
@@ -375,7 +649,7 @@ exit=exited code=AF010002\r\n"
 /// than an empty field, so a transcript is parseable by one rule.
 #[test]
 fn a_bootstrap_completion_cause_without_a_detail_still_renders_one() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_bootstrap_completion_record(
         &mut serial,
@@ -401,7 +675,7 @@ fn a_bootstrap_completion_cause_without_a_detail_still_renders_one() {
 /// dropped its leading zeroes would be read wrong rather than not read.
 #[test]
 fn process_retirement_records_carry_the_exit_status_and_the_primordial_state() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
 
     let rendered = |application, reason, primordial_live, expected: &str| {
         let mut serial = Com1::new(FakePort::ready());
@@ -440,7 +714,7 @@ fn process_retirement_records_carry_the_exit_status_and_the_primordial_state() {
 
 #[test]
 fn the_power_off_record_says_no_process_remains() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_system_empty_record(&mut serial).unwrap();
     let port = serial.io;
@@ -453,7 +727,7 @@ fn the_power_off_record_says_no_process_remains() {
 
 #[test]
 fn smp_records_identify_cpu_apic_and_state() {
-    let _test_lock = lock_output_guard_test();
+    let _test_lock = lock_output_for_test();
     let mut serial = Com1::new(FakePort::ready());
     emit_cpu_state_record(&mut serial, 3, 17, "parked").unwrap();
     let port = serial.io;

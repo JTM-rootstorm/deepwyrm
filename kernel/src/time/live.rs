@@ -2007,8 +2007,9 @@ fn read_pm_timer(descriptor: PmTimerDescriptor) -> u32 {
 }
 
 /// Writes `halt reason=<reason>` as one error record, then stops this CPU
-/// with interrupts disabled. The record only tries the output lock, a
-/// bounded number of times, so a held lock cannot keep the CPU from halting.
+/// with interrupts disabled. The record waits for another CPU's record only
+/// up to the output gate's bound, and a record inside a record on this CPU
+/// is refused at once, so the output gate cannot keep the CPU from halting.
 #[allow(
     unsafe_code,
     reason = "an impossible F3 interrupt/runtime invariant is fail-stop with interrupts disabled"
@@ -2018,7 +2019,6 @@ fn halt_forever(reason: &'static str) -> ! {
     #[cfg(not(feature = "test-support"))]
     {
         const PREFIX: &[u8] = b"halt reason=";
-        const RECORD_TRIES: u32 = 64;
         let mut bytes = [0_u8; 64];
         let mut len = 0;
         for (slot, byte) in bytes.iter_mut().zip(PREFIX.iter().chain(reason.as_bytes())) {
@@ -2026,17 +2026,8 @@ fn halt_forever(reason: &'static str) -> ! {
             len += 1;
         }
         let message = core::str::from_utf8(&bytes[..len]).unwrap_or("halt reason=unprintable");
-        for _ in 0..RECORD_TRIES {
-            let written = crate::debug::emit_early_record(
-                crate::debug::DiagnosticLevel::Error,
-                "time",
-                message,
-            );
-            if written != Err(crate::debug::SerialError::Busy) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        let _ =
+            crate::debug::emit_early_record(crate::debug::DiagnosticLevel::Error, "time", message);
     }
     #[cfg(feature = "test-support")]
     let _ = reason;
