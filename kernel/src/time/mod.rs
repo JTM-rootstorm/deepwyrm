@@ -63,9 +63,10 @@ pub(crate) use live::{
     TimerExpiryTarget, ap_scheduler_timer_is_masked, arm_scheduler_quantum,
     bind_deadline_wake_target, bind_timer_expiry_target, bsp_local_apic_identity,
     busy_wait_nanoseconds, cancel_deadline, cancel_scheduler_quantum, deliver_bsp_owed_work_wake,
-    initialize, initialize_ap_local_apic, mark_bsp_owed_event, monotonic_now, register_deadline,
-    send_bsp_ipi, service_current_rendezvous_latch, service_current_scheduler_quantum_deadline,
-    settle_bsp_owed_events, timer_arm_counts, timer_service_is_healthy,
+    initialize, initialize_ap_local_apic, mark_bsp_owed_event, measured_tsc_hz, monotonic_now,
+    raw_tsc, register_deadline, send_bsp_ipi, service_current_rendezvous_latch,
+    service_current_scheduler_quantum_deadline, settle_bsp_owed_events, timer_arm_counts,
+    timer_service_is_healthy,
 };
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
 #[allow(

@@ -4138,6 +4138,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
             step_report::owed_wake(cause.queue, cause.retirement, sent);
         }
     }
+
+    /// T's timing for the step report (DW2 §13.5): raw TSC reads, three
+    /// for an acquisition that spins and two for one served at once.
+    #[inline(always)]
+    fn timing_now() -> Option<u64> {
+        Some(step_report::ticks())
+    }
+
+    #[inline(always)]
+    fn hold_served(cpu: u32, ticketed: Option<u64>) {
+        step_report::t_lock_served(cpu as usize, ticketed);
+    }
+
+    #[inline(always)]
+    fn hold_released(cpu: u32, released: Option<u64>) {
+        if let Some(released) = released {
+            step_report::t_lock_released(cpu as usize, released);
+        }
+    }
 }
 
 /// A carrier is built only from a held runtime guard, which mints its
@@ -10450,8 +10469,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::UserPageFaultOutcome {
         use crate::memory::frame_roles::FrameRoleError;
         use crate::syscall::native::UserPageFaultOutcome as Outcome;
+        use step_report::FaultStamp;
         const WRITE: u64 = 1 << 1;
         const FETCH: u64 = 1 << 4;
+        // The step report's stamps (DW2 §13.5), taken only while this CPU's
+        // fault gate is timing a fault, so a fill-in's serves read no clock.
+        let cpu = self.cpu().index();
+        step_report::fault_pass_began(cpu);
         let process = self.own.scheduled().process;
         let thread = self.own.scheduled().thread;
         if self.core.tasks.thread_process(thread) != Ok(process)
@@ -10510,12 +10534,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         // Admit both, together, before taking a frame (§8.4). Only a quota
         // refusal is exhaustion; the object and Process are live here.
-        match crate::syscall::admit_charged_pages_together(
+        step_report::fault_stamped(cpu, FaultStamp::AdmitBegan);
+        let admitted = crate::syscall::admit_charged_pages_together(
             &self.core.registry,
             &self.core.tasks,
             (object, cost),
             (process.object_id(), tables),
-        ) {
+        );
+        step_report::fault_stamped(cpu, FaultStamp::AdmitEnded);
+        match admitted {
             Ok(()) => {}
             Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
                 return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
@@ -10523,7 +10550,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Err(_) => return Outcome::Unserved,
         }
         if cost != 0 {
-            match session.commit_on_demand_page(backing, page) {
+            let committed = session.commit_on_demand_page(backing, page);
+            step_report::fault_stamped(cpu, FaultStamp::CommitEnded);
+            match committed {
                 Ok(commit) => crate::syscall::record_charged_pages(
                     &mut self.core.registry,
                     object,
@@ -10536,6 +10565,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ) => return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY),
                 Err(_) => return Outcome::Unserved,
             }
+        } else {
+            // Nothing to commit: the commit part is the gap to here.
+            step_report::fault_stamped(cpu, FaultStamp::CommitEnded);
         }
         // The levels missing are the lowest `tables` of PDPT, PD, PT.
         let mut candidates: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
@@ -10592,6 +10624,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             );
         }
         if published || cost != 0 {
+            step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
             Outcome::Served
         } else {
             Outcome::AlreadyPresent
@@ -10612,6 +10645,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         const USER: u64 = 1 << 2;
         const WRITE: u64 = 1 << 1;
         let process = self.own.scheduled().process;
+        // A fill-in's serves are not the fault gate's: none is timed, so
+        // none reads the clock (DW2 §13.5).
+        step_report::fault_untimed(self.cpu().index());
         let step_end = end.min(next.saturating_add(FAMILY_G_STEP_BYTES));
         while *next < step_end {
             let page = *next;
@@ -10630,6 +10666,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 continue;
             }
             let error = USER | if write { WRITE } else { 0 };
+            step_report::fill_in_served();
             if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
                 self.serve_user_page_fault(page, error)
             {
@@ -10655,6 +10692,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         required: deepwyrm_abi::DwRights,
         next: &mut u64,
     ) -> Result<bool, deepwyrm_abi::DwStatus> {
+        // The step report's commit-step stamps (DW2 §13.5): a step that
+        // reaches its end is one sample.
+        let began = step_report::ticks();
         let process = self.own.scheduled().process;
         let Some((backing, object)) = crate::syscall::memory_object_commit_target(
             &mut self.core.registry,
@@ -10693,6 +10733,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         // The whole step, or else the longest start of it the quota admits,
         // so a commit still fills the quota exactly: at most ten admissions.
+        let admit_began = step_report::ticks();
         let (admitted, cost, mut result) = match admit(count) {
             Ok(cost) => (count, cost, Ok(())),
             Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
@@ -10709,6 +10750,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             Err(status) => return Err(status),
         };
+        let admit_ended = step_report::ticks();
         let mut frames = 0;
         for page in first..first + admitted {
             match session.commit_on_demand_page(backing, page) {
@@ -10727,11 +10769,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             *next += page_size;
         }
+        let taken = step_report::ticks();
         // What was taken stays committed and charged, even after a failure.
         debug_assert!(frames <= cost, "a commit step took more than it admitted");
         if frames != 0 {
             crate::syscall::record_charged_pages(&mut self.core.registry, object, frames);
         }
+        step_report::commit_step(began, admit_began, admit_ended, taken, step_report::ticks());
         result.map(|()| *next >= end)
     }
 

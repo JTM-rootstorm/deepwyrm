@@ -1725,10 +1725,22 @@ unsafe fn native_runtime_user_page_fault<
     cr2: u64,
     error: u64,
 ) {
+    use crate::arch::x86_64::step_report::{self, FaultPass};
     use crate::syscall::native::UserPageFaultOutcome;
-    drain_source_here(crate::arch::x86_64::step_report::DrainSource::Fault);
+    // The step report times this fault from here (DW2 §13.5).
+    let cpu = current_cpu_index();
+    if let Some(cpu) = cpu {
+        step_report::fault_entered(cpu);
+        step_report::set_drain_source(cpu, step_report::DrainSource::Fault);
+    }
+    let untimed = || {
+        if let Some(cpu) = cpu {
+            step_report::fault_untimed(cpu);
+        }
+    };
     let record = user_page_fault_record(frame, cr2, error);
     if !crate::arch::x86_64::exceptions::page_fault_may_be_served(error, cr2) {
+        untimed();
         end_user_page_fault::<R>(context, TerminalAction::UserException(record));
     }
     let outcome = loop {
@@ -1737,7 +1749,16 @@ unsafe fn native_runtime_user_page_fault<
         // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the fault gate has no other
         // Rust frame on this CPU that holds one.
         let runtime = unsafe { &mut *context.cast::<R>() };
-        match runtime.serve_user_page_fault(cr2, error) {
+        let outcome = runtime.serve_user_page_fault(cr2, error);
+        step_report::fault_pass(match outcome {
+            UserPageFaultOutcome::Served => FaultPass::Served,
+            UserPageFaultOutcome::AlreadyPresent => FaultPass::AlreadyPresent,
+            UserPageFaultOutcome::Released => FaultPass::Released,
+            UserPageFaultOutcome::Retry => FaultPass::Retry,
+            UserPageFaultOutcome::Unserved => FaultPass::Unserved,
+            UserPageFaultOutcome::Exhausted(_) => FaultPass::Exhausted,
+        });
+        match outcome {
             UserPageFaultOutcome::Retry => continue,
             outcome => break outcome,
         }
@@ -1751,9 +1772,11 @@ unsafe fn native_runtime_user_page_fault<
         | UserPageFaultOutcome::AlreadyPresent
         | UserPageFaultOutcome::Released => {}
         UserPageFaultOutcome::Unserved => {
+            untimed();
             end_user_page_fault::<R>(context, TerminalAction::UserException(record));
         }
         UserPageFaultOutcome::Exhausted(_) => {
+            untimed();
             end_user_page_fault::<R>(context, TerminalAction::UserResourceFault(record));
         }
         UserPageFaultOutcome::Retry => unreachable!("the serve loop retries"),
@@ -1766,8 +1789,13 @@ unsafe fn native_runtime_user_page_fault<
         // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
         let runtime = unsafe { &mut *context.cast::<R>() };
         if let Err(error) = runtime.authorize_timer_return(frame) {
+            untimed();
             invalid_bound_return::<R>(context, error);
         }
+    }
+    // The fault's time ends here, before the reschedule check.
+    if let Some(cpu) = cpu {
+        step_report::fault_returned(cpu, matches!(outcome, UserPageFaultOutcome::Served));
     }
     let has_request = {
         // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.

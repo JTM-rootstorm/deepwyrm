@@ -619,6 +619,9 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     /// Pages of live and finalizing objects charged to `group`. A
     /// finalizing MemoryObject still holds its frames, so it still counts.
     pub(crate) fn charged_pages(&self, group: ObjectId) -> usize {
+        // Counted for the step report's admission line (DW2 §13.5).
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        crate::arch::x86_64::step_report::page_scanned(CAPACITY);
         self.slots
             .iter()
             .zip(&self.tags)
@@ -643,6 +646,9 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
 
     /// Live and finalizing objects of `class` charged to `group`.
     pub(crate) fn charged(&self, group: ObjectId, class: usize) -> usize {
+        // Counted for the step report's admission line (DW2 §13.5).
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        crate::arch::x86_64::step_report::object_scanned(CAPACITY);
         self.slots
             .iter()
             .zip(&self.tags)
