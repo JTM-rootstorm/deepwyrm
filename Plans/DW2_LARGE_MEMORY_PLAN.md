@@ -2048,3 +2048,39 @@ A miss of one of the first three is sized in instructions and reported before an
 2. Approve the language rule of part 2 item 4 (C only for a saving of at least 10% and 50 instructions per free), or set another.
 3. Approve part 2 being built from the counts by the rules above without another approval round, coming back first only if the counts point somewhere the candidates do not cover.
 4. Compaction: (a) close M7 without it, with the three reopening conditions in §9 (recommended), or (b) have the migration design written next.
+
+**Part 1 as counted (2026-11-16).** By an Opus worker (Claude Opus 5.5) in the throwaway lane `lane/m7-count-paths` (HEAD `18d109b`, never merged), from the coordinator's brief. One CPU under `--icount`; every figure is guest instructions from probe pairs, with the probes' own cost taken out (an empty probe reads 4 and costs the code around it 49; calibrated in each boot). The coordinator recomputed the free path's rows from the `[count]` lines of the three logs and they agree. Boots, all passing: `.tmp/dev-boot/1794875706146221115` and `…6028895599452` (Rust as it is, twice: per-call figures agree within 1%), `…6342148414581` (Rust without bounds checks), `…6662982119313` (C). The 1,510 kernel tests pass for each of the three, the C paths included: the host build compiled the C file with the pinned host clang.
+
+- *Freeing one page* (1.38 million calls in on-demand finalize steps), per call:
+
+  | | Rust as it is | Rust, no bounds checks | C |
+  |---|---|---|---|
+  | `free_run`, whole | 705 | 599 | 459 |
+  | finding the range (`range_index`) | 40 | 41 | 39 |
+  | the double-free check (`overlaps_free_in`) | 439 | 389 | 237 |
+  | merging (`insert_range`) | 186 | 125 | 154 |
+  | the rest | 41 | 45 | 29 |
+  | whole, without the check | 267 | 211 | 222 |
+
+  The check is 62%, 65% and 52% of a free. Why the C check is cheaper than Rust's without bounds checks is not measured.
+- *Allocating one page* (1.2 million calls in commit steps): 252, 198 and 240.
+- *The role slot.* `vacate` 110 to 128, `occupy` 180 to 203, `free_index_slot` 109 of its own.
+- *Index node access.* `DirectMapIndexMemory::word` costs 70 instructions from a read and 69 from a write, every call. Writing one entry while building costs 126 in all (69 for the address, 47 in `write_run_entries` itself, the rest probes' neighbours); §12.11's inferred 92 was low.
+- *A walk* (`index_walk`) costs 520 instructions on the fragmented object, 288 of them its own, 140 the two address lookups, 92 the two entry checks. **A map or unmap step walks three times for each page and a protect step four times** (1,542 and 2,060 walks for a step of 512 pages). The on-demand finalize step walks once for each entry it frees (509 walks and 481 frees a step).
+- *Where a step's instructions are* (own instructions of the probed functions, per step):
+  - on-demand finalize: the double-free check 211 thousand, walks 150, merging 89, address lookups 112, `vacate` 62, `free_index_slot` 52, entry checks 48;
+  - commit: zeroing and taking the frame 11.3 thousand, walks 7.2, allocation 3.7, address lookups 4.4, `occupy` 3.0;
+  - map on the fragmented object: walks 444 thousand, address lookups 216, entry checks 142;
+  - building: address lookups 360 thousand, `write_run_entries` 245, `occupy` 87, allocation 77.
+- *What the probes changed.* A probed finalize step costs 15% more than the probes' own cost explains, and a fragmented map step 5%; the worker supposes inlining and did not show it. The tables say where the cost is, not its exact size, as in §12.6.
+- *The C build.* One file of 358 lines, compiled by the build's clang (22.1.8, the pinned host clang's binary) with the kernel target's flags read from the target specification (kernel code model, no red zone, no SSE or x87, soft float, PIE); no stack-clash protection (clang does not offer it for this target). It depends on a Rust slice field being laid out as pointer then length, which Rust does not promise; the worker checks it at seed time.
+
+**What the counts select, by §12.12's rules.**
+1. *The free bitmap is built:* the check is 439 instructions of a one-page free, against the rule's 100.
+2. *The node access change is built* (it was unconditional): in progress in `lane/m7-node-access`.
+3. *No narrower slot writer is built.* `occupy` is above the rule's 150, but the narrow `occupy_slot` and `vacate_slot` the rule had in mind already exist (§12.6 item 3); what is left of `occupy` is the start index and the packing, which the count does not split. It is 87 thousand instructions of a building step and 3 thousand of a commit step.
+4. *The language is not chosen yet.* Read to the letter the rule takes C: 459 against 599. But 237 of C's 459 and 389 of Rust's 599 are the check that item 1 replaces whatever the language, and on the rest C (222) is behind Rust without bounds checks (211), as it is on allocation (240 against 198). The rule was written for the path that ships, so the three are being counted again with the bitmap in place, and the rule is applied to that table.
+5. *Two things the candidates do not cover,* put to Mike before they are built (decision 3):
+   - **A place in the index for `BackingCursor`.** The journal and the publisher already resolve pages in order through a cursor that makes a chain cost one step for each run crossed; for an index root `resolve_at` ignores it and walks from the root for every page. The cursor would remember the leaf and the run it last resolved; the next page then costs a check of that run, or of that leaf and one entry read, in place of a walk. As now it would hold no borrow and grant nothing: each use checks the leaf and the run by identity against the head. Not measured: by the counts above a walk is 520 instructions and its replacement about two entry checks and a read.
+   - **The release step walks once for a leaf,** not once for each entry it frees, inside its one exclusive call.
+
