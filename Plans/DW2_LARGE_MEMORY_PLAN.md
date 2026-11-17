@@ -493,6 +493,7 @@ Mike (2026-11-13): nothing stays "open" without an owner. Every finding, risk an
 | Writing one index entry while building costs about 92 instructions, most of it the direct-map address looked up again for every entry (`DirectMapIndexMemory::word`). The figure is an inference: a step of 65,536 entries cost 6.07 million instructions and one of 32,768 fell under 3.6 million; no per-function count was taken. It is about 10.5 million of the 107 million a fragmented 448 MiB create costs | §12.11, part 2 as built | M7 step 4, with its count of the free path: one address lookup per leaf, not per entry |
 | `memory/object.rs` is 1,915 lines (1,816 before step 3b part 2), past the 1,500 a module is split at | §12.11, part 2 as built | **Fixed, Deepwyrm `2ebf6ba`** (commit `0663c9f`, a pure move): `object.rs` is 1,399 lines, with `object/owed.rs` (222) and `object/release.rs` (313) |
 | Under KVM the guest does not start its second CPU: `dev-boot --check --kvm --smp` stops after `[smp] cpu=0 apic=0 state=online` on both the PM-timer and the TSC clock, with the emulated VT-d's interrupt remapping on and the split irqchip (Wyrmroot `da9115b`, Deepwyrm `65d03fe`; `.tmp/dev-boot/1794881321730218743`). The same boot passes under the emulator. Not investigated; QEMU's stderr is not kept by the harness | §12.12 | M8, at its entry: M8 is the stage about more than one CPU and its times must be taken with four CPUs under KVM, so its first step is to find and fix this. M8 does not start its measurements while this row is open |
+| Under KVM `dev-boot --check` fails about one boot in twelve at `run bin/hello on-demand`: the job prints its budget line and exits normally with application status 0, and its last line, `on-demand ok`, written just before it returns, does not reach the shell. Seen once on `189caa2` and once on `8b73d2d` in 24 boots (`.tmp/coord/bpk2-main-8.log`, `bpk2-cand-4.log`), never in the emulator's boots. Not investigated: whether the line is lost in the job's write, in the kernel's stream, or by the shell at the job's exit | §12.12 | M8, at its entry, with the row above: M8's times are taken under KVM and its check must pass there every time |
 | An owed backing holds one of the registry's 64 reservation slots until it is freed, and a create that finds none free is refused with `NO_RESOURCES` (Mike approved the refusal, §12.11 decision 2). A job in fragmented memory can so hold the slots with abandoned creates and delay other processes' creates until finalize steps free them; the frames stay charged to the job, so its quota bounds the pages, not the slots | §12.11, part 2 as built | M8: bound the owed backings one TaskGroup may hold, or give owed backings slots of their own |
 | R3: stepped calls never yield the CPU; creation's zeroing has no safe point | §7.3 | M5 (Mike, 2026-11-13: moved from M8; §10.1) |
 | Every first touch takes the global T, and usage is a linear scan | §8.9 | M8 |
@@ -2136,6 +2137,27 @@ The first real step times, one boot of `65d03fe` on one CPU (`.tmp/dev-boot/1794
 3. *Tests (host, behaviour).* The lane's `the_free_bitmap_refuses_every_overlap_with_a_free_block`, shown failing against a check that looks only at the first page; adoption refuses a bitmap of the wrong length; the grown layout holds the bitmap inside its pages for a page count that is not a multiple of 64; a long random sequence of allocations and frees, with ceilings, calls `check` (so I7) after every operation; the existing 1,512 pass unchanged except where they build a `BuddyStorage`.
 4. *Checks and measurement.* fmt, clippy, kernel-check, the host tests, and the plain, `--smp` and `--icount` boots. Then time: three `dev-boot --check --kvm` boots of `65d03fe` and three of the candidate, interleaved, comparing the step means of finalize, commit and create and the guest's lines, in nanoseconds. The change is kept if no step is slower beyond the boots' own spread; what it gains is reported as measured.
 5. *Review.* The coordinator reviews the diff and does the security review: this removes bounds checks from the frame allocator, so an invariant broken elsewhere would become a wild write where it is a panic today. Each unchecked access is checked against the invariant its comment names.
+
+**Part 2 items 1 and 4 as built and timed (2026-11-16).** Deepwyrm `5eebd74` merges `ab78d3b` (the free bitmap with carved storage) and `8b73d2d` (the paths without bounds checks), by an Opus worker (Claude Opus 5.5) from the specification above; the coordinator reviewed every unchecked access against its invariant and found no defect, and re-ran on `8b73d2d` fmt, clippy (236 / 86), kernel-check, 1,515 host tests and the plain, `--smp` and `--icount` boots.
+
+- *Beyond the specification, and kept:* `seed` is `unsafe` too and now really checks that each boot free range lies inside one initial range (a panic at boot otherwise); `free_run` also requires a non-empty, aligned range, which `validate_candidate` checks before every call (a reversed range would otherwise reach unchecked indexing).
+- *Not done:* Miri was not run; the unchecked accesses are exercised through the host tests' debug assertions only.
+- *Timed under KVM,* one CPU, 12 boots each of `189caa2` (the code of `65d03fe`) and `8b73d2d`, interleaved; 11 of each passed their check (the two failures are the row added to §9 today, one on each tree). Medians, with the range over the boots:
+
+| Measure | Before | After | Change |
+|---|---|---|---|
+| finalize step | 53.4 µs (53.2–53.4) | 47.9 µs (47.9–48.1) | −10.1% |
+| close, fragmented 448 MiB | 183 µs (181–189) | 37 µs (36–38) | −80% |
+| close, unfragmented 448 MiB | 29 µs (28–36) | 26 µs (25–26) | −10% |
+| release step | 200 ns (198–202) | 189 ns (185–194) | −5.5% |
+| fill step | 1.59 µs (1.58–1.61) | 1.56 µs (1.55–1.57) | −1.8% |
+| commit step | 17.8 µs (17.6–18.3) | 18.0 µs (17.6–18.3) | +0.8%, same range |
+| map, unmap, protect steps | 167, 242, 369 µs | 166, 242, 368 µs | within 0.6% |
+| create step | 345 µs (340–353) | 355 µs (342–368) | +2.9%, ranges overlap |
+| create of the three timed objects | 25.3, 27.1, 28.0 ms | 24.3, 27.1, 27.8 ms | −3.8%, +0.2%, −0.6% |
+
+  The create step mean is taken over every create in a boot, most of them the churn probe's, whose number varies from boot to boot (443 to 596 steps); the three creates the guest times itself did not move. Whether any create step is slower was not established, and the cause of the higher mean was not measured. Why the fragmented close gains so much more than the finalize step was not looked at either.
+- *The earlier estimate* ("the language moves a finalize step by about 1%") was about Rust against C with the bitmap in both; the 10% here is the bitmap and the unchecked paths together against main.
 
 **Not built.** Item 3 (narrow slot writers) exists since §12.6.
 
