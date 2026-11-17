@@ -2186,3 +2186,26 @@ The first real step times, one boot of `65d03fe` on one CPU (`.tmp/dev-boot/1794
 *Review.* The coordinator reviews both and does the security review of 5a: it changes how the frames a mapping, a DMA mapping and a boot write name are found, so each fast path is checked against item 3.
 
 *Not in this change.* `decommit_on_demand_range` walks once for each entry too, as the release step did; it is the same change and is not built until asked for.
+
+**Item 5 as built and timed (2026-11-17).** Deepwyrm `2fd831d` merges `9a1f928` (5a) and `5dae6e5` (5b), by an Opus worker (Claude Opus 5.5) from the specification above. The coordinator reviewed both diffs, with the security review of 5a against item 3, and found no defect; it re-ran on `5dae6e5` fmt, clippy (236 / 86), kernel-check, 1,521 host tests and the plain, `--smp` and `--icount` boots, and on the merged tree the four checks (1,524 tests), an `--smp` boot and four `--kvm` boots.
+
+- *Timed under KVM,* one CPU, six interleaved rounds of `189caa2` (main before the allocator build), `9a1f928` and `5dae6e5`; 6, 6 and 5 boots passed their check (the failure is the §9 row of 2026-11-16). Medians, with the range over the boots:
+
+| Measure | Base | 5a | 5a and 5b |
+|---|---|---|---|
+| finalize step | 53.3 µs (53.3–53.4) | 39.9 µs (39.8–39.9) | 27.2 µs (27.1–27.2) |
+| protect step | 368 µs (366–371) | 327 µs (325–329) | 328 µs (325–329) |
+| unmap step | 242 µs (241–243) | 225 µs (224–226) | 226 µs (217–226) |
+| map step | 167 µs (164–174) | 156 µs (154–161) | 158 µs (155–167) |
+| commit step | 17.9 µs (17.6–18.1) | 16.7 µs (16.6–16.8) | 16.9 µs (16.6–17.6) |
+| fill step | 1.58 µs (1.58–1.61) | 1.57 µs (1.56–1.59) | 1.53 µs (1.52–1.55) |
+| fragmented 448 MiB: map | 97.2 ms (96.9–98.9) | 79.2 ms (78.7–80.4) | 80.7 ms (78.9–82.5) |
+| fragmented 448 MiB: protect | 102.7 ms (102.5–103.5) | 78.5 ms (78.4–79.8) | 78.7 ms (76.8–79.0) |
+| fragmented 448 MiB: unmap | 79.7 ms (79.4–82.2) | 69.3 ms (68.2–70.8) | 70.2 ms (60.6–70.3) |
+| fragmented 448 MiB: close | 183 µs (181–195) | 144 µs (143–164) | 112 µs (111–121) |
+
+  The unfragmented and the eager 256 MiB objects, which are chains, and the create, teardown and release steps are within about 1%. The number of finalize steps differs from boot to boot with the churn probe (8,792 to 12,132 here), so the step mean is over a varying mix; the time all finalize steps of a boot take together was about 500 ms on the base, 410 ms with 5a and 290 to 330 ms with both.
+- *With the allocator build (the merged tree).* Two interleaved rounds of `5eebd74` and `2fd831d`, and two more boots of `2fd831d`: the finalize step is 48.0 µs before the merge and 22.0 µs after it (all finalize steps of a boot together: about 437 ms, then 236 to 275 ms); protect 351 to 365 µs, then 317 to 328 µs; unmap 238 µs, then 217 µs; the fragmented object's map 98 ms, then 79 ms.
+- *Slower in the merged tree, cause not found:* the close of the fragmented 448 MiB object takes 98 to 100 µs in all four boots of `2fd831d` against 36 and 37 µs in the two of `5eebd74`: 62 µs more, once for each close of such an object. On the base the same two changes made that close faster (183 to 112 µs). The unfragmented close is 26 µs in both. Disposition: put to Mike on 2026-11-17.
+- *A host effect on create times, found while timing.* From 23:01 on 2026-11-16 every KVM boot showed one create step of 30 to 90 ms (0.84 to 1.17 ms in the 39 passing boots before it) and a fragmented create of 230 to 550 ms (about 27 ms before). It is not the index changes: `189caa2` and `5eebd74` booted on 2026-11-17 show the same (create steps of 31 to 42 ms, fragmented creates of 330 to 422 ms). In those boots the host had about 2.5 GiB free of 62 with 49 GiB in its page cache, and its `allocstall_movable` and `compact_stall` counters rose by 75 to 140 and 60 to 150 during each boot; `compact_stall` stood at 5 before the first long step. Map, protect, unmap, close and the finalize step read as before in the same boots. The timing script (`.tmp/coord/time-kvm.sh`) now prints the host's free memory and those counters around each boot; a create time from a boot in which they rise is not a measurement of the kernel.
+- *The twelve further boots* of `5dae6e5` that were to show whether the long create step recurs ran in 16 minutes (11 passed; the failure is the same §9 row) and all fell after 23:01, so they show the host effect and nothing about the change.
