@@ -18,10 +18,12 @@ const GARBAGE: u64 = 0xdead_beef_0000_0001;
 
 /// Index memory that counts reads and zeroes, and can fail one zeroing.
 #[derive(Default)]
-struct Model {
+pub(super) struct Model {
     zeroed: Mutex<BTreeSet<u64>>,
     entries: Mutex<BTreeMap<(u64, usize), u64>>,
     reads: AtomicU64,
+    /// Reads of each entry.
+    entry_reads: Mutex<BTreeMap<(u64, usize), u64>>,
     zeroes: AtomicU64,
     /// The zeroing, counted from 0, that fails.
     fail_zero_at: Mutex<Option<u64>>,
@@ -30,6 +32,12 @@ struct Model {
 impl IndexMemory for Model {
     fn read(&self, node: u64, entry: usize) -> u64 {
         self.reads.fetch_add(1, Ordering::Relaxed);
+        *self
+            .entry_reads
+            .lock()
+            .unwrap()
+            .entry((node, entry))
+            .or_default() += 1;
         if let Some(value) = self.entries.lock().unwrap().get(&(node, entry)) {
             return *value;
         }
@@ -71,8 +79,23 @@ impl IndexMemory for Model {
 }
 
 impl Model {
-    fn reads(&self) -> u64 {
+    pub(super) fn reads(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Reads of entry `entry` of the node page at `node` so far.
+    pub(super) fn reads_of(&self, node: u64, entry: usize) -> u64 {
+        self.entry_reads
+            .lock()
+            .unwrap()
+            .get(&(node, entry))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every entry written, nonzero or not.
+    pub(super) fn written(&self) -> BTreeMap<(u64, usize), u64> {
+        self.entries.lock().unwrap().clone()
     }
 }
 
@@ -82,14 +105,14 @@ fn model() -> &'static Model {
 
 // ---- A range-allocator manager with holes of chosen sizes. ----
 
-type Small = FrameRoleManager<48, 160>;
+pub(super) type Small = FrameRoleManager<48, 160>;
 
 /// A manager of `page_count` pages, its index memory set.
-fn small(page_count: u64) -> (Small, &'static Model) {
+pub(super) fn small(page_count: u64) -> (Small, &'static Model) {
     sized(page_count)
 }
 
-fn sized<const S: usize>(page_count: u64) -> (FrameRoleManager<48, S>, &'static Model) {
+pub(super) fn sized<const S: usize>(page_count: u64) -> (FrameRoleManager<48, S>, &'static Model) {
     let limit = PhysicalAddressLimit::new(1_u64 << 40).unwrap();
     let candidate = PageRange::from_page_count(PAGE, page_count, limit).unwrap();
     let allocator = PhysicalFrameAllocator::from_candidates(&[candidate], limit, []).unwrap();
@@ -101,7 +124,7 @@ fn sized<const S: usize>(page_count: u64) -> (FrameRoleManager<48, S>, &'static 
 
 /// Leaves free holes of the given page counts, in address order, separated
 /// by one held page each, and holds the rest.
-fn holes<const S: usize>(
+pub(super) fn holes<const S: usize>(
     roles: &mut FrameRoleManager<48, S>,
     sizes: &[u64],
 ) -> Vec<AllocationGrant> {
@@ -157,7 +180,7 @@ fn fragmented(pages: u64) -> (Grown, &'static Model, Vec<AllocationGrant>) {
     unsafe_code,
     reason = "the host model never dereferences synthetic physical memory"
 )]
-fn zeroed<const R: usize, const S: usize>(
+pub(super) fn zeroed<const R: usize, const S: usize>(
     roles: &mut FrameRoleManager<R, S>,
     allocation: BackingAllocation,
 ) -> ObjectBackingGrant {
@@ -165,7 +188,7 @@ fn zeroed<const R: usize, const S: usize>(
     unsafe { roles.assume_backing_zeroed(allocation) }.unwrap()
 }
 
-fn backing<const R: usize, const S: usize>(
+pub(super) fn backing<const R: usize, const S: usize>(
     roles: &mut FrameRoleManager<R, S>,
     pages: u64,
 ) -> ObjectBackingGrant {
@@ -242,7 +265,7 @@ fn index_layout<const R: usize, const S: usize>(
 }
 
 /// [`index_layout`] as (first object page, pages).
-fn index_runs<const R: usize, const S: usize>(
+pub(super) fn index_runs<const R: usize, const S: usize>(
     roles: &FrameRoleManager<R, S>,
     backing: BackingIdentity,
 ) -> Vec<(u64, u64)> {

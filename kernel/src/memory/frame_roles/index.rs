@@ -222,6 +222,8 @@ pub(super) struct Taken {
 struct IndexStep {
     /// The node holding the entry.
     node: u64,
+    /// The node's identity: [`FrameRoleIdentity::EMPTY`] for the root.
+    identity: FrameRoleIdentity,
     entry: usize,
     level: u8,
     /// The first object page the entry covers.
@@ -373,6 +375,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         wanted: RootUse,
     ) -> Result<IndexWalk, FrameRoleError> {
         let (root_range, root) = self.index_root(head, wanted)?;
+        self.index_walk_from(head, root_range, root, page)
+    }
+
+    /// [`Self::index_walk`] from the root `root_range` of `head`, already
+    /// taken.
+    fn index_walk_from(
+        &self,
+        head: FrameRoleIdentity,
+        root_range: PageRange,
+        root: IndexRootLink,
+        page: u64,
+    ) -> Result<IndexWalk, FrameRoleError> {
         if page >= root.pages {
             return Err(FrameRoleError::WrongRole);
         }
@@ -380,6 +394,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let memory = self.memory()?;
         let mut steps = [None; INDEX_MAX_LEVELS as usize];
         let mut node = root_range.start;
+        let mut node_identity = FrameRoleIdentity::EMPTY;
         let mut node_first = 0_u64;
         for (depth, level) in (0..root.levels).rev().enumerate() {
             let span = entry_span(level);
@@ -387,6 +402,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let first_page = node_first + entry as u64 * span;
             steps[depth] = Some(IndexStep {
                 node,
+                identity: node_identity,
                 entry,
                 level,
                 first_page,
@@ -402,29 +418,124 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 let (identity, range, link) = self.index_entry(head, raw, false, page, eager)?;
                 return Ok((steps, Some((identity, range, link.place))));
             }
-            let (_, range, _) =
+            let (identity, range, _) =
                 self.index_entry(head, raw, true, node_place(first_page, level - 1), false)?;
             node = range.start;
+            node_identity = identity;
             node_first = first_page;
         }
         Err(FrameRoleError::InvariantViolation)
     }
 
     /// The frames at object page `page` of the on-demand or zeroed eager
-    /// backing `head`: the run holding it and its physical address, or
-    /// [`FrameRoleError::Absent`] when an on-demand page has none yet.
-    pub(super) fn index_resolve(
+    /// backing `cursor` walks: the run holding it and its physical address,
+    /// or [`FrameRoleError::Absent`] when an on-demand page has none yet
+    /// (DW2 §12.12 item 5a).
+    ///
+    /// The root is taken and the page checked against it first. Then the
+    /// cursor's run is tried, then its leaf, then a walk from the root; a
+    /// place that fails a check is passed over, never an error by itself.
+    /// The cursor is left at the run and leaf found, or with none.
+    pub(super) fn index_resolve_at(
         &self,
-        head: FrameRoleIdentity,
+        cursor: &mut BackingCursor,
         page: u64,
     ) -> Result<(FrameRoleIdentity, u64), FrameRoleError> {
-        match self.index_walk(head, page, RootUse::Live)? {
+        let head = cursor.head;
+        let (root_range, root) = self.index_root(head, RootUse::Live)?;
+        if page >= root.pages {
+            return Err(FrameRoleError::WrongRole);
+        }
+        let eager = root.state != IndexRootState::OnDemand;
+        // The same run: no node is read.
+        if let Some(found) = self.place_run(cursor, page) {
+            return Ok(found);
+        }
+        // The same leaf: one entry is read, and checked as the walk's last
+        // level checks it.
+        if root.levels > 1
+            && let Some(raw) = self.place_leaf_entry(cursor, page)
+        {
+            if raw == 0 {
+                if !eager {
+                    cursor.run = head;
+                    cursor.run_page = 0;
+                    return Err(FrameRoleError::Absent);
+                }
+            } else if let Ok((identity, range, link)) =
+                self.index_entry(head, raw, false, page, eager)
+            {
+                cursor.run = identity;
+                cursor.run_page = link.place;
+                // `index_entry` checked `place <= page` inside the run.
+                return Ok((identity, range.start + (page - link.place) * BASE_PAGE_SIZE));
+            }
+        }
+        // The walk.
+        cursor.run = head;
+        cursor.run_page = 0;
+        cursor.leaf = FrameRoleIdentity::EMPTY;
+        cursor.leaf_first = 0;
+        let (steps, found) = self.index_walk_from(head, root_range, root, page)?;
+        if let Some(leaf) = steps
+            .iter()
+            .flatten()
+            .last()
+            .filter(|step| step.level == 0 && step.identity != FrameRoleIdentity::EMPTY)
+        {
+            cursor.leaf = leaf.identity;
+            cursor.leaf_first = leaf.first_page - leaf.entry as u64;
+        }
+        match found {
             // `index_entry` checked `place <= page` inside the run.
-            (_, Some((identity, range, place))) => {
+            Some((identity, range, place)) => {
+                cursor.run = identity;
+                cursor.run_page = place;
                 Ok((identity, range.start + (page - place) * BASE_PAGE_SIZE))
             }
-            (_, None) => Err(FrameRoleError::Absent),
+            None => Err(FrameRoleError::Absent),
         }
+    }
+
+    /// The run or committed page `cursor` names and the address of `page`
+    /// in it, if its slot is live, it is an object page of the cursor's
+    /// head at the cursor's run page, and it holds `page`.
+    #[inline]
+    fn place_run(&self, cursor: &BackingCursor, page: u64) -> Option<(FrameRoleIdentity, u64)> {
+        if cursor.run == cursor.head {
+            return None;
+        }
+        let facts = self.index_entry_at(self.slot(cursor.run).ok()?)?;
+        let offset = page.checked_sub(cursor.run_page)?;
+        let link = facts.link;
+        (!facts.node
+            && link.owner == cursor.head.raw
+            && link.place == cursor.run_page
+            && offset < facts.range.page_count())
+        .then(|| (cursor.run, facts.range.start + offset * BASE_PAGE_SIZE))
+    }
+
+    /// The raw entry for `page` in the leaf `cursor` names, if the page
+    /// lies in the leaf's pages and its slot is live and is an index node
+    /// of the cursor's head, of one page, at the leaf's place.
+    #[inline]
+    fn place_leaf_entry(&self, cursor: &BackingCursor, page: u64) -> Option<u64> {
+        if cursor.leaf == FrameRoleIdentity::EMPTY {
+            return None;
+        }
+        let entry = page
+            .checked_sub(cursor.leaf_first)
+            .filter(|offset| *offset < INDEX_FANOUT)?;
+        let facts = self.index_entry_at(self.slot(cursor.leaf).ok()?)?;
+        let link = facts.link;
+        if !facts.node
+            || link.owner != cursor.head.raw
+            || link.place != node_place(cursor.leaf_first, 0)
+            || facts.range.page_count() != 1
+        {
+            return None;
+        }
+        Some(self.memory().ok()?.read(facts.range.start, entry as usize))
     }
 
     /// Frames committing `page` would allocate: zero when it is committed,
@@ -819,7 +930,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// its own leaf, has its entries from the cursor cleared (one visit
     /// each, as far as the budget goes) and is freed once all are. A run is
     /// so freed at its last leaf, after the leaves before it, which named
-    /// it, were freed.
+    /// it, were freed. A leaf is walked to once, and its entries from the
+    /// cursor are read from it directly (DW2 §12.12 item 5b).
     ///
     /// Once the cursor reaches the end of a node below the root (its span,
     /// clamped to the object), that node is empty of live entries and is
@@ -868,78 +980,106 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .iter()
                 .rposition(Option::is_some)
                 .ok_or(FrameRoleError::InvariantViolation)?;
-            let deepest = steps[depth].ok_or(FrameRoleError::InvariantViolation)?;
-            match found {
-                Some((identity, range, place)) if eager => {
-                    // `deepest` is the cursor's entry in its leaf.
-                    let leaf_first = deepest.first_page - deepest.entry as u64;
-                    let leaf_end = leaf_first
-                        .checked_add(INDEX_FANOUT)
-                        .ok_or(FrameRoleError::InvariantViolation)?
-                        .min(pages);
-                    let run_end = place
-                        .checked_add(range.page_count())
-                        .ok_or(FrameRoleError::InvariantViolation)?;
-                    if run_end > leaf_end {
-                        cursor = leaf_end;
+            let mut deepest = steps[depth].ok_or(FrameRoleError::InvariantViolation)?;
+            // The leaf the walk reached, if it reached one: its entries from
+            // the cursor are handled from this one walk, each read and
+            // checked as the walk's last level checks it, until the leaf
+            // ends or the budget is spent.
+            let leaf_first = deepest.first_page - deepest.entry as u64;
+            let leaf_end = leaf_first
+                .checked_add(INDEX_FANOUT)
+                .ok_or(FrameRoleError::InvariantViolation)?
+                .min(pages);
+            let mut found = found;
+            loop {
+                match found {
+                    Some((identity, range, place)) if eager => {
+                        // `deepest` is the cursor's entry in its leaf.
+                        let run_end = place
+                            .checked_add(range.page_count())
+                            .ok_or(FrameRoleError::InvariantViolation)?;
+                        if run_end > leaf_end {
+                            cursor = leaf_end;
+                            visited += 1;
+                        } else if depth != 0 && run_end == leaf_end {
+                            let slot = self.slot(identity)?;
+                            self.free_index_slot(slot);
+                            freed += range.page_count();
+                            cursor = run_end;
+                            visited += 1;
+                        } else {
+                            let stop = run_end.min(cursor + (budget - visited));
+                            #[allow(
+                                unsafe_code,
+                                reason = "the manager owns its index nodes exclusively under `&mut self`"
+                            )]
+                            // SAFETY: `deepest.node` is a leaf of this backing,
+                            // which the manager owns exclusively under
+                            // `&mut self`; the entries `[cursor, stop)` lie in it,
+                            // since `stop <= run_end <= leaf_end`.
+                            unsafe {
+                                memory.write_run(
+                                    deepest.node,
+                                    (cursor - leaf_first) as usize,
+                                    (stop - cursor) as usize,
+                                    0,
+                                )
+                            };
+                            visited += stop - cursor;
+                            cursor = stop;
+                            if cursor == run_end {
+                                let slot = self.slot(identity)?;
+                                self.free_index_slot(slot);
+                                freed += range.page_count();
+                            }
+                        }
+                    }
+                    Some((identity, _, _)) => {
                         visited += 1;
-                    } else if depth != 0 && run_end == leaf_end {
-                        let slot = self.slot(identity)?;
-                        self.free_index_slot(slot);
-                        freed += range.page_count();
-                        cursor = run_end;
-                        visited += 1;
-                    } else {
-                        let stop = run_end.min(cursor + (budget - visited));
                         #[allow(
                             unsafe_code,
                             reason = "the manager owns its index nodes exclusively under `&mut self`"
                         )]
-                        // SAFETY: `deepest.node` is a leaf of this backing,
-                        // which the manager owns exclusively under
-                        // `&mut self`; the entries `[cursor, stop)` lie in it,
-                        // since `stop <= run_end <= leaf_end`.
+                        // SAFETY: `deepest.node` is a node of this backing, which
+                        // the manager owns exclusively under `&mut self`.
                         unsafe {
-                            memory.write_run(
-                                deepest.node,
-                                (cursor - leaf_first) as usize,
-                                (stop - cursor) as usize,
-                                0,
-                            )
+                            memory.write(deepest.node, deepest.entry, 0)
                         };
-                        visited += stop - cursor;
-                        cursor = stop;
-                        if cursor == run_end {
-                            let slot = self.slot(identity)?;
-                            self.free_index_slot(slot);
-                            freed += range.page_count();
-                        }
+                        let slot = self.slot(identity)?;
+                        self.free_index_slot(slot);
+                        freed += 1;
+                        cursor += 1;
+                    }
+                    None => {
+                        visited += 1;
+                        cursor = deepest
+                            .first_page
+                            .checked_add(entry_span(deepest.level))
+                            .ok_or(FrameRoleError::InvariantViolation)?
+                            .min(pages);
                     }
                 }
-                Some((identity, _, _)) => {
-                    visited += 1;
-                    #[allow(
-                        unsafe_code,
-                        reason = "the manager owns its index nodes exclusively under `&mut self`"
-                    )]
-                    // SAFETY: `deepest.node` is a node of this backing, which
-                    // the manager owns exclusively under `&mut self`.
-                    unsafe {
-                        memory.write(deepest.node, deepest.entry, 0)
-                    };
-                    let slot = self.slot(identity)?;
-                    self.free_index_slot(slot);
-                    freed += 1;
-                    cursor += 1;
+                if deepest.level != 0 || cursor >= leaf_end || visited >= budget {
+                    break;
                 }
-                None => {
-                    visited += 1;
-                    cursor = deepest
-                        .first_page
-                        .checked_add(entry_span(deepest.level))
-                        .ok_or(FrameRoleError::InvariantViolation)?
-                        .min(pages);
-                }
+                // `deepest` becomes the cursor's entry in the leaf.
+                let entry = (cursor - leaf_first) as usize;
+                deepest = IndexStep {
+                    entry,
+                    first_page: cursor,
+                    ..deepest
+                };
+                let raw = memory.read(deepest.node, entry);
+                found = if raw == 0 {
+                    if eager {
+                        return Err(FrameRoleError::WrongRole);
+                    }
+                    None
+                } else {
+                    let (identity, range, link) =
+                        self.index_entry(head, raw, false, cursor, eager)?;
+                    Some((identity, range, link.place))
+                };
             }
             // The node at each depth below the root is the child its parent
             // step's entry names; it ends where that entry's span ends.
@@ -1295,3 +1435,11 @@ mod tests;
 #[cfg(test)]
 #[path = "indexed_tests.rs"]
 mod indexed_tests;
+
+#[cfg(test)]
+#[path = "place_tests.rs"]
+mod place_tests;
+
+#[cfg(test)]
+#[path = "release_step_tests.rs"]
+mod release_step_tests;

@@ -416,7 +416,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// in increasing order costs one step per run crossed; an earlier page
     /// or a stale cursor restarts from the head. Every step checks its run
     /// against the head and the object page it starts at, so the cursor
-    /// grants nothing by itself.
+    /// grants nothing by itself. Under an index root the cursor's run and
+    /// leaf are tried before a walk ([`Self::index_resolve_at`]).
     pub(crate) fn resolve_at(
         &self,
         cursor: &mut BackingCursor,
@@ -430,7 +431,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let head = cursor.head;
         match self.head_kind_at(self.slot(head)?) {
             HeadKind::IndexRoot => {
-                let (run, physical_start) = self.index_resolve(head, page)?;
+                let (run, physical_start) = self.index_resolve_at(cursor, page)?;
                 return Ok(ObjectSegment {
                     run,
                     object_offset: offset,
