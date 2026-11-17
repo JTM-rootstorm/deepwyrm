@@ -567,3 +567,63 @@ fn model_page(roles: &Manager, raw: u64) -> u64 {
         .range
         .start
 }
+
+/// `model`, with node page `node` zeroed and entries `[3, 9)` written one
+/// at a time as `0x77`, so a run's writes land among others.
+fn run_model(node: u64) -> Model {
+    let model = Model::default();
+    #[allow(unsafe_code, reason = "the test owns its model's pages")]
+    // SAFETY: the model is the test's own; nothing else names its pages.
+    unsafe {
+        assert!(model.zero(node));
+        for entry in 3..9 {
+            model.write(node, entry, 0x77);
+        }
+    }
+    model
+}
+
+#[test]
+fn a_run_writes_what_its_entries_written_one_at_a_time_write() {
+    let node = 5 * PAGE;
+    for (first, count) in [(0, 1), (4, 3), (7, 0), (100, 312), (500, 12), (0, 512)] {
+        let by_run = run_model(node);
+        let by_entry = run_model(node);
+        #[allow(unsafe_code, reason = "the test owns its model's pages")]
+        // SAFETY: the models are the test's own; the run lies in the node.
+        unsafe {
+            by_run.write_run(node, first, count, 0x1234);
+            for entry in first..first + count {
+                by_entry.write(node, entry, 0x1234);
+            }
+        }
+        assert_eq!(
+            *by_run.entries.lock().unwrap(),
+            *by_entry.entries.lock().unwrap(),
+            "run of {count} from entry {first}"
+        );
+        for entry in 0..INDEX_FANOUT as usize {
+            let expected = if (first..first + count).contains(&entry) {
+                0x1234
+            } else if (3..9).contains(&entry) {
+                0x77
+            } else {
+                0
+            };
+            assert_eq!(by_run.read(node, entry), expected, "entry {entry}");
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "an index run lies in its node")]
+fn a_run_past_its_nodes_end_panics() {
+    let node = 5 * PAGE;
+    let model = run_model(node);
+    #[allow(unsafe_code, reason = "the test owns its model's pages")]
+    // SAFETY: the model is the test's own; the run is refused before any
+    // write.
+    unsafe {
+        model.write_run(node, 500, 13, 1)
+    };
+}

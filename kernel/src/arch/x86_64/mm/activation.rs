@@ -1933,9 +1933,10 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         unsafe { roles.adopt_storage(TABLE_MAP_BASE as *mut u8) }
             .map_err(|_| LiveActiveTargetError::InvalidIndex)?;
         // On-demand backings reach their index pages through the direct map
-        // (DW2 M6 §8.3).
+        // (DW2 M6 §8.3), once every allocator range is checked to lie in it.
         if let Some(direct) = self.target.scratch_bindings.direct {
-            roles.set_index_memory(DIRECT_MAP_INDEX_MEMORY.init(DirectMapIndexMemory(direct)));
+            let memory = DirectMapIndexMemory::new(direct, roles.allocator_ranges());
+            roles.set_index_memory(DIRECT_MAP_INDEX_MEMORY.init(memory));
         }
         Ok(FrameRoleGrowth {
             slots: layout.slot_count(),
@@ -2998,9 +2999,27 @@ pub(crate) unsafe fn activate_bootstrap_deep_paging<
 mod tests;
 
 /// On-demand index pages and committed pages, reached through the direct
-/// map (DW2 M6 §8.3). The role manager calls it only for pages it owns.
+/// map (DW2 M6 §8.3). The role manager calls it only for pages it owns, in
+/// an index role (the trait's contract), and those are allocator pages.
+///
+/// Checked once, when it is made ([`Self::new`]): every initial allocator
+/// range of the role manager lies inside one direct-map range, so every page
+/// the allocator can hand out, index nodes included, is mapped. Checked on
+/// every node access ([`Self::word`]): the entry lies in its node, and the
+/// node's page lies between the lowest mapped byte and the end of the highest
+/// mapped range, so no address, however wild, is added to
+/// the direct map's base to land in another kernel region. A page in a hole
+/// between two mapped ranges passes that check but is not mapped: an access
+/// to it faults. `zero` still looks its page up in the map.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-struct DirectMapIndexMemory(&'static crate::arch::x86_64::mm::direct_map::DirectMap);
+struct DirectMapIndexMemory {
+    map: &'static crate::arch::x86_64::mm::direct_map::DirectMap,
+    /// The lowest mapped physical byte.
+    lowest: u64,
+    /// The highest physical page start whose whole page lies at or below
+    /// the end of the highest mapped range.
+    last_page: u64,
+}
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static DIRECT_MAP_INDEX_MEMORY: crate::one_shot::OneShotStorage<DirectMapIndexMemory> =
@@ -3008,13 +3027,37 @@ static DIRECT_MAP_INDEX_MEMORY: crate::one_shot::OneShotStorage<DirectMapIndexMe
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl DirectMapIndexMemory {
+    /// Index memory over `map`, after checking that every initial allocator
+    /// range `allocator` names lies inside `map`; panics if one does not.
+    fn new(
+        map: &'static crate::arch::x86_64::mm::direct_map::DirectMap,
+        allocator: impl IntoIterator<Item = PhysicalRange>,
+    ) -> Self {
+        for range in allocator {
+            assert!(
+                map.contains(range.physical_start(), range.byte_len()),
+                "every initial allocator range lies in the direct map (DW2 M2)"
+            );
+        }
+        let ranges = map.ranges();
+        let (Some(&(lowest, _)), Some(&(_, highest_end))) = (ranges.first(), ranges.last()) else {
+            panic!("the direct map maps the allocator's RAM");
+        };
+        Self {
+            map,
+            lowest,
+            // A direct-map range is a whole, non-empty number of pages.
+            last_page: highest_end - PAGE_SIZE,
+        }
+    }
+
     fn word(&self, page: u64, entry: usize) -> *mut u64 {
         assert!(entry < ENTRY_COUNT, "an index entry lies in its node");
-        let base = self
-            .0
-            .virtual_address(page, PAGE_SIZE)
-            .expect("an index page is allocator RAM in the direct map");
-        (base as *mut u64).wrapping_add(entry)
+        assert!(
+            self.lowest <= page && page <= self.last_page,
+            "an index page lies within the direct map's extent"
+        );
+        (crate::arch::x86_64::mm::direct_map::DIRECT_MAP_BASE + page + 8 * entry as u64) as *mut u64
     }
 }
 
@@ -3025,18 +3068,42 @@ impl DirectMapIndexMemory {
 )]
 impl crate::memory::frame_roles::IndexMemory for DirectMapIndexMemory {
     fn read(&self, node: u64, entry: usize) -> u64 {
-        // SAFETY: the word lies in a whole direct-map page of a node the
-        // manager owns; nodes change only under its exclusive borrow.
+        // SAFETY: the role manager passes only a node page it owns in an
+        // index role, an allocator page, which the check in `new` proved
+        // mapped; `word` checked the entry lies in the page and the page in
+        // the direct map's extent. Nodes change only under the manager's
+        // exclusive borrow.
         unsafe { self.word(node, entry).read_volatile() }
     }
 
     unsafe fn write(&self, node: u64, entry: usize, value: u64) {
-        // SAFETY: the caller owns the node exclusively (trait contract).
+        // SAFETY: the caller owns the node exclusively (trait contract), an
+        // allocator page the check in `new` proved mapped; `word` checked the
+        // entry lies in the page and the page in the direct map's extent.
         unsafe { self.word(node, entry).write_volatile(value) }
     }
 
+    unsafe fn write_run(&self, node: u64, first_entry: usize, count: usize, value: u64) {
+        assert!(
+            first_entry
+                .checked_add(count)
+                .is_some_and(|end| end <= ENTRY_COUNT),
+            "an index run lies in its node"
+        );
+        // One address computation for the run; `word` checks the node page.
+        let base = self.word(node, 0);
+        for entry in first_entry..first_entry + count {
+            // SAFETY: as in `write`, for each entry of the run: the caller
+            // owns the node exclusively (trait contract), an allocator page
+            // the check in `new` proved mapped; `word` checked the page lies
+            // in the direct map's extent, and the entry is below
+            // `ENTRY_COUNT` (asserted above), so the word lies in the page.
+            unsafe { base.add(entry).write_volatile(value) };
+        }
+    }
+
     unsafe fn zero(&self, page: u64) -> bool {
-        let Some(address) = self.0.virtual_address(page, PAGE_SIZE) else {
+        let Some(address) = self.map.virtual_address(page, PAGE_SIZE) else {
             return false;
         };
         // SAFETY: a whole direct-map page the caller owns exclusively, with
