@@ -793,11 +793,22 @@ impl OwedBacking {
 /// order so each page costs one step instead of a walk from the head (DW2
 /// M3 §6.2). It holds no borrow and grants nothing: every step revalidates
 /// the run it names, and a stale place restarts from the head.
+///
+/// Under an index root (DW2 §12.12 item 5a) `run` and `run_page` name the
+/// run (eager) or committed page (on demand) last resolved and the object
+/// page it starts at, or the head when there is none, and `leaf` the leaf
+/// node last used and the first object page it covers. Each use checks the
+/// slot a place names by identity, its role, its owner and its place; a
+/// place that fails falls back to a walk from the root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BackingCursor {
     head: FrameRoleIdentity,
     run: FrameRoleIdentity,
     run_page: u64,
+    /// The index leaf last used: [`FrameRoleIdentity::EMPTY`] for none.
+    leaf: FrameRoleIdentity,
+    /// The first object page `leaf` covers.
+    leaf_first: u64,
 }
 
 impl BackingCursor {
@@ -806,6 +817,27 @@ impl BackingCursor {
             head: backing.0,
             run: backing.0,
             run_page: 0,
+            leaf: FrameRoleIdentity::EMPTY,
+            leaf_first: 0,
+        }
+    }
+
+    /// A cursor on `backing` holding any place, for host tests of a place
+    /// that does not belong to the backing.
+    #[cfg(test)]
+    pub(crate) const fn with_place(
+        backing: BackingIdentity,
+        run: FrameRoleIdentity,
+        run_page: u64,
+        leaf: FrameRoleIdentity,
+        leaf_first: u64,
+    ) -> Self {
+        Self {
+            head: backing.0,
+            run,
+            run_page,
+            leaf,
+            leaf_first,
         }
     }
 
