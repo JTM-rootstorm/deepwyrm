@@ -66,6 +66,28 @@ pub(crate) trait IndexMemory: Sync {
     /// does for a page in an index role while it holds `&mut self`.
     unsafe fn write(&self, node: u64, entry: usize, value: u64);
 
+    /// Writes `value` to entries `[first_entry, first_entry + count)` of the
+    /// node page at physical `node`, which must not pass the node's
+    /// [`INDEX_FANOUT`] entries (asserted). By default, one
+    /// [`Self::write`] per entry.
+    ///
+    /// # Safety
+    ///
+    /// [`Self::write`]'s, for every entry of the run.
+    unsafe fn write_run(&self, node: u64, first_entry: usize, count: usize, value: u64) {
+        assert!(
+            first_entry
+                .checked_add(count)
+                .is_some_and(|end| end <= INDEX_FANOUT as usize),
+            "an index run lies in its node"
+        );
+        for entry in first_entry..first_entry + count {
+            // SAFETY: the caller owns the node exclusively (this function's
+            // contract), and the entry lies in it (asserted above).
+            unsafe { self.write(node, entry, value) };
+        }
+    }
+
     /// Zeroes the whole base page at physical `page`, with any cache
     /// maintenance it needs, or returns `false`.
     ///
@@ -869,18 +891,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         visited += 1;
                     } else {
                         let stop = run_end.min(cursor + (budget - visited));
-                        for page in cursor..stop {
-                            #[allow(
-                                unsafe_code,
-                                reason = "the manager owns its index nodes exclusively under `&mut self`"
-                            )]
-                            // SAFETY: `deepest.node` is a leaf of this
-                            // backing, which the manager owns exclusively
-                            // under `&mut self`; the entry lies in it.
-                            unsafe {
-                                memory.write(deepest.node, (page - leaf_first) as usize, 0)
-                            };
-                        }
+                        #[allow(
+                            unsafe_code,
+                            reason = "the manager owns its index nodes exclusively under `&mut self`"
+                        )]
+                        // SAFETY: `deepest.node` is a leaf of this backing,
+                        // which the manager owns exclusively under
+                        // `&mut self`; the entries `[cursor, stop)` lie in it,
+                        // since `stop <= run_end <= leaf_end`.
+                        unsafe {
+                            memory.write_run(
+                                deepest.node,
+                                (cursor - leaf_first) as usize,
+                                (stop - cursor) as usize,
+                                0,
+                            )
+                        };
                         visited += stop - cursor;
                         cursor = stop;
                         if cursor == run_end {
@@ -1065,7 +1091,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         count: u64,
         leaf: &mut Option<(u64, u64)>,
     ) {
-        for page in first..first + count {
+        let end = first + count;
+        let mut page = first;
+        // One run of entries per leaf the pages reach.
+        while page < end {
             let number = page / INDEX_FANOUT;
             let node = match *leaf {
                 Some((known, node)) if known == number => node,
@@ -1075,17 +1104,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     node
                 }
             };
+            let segment_end = end.min((number + 1) * INDEX_FANOUT);
             #[allow(
                 unsafe_code,
                 reason = "the manager owns its index nodes exclusively under `&mut self`"
             )]
             // SAFETY: `node` is a leaf of this new index, which the manager
-            // owns exclusively under `&mut self`.
+            // owns exclusively under `&mut self`; pages `[page, segment_end)`
+            // lie in leaf `number`, so their entries lie in the node.
             unsafe {
-                index
-                    .memory
-                    .write(node, (page % INDEX_FANOUT) as usize, run.raw)
+                index.memory.write_run(
+                    node,
+                    (page % INDEX_FANOUT) as usize,
+                    (segment_end - page) as usize,
+                    run.raw,
+                )
             };
+            page = segment_end;
         }
     }
 
