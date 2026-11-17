@@ -254,13 +254,16 @@ impl FreeLink {
 
 /// The buddy allocator's per-page and per-range metadata, carved from the
 /// grown role table's run: `tags` and `links` have one entry per allocator
-/// page, `bases` one per initial range, and `hints` one per granule of the
-/// range lookup ([`PhysicalFrameAllocator::range_hint_count`]).
+/// page, `bases` one per initial range, `hints` one per granule of the
+/// range lookup ([`PhysicalFrameAllocator::range_hint_count`]), and
+/// `free_bits` one bit per allocator page, `tags.len().div_ceil(64)` words
+/// (DW2 large-memory plan, M7 §12.12).
 pub(super) struct BuddyStorage {
     pub(super) tags: &'static mut [u8],
     pub(super) links: &'static mut [FreeLink],
     pub(super) bases: &'static mut [u64],
     pub(super) hints: &'static mut [u32],
+    pub(super) free_bits: &'static mut [u64],
 }
 
 /// The frame allocator over sanitized, already-reserved physical ranges, in
@@ -579,13 +582,15 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
     /// Whether [`Self::adopt_buddy`] accepts storage of these lengths: this
     /// is the first adoption, `tags` and `links` hold one entry per initial
     /// frame, that count is below `u32::MAX`, `bases` holds one entry per
-    /// initial range, and `hints` [`Self::range_hint_count`] entries.
+    /// initial range, `hints` [`Self::range_hint_count`] entries, and
+    /// `free_bits` one bit per initial frame, `tags.div_ceil(64)` words.
     pub(super) fn accepts_buddy_storage(
         &self,
         tags: usize,
         links: usize,
         bases: usize,
         hints: usize,
+        free_bits: usize,
     ) -> bool {
         self.buddy.is_none()
             && tags == links
@@ -593,6 +598,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             && u32::try_from(tags).is_ok_and(|tags| tags < u32::MAX)
             && bases == self.initial_len
             && hints == self.range_hint_count()
+            && free_bits == tags.div_ceil(64)
     }
 
     /// The hints the buddy allocator's range lookup needs: one per granule
@@ -611,6 +617,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
             storage.links.len(),
             storage.bases.len(),
             storage.hints.len(),
+            storage.free_bits.len(),
         ) {
             return Err(storage);
         }
@@ -647,7 +654,7 @@ impl<const RANGE_CAPACITY: usize> PhysicalFrameAllocator<RANGE_CAPACITY> {
         None
     }
 
-    /// Checks the buddy allocator's invariants I1 to I6 (DW2 M7 §12.2); `Ok`
+    /// Checks the buddy allocator's invariants I1 to I7 (DW2 M7 §12.2); `Ok`
     /// before adoption. Linear in the allocator pages.
     pub(super) fn check_buddy(&self) -> Result<(), PhysicalMemoryError> {
         self.buddy.as_ref().map_or(Ok(()), |buddy| {

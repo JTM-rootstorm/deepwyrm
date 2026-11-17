@@ -23,6 +23,10 @@
 //!   above `g << hint_shift` (the first range that can hold an address in
 //!   granule `g`), or the range count if there is none, for every granule up
 //!   to the last initial range's last byte.
+//! - I7. `free_bits` has `tags.len().div_ceil(64)` words, one bit per
+//!   allocator page by position; a page's bit is set exactly while the page
+//!   lies inside a free block, and every bit at a position at or past
+//!   `tags.len()` is clear.
 //!
 //! Finding the initial range that holds an address starts at the hint of its
 //! granule and walks upward over the ranges that share the granule, so the
@@ -45,6 +49,8 @@ pub(super) struct Buddy {
     /// Per granule of 2^`hint_shift` bytes: the first initial range that
     /// can hold an address in it (I6).
     hints: &'static mut [u32],
+    /// One bit per allocator page, by position: set while free (I7).
+    free_bits: &'static mut [u64],
     hint_shift: u32,
     /// Per order: position + 1 of the first free block, 0 = empty.
     heads: [u32; BUDDY_ORDERS],
@@ -102,14 +108,57 @@ fn order_for(page_count: u64) -> Option<u32> {
         .filter(|order| *order <= MAX_ORDER)
 }
 
-/// Whether any of `tags[start..end]` is non-zero, eight at a time where the
-/// position is aligned.
-fn any_tag(tags: &[u8], start: usize, end: usize) -> bool {
-    let aligned = start.next_multiple_of(8).min(end);
-    let (words, rest) = tags[aligned..end].as_chunks::<8>();
-    tags[start..aligned].iter().any(|tag| *tag != 0)
-        || words.iter().any(|word| u64::from_ne_bytes(*word) != 0)
-        || rest.iter().any(|tag| *tag != 0)
+/// The edge masks of the bit range `[start, end)`, `start < end`: the
+/// words it spans and the masks of its first and last word.
+#[inline]
+const fn bit_span(start: usize, end: usize) -> (usize, usize, u64, u64) {
+    let last = end - 1;
+    (
+        start / 64,
+        last / 64,
+        !0_u64 << (start % 64),
+        !0_u64 >> (63 - last % 64),
+    )
+}
+
+/// Whether any bit of `[start, end)` is set; `end <= bits.len() * 64`.
+#[inline]
+fn bits_any(bits: &[u64], start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let (first, last, head, tail) = bit_span(start, end);
+    if first == last {
+        return bits[first] & head & tail != 0;
+    }
+    bits[first] & head != 0
+        || bits[first + 1..last].iter().any(|word| *word != 0)
+        || bits[last] & tail != 0
+}
+
+/// Sets (`set`) or clears every bit of `[start, end)`.
+#[inline]
+fn bits_update(bits: &mut [u64], start: usize, end: usize, set: bool) {
+    if start >= end {
+        return;
+    }
+    let (first, last, head, tail) = bit_span(start, end);
+    let apply = |word: &mut u64, mask: u64| {
+        if set {
+            *word |= mask;
+        } else {
+            *word &= !mask;
+        }
+    };
+    if first == last {
+        apply(&mut bits[first], head & tail);
+        return;
+    }
+    apply(&mut bits[first], head);
+    for word in &mut bits[first + 1..last] {
+        apply(word, !0);
+    }
+    apply(&mut bits[last], tail);
 }
 
 impl Buddy {
@@ -124,9 +173,11 @@ impl Buddy {
             links,
             bases,
             hints,
+            free_bits,
         } = storage;
         tags.fill(0);
         links.fill(FreeLink::EMPTY);
+        free_bits.fill(0);
         let mut base = 0_u64;
         for (entry, range) in bases.iter_mut().zip(initial) {
             *entry = base;
@@ -142,6 +193,7 @@ impl Buddy {
             links,
             bases,
             hints,
+            free_bits,
             hint_shift: shift,
             heads: [0; BUDDY_ORDERS],
             nonempty: 0,
@@ -153,6 +205,13 @@ impl Buddy {
                 .range_index(initial, range.start)
                 .expect("a boot free range lies inside one initial range");
             buddy.insert_range(initial, index, first_pfn(*range), range.page_count());
+            let start = buddy.position(initial, index, first_pfn(*range));
+            bits_update(
+                buddy.free_bits,
+                start,
+                start + range.page_count() as usize,
+                true,
+            );
             total += range.page_count();
         }
         buddy.free_pages = total;
@@ -276,6 +335,12 @@ impl Buddy {
     ) -> PageRange {
         let (index, pfn) = self.page_at(ranges, position);
         self.unlink(order, position);
+        bits_update(
+            self.free_bits,
+            position,
+            position + page_count as usize,
+            false,
+        );
         let block = 1_u64 << order;
         if block > page_count {
             self.insert_range(ranges, index, pfn + page_count, block - page_count);
@@ -360,34 +425,15 @@ impl Buddy {
             .range_index(ranges, range.start)
             .filter(|index| ranges[*index].contains(range))
             .ok_or(PhysicalMemoryError::InvalidFrame)?;
-        if self.overlaps_free_in(ranges, index, range) {
+        let pages = range.page_count() as usize;
+        let start = self.position(ranges, index, first_pfn(range));
+        if bits_any(self.free_bits, start, start + pages) {
             return Err(PhysicalMemoryError::DoubleFree);
         }
         self.insert_range(ranges, index, first_pfn(range), range.page_count());
+        bits_update(self.free_bits, start, start + pages, true);
         self.free_pages += range.page_count();
         Ok(())
-    }
-
-    /// Whether any page of `range`, a non-empty page range inside
-    /// `ranges[index]`, is free: exactly when a free block starts inside it,
-    /// or one starting below it reaches into it.
-    fn overlaps_free_in(&self, ranges: &[PageRange], index: usize, range: PageRange) -> bool {
-        let pfn = first_pfn(range);
-        let start = self.position(ranges, index, pfn);
-        if any_tag(self.tags, start, start + range.page_count() as usize) {
-            return true;
-        }
-        let low = first_pfn(ranges[index]);
-        for order in 1..=MAX_ORDER {
-            let head = pfn & !((1_u64 << order) - 1);
-            if head < low {
-                break;
-            }
-            if head < pfn && u32::from(self.tags[self.position(ranges, index, head)]) == order + 1 {
-                return true;
-            }
-        }
-        false
     }
 
     pub(super) fn overlaps_free(&self, ranges: &[PageRange], range: PageRange) -> bool {
@@ -401,8 +447,10 @@ impl Buddy {
                     start: range.start.max(initial.start),
                     end: range.end.min(initial.end),
                 };
-                clipped.start < clipped.end
-                    && self.overlaps_free_in(ranges, first + offset, clipped)
+                clipped.start < clipped.end && {
+                    let start = self.position(ranges, first + offset, first_pfn(clipped));
+                    bits_any(self.free_bits, start, start + clipped.page_count() as usize)
+                }
             })
     }
 
@@ -418,13 +466,15 @@ impl Buddy {
         self.free_pages
     }
 
-    /// Checks I1 to I6; any violation is reported as `InvalidFrame`.
+    /// Checks I1 to I7; any violation is reported as `InvalidFrame`.
     pub(super) fn check(&self, ranges: &[PageRange]) -> Result<(), PhysicalMemoryError> {
         const VIOLATION: Result<(), PhysicalMemoryError> = Err(PhysicalMemoryError::InvalidFrame);
         let total = ranges.iter().map(|range| range.page_count()).sum::<u64>();
         if self.bases.len() != ranges.len()
             || u64::try_from(self.tags.len()) != Ok(total)
             || self.links.len() != self.tags.len()
+            || self.free_bits.len() != self.tags.len().div_ceil(64)
+            || bits_any(self.free_bits, self.tags.len(), self.free_bits.len() * 64)
         {
             return VIOLATION;
         }
@@ -451,6 +501,10 @@ impl Buddy {
                 let position = self.position(ranges, index, pfn);
                 let tag = self.tags[position];
                 if tag == 0 {
+                    // I7: a page outside every free block has its bit clear.
+                    if bits_any(self.free_bits, position, position + 1) {
+                        return VIOLATION;
+                    }
                     pfn += 1;
                     continue;
                 }
@@ -478,6 +532,11 @@ impl Buddy {
                     {
                         return VIOLATION;
                     }
+                }
+                // I7: every page of a free block has its bit set.
+                if (position..position + size).any(|page| !bits_any(self.free_bits, page, page + 1))
+                {
+                    return VIOLATION;
                 }
                 blocks[order as usize] += 1;
                 pages += 1_u64 << order;

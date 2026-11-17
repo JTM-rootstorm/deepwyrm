@@ -37,14 +37,26 @@ fn boot_below<const N: usize>(
     PhysicalFrameAllocator::from_candidates(&candidates, limit, []).unwrap()
 }
 
-/// Leaked storage of the given lengths, filled with garbage `adopt_buddy`
-/// must overwrite.
+/// Leaked storage of the given lengths, with the free bitmap's right length
+/// for `tags`, filled with garbage `adopt_buddy` must overwrite.
 fn storage(tags: usize, links: usize, bases: usize, hints: usize) -> BuddyStorage {
+    storage_with_bits(tags, links, bases, hints, tags.div_ceil(64))
+}
+
+/// As [`storage`], with a free bitmap of `free_bits` words.
+fn storage_with_bits(
+    tags: usize,
+    links: usize,
+    bases: usize,
+    hints: usize,
+    free_bits: usize,
+) -> BuddyStorage {
     BuddyStorage {
         tags: Box::leak(vec![0xa5_u8; tags].into_boxed_slice()),
         links: Box::leak(vec![FreeLink { next: 7, prev: 9 }; links].into_boxed_slice()),
         bases: Box::leak(vec![u64::MAX; bases].into_boxed_slice()),
         hints: Box::leak(vec![u32::MAX; hints].into_boxed_slice()),
+        free_bits: Box::leak(vec![u64::MAX; free_bits].into_boxed_slice()),
     }
 }
 
@@ -153,7 +165,13 @@ fn storage_is_refused_at_u32_max_pages() {
         let allocator = Allocator::from_candidates(&[candidate], limit, []).unwrap();
         let count = usize::try_from(count).unwrap();
         assert_eq!(
-            allocator.accepts_buddy_storage(count, count, 1, allocator.range_hint_count()),
+            allocator.accepts_buddy_storage(
+                count,
+                count,
+                1,
+                allocator.range_hint_count(),
+                count.div_ceil(64)
+            ),
             accepted
         );
     }
@@ -725,5 +743,81 @@ fn a_wrong_hint_fails_the_check() {
             allocator.buddy.as_mut().unwrap().hints_mut()[granule] = original;
         }
     }
+    assert_eq!(allocator.check_buddy(), Ok(()));
+}
+
+#[test]
+fn adoption_refuses_a_free_bitmap_of_the_wrong_length() {
+    // 130 pages: three words, the last partly used.
+    let mut allocator = boot(&[(8, 64), (200, 66)]);
+    let frames = 130;
+    assert_eq!(allocator.initial_frames(), frames);
+    let hints = allocator.range_hint_count();
+    for words in [2, 4] {
+        assert!(
+            allocator
+                .adopt_buddy(storage_with_bits(130, 130, 2, hints, words))
+                .is_err(),
+            "{words} words"
+        );
+        assert_eq!(blocks(&allocator), []);
+        assert_eq!(allocator.available_frames(), frames);
+        assert_eq!(allocator.check_buddy(), Ok(()));
+    }
+    // The garbage in the right-length bitmap, the bits past the last page
+    // included, is cleared by the seeding.
+    assert!(
+        allocator
+            .adopt_buddy(storage_with_bits(130, 130, 2, hints, 3))
+            .is_ok()
+    );
+    assert_eq!(
+        blocks(&allocator),
+        [
+            (8, 3),
+            (16, 4),
+            (32, 5),
+            (64, 3),
+            (200, 3),
+            (208, 4),
+            (224, 5),
+            (256, 3),
+            (264, 1)
+        ]
+    );
+    assert_eq!(allocator.check_buddy(), Ok(()));
+}
+
+/// The free bitmap refuses a double free of a page inside a larger free
+/// block and a range overlapping a free block at its start, in its middle
+/// and at its end, changing nothing.
+#[test]
+fn the_free_bitmap_refuses_every_overlap_with_a_free_block() {
+    let mut allocator = adopted(&[(32, 32)]);
+    let all = allocator.allocate_run(32).unwrap();
+    assert_eq!(page_list(all), (32, 32));
+    allocator.free_run(pages(40, 8)).unwrap();
+    assert_eq!(blocks(&allocator), [(40, 3)]);
+    for (first, count) in [
+        (45, 1),
+        (41, 1),
+        (38, 4),
+        (42, 2),
+        (46, 4),
+        (36, 16),
+        (40, 8),
+    ] {
+        assert_eq!(
+            allocator.free_run(pages(first, count)),
+            Err(PhysicalMemoryError::DoubleFree),
+            "freeing {count} pages from {first}"
+        );
+        assert_eq!(blocks(&allocator), [(40, 3)]);
+        assert_eq!(allocator.available_frames(), 8);
+        assert_eq!(allocator.check_buddy(), Ok(()));
+    }
+    allocator.free_run(pages(32, 8)).unwrap();
+    allocator.free_run(pages(48, 16)).unwrap();
+    assert_eq!(blocks(&allocator), [(32, 5)]);
     assert_eq!(allocator.check_buddy(), Ok(()));
 }

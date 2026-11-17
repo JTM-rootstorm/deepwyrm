@@ -22,8 +22,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// The run the grown role table needs: one slot per page of allocator
     /// RAM beyond the boot slots, a start index entry
     /// per allocator page (DW2 M2 §5.3), and the buddy allocator's metadata:
-    /// a link pair and a tag per allocator page, a base per initial range and
-    /// a range-lookup hint per granule (DW2 M7 §12.2).
+    /// a link pair and a tag per allocator page, a base per initial range,
+    /// a range-lookup hint per granule (DW2 M7 §12.2), and a free bit per
+    /// allocator page in 64-bit words (DW2 M7 §12.12).
     pub(crate) fn grown_layout(&self) -> Result<RoleTableLayout, FrameRoleError> {
         let frames = self.allocator.initial_frames();
         let slots = usize::try_from(frames.div_ceil(GROWN_SLOT_PAGES))
@@ -51,7 +52,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .ok_or(FrameRoleError::Capacity)?;
         let tags_offset = after(hints_offset, hints, core::mem::size_of::<u32>())
             .ok_or(FrameRoleError::Capacity)?;
-        let bytes = after(tags_offset, starts, core::mem::size_of::<u8>())
+        let free_bits = starts.div_ceil(64);
+        let free_bits_offset = after(tags_offset, starts, core::mem::size_of::<u8>())
+            .ok_or(FrameRoleError::Capacity)?;
+        let bytes = after(free_bits_offset, free_bits, core::mem::size_of::<u64>())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(FrameRoleError::Capacity)?;
         Ok(RoleTableLayout {
@@ -64,6 +68,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             hints_offset,
             hints,
             tags_offset,
+            free_bits_offset,
+            free_bits,
             bytes,
         })
     }
@@ -174,6 +180,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 layout.starts,
                 layout.bases,
                 layout.hints,
+                layout.free_bits,
             )
             && (base as usize).is_multiple_of(8);
         if !valid {
@@ -192,6 +199,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     bases: Self::carve(base, layout.bases_offset, layout.bases, 0_u64),
                     hints: Self::carve(base, layout.hints_offset, layout.hints, 0_u32),
                     tags: Self::carve(base, layout.tags_offset, layout.starts, 0_u8),
+                    free_bits: Self::carve(base, layout.free_bits_offset, layout.free_bits, 0_u64),
                 },
             )
         };
