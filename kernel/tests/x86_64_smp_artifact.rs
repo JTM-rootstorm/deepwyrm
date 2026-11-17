@@ -18,20 +18,7 @@ const PAGE_SIZE: u64 = 4096;
 
 #[test]
 fn h1_trampoline_template_is_one_page_and_relocation_free() {
-    // `assemble_source` reads DEEPWYRM_CLANG itself; this verifies it first.
-    host_tools::clang();
-
-    let layout_source = fs::read_to_string(kernel_root().join("arch/x86_64/layout.toml"))
-        .expect("read canonical layout manifest");
-    let layout =
-        kernel_build::Layout::parse(&layout_source).expect("parse canonical layout manifest");
-    let temporary = TemporaryDirectory::new("deepwyrm-h1-ap-trampoline");
-    let object = temporary.path.join("ap-trampoline.o");
-
-    kernel_build::assemble_source(&assembly_path(), &object, layout)
-        .expect("assemble the AP trampoline through the production build helper");
-
-    let object = fs::read(&object).expect("read AP trampoline object");
+    let object = assembled_trampoline_object("deepwyrm-h1-ap-trampoline");
     let elf = Elf::parse(&object);
     let template = elf
         .section_named(".rodata.ap_trampoline_template")
@@ -83,6 +70,81 @@ fn h1_trampoline_template_is_one_page_and_relocation_free() {
             relocation.section_name, relocation.entry_index
         );
     }
+}
+
+#[test]
+fn trampoline_gdt_descriptors_are_present_and_pre_accessed() {
+    // The AP loads CS from selector 0x18 after CR0.PG|WP while the trampoline
+    // page is mapped read-only; a clear accessed bit makes the CPU write the
+    // table and fault. Every non-null descriptor must arrive already accessed.
+    const PRESENT: u64 = 1 << 47;
+    const ACCESSED: u64 = 1 << 40;
+    const DESCRIPTOR_SIZE: usize = 8;
+
+    let object = assembled_trampoline_object("deepwyrm-m8-ap-trampoline-gdt");
+    let elf = Elf::parse(&object);
+    let template = elf
+        .section_named(".rodata.ap_trampoline_template")
+        .expect("AP trampoline template section");
+    let bytes = checked_slice(
+        &object,
+        template.offset as usize,
+        template.size as usize,
+        "AP trampoline template bytes",
+    );
+    let template_offset = |name: &str| -> usize {
+        let symbol = elf.symbol(name);
+        assert_eq!(
+            symbol.section_index, template.index,
+            "{name} escaped template"
+        );
+        (symbol.value - template.address) as usize
+    };
+    let gdt = template_offset("__dw_ap_trampoline_gdt");
+    // The `lgdt` operand is a 16-bit limit followed by the base patch.
+    let limit = u16_at(bytes, template_offset("__dw_ap_trampoline_gdt_base") - 2);
+    let gdt_len = usize::from(limit) + 1;
+    assert!(
+        gdt_len >= 4 * DESCRIPTOR_SIZE && gdt_len.is_multiple_of(DESCRIPTOR_SIZE),
+        "AP trampoline GDT limit {limit} does not cover whole descriptors through selector 0x18"
+    );
+    let table = checked_slice(bytes, gdt, gdt_len, "AP trampoline GDT");
+    let descriptors = table.as_chunks::<DESCRIPTOR_SIZE>().0;
+    assert_eq!(
+        u64::from_le_bytes(descriptors[0]),
+        0,
+        "GDT entry 0 must be null"
+    );
+    for (index, descriptor) in descriptors.iter().enumerate().skip(1) {
+        let descriptor = u64::from_le_bytes(*descriptor);
+        assert_ne!(
+            descriptor & PRESENT,
+            0,
+            "AP trampoline GDT entry {index} ({descriptor:#018x}) is not present"
+        );
+        assert_ne!(
+            descriptor & ACCESSED,
+            0,
+            "AP trampoline GDT entry {index} ({descriptor:#018x}) has its accessed bit clear"
+        );
+    }
+}
+
+fn assembled_trampoline_object(label: &str) -> Vec<u8> {
+    // `assemble_source` reads DEEPWYRM_CLANG itself; this verifies it first.
+    host_tools::clang();
+
+    let layout_source = fs::read_to_string(kernel_root().join("arch/x86_64/layout.toml"))
+        .expect("read canonical layout manifest");
+    let layout =
+        kernel_build::Layout::parse(&layout_source).expect("parse canonical layout manifest");
+    let temporary = TemporaryDirectory::new(label);
+    let object = temporary.path.join("ap-trampoline.o");
+
+    kernel_build::assemble_source(&assembly_path(), &object, layout)
+        .expect("assemble the AP trampoline through the production build helper");
+
+    fs::read(&object).expect("read AP trampoline object")
 }
 
 fn kernel_root() -> PathBuf {
