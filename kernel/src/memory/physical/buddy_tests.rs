@@ -516,7 +516,9 @@ fn a_model_of_mixed_allocations_and_frees_agrees_with_the_buddy_allocator() {
     }
     let mut random = Lcg(0x05ee_d0dd_5b0d_d1e5);
     let mut live: Vec<PageRange> = Vec::new();
+    let mut released: Vec<PageRange> = Vec::new();
     let (mut allocated, mut refused, mut freed) = (0, 0, 0);
+    let (mut double_frees, mut partial_frees) = (0, 0);
     for step in 0..4000 {
         let choice = random.below(100);
         if choice < 55 || live.is_empty() {
@@ -555,24 +557,63 @@ fn a_model_of_mixed_allocations_and_frees_agrees_with_the_buddy_allocator() {
         } else if choice < 92 {
             let index = random.below(live.len() as u64) as usize;
             let run = live.swap_remove(index);
+            assert!(!allocator.overlaps_free(run), "step {step}");
             allocator.free_run(run).unwrap();
             model.set(run, true);
+            released.push(run);
             freed += 1;
         } else {
-            // A free overlapping a free page is refused and changes nothing.
+            // A free overlapping a free page is refused and changes nothing:
+            // a free page alone, a range around a free page reaching into
+            // the pages beside it, or a run freed earlier of which a page is
+            // still free (all of it: a double free; some: a partial one).
             let free_pages: Vec<u64> = (0..model.free.len() as u64)
                 .filter(|page| model.free[*page as usize])
                 .collect();
-            if let Some(page) =
-                free_pages.get(random.below(free_pages.len().max(1) as u64) as usize)
-            {
+            let page = free_pages
+                .get(random.below(free_pages.len().max(1) as u64) as usize)
+                .copied();
+            let candidate = match (random.below(3), page) {
+                (0, Some(page)) => Some(pages(page, 1)),
+                (1, Some(page)) => {
+                    let (first, count) = *model
+                        .ranges
+                        .iter()
+                        .find(|(first, count)| (*first..first + count).contains(&page))
+                        .unwrap();
+                    let low = page.saturating_sub(random.below(6)).max(first);
+                    let high = (page + 1 + random.below(6)).min(first + count);
+                    Some(pages(low, high - low))
+                }
+                _ => {
+                    let stale: Vec<PageRange> = released
+                        .iter()
+                        .copied()
+                        .filter(|run| {
+                            (run.start / PAGE..run.end / PAGE).any(|page| model.free[page as usize])
+                        })
+                        .collect();
+                    stale
+                        .get(random.below(stale.len().max(1) as u64) as usize)
+                        .copied()
+                }
+            };
+            if let Some(run) = candidate {
                 let before = blocks(&allocator);
-                let run = pages(*page, 1);
+                assert!(allocator.overlaps_free(run), "step {step}");
                 assert_eq!(
                     allocator.free_run(run),
-                    Err(PhysicalMemoryError::DoubleFree)
+                    Err(PhysicalMemoryError::DoubleFree),
+                    "step {step}: pages {}..+{}",
+                    run.start / PAGE,
+                    run.page_count()
                 );
-                assert_eq!(blocks(&allocator), before);
+                assert_eq!(blocks(&allocator), before, "step {step}");
+                if (run.start / PAGE..run.end / PAGE).all(|page| model.free[page as usize]) {
+                    double_frees += 1;
+                } else {
+                    partial_frees += 1;
+                }
             }
         }
         assert_eq!(allocator.check_buddy(), Ok(()), "step {step}");
@@ -588,6 +629,10 @@ fn a_model_of_mixed_allocations_and_frees_agrees_with_the_buddy_allocator() {
         );
     }
     assert!(allocated > 1000 && refused > 10 && freed > 1000);
+    assert!(
+        double_frees > 50 && partial_frees > 50,
+        "{double_frees} double and {partial_frees} partial frees"
+    );
     for run in live {
         allocator.free_run(run).unwrap();
     }

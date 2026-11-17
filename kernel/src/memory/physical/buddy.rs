@@ -31,6 +31,19 @@
 //! Finding the initial range that holds an address starts at the hint of its
 //! granule and walks upward over the ranges that share the granule, so the
 //! common case costs one or two comparisons.
+//!
+//! The paths index the slices without bounds checks (DW2 M7 §12.12 part 2
+//! item 4: measured faster than the bounds-checked form and than C). Every
+//! unchecked index is a position below `tags.len()` (`links` has that
+//! length, and `free_bits` covers it by I7), an order at most `MAX_ORDER`,
+//! a range index below `bases.len()`, or a hint index just compared
+//! against `hints.len()`. Positions come from the lists and tags, which
+//! only this module writes (I1 to I7), or from a caller's range that
+//! `range_index` has placed inside one initial range. The one fact this
+//! module cannot establish is that the `ranges` a method is given are the
+//! initial ranges the allocator was seeded with, so every method that takes
+//! `ranges` and reaches an unchecked index is `unsafe` with that as its
+//! requirement. Each helper `debug_assert!`s its preconditions.
 
 use super::{BASE_PAGE_SIZE, BuddyStorage, FreeLink, PageRange, PhysicalMemoryError};
 
@@ -121,53 +134,27 @@ const fn bit_span(start: usize, end: usize) -> (usize, usize, u64, u64) {
     )
 }
 
-/// Whether any bit of `[start, end)` is set; `end <= bits.len() * 64`.
-#[inline]
-fn bits_any(bits: &[u64], start: usize, end: usize) -> bool {
-    if start >= end {
-        return false;
-    }
-    let (first, last, head, tail) = bit_span(start, end);
-    if first == last {
-        return bits[first] & head & tail != 0;
-    }
-    bits[first] & head != 0
-        || bits[first + 1..last].iter().any(|word| *word != 0)
-        || bits[last] & tail != 0
-}
-
-/// Sets (`set`) or clears every bit of `[start, end)`.
-#[inline]
-fn bits_update(bits: &mut [u64], start: usize, end: usize, set: bool) {
-    if start >= end {
-        return;
-    }
-    let (first, last, head, tail) = bit_span(start, end);
-    let apply = |word: &mut u64, mask: u64| {
-        if set {
-            *word |= mask;
-        } else {
-            *word &= !mask;
-        }
-    };
-    if first == last {
-        apply(&mut bits[first], head & tail);
-        return;
-    }
-    apply(&mut bits[first], head);
-    for word in &mut bits[first + 1..last] {
-        apply(word, !0);
-    }
-    apply(&mut bits[last], tail);
-}
-
+#[allow(
+    unsafe_code,
+    reason = "the buddy's paths index its per-page slices without bounds checks under I1 to I7 (DW2 M7 §12.12)"
+)]
 impl Buddy {
     /// Takes `storage` and frees every range of `free` (the boot free list)
-    /// into it, in order. The caller has checked the storage's lengths
-    /// against `initial` (`accepts_buddy_storage`), and every free range lies
-    /// inside one initial range: the initial ranges never touch, since the
-    /// boot list merges touching ranges and a reservation leaves a gap.
-    pub(super) fn seed(storage: BuddyStorage, initial: &[PageRange], free: &[PageRange]) -> Self {
+    /// into it, in order.
+    ///
+    /// # Safety
+    ///
+    /// `initial` must be the allocator's initial ranges (page-aligned, in
+    /// address order, never touching), and the storage's lengths must be
+    /// the ones `accepts_buddy_storage` accepts for them. Every free range
+    /// lies inside one initial range, since the initial ranges never touch:
+    /// the boot list merges touching ranges and a reservation leaves a gap;
+    /// a range that does not is a panic before anything is inserted for it.
+    pub(super) unsafe fn seed(
+        storage: BuddyStorage,
+        initial: &[PageRange],
+        free: &[PageRange],
+    ) -> Self {
         let BuddyStorage {
             tags,
             links,
@@ -175,6 +162,8 @@ impl Buddy {
             hints,
             free_bits,
         } = storage;
+        debug_assert_eq!(bases.len(), initial.len());
+        debug_assert_eq!(free_bits.len(), tags.len().div_ceil(64));
         tags.fill(0);
         links.fill(FreeLink::EMPTY);
         free_bits.fill(0);
@@ -203,15 +192,25 @@ impl Buddy {
         for range in free {
             let index = buddy
                 .range_index(initial, range.start)
+                .filter(|index| initial[*index].contains(*range))
                 .expect("a boot free range lies inside one initial range");
-            buddy.insert_range(initial, index, first_pfn(*range), range.page_count());
-            let start = buddy.position(initial, index, first_pfn(*range));
-            bits_update(
-                buddy.free_bits,
-                start,
-                start + range.page_count() as usize,
-                true,
-            );
+            // SAFETY: `initial` is the seeded slice and the free range lies
+            // inside `initial[index]`, as just checked.
+            unsafe {
+                buddy.insert_range(initial, index, first_pfn(*range), range.page_count());
+            }
+            // SAFETY: as above; the range's first page is inside it.
+            let start = unsafe { buddy.position(initial, index, first_pfn(*range)) };
+            // SAFETY: the range's positions run from `start` to at most
+            // `tags.len()`, which is at most `free_bits.len() * 64` (I7).
+            unsafe {
+                Self::bits_update(
+                    buddy.free_bits,
+                    start,
+                    start + range.page_count() as usize,
+                    true,
+                );
+            }
             total += range.page_count();
         }
         buddy.free_pages = total;
@@ -219,11 +218,19 @@ impl Buddy {
     }
 
     /// The initial range holding `physical`: from the hint of its granule,
-    /// upward over the ranges that can still hold it.
+    /// upward over the ranges that can still hold it. Returns only indices
+    /// below `ranges.len()`.
+    #[inline]
     pub(super) fn range_index(&self, ranges: &[PageRange], physical: u64) -> Option<usize> {
         let granule = usize::try_from(physical >> self.hint_shift).ok()?;
-        let mut index = *self.hints.get(granule)? as usize;
-        while let Some(range) = ranges.get(index) {
+        if granule >= self.hints.len() {
+            return None;
+        }
+        // SAFETY: `granule < hints.len()` was just checked.
+        let mut index = unsafe { *self.hints.get_unchecked(granule) } as usize;
+        while index < ranges.len() {
+            // SAFETY: `index < ranges.len()` is the loop condition.
+            let range = unsafe { ranges.get_unchecked(index) };
             if range.start > physical {
                 return None;
             }
@@ -236,17 +243,40 @@ impl Buddy {
     }
 
     /// The position of the page at `pfn`, which lies inside `ranges[index]`.
-    fn position(&self, ranges: &[PageRange], index: usize, pfn: u64) -> usize {
-        (self.bases[index] + (pfn - first_pfn(ranges[index]))) as usize
+    /// With `ranges` the seeded slice, it is below `tags.len()`.
+    ///
+    /// # Safety
+    ///
+    /// `index < ranges.len()` and `ranges.len() == bases.len()`.
+    #[inline]
+    unsafe fn position(&self, ranges: &[PageRange], index: usize, pfn: u64) -> usize {
+        debug_assert!(index < ranges.len() && ranges.len() == self.bases.len());
+        debug_assert!(pfn >= first_pfn(ranges[index]) && pfn < end_pfn(ranges[index]));
+        // SAFETY: `index < ranges.len() == bases.len()` (caller).
+        let base = unsafe { *self.bases.get_unchecked(index) };
+        // SAFETY: as above.
+        let first = first_pfn(unsafe { *ranges.get_unchecked(index) });
+        (base + (pfn - first)) as usize
     }
 
     /// The initial range and the page number of the page at `position`.
-    fn page_at(&self, ranges: &[PageRange], position: usize) -> (usize, u64) {
+    ///
+    /// # Safety
+    ///
+    /// `position < tags.len()` and `ranges` is the seeded slice, so
+    /// `ranges.len() == bases.len()`.
+    #[inline]
+    unsafe fn page_at(&self, ranges: &[PageRange], position: usize) -> (usize, u64) {
+        debug_assert!(position < self.tags.len());
+        debug_assert_eq!(ranges.len(), self.bases.len());
         let index = self.bases.partition_point(|base| *base <= position as u64) - 1;
-        (
-            index,
-            first_pfn(ranges[index]) + (position as u64 - self.bases[index]),
-        )
+        // SAFETY: there is a page, so a range: `bases[0] == 0 <= position`,
+        // the partition point is at least 1, and `index < bases.len() ==
+        // ranges.len()` (caller).
+        let range = unsafe { *ranges.get_unchecked(index) };
+        // SAFETY: as above.
+        let base = unsafe { *self.bases.get_unchecked(index) };
+        (index, first_pfn(range) + (position as u64 - base))
     }
 
     pub(super) fn page_position(&self, ranges: &[PageRange], physical: u64) -> Option<usize> {
@@ -255,44 +285,83 @@ impl Buddy {
     }
 
     /// Puts the free block at `position` on the head of list `order`.
-    fn push(&mut self, order: u32, position: usize) {
+    ///
+    /// # Safety
+    ///
+    /// `position < tags.len()` and `order <= MAX_ORDER`.
+    #[inline]
+    unsafe fn push(&mut self, order: u32, position: usize) {
+        debug_assert!(position < self.tags.len() && order <= MAX_ORDER);
         let link = position as u32 + 1;
-        let head = self.heads[order as usize];
-        self.links[position] = FreeLink {
-            next: head,
-            prev: 0,
-        };
-        if head != 0 {
-            self.links[head as usize - 1].prev = link;
+        // SAFETY: `order <= MAX_ORDER < BUDDY_ORDERS` (caller).
+        let head = unsafe { *self.heads.get_unchecked(order as usize) };
+        // SAFETY: `position < tags.len() == links.len()` (caller).
+        unsafe {
+            *self.links.get_unchecked_mut(position) = FreeLink {
+                next: head,
+                prev: 0,
+            };
         }
-        self.heads[order as usize] = link;
+        if head != 0 {
+            // SAFETY: a non-zero head is a free block's position + 1 (I3),
+            // a position below `links.len()`.
+            unsafe { self.links.get_unchecked_mut(head as usize - 1).prev = link };
+        }
+        // SAFETY: as for `head` above.
+        unsafe { *self.heads.get_unchecked_mut(order as usize) = link };
         self.nonempty |= 1 << order;
-        self.tags[position] = order as u8 + 1;
+        // SAFETY: `position < tags.len()` (caller).
+        unsafe { *self.tags.get_unchecked_mut(position) = order as u8 + 1 };
     }
 
     /// Takes the free block at `position` off list `order` and clears its tag.
-    fn unlink(&mut self, order: u32, position: usize) {
-        let FreeLink { next, prev } = self.links[position];
+    ///
+    /// # Safety
+    ///
+    /// `position` is a free block of `order` on its list (I3), so
+    /// `position < tags.len()` and `order <= MAX_ORDER`.
+    #[inline]
+    unsafe fn unlink(&mut self, order: u32, position: usize) {
+        debug_assert!(order <= MAX_ORDER && position < self.tags.len());
+        debug_assert_eq!(u32::from(self.tags[position]), order + 1);
+        // SAFETY: `position < links.len()` (caller).
+        let FreeLink { next, prev } = unsafe { *self.links.get_unchecked(position) };
         if prev == 0 {
-            self.heads[order as usize] = next;
+            // SAFETY: `order <= MAX_ORDER < BUDDY_ORDERS` (caller).
+            unsafe { *self.heads.get_unchecked_mut(order as usize) = next };
         } else {
-            self.links[prev as usize - 1].next = next;
+            // SAFETY: a non-zero link is a listed block's position + 1 (I3).
+            unsafe { self.links.get_unchecked_mut(prev as usize - 1).next = next };
         }
         if next != 0 {
-            self.links[next as usize - 1].prev = prev;
+            // SAFETY: as for `prev`.
+            unsafe { self.links.get_unchecked_mut(next as usize - 1).prev = prev };
         }
-        if self.heads[order as usize] == 0 {
+        // SAFETY: as for the head write above.
+        if unsafe { *self.heads.get_unchecked(order as usize) } == 0 {
             self.nonempty &= !(1 << order);
         }
-        self.links[position] = FreeLink::EMPTY;
-        self.tags[position] = 0;
+        // SAFETY: `position < links.len() == tags.len()` (caller).
+        unsafe {
+            *self.links.get_unchecked_mut(position) = FreeLink::EMPTY;
+            *self.tags.get_unchecked_mut(position) = 0;
+        }
     }
 
     /// Frees the aligned block of 2^`order` pages at `pfn`, inside
     /// `ranges[index]`, merging it with its free buddies while the merged
     /// block stays inside that range.
-    fn insert_block(&mut self, ranges: &[PageRange], index: usize, pfn: u64, order: u32) {
-        let range = ranges[index];
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the seeded slice, `index < ranges.len()`, `order <=
+    /// MAX_ORDER`, and the block lies inside `ranges[index]`.
+    #[inline]
+    unsafe fn insert_block(&mut self, ranges: &[PageRange], index: usize, pfn: u64, order: u32) {
+        debug_assert!(index < ranges.len() && ranges.len() == self.bases.len());
+        debug_assert!(order <= MAX_ORDER && block_inside(ranges[index], pfn, order));
+        // SAFETY: `index < ranges.len()` (caller).
+        let range = unsafe { *ranges.get_unchecked(index) };
         let (mut pfn, mut order) = (pfn, order);
         while order < MAX_ORDER {
             let buddy = pfn ^ (1_u64 << order);
@@ -300,25 +369,47 @@ impl Buddy {
             if !block_inside(range, merged, order + 1) {
                 break;
             }
-            let position = self.position(ranges, index, buddy);
-            if u32::from(self.tags[position]) != order + 1 {
+            // SAFETY: the merged block, and with it `buddy`, lies inside
+            // `ranges[index]`.
+            let position = unsafe { self.position(ranges, index, buddy) };
+            // SAFETY: a page of a seeded range has a position below
+            // `tags.len()`.
+            if u32::from(unsafe { *self.tags.get_unchecked(position) }) != order + 1 {
                 break;
             }
-            self.unlink(order, position);
+            // SAFETY: a tag of `order + 1` marks a listed free block of
+            // `order` (I1, I3), and `order < MAX_ORDER`.
+            unsafe { self.unlink(order, position) };
             pfn = merged;
             order += 1;
         }
-        let position = self.position(ranges, index, pfn);
-        self.push(order, position);
+        // SAFETY: `pfn` starts a block inside `ranges[index]`.
+        let position = unsafe { self.position(ranges, index, pfn) };
+        // SAFETY: `position < tags.len()`, as for the buddy above, and
+        // `order <= MAX_ORDER`.
+        unsafe { self.push(order, position) };
     }
 
     /// Frees `pages` pages from `pfn`, inside `ranges[index]`, as maximal
     /// aligned blocks. Never touches `free_pages`; its callers do.
-    fn insert_range(&mut self, ranges: &[PageRange], index: usize, pfn: u64, pages: u64) {
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the seeded slice, `index < ranges.len()`, and the pages
+    /// lie inside `ranges[index]`.
+    #[inline]
+    unsafe fn insert_range(&mut self, ranges: &[PageRange], index: usize, pfn: u64, pages: u64) {
+        debug_assert!(index < ranges.len() && ranges.len() == self.bases.len());
+        debug_assert!(
+            pages == 0
+                || (pfn >= first_pfn(ranges[index]) && pfn + pages <= end_pfn(ranges[index]))
+        );
         let (mut pfn, mut pages) = (pfn, pages);
         while pages > 0 {
             let order = pfn.trailing_zeros().min(pages.ilog2()).min(MAX_ORDER);
-            self.insert_block(ranges, index, pfn, order);
+            // SAFETY: the block of 2^order pages at `pfn` lies inside the
+            // caller's pages, so inside `ranges[index]`.
+            unsafe { self.insert_block(ranges, index, pfn, order) };
             pfn += 1_u64 << order;
             pages -= 1_u64 << order;
         }
@@ -326,24 +417,41 @@ impl Buddy {
 
     /// Takes the free block of `order` at `position`: its first `page_count`
     /// pages are the run, the rest goes back at once.
-    fn take(
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the seeded slice, `position` is a listed free block of
+    /// `order` (so `position < tags.len()`, `order <= MAX_ORDER`), and
+    /// `page_count <= 2^order`.
+    #[inline]
+    unsafe fn take(
         &mut self,
         ranges: &[PageRange],
         order: u32,
         position: usize,
         page_count: u64,
     ) -> PageRange {
-        let (index, pfn) = self.page_at(ranges, position);
-        self.unlink(order, position);
-        bits_update(
-            self.free_bits,
-            position,
-            position + page_count as usize,
-            false,
-        );
+        debug_assert!(ranges.len() == self.bases.len() && position < self.tags.len());
+        debug_assert!(order <= MAX_ORDER && page_count <= 1_u64 << order);
+        debug_assert_eq!(u32::from(self.tags[position]), order + 1);
+        // SAFETY: a listed block's position is below `tags.len()` (I3).
+        let (index, pfn) = unsafe { self.page_at(ranges, position) };
+        // SAFETY: the block is listed at `order` (caller).
+        unsafe { self.unlink(order, position) };
+        // SAFETY: the run's positions lie in the block, below `tags.len()`
+        // (I1), so below `free_bits.len() * 64` (I7).
+        unsafe {
+            Self::bits_update(
+                self.free_bits,
+                position,
+                position + page_count as usize,
+                false,
+            );
+        }
         let block = 1_u64 << order;
         if block > page_count {
-            self.insert_range(ranges, index, pfn + page_count, block - page_count);
+            // SAFETY: the rest of the block lies inside `ranges[index]` (I1).
+            unsafe { self.insert_range(ranges, index, pfn + page_count, block - page_count) };
         }
         self.free_pages -= page_count;
         PageRange {
@@ -353,29 +461,46 @@ impl Buddy {
     }
 
     /// `page_count` is non-zero and its byte length does not overflow.
-    pub(super) fn allocate_run(
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the slice of initial ranges the buddy was seeded with:
+    /// the same length as `bases` and the same contents.
+    pub(super) unsafe fn allocate_run(
         &mut self,
         ranges: &[PageRange],
         page_count: u64,
     ) -> Result<PageRange, PhysicalMemoryError> {
+        debug_assert_eq!(ranges.len(), self.bases.len());
         let order = order_for(page_count).ok_or(PhysicalMemoryError::NoFramesAvailable)?;
         let available = self.nonempty >> order;
         if available == 0 {
             return Err(PhysicalMemoryError::NoFramesAvailable);
         }
         let found = order + available.trailing_zeros();
-        let position = self.heads[found as usize] as usize - 1;
-        Ok(self.take(ranges, found, position, page_count))
+        // SAFETY: `nonempty` has no bit at or above BUDDY_ORDERS (I3), so
+        // `found <= MAX_ORDER`.
+        let position = unsafe { *self.heads.get_unchecked(found as usize) } as usize - 1;
+        // SAFETY: bit `found` of `nonempty` is set, so its head is a listed
+        // block of order `found >= order`, which holds `page_count` pages
+        // (I3); `ranges` is the seeded slice (caller).
+        Ok(unsafe { self.take(ranges, found, position, page_count) })
     }
 
     /// `page_count` is non-zero and its byte length does not overflow;
     /// `ceiling` is already bounded by the physical limit.
-    pub(super) fn allocate_run_below(
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the slice of initial ranges the buddy was seeded with:
+    /// the same length as `bases` and the same contents.
+    pub(super) unsafe fn allocate_run_below(
         &mut self,
         ranges: &[PageRange],
         page_count: u64,
         ceiling: u64,
     ) -> Result<PageRange, PhysicalMemoryError> {
+        debug_assert_eq!(ranges.len(), self.bases.len());
         let order = order_for(page_count).ok_or(PhysicalMemoryError::NoFramesAvailable)?;
         let fits = |pfn: u64| {
             pfn.checked_add(page_count)
@@ -387,9 +512,15 @@ impl Buddy {
             if self.nonempty & (1_u64 << found) == 0 {
                 continue;
             }
-            let position = self.heads[found as usize] as usize - 1;
-            if fits(self.page_at(ranges, position).1) {
-                return Ok(self.take(ranges, found, position, page_count));
+            // SAFETY: `found <= MAX_ORDER < BUDDY_ORDERS`.
+            let position = unsafe { *self.heads.get_unchecked(found as usize) } as usize - 1;
+            // SAFETY: bit `found` of `nonempty` is set, so its head is a
+            // listed block (I3), whose position is below `tags.len()`;
+            // `ranges` is the seeded slice (caller).
+            if fits(unsafe { self.page_at(ranges, position) }.1) {
+                // SAFETY: that block is listed at `found >= order`, so it
+                // holds `page_count` pages.
+                return Ok(unsafe { self.take(ranges, found, position, page_count) });
             }
         }
         // Then the tags upward from the lowest allocator page.
@@ -399,13 +530,20 @@ impl Buddy {
                 if !fits(pfn) {
                     return Err(PhysicalMemoryError::NoFramesAvailable);
                 }
-                let position = self.position(ranges, index, pfn);
-                match self.tags[position] {
+                // SAFETY: `index < ranges.len()` and `pfn` lies inside
+                // `ranges[index]`; `ranges` is the seeded slice (caller).
+                let position = unsafe { self.position(ranges, index, pfn) };
+                // SAFETY: a page of a seeded range has a position below
+                // `tags.len()`.
+                match unsafe { *self.tags.get_unchecked(position) } {
                     0 => pfn += 1,
                     tag => {
                         let found = u32::from(tag) - 1;
                         if found >= order {
-                            return Ok(self.take(ranges, found, position, page_count));
+                            // SAFETY: a non-zero tag marks a listed free
+                            // block of `found` (I1, I3), and `found >=
+                            // order`, so it holds `page_count` pages.
+                            return Ok(unsafe { self.take(ranges, found, position, page_count) });
                         }
                         pfn += 1_u64 << found;
                     }
@@ -415,28 +553,115 @@ impl Buddy {
         Err(PhysicalMemoryError::NoFramesAvailable)
     }
 
+    /// Whether any bit of `[start, end)` is set.
+    ///
+    /// # Safety
+    ///
+    /// `start <= end <= bits.len() * 64`.
+    #[inline]
+    unsafe fn bits_any(bits: &[u64], start: usize, end: usize) -> bool {
+        debug_assert!(start <= end && end <= bits.len() * 64);
+        if start >= end {
+            return false;
+        }
+        let (first, last, head, tail) = bit_span(start, end);
+        // SAFETY: `first <= last < bits.len()` since `end - 1 < bits.len() *
+        // 64` (caller).
+        unsafe {
+            if first == last {
+                return *bits.get_unchecked(first) & head & tail != 0;
+            }
+            *bits.get_unchecked(first) & head != 0
+                || bits
+                    .get_unchecked(first + 1..last)
+                    .iter()
+                    .any(|word| *word != 0)
+                || *bits.get_unchecked(last) & tail != 0
+        }
+    }
+
+    /// Sets (`set`) or clears every bit of `[start, end)`.
+    ///
+    /// # Safety
+    ///
+    /// `start <= end <= bits.len() * 64`.
+    #[inline]
+    unsafe fn bits_update(bits: &mut [u64], start: usize, end: usize, set: bool) {
+        debug_assert!(start <= end && end <= bits.len() * 64);
+        if start >= end {
+            return;
+        }
+        let (first, last, head, tail) = bit_span(start, end);
+        let apply = |word: &mut u64, mask: u64| {
+            if set {
+                *word |= mask;
+            } else {
+                *word &= !mask;
+            }
+        };
+        // SAFETY: `first <= last < bits.len()` (caller).
+        unsafe {
+            if first == last {
+                apply(bits.get_unchecked_mut(first), head & tail);
+                return;
+            }
+            apply(bits.get_unchecked_mut(first), head);
+            for word in bits.get_unchecked_mut(first + 1..last) {
+                apply(word, !0);
+            }
+            apply(bits.get_unchecked_mut(last), tail);
+        }
+    }
+
     /// `range` is a valid page range below the physical limit.
-    pub(super) fn free_run(
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the slice of initial ranges the buddy was seeded with:
+    /// the same length as `bases` and the same contents. `range` is
+    /// non-empty and page-aligned (`start < end`).
+    pub(super) unsafe fn free_run(
         &mut self,
         ranges: &[PageRange],
         range: PageRange,
     ) -> Result<(), PhysicalMemoryError> {
+        debug_assert_eq!(ranges.len(), self.bases.len());
+        debug_assert!(
+            range.start < range.end
+                && range.start.is_multiple_of(BASE_PAGE_SIZE)
+                && range.end.is_multiple_of(BASE_PAGE_SIZE)
+        );
         let index = self
             .range_index(ranges, range.start)
-            .filter(|index| ranges[*index].contains(range))
+            // SAFETY: `range_index` returns only indices below
+            // `ranges.len()`.
+            .filter(|index| unsafe { ranges.get_unchecked(*index) }.contains(range))
             .ok_or(PhysicalMemoryError::InvalidFrame)?;
         let pages = range.page_count() as usize;
-        let start = self.position(ranges, index, first_pfn(range));
-        if bits_any(self.free_bits, start, start + pages) {
+        // SAFETY: the range lies inside `ranges[index]`, as just checked, and
+        // `ranges` is the seeded slice (caller).
+        let start = unsafe { self.position(ranges, index, first_pfn(range)) };
+        // SAFETY: its positions run from `start` to at most `tags.len()`, so
+        // to at most `free_bits.len() * 64` (I7).
+        if unsafe { Self::bits_any(self.free_bits, start, start + pages) } {
             return Err(PhysicalMemoryError::DoubleFree);
         }
-        self.insert_range(ranges, index, first_pfn(range), range.page_count());
-        bits_update(self.free_bits, start, start + pages, true);
+        // SAFETY: the range lies inside `ranges[index]`, as checked.
+        unsafe { self.insert_range(ranges, index, first_pfn(range), range.page_count()) };
+        // SAFETY: as for the check.
+        unsafe { Self::bits_update(self.free_bits, start, start + pages, true) };
         self.free_pages += range.page_count();
         Ok(())
     }
 
-    pub(super) fn overlaps_free(&self, ranges: &[PageRange], range: PageRange) -> bool {
+    /// Whether any page of `range` is free.
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the slice of initial ranges the buddy was seeded with:
+    /// the same length as `bases` and the same contents.
+    pub(super) unsafe fn overlaps_free(&self, ranges: &[PageRange], range: PageRange) -> bool {
+        debug_assert_eq!(ranges.len(), self.bases.len());
         let first = ranges.partition_point(|initial| initial.end <= range.start);
         ranges[first..]
             .iter()
@@ -448,8 +673,16 @@ impl Buddy {
                     end: range.end.min(initial.end),
                 };
                 clipped.start < clipped.end && {
-                    let start = self.position(ranges, first + offset, first_pfn(clipped));
-                    bits_any(self.free_bits, start, start + clipped.page_count() as usize)
+                    // SAFETY: `first + offset < ranges.len()` and the clipped
+                    // range lies inside that initial range; `ranges` is the
+                    // seeded slice (caller).
+                    let start =
+                        unsafe { self.position(ranges, first + offset, first_pfn(clipped)) };
+                    // SAFETY: its positions end at most at `tags.len()`, so at
+                    // most at `free_bits.len() * 64` (I7).
+                    unsafe {
+                        Self::bits_any(self.free_bits, start, start + clipped.page_count() as usize)
+                    }
                 }
             })
     }
@@ -467,14 +700,21 @@ impl Buddy {
     }
 
     /// Checks I1 to I7; any violation is reported as `InvalidFrame`.
-    pub(super) fn check(&self, ranges: &[PageRange]) -> Result<(), PhysicalMemoryError> {
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the slice of initial ranges the buddy was seeded with:
+    /// the same length as `bases` and the same contents.
+    pub(super) unsafe fn check(&self, ranges: &[PageRange]) -> Result<(), PhysicalMemoryError> {
         const VIOLATION: Result<(), PhysicalMemoryError> = Err(PhysicalMemoryError::InvalidFrame);
         let total = ranges.iter().map(|range| range.page_count()).sum::<u64>();
         if self.bases.len() != ranges.len()
             || u64::try_from(self.tags.len()) != Ok(total)
             || self.links.len() != self.tags.len()
             || self.free_bits.len() != self.tags.len().div_ceil(64)
-            || bits_any(self.free_bits, self.tags.len(), self.free_bits.len() * 64)
+            // SAFETY: `free_bits.len() == tags.len().div_ceil(64)`, just
+            // checked, so `tags.len() <= free_bits.len() * 64`.
+            || unsafe { Self::bits_any(self.free_bits, self.tags.len(), self.free_bits.len() * 64) }
         {
             return VIOLATION;
         }
@@ -498,11 +738,15 @@ impl Buddy {
             }
             let mut pfn = first_pfn(*range);
             while pfn < end_pfn(*range) {
-                let position = self.position(ranges, index, pfn);
+                // SAFETY: `index < ranges.len() == bases.len()` (checked
+                // above) and `pfn` lies inside `ranges[index]`.
+                let position = unsafe { self.position(ranges, index, pfn) };
                 let tag = self.tags[position];
                 if tag == 0 {
                     // I7: a page outside every free block has its bit clear.
-                    if bits_any(self.free_bits, position, position + 1) {
+                    // SAFETY: `position < tags.len()`, just indexed, and
+                    // `tags.len() <= free_bits.len() * 64`.
+                    if unsafe { Self::bits_any(self.free_bits, position, position + 1) } {
                         return VIOLATION;
                     }
                     pfn += 1;
@@ -528,14 +772,20 @@ impl Buddy {
                 if order < MAX_ORDER {
                     let buddy = pfn ^ (1_u64 << order);
                     if block_inside(*range, pfn.min(buddy), order + 1)
-                        && u32::from(self.tags[self.position(ranges, index, buddy)]) == order + 1
+                        // SAFETY: the merged block, and with it `buddy`,
+                        // lies inside `ranges[index]`.
+                        && u32::from(self.tags[unsafe { self.position(ranges, index, buddy) }])
+                            == order + 1
                     {
                         return VIOLATION;
                     }
                 }
                 // I7: every page of a free block has its bit set.
-                if (position..position + size).any(|page| !bits_any(self.free_bits, page, page + 1))
-                {
+                if (position..position + size).any(|page| {
+                    // SAFETY: the block's pages were just sliced from `tags`,
+                    // so `page < tags.len() <= free_bits.len() * 64`.
+                    !unsafe { Self::bits_any(self.free_bits, page, page + 1) }
+                }) {
                     return VIOLATION;
                 }
                 blocks[order as usize] += 1;
@@ -590,14 +840,21 @@ impl Buddy {
     }
 
     /// The free blocks in address order, as (physical start, order).
+    ///
+    /// # Safety
+    ///
+    /// `ranges` is the slice of initial ranges the buddy was seeded with:
+    /// the same length as `bases` and the same contents.
     #[cfg(test)]
-    pub(super) fn free_blocks<'a>(
+    pub(super) unsafe fn free_blocks<'a>(
         &'a self,
         ranges: &'a [PageRange],
     ) -> impl Iterator<Item = (u64, u32)> + 'a {
         ranges.iter().enumerate().flat_map(move |(index, range)| {
             (first_pfn(*range)..end_pfn(*range)).filter_map(move |pfn| {
-                let tag = self.tags[self.position(ranges, index, pfn)];
+                // SAFETY: `index < ranges.len()` and `pfn` lies inside
+                // `ranges[index]`; `ranges` is the seeded slice (caller).
+                let tag = self.tags[unsafe { self.position(ranges, index, pfn) }];
                 (tag != 0).then(|| (pfn * BASE_PAGE_SIZE, u32::from(tag) - 1))
             })
         })
