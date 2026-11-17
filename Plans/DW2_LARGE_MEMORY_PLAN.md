@@ -1,6 +1,6 @@
 # DW2 large-memory plan
 
-**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11). M5's seven steps are built and checked at the development tier (§10.18), and so is step 8, which Mike added on 2026-11-15: the wake that bounds how long owed finalization waits for its next step (§10.19, revision 3 as built). Mike had the probe for the wake built the same day (§10.19, the probe): it shows the wake sent and the gap at about 5 ms against 14 to 22 ms without it. **M5 is done at the development tier: closed by Mike, 2026-11-15** (§10.18), with the check's one-second deadline left as it is and the steps a BSP syscall takes accepted (§9). **M7 is started** (Mike, 2026-11-15): its first step, the buddy allocator, is built and checked at the development tier (§12.2, as built, Deepwyrm `1aeb551`); step 2, the role table, is designed in §12.3 and §12.4 and approved ("Approve, build 2a"); **2a is built and merged** (Deepwyrm `c19513d`, 2026-11-16; §12.6, as built): within 4% of the kernel before it on every call, counted in guest instructions; the four-CPU icount boot then found a kernel stop in the BSP's timer re-arm, **fixed and merged** (Deepwyrm `18fed40`, 2026-11-16; §12.7); 2b's first build, in chunks, cost 16 to 41% more guest instructions per step and is not merged (§12.9); **its revision, the table's pieces mapped at one virtual range, is built and merged** (Deepwyrm `9d62d5c`, 2026-11-16; §12.9, as built): within 0.6% of the kernel before it on map, unmap, protect, commit and finalize; step 3 is designed in §12.10 and approved; its part 1, a fragmented guest in the check, is built and measured (Deepwyrm `269843f`, Wyrmroot `3ffdee3`): the same 448 MiB eager object costs 59 to 123% more instructions to map, protect and unmap in 10,171 runs than in one; **part 2, the index, is built and merged** (Deepwyrm `9114920`, 2026-11-16; §12.10, part 2 as built): the same object now costs 8 to 20% more than in one run, and its close no longer frees every run in one hold; step 3b, allocating a fragmented backing in steps, is designed in §12.11 and approved; **its part 2, items 1 to 10, is built and merged** (Deepwyrm `42159ae`, 2026-11-16; §12.11, part 2 as built): the first hold of a fragmented create fell from 21.6 million instructions to 13 thousand, and no create step is longer than the boot's longest step; **item 11, one finalize step in one hold of the runtime lock, is built and merged** (Deepwyrm `2ebf6ba`, Wyrmroot `b53b404`, 2026-11-16; §12.11, item 11 as built), which completes step 3b; step 4 is designed in §12.12 and approved by Mike (2026-11-16, "Approve all four"): a count, then the cheaper paths it selects; M7 closes without compaction (§9 holds what would reopen it). Commits made between the reboot of 2026-11-15 and 2026-11-16 were re-signed on 2026-11-16, so this plan cites their old hashes: the root repository's `RESIGN_2026-11-10_RECORD.md` §9 and its hash map give the new ones (`2ebf6ba` is now `48d2612`, Wyrmroot `b53b404` is now `cd76d8a`). Step times in this plan taken from QEMU wall time do not compare builds reliably; §12.5 says why and what replaces them. **M7 is done at the development tier: closed 2026-11-17** on Mike's word ("Go in order", to the coordinator's order of cleaning the host, closing M7, pushing, then designing M8), with step 4 built and timed under KVM and the final boots of §12.13. M8 is next. **Pushed 2026-11-17** on Mike's word ("Go in order"): Deepwyrm `main` at `e3ed553` and Wyrmroot at `da9115b`, over HTTPS, Deepwyrm first; 81 and 11 commits, all with good signatures, each remote an ancestor of the local `main`. **M8 is started** (2026-11-17): the two KVM findings at its entry are fixed (§13.2), and its design (§13) is approved by Mike (2026-11-17, "1. Approved"). **Step 0 is built and merged** (Deepwyrm `ed72f34`, Wyrmroot `dfa8367`, 2026-11-17; §13.10): four CPUs under KVM pass the check 20 boots of 20 and one CPU 10 of 10. Step 1, the measurement, is next. Nothing since `e3ed553` and `da9115b` is pushed.
+**Status:** decided by Mike 2026-11-12 (§3). M1 is done. M2 is done at the development tier: the direct map, usercopy through it, SMEP/SMAP (§5.1–§5.2) and the RAM-sized role table (§5.3), each with its independent review. M3 is done at the development tier (§6.9), with its independent review (§6.9a). M4 is done at the development tier: batched publication (§7) and, as M4b, calls made in steps so the global locks are held one step at a time (§7.2), each with its independent review. M6 is done at the development tier (§8.10), with its independent review (§8.11). M5's seven steps are built and checked at the development tier (§10.18), and so is step 8, which Mike added on 2026-11-15: the wake that bounds how long owed finalization waits for its next step (§10.19, revision 3 as built). Mike had the probe for the wake built the same day (§10.19, the probe): it shows the wake sent and the gap at about 5 ms against 14 to 22 ms without it. **M5 is done at the development tier: closed by Mike, 2026-11-15** (§10.18), with the check's one-second deadline left as it is and the steps a BSP syscall takes accepted (§9). **M7 is started** (Mike, 2026-11-15): its first step, the buddy allocator, is built and checked at the development tier (§12.2, as built, Deepwyrm `1aeb551`); step 2, the role table, is designed in §12.3 and §12.4 and approved ("Approve, build 2a"); **2a is built and merged** (Deepwyrm `c19513d`, 2026-11-16; §12.6, as built): within 4% of the kernel before it on every call, counted in guest instructions; the four-CPU icount boot then found a kernel stop in the BSP's timer re-arm, **fixed and merged** (Deepwyrm `18fed40`, 2026-11-16; §12.7); 2b's first build, in chunks, cost 16 to 41% more guest instructions per step and is not merged (§12.9); **its revision, the table's pieces mapped at one virtual range, is built and merged** (Deepwyrm `9d62d5c`, 2026-11-16; §12.9, as built): within 0.6% of the kernel before it on map, unmap, protect, commit and finalize; step 3 is designed in §12.10 and approved; its part 1, a fragmented guest in the check, is built and measured (Deepwyrm `269843f`, Wyrmroot `3ffdee3`): the same 448 MiB eager object costs 59 to 123% more instructions to map, protect and unmap in 10,171 runs than in one; **part 2, the index, is built and merged** (Deepwyrm `9114920`, 2026-11-16; §12.10, part 2 as built): the same object now costs 8 to 20% more than in one run, and its close no longer frees every run in one hold; step 3b, allocating a fragmented backing in steps, is designed in §12.11 and approved; **its part 2, items 1 to 10, is built and merged** (Deepwyrm `42159ae`, 2026-11-16; §12.11, part 2 as built): the first hold of a fragmented create fell from 21.6 million instructions to 13 thousand, and no create step is longer than the boot's longest step; **item 11, one finalize step in one hold of the runtime lock, is built and merged** (Deepwyrm `2ebf6ba`, Wyrmroot `b53b404`, 2026-11-16; §12.11, item 11 as built), which completes step 3b; step 4 is designed in §12.12 and approved by Mike (2026-11-16, "Approve all four"): a count, then the cheaper paths it selects; M7 closes without compaction (§9 holds what would reopen it). Commits made between the reboot of 2026-11-15 and 2026-11-16 were re-signed on 2026-11-16, so this plan cites their old hashes: the root repository's `RESIGN_2026-11-10_RECORD.md` §9 and its hash map give the new ones (`2ebf6ba` is now `48d2612`, Wyrmroot `b53b404` is now `cd76d8a`). Step times in this plan taken from QEMU wall time do not compare builds reliably; §12.5 says why and what replaces them. **M7 is done at the development tier: closed 2026-11-17** on Mike's word ("Go in order", to the coordinator's order of cleaning the host, closing M7, pushing, then designing M8), with step 4 built and timed under KVM and the final boots of §12.13. M8 is next. **Pushed 2026-11-17** on Mike's word ("Go in order"): Deepwyrm `main` at `e3ed553` and Wyrmroot at `da9115b`, over HTTPS, Deepwyrm first; 81 and 11 commits, all with good signatures, each remote an ancestor of the local `main`. **M8 is started** (2026-11-17): the two KVM findings at its entry are fixed (§13.2), and its design (§13) is approved by Mike (2026-11-17, "1. Approved"). **Step 0 is built and merged** (Deepwyrm `ed72f34`, Wyrmroot `dfa8367`, 2026-11-17; §13.10): four CPUs under KVM pass the check 20 boots of 20 and one CPU 10 of 10. **Step 1, the measurement, is built and merged** (Deepwyrm `03123e5`, Wyrmroot `389999b`, 2026-11-17; §13.11): under KVM a first touch costs about 14 µs, 40% of it a boundary check that a fault runs and a syscall does not, and takes the runtime lock six times; three jobs at once reach 1.34 times one job's rate. The designs of steps 2 and 3 from those numbers (§13.12, §13.13) wait for Mike's approval (§13.14). Nothing since `e3ed553` and `da9115b` is pushed, and the commits since the key was locked (step 1's) are unsigned until re-signed.
 
 **Goal:** Wyrmroot is meant to run on real machines with 64 GiB of RAM or more. On those machines one program should be able to use most of that memory. The kernel's bookkeeping should grow with the RAM installed, not with constants chosen for a small QEMU guest. The cost of a request should follow what a program actually touches.
 
@@ -2286,9 +2286,9 @@ Both rows of §9 scheduled at M8's entry are fixed, and fixing the first uncover
 Each step is designed here before it is built and approved by Mike; steps 2 and 3 are designed from step 1's numbers.
 
 0. **Four CPUs under KVM pass the check.** Entry, above: M8 does not measure until `dev-boot --check --kvm --smp` passes every time. Its parts are specified in §13.4.
-1. **Measure a first touch** (§13.5): a guest probe and kernel report lines, on one CPU and with four jobs on four CPUs, in real time. Nothing is changed in this step.
-2. **Usage that is not a scan** (§13.6, outline): designed in full once step 1 shows what admission costs.
-3. **A first touch outside the global lock** (§13.7, outline): designed in full from step 1's split of a fault's time and of the wait for T.
+1. **Measure a first touch** (§13.5): a guest probe and kernel report lines, on one CPU and with four jobs on four CPUs, in real time. Nothing is changed in this step. Built and measured: §13.11.
+2. **Usage that is not a scan** (§13.6, outline): designed in full once step 1 shows what admission costs. The design: §13.12.
+3. **A first touch outside the global lock** (§13.7, outline): designed in full from step 1's split of a fault's time and of the wait for T. The design, which starts with what a fault does not need: §13.13.
 4. **The carried items** (§13.8), each built with the step it belongs to or by itself.
 
 ### 13.4 Step 0: four CPUs under KVM pass the check
@@ -2335,12 +2335,12 @@ Whichever is built keeps §8.4's rule (what is admitted is what is charged) and 
 
 | Item (§9) | With |
 |---|---|
-| The fault gate, fill-in and commit step have no host tests | Step 3: the handler is split from the target-only runtime so its parts run on the host |
-| The commit step's 1,600 to 2,000 instructions over the kernel before the index | Step 1 times a commit step's parts with the fault's; closed or acted on from that |
-| The role table reached in 2 MiB pages: its cost on a real TLB | Step 1's boots under KVM: timed by booting with the table in 2 MiB and in 1 GiB pages if step 1's `lookup-us` or `commit-us` point at role-table reads; else closed as not shown |
+| The fault gate, fill-in and commit step have no host tests | Step 3 part c (§13.13): the gate's decisions move behind the runtime trait and are tested on the host |
+| The commit step's 1,600 to 2,000 instructions over the kernel before the index | **Closed** (§13.11): a step's 13.8 µs is 11.5 µs of taking and zeroing 512 frames and 1.9 µs of admission scans, which step 2 removes |
+| The role table reached in 2 MiB pages: its cost on a real TLB | **Closed as not shown** (§13.11): the parts of a first touch that read the role table are 107 to 471 ns each |
 | An owed backing holds a reservation slot; a job can hold all 64 | After step 2 (its counters change the reservations): bound the owed backings one TaskGroup may hold |
 | `halt_forever` in `arch/x86_64/syscall/live.rs` logs nothing (102 sites) | Step 0, item 3: built (§13.10) |
-| A closed object counts against its group's limits until its finalization is done (§13.10) | Step 2's design |
+| A closed object counts against its group's limits until its finalization is done (§13.10) | Step 2 part b (§13.12) |
 | The kernel does not compile for the target with `test-support` (§13.10) | Decided with Mike at M8's exit: fix and check it, or delete the feature's guest half |
 | Consecutive deferrals of the BSP's timer arm | Decided at M8's exit from the `deferred` counter of its four-CPU boots |
 | One boot whose finalization stayed owed for 2.9 s | Not seen since; closed at M8's exit unless a four-CPU KVM boot shows it |
@@ -2387,3 +2387,148 @@ Built by two Opus workers from §13.4 and the coordinator's briefs, reviewed by 
 *Exit boots* (`dev-boot --check --sdk`, Deepwyrm `ad9eaac`, Wyrmroot `a2e1597`, SDK `56eb579`): `--kvm --smp` 20 of 20, `--kvm` 10 of 10, and one each plain, `--smp` and `--icount`; every boot with `records-dropped=0`. The probe kernel passed 12 more `--kvm --smp` boots with the same Wyrmroot. Step 0 is done.
 
 *Lanes.* `m8-records` and `m8-churn-status` are merged and retired. `lane/m8-refusal-probe` (`a6d6675`) is kept until Mike says to delete it: a throwaway that is in no tree.
+
+### 13.11 Step 1 as built and measured (2026-11-17)
+
+Built by two Opus workers from §13.5 and the coordinator's briefs, reviewed by the coordinator, merged as Deepwyrm `03123e5` (lane commits `480974f`, `274fad0`) and Wyrmroot `389999b` (`7aec9bc`, `5ddbd34`); the SDK stays `56eb579`. All five commits and both merges are unsigned: the signing key was locked. They are re-signed before any push.
+
+*Kernel report lines* (`arch/x86_64/step_report.rs`), before the closing lines:
+- `faults served= total-us= longest-us= sync-us= lookup-us= admit-us= commit-us= tables-us= return-us=`
+- `fault-passes served= already-present= released= retry= unserved= exhausted= fill-in-serves=`
+- `t-lock cpu= source=<gate|syscall|fault|idle|other> count= waited= wait-us= wait-longest-us= held-us= held-longest-us=`, one per nonzero CPU and source
+- `admission page-scans= object-scans= slots= reservations=`
+- `commit-steps count= admit-us= take-us= rest-us=`
+
+*Guest.* `hello touch-loop <MiB> <rounds>` prints `touch-loop size-mib= rounds= pauses= min-ns-per-page= median-ns-per-page= max-ns-per-page=`. The check runs `touch-loop 64 20` in its first boot and, under `--smp`, three at once in its second; it requires the `faults` line with at least 327,680 served and prints the kernel's mean and parts.
+
+*Where the build differs from §13.5:*
+- *Raw TSC stamps.* §13.5 named `step_report::now()`, which takes the clock's lock and, under TCG, reads the PM timer; at about 19 stamps a fault that would have measured the clock. The stamps are `rdtsc`, converted at report time with the measured TSC rate. An acquisition of T served at once reads the TSC twice, one that waits three times.
+- *Three at once, not four.* A shell holds three jobs and the foreground `run` is one, so two are spawned and one runs in front.
+- *The concurrent run is in the second boot*, so the first boot's `faults` line is one job's alone.
+- *`waited=`* counts the acquisitions that found T held.
+- *`dev_boot.rs` is split by responsibility* (it had passed 1,600 lines): `dev_boot/qemu.rs` starts and observes the machine, `dev_boot/shell.rs` is the serial shell session; a pure move.
+
+*What the stamps cost.* Three KVM boots each of main's kernel (`ed52844`) and the timing kernel with the same Wyrmroot, interleaved: the median first touch is 14,861 ns against 15,215 ns on one CPU and 13,597 ns against 13,840 ns on four. The stamps add about 2%.
+
+*Checked by the coordinator.* Deepwyrm `274fad0`: fmt, clippy (236 / 86), kernel-check, 1,552 host tests. Wyrmroot `5ddbd34`: fmt, clippy, 1,291 unit tests, 105 + 5 `xtask` tests. `dev-boot --check --sdk`: plain, `--smp`, `--kvm` and `--kvm --smp` on `274fad0` + `7aec9bc`; `--kvm` three times and `--kvm --smp` three times more for the numbers; `--kvm` and `--kvm --smp` on the probe kernels below with `5ddbd34` and with merged Wyrmroot `389999b`. Every one of these boots passed with `records-dropped=0`. (Main's kernel with the new Wyrmroot, booted only for the comparison below, fails the check as it must: it has no `faults` line.)
+
+**The numbers.** All under KVM on the development host (AMD Ryzen 7 9800X3D), `touch-loop 64 20`, so each is a guest's time and none stands for hardware. A first touch as the program sees it:
+
+| | median ns a page |
+|---|---|
+| One job, one CPU | 15,196, 15,253, 15,195 |
+| One job, four CPUs | 13,829, 13,840, 13,852 |
+| Three jobs at once, four CPUs | 30,596, 30,851, 30,860 |
+
+Three jobs together touch a page every 10.3 µs against one job's 13.8 µs: 1.34 times one job's rate on three CPUs. For scale, `memory_object_commit` commits a page in about 27 ns (13.8 µs a 512-page step).
+
+*Where one first touch goes* was split further by a throwaway probe kernel (`lane/m8-hold-sites`, four commits on `274fad0`, `aee3165` to `1cd5518`, never merged; its boots' medians, 14.9 to 16.1 µs a page on one CPU, bracket the timing kernel's 15.2). One job, one CPU, 569,254 served faults, mean nanoseconds a fault (`.tmp/dev-boot/1794946661058086241/com1.log`):
+
+| Part | ns | Of which |
+|---|---|---|
+| The gate before the serve | 5,791 | `validate_live_syscall_boundary`: three control-register reads 3,449 (a later boot split them: CR4 1,839 and 1,609 for its two reads, CR0 8); ten MSR reads 2,209, of which IA32_EFER alone 1,785; everything else 133 |
+| The serve wrapper's synchronising hold | 693 | a hold of T of its own |
+| Taking T for the serve | 16 | |
+| Before the inner serve | 610 | |
+| Lookup | 1,065 | identity 43, mapping 173, paging session 213, commit cost 128, the page-table walk that counts missing tables 509 |
+| Admission | 878 | two scans of the registry's 640 slots and its 64 reservations |
+| Commit (frame taken and zeroed) | 471 | |
+| Tables | 2,883 | the leaf's publish 2,803: validate 55, journal built 101, descriptor 222, present check (a walk) 258, authorise 107, candidates 164, `map_page` (a walk) 1,141, apply 635 (stage 73, re-read and compare 169, write 366, roles 27), outside 120 |
+| Return | 1,961 | authorise 1,664: its synchronising hold and taking T 669, identity 51, session 106, validating the frame 667, after 171 |
+| **Total** | **14,368** | |
+
+The program's 14.9 µs a page is this plus the exception's entry and exit and two more holds of T after the timed part.
+
+*The gate.* 5.7 µs of a 14.4 µs fault is `validate_live_syscall_boundary`, and 5.2 µs of that is three reads: CR4 twice (1.8 and 1.6 µs) and IA32_EFER (1.8 µs). CR0 reads in 8 ns and each of the other nine MSRs in about 35 ns. KVM intercepts reads of CR4 and EFER on AMD processors, and these three cost what such a trap costs; the host side was not inspected. The fault gate runs the check on every pass, as the timer gate does before its `iretq`. A syscall does not run it: one boot read EFER 581,313 times for 569,254 faults and made 4.5 million syscall holds. On hardware no hypervisor intercepts them; what the check costs there is not measured.
+
+*The holds.* A served fault takes T six times, each `with_synchronized_runtime_at_safe_point` taking it twice (once in `synchronize_scheduler_current_at_safe_point_detached`, once for its operation): the serve, the return's authorisation, and the reschedule check. One CPU, mean held a fault: the serve 6,008 ns, the authorisation 1,224, the reschedule check 763, and the three synchronising holds 528, 322 and 225; 9,070 ns in all. A syscall takes T in the same pairs.
+
+*Three at once* (four CPUs, second boot, 1,021,682 served, `.tmp/dev-boot/1794946760130623656/com1-reboot.log`): a fault's 30.2 µs is the same work plus waiting for T. The gate is 5,846 ns and the tables 3,129, as with one job; the waits are 17.6 µs a fault over the six acquisitions (3.8, 3.6, 3.5, 4.3, 2.0 and 0.5 µs), nearly every acquisition finds T held, and T is held 8.7 µs a fault. Three CPUs each holding T for 8.7 µs of every fault cannot touch a page more often than every 8.7 µs between them; they manage 10.3.
+
+*The CPU index.* `current_cpu_index()` reads IA32_GS_BASE and searches the entry records for the value. One job on one CPU made 34.7 million such reads inside its 569,254 served faults, 61 a fault, and the boot made 94 million (`.tmp/dev-boot/1794947207688462357/com1.log`). With three jobs it is 261 a fault, 205 of them in T's wait loop, which reads it on every spin through `service_local_tlb_shootdown`. A read took at most 30 ns with the probe's own two TSC reads around it, so 61 are at most 1.8 µs of a fault; a read's own cost is not measured.
+
+*The commit step* (§13.8's carried item): 92,529 steps of 512 pages took 13.8 µs each in the step: admission 1.9 µs (the same two scans), taking and zeroing the frames 11.5 µs (22 ns a page), the rest 0.4 µs. Its time is the frames; the scans go with step 2. Closed.
+
+*The role table in 2 MiB pages* (§13.8's carried item): the parts that read the role table are the commit cost (128 ns), the commit (471), the descriptor (222) and the leaf's authorisation (107). None is a part worth a boot with the table in 1 GiB pages. Closed as not shown.
+
+*Lanes.* `m8-fault-timing` and `m8-touch-loop` are merged and retired. `lane/m8-hold-sites` (`1cd5518`), the probe above, is kept with `lane/m8-refusal-probe` until Mike says to delete them: throwaways that are in no tree.
+
+*What it decides.*
+1. One job's first touch is not slow because of the lock. It is slow because of one check that traps four times (40%), a general page-table journal walked three times to write one leaf (23% with the lookup's walk), six lock holds where one would do, and two registry scans (6%).
+2. Three jobs are slow because of the lock: T is held for 8.7 µs of each fault, in six pieces, each waited for.
+3. So the order is: remove what a fault does not need (§13.12, §13.13 parts a to c), measure, and then decide from what is left in the hold whether a fault must leave T (§13.13 part e). The candidates of §13.7 that move zeroing out of the hold are worth at most the commit's 0.47 µs and are not built now.
+
+### 13.12 Step 2: usage that is kept, and a refusal only when nothing is owed: design (2026-11-17, for Mike's approval)
+
+Two parts. Part a is the outline of §13.6 made exact; part b is the finding of §13.10.
+
+**Part a: each group's usage is kept in the registry.**
+
+*State.* `ObjectRegistry` gains two arrays indexed by registry slot: `usage_pages: [u64; CAPACITY]` and `usage_objects: [[u16; 7]; CAPACITY]`, and, for part b, `finalizing_pages` and `finalizing_objects` of the same shapes. A TaskGroup is a registry object, so the entry for a group is the one at the group's own slot. An entry counts only for the generation that holds the slot now.
+
+*The one rule for every write.* A change of `(objects of class c, pages)` for a tag is applied, for each group the tag names, to the entry at that group's slot if the slot's generation is the one in the group's identity and the slot is not vacant or retired; otherwise it is skipped. A group whose slot is released has its entries zeroed in that release. So a tag that outlives its group (`task/quota.rs`: a group's key is never reissued) changes nothing after the group is gone, and a new object in the same slot starts from zero.
+
+*The writes*, all inside `object/mod.rs`, whose fields are private:
+- a slot created with a tag: plus one object of its class;
+- `set_charge_pages`: the difference in pages;
+- `lower_finalizing_charge_pages`: minus the frames, from `usage_pages` and `finalizing_pages`;
+- a slot passing from live to finalizing: its object and its pages are added to the finalizing entries;
+- a slot released: minus its object and its remaining pages, from usage and, if it was finalizing, from the finalizing entries;
+- a reservation made, changed or released (`reserve_pages`, `reserve_owed_backing_pages`, `release_reserved_pages` and the owed backing's release): the difference in pages; an owed backing's reservation counts as finalizing, since its frames are freed by owed steps.
+The worker lists every write of `tags`, `pages`, `reserved` and a slot's state before changing any, and the list goes in the record.
+
+*The reads.* `charged_pages(group)` and `charged(group, class)` return the entry (zero for a stale identity). `admit_quota` and `group_memory_budget` are unchanged.
+
+*The check that the present design gave for free.* Usage was derived so that no release path could be wrong. The scans stay, renamed `charged_pages_by_scan` and `charged_by_scan`:
+- in host tests, a helper compares every group's entries with the scans after every registry operation of the existing tests, and a new randomised test drives creates, charges, closes, stepped finalization, reservations and group deaths with the same comparison;
+- in the kernel, the step report's last hold compares every live TaskGroup once and prints `usage-check groups=<n> mismatches=<n>`; the check requires `mismatches=0` in both boots.
+
+*Expected.* Admission falls from 0.88 µs a fault and 1.9 µs a commit step to a few loads. Kept if the first touch and the commit step are faster by measured time.
+
+**Part b: a create or commit is refused for quota or memory only when no owed work could admit it.**
+
+Today a job that closes faster than owed steps drain is refused `NO_RESOURCES` while it holds nothing (§13.10), and a page fault in the same position already frees owed memory and comes again. The create and the commit do the same:
+
+*The rule.* A refusal is waited out when
+- it is a quota refusal by group G for a class, and G's finalizing entry for that class is not zero, or a dead job's teardown is owed; or
+- it is `NO_MEMORY`, and any finalization or teardown is owed.
+Otherwise it is returned as today. So a quota refusal is returned only when everything G is charged for is held by something live.
+
+*Waiting.* The hold that met the refusal takes its owed step (`allow_teardown_step`, `drain_finalizers`, as the fault's wrapper does) and the call goes to its next step safe point, where it tries again; a quantum that ends parks the call as the stepped calls park. Each hold takes one owed step, so the wait ends when the group's finalizing weight is freed or the admission succeeds.
+- `memory_object_commit` (`run_commit`): a step refused under the rule reports "not done" with `next` unchanged.
+- `memory_object_create` (`handle_deferred_output`): its first hold, which reserves the pages and admits the object, becomes a step safe point in a loop; a refusal under the rule drains and loops. A call parked there is a new `ParkedCall::Admission { request }`, resumed by running the request from its start. The final hold admits again; a refusal there under the rule abandons the backing through the existing path and restarts the call.
+- `dma_map`'s commit and the fill-in's commits use `commit_on_demand_step` and take the same change.
+- `admit_quota` reports which group refused, so the rule can ask that group's entry.
+
+*What a program sees.* `mmap` and `memory_object_create` no longer fail for memory the caller's own closes are still freeing; the SDK is unchanged. A group truly at its limit is refused at once, as now.
+
+*The regression test.* The churn probes' wait for a refused create (§13.10) is removed: a refusal ends the job again, and `churn-commit` on four CPUs under KVM is the test (it failed 5 boots of 10 before the probes waited). `touch-loop` requires `pauses=0`. Host tests drive the rule through the registry and the create and commit adapters.
+
+*Bounded by.* The finalizing weight of the refusing group, which only that group's own closes add to. A job cannot make another group wait: another group's refusal asks its own entry.
+
+### 13.13 Step 3: a first touch without what it does not need: design (2026-11-17, for Mike's approval)
+
+Five parts in the order of what the measurement shows. Each is built, booted and kept only if the first touch is faster by measured time, one job and three.
+
+**Part a: the fault gate does not run the boundary check.** `native_runtime_user_page_fault` stops calling `validate_live_syscall_boundary()` in its loop. The check compares CR0, CR4 and ten MSRs with the values the kernel installed. Only kernel code can write them, and no path a fault runs writes them; a syscall returns to the same program without the check. The timer gate keeps it, so a running Thread's CPU is still checked at every timer interrupt taken from userspace, and the other eight callers are unchanged. Expected: 5.7 µs of 14.4 under KVM; unmeasured on hardware, where it is smaller. *This removes a check, so it is Mike's decision* (§13.14).
+
+**Part b: one hold where the wrapper takes two.** `with_synchronized_runtime_at_safe_point` takes T once. In that hold it does what `synchronize_scheduler_current_at_safe_point_detached` does first (the Stop check; a terminal scheduler-current, for which it releases, spins and takes T again; `prepare_scheduler_root_switch`), and when no root switch is prepared, which is every time the Thread's root is already active, it runs the operation in the same hold. When a switch is prepared it releases T, executes and commits the switch as today, and takes the hold again from the top. The second Stop check of today's second hold is the first check of the one hold. The other callers of the detached function keep it. This halves the holds of every syscall as well. Expected for a fault: three holds fewer, about 1.1 µs of holds with one job, and three of the six waits with three.
+
+**Part c: the fault's return in the serve's hold.** `serve_user_page_fault` takes the frame. When the outcome is one that returns to the program (`Served`, `AlreadyPresent`, `Released`), the same hold then runs `authorize_timer_return(frame)` and reads `has_reschedule_request()` (after the BSP's pending timer expiries, as today), and returns both with the outcome. The gate's separate authorise and reschedule calls go; its Stop polls stay where they are, and a Stop published during the hold is taken by the poll after it, as now. The frame is validated against the mappings in the hold that published the leaf, which is stricter than today. With part b a served fault takes T once.
+
+**Part d: fewer reads of the CPU index, then a cheaper one if it still shows.** After parts b and c a fault takes T once where it took it six times, and most of its 61 reads go with the five holds. Then:
+1. T's wait loop passes the CPU its handle already holds to `service_local_tlb_shootdown`, so a spin reads no MSR.
+2. The builder counts the reads a fault still makes (the probe's `fault-gs` line, in a throwaway lane) and times a fault with `current_cpu_index()` answered by `RDPID`: IA32_TSC_AUX is written with the CPU's slot when its boundary is installed and joins the MSRs the boundary check verifies, and `current_cpu_index()` uses `RDPID` when CPUID reports it and the GS pair otherwise. A program can read TSC_AUX and cannot write it. Kept only if the fault is faster by measured time.
+
+**Part e, designed after a to d are measured: the leaf's publish, and whether a fault leaves T.**
+- *The publish.* Writing one leaf costs 2.8 µs, and the lookup's count of missing tables 0.5 µs more, because the general journal is built twice and the tables are walked three times (`touch_table_cost`, `present_leaf_matches`, `map_page`), then every entry is read again before the write. The journal is the mechanism that authenticates every page-table write against the frame roles, so a cheaper path for one leaf is a change to it and gets its own design and security review. It comes after parts a to d because its share of the fault roughly doubles once they land.
+- *Off the lock.* After step 2 and parts a to c the hold is about the lookup, the commit, the tables and the frame's validation: about 6 µs of a fault of about 7. Three jobs would then still be bound by T. Whether a fault takes a lock of its address space instead, and what T must still cover, is designed from that measurement, with the candidates of §13.7.
+
+*Host tests.* §13.8's carried item (the fault gate, fill-in and commit step have no host tests) is built with part c, which changes the gate's shape: the gate's decisions (which outcomes return, when the return is authorised, when a reschedule is taken) move behind the runtime trait the host can implement, and are tested there.
+
+### 13.14 Decisions this asks of Mike
+
+1. Approve step 2 as designed (§13.12): usage kept in the registry with the scan as its check, and a create or commit refused only when no owed work could admit it.
+2. Approve step 3 part a (§13.13): the fault gate stops running the boundary check, which the timer gate keeps. The alternative is to keep it and accept 5.7 µs a fault under KVM.
+3. Approve step 3 parts b to d (§13.13).
+4. Approve that part e (the leaf's publish, and a fault off T) comes back as its own design after a to d are measured.
