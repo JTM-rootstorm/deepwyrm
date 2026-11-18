@@ -9473,7 +9473,7 @@ pub(super) fn enter(
             PRIMORDIAL_RUNTIME_AUTHORITY.init_in_place(|lock| {
                 RuntimeAuthorityLock::init_in_place(
                     lock,
-                    user_access::service_local_tlb_shootdown_for_slot,
+                    user_access::service_local_tlb_shootdown,
                     |state| {
                         init_fields!(
                             core::ptr::addr_of_mut!((*state).core),

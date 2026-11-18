@@ -288,7 +288,7 @@ mod tests {
             drop(initiator.release(ShootdownOutcome::Completed(permit)));
         }
 
-        let runtime = RuntimeAuthorityLock::new((), |_cpu| {});
+        let runtime = RuntimeAuthorityLock::new((), no_service);
         let paging = PagingLock::new((), no_service);
         let initiator_lock = ShootdownInitiatorLock::new(note_spin);
         let mailbox = LiveTlbMailbox::new();
@@ -383,7 +383,7 @@ mod tests {
         }
         fn no_service() {}
 
-        let runtime = RuntimeAuthorityLock::new((), |_cpu| {});
+        let runtime = RuntimeAuthorityLock::new((), no_service);
         let paging = PagingLock::new((), no_service);
         let initiator_lock = ShootdownInitiatorLock::new(note_spin);
         let space = AddressSpaceCoherency::<{ crate::cpu::CPU_CAPACITY }>::new(
