@@ -9,7 +9,6 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Text test: the G5 completion oracle runs only on the target-only primordial terminal path.
 #[test]
 fn e4_exception_assembly_remains_freestanding() {
     let clang = host_tools::clang();

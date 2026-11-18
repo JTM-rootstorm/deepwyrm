@@ -14823,6 +14823,7 @@ fn a_quota_refused_early_backing_fails_closed() {
 }
 
 mod dma;
+mod owed_refusal;
 
 /// DW2 §7.3 R7: two threads' creates admitted before either allocates see
 /// each other's reservation, so together they cannot pass the group's limit.

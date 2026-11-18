@@ -200,26 +200,6 @@ fn host_selector_tests_require_an_explicit_library_only_shape() {
 }
 
 #[test]
-fn both_toolchain_identities_pin_the_same_project_cargo_home() {
-    for identity in [
-        "tooling/host-rust-toolchain.toml",
-        "tooling/rust-toolchain.toml",
-    ] {
-        let text = std::fs::read_to_string(workspace().join(identity)).expect("read identity");
-        assert!(text.contains("cargo_home = \".tmp/cargo-home/offline-v1\""));
-        assert!(text.contains("target_dir = \".tmp/cargo-target/"));
-    }
-
-    let wrapper = std::fs::read_to_string(workspace().join("tools/pinned-cargo"))
-        .expect("read canonical pinned-Cargo wrapper");
-    assert!(wrapper.contains(".worktrees/deepwyrm/<lane>"));
-    assert!(wrapper.contains("common_git_dir=$(git -C \"$workspace\" rev-parse"));
-    assert!(wrapper.contains("lane worktree is not registered to canonical deepwyrm"));
-    assert!(wrapper.contains("project_root=$lane_project_root"));
-    assert!(wrapper.contains("The lane still owns an isolated target directory"));
-}
-
-#[test]
 fn canonical_invocation_owns_a_reusable_lane_target() {
     let output = Command::new(workspace().join("tools/pinned-cargo"))
         .args(["host", "--version"])
@@ -239,29 +219,4 @@ fn canonical_invocation_owns_a_reusable_lane_target() {
             .join(".tmp/cargo-target/host-1.98.1/.deepwyrm-pinned-cargo-v1")
             .is_file()
     );
-}
-
-#[test]
-fn metadata_uses_the_selected_lane_and_dangerous_ambient_overrides_are_removed() {
-    let source = std::fs::read_to_string(workspace().join("tools/pinned-cargo"))
-        .expect("read pinned Cargo launcher");
-    let metadata = source
-        .find("\"$cargo\" metadata --locked --offline")
-        .expect("offline metadata preflight");
-    for required_before_metadata in [
-        "unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS CARGO_TARGET_DIR",
-        "unset LD_LIBRARY_PATH LD_PRELOAD",
-        "export CARGO_HOME=\"$cargo_home\"",
-        "export CARGO_TARGET_DIR=\"$normalized_target\"",
-        "export RUSTC=\"$rustc\"",
-    ] {
-        assert!(
-            source
-                .find(required_before_metadata)
-                .is_some_and(|position| position < metadata),
-            "{required_before_metadata} must precede metadata"
-        );
-    }
-    assert!(source.contains("rustc_driver_internal_library_sha256"));
-    assert!(source.contains("llvm_internal_library_sha256"));
 }

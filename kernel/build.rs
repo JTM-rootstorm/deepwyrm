@@ -2321,8 +2321,6 @@ fn parse_bool(value: &str) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    const GENERATED_ABI: &str = include_str!("../abi/generated/deepwyrm_abi.rs");
-
     /// F3A.6y. Production's ceiling is now measured when a producer measured
     /// it, and the historical Wave 4 value otherwise.
     ///

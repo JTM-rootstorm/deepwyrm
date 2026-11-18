@@ -2648,6 +2648,161 @@ pub(crate) fn admit_charged_pages_together<
     Ok(())
 }
 
+/// The quota half of DW2 §13.12 part b's rule for one admission of
+/// MEMORY_PAGES: `Some(owed)` when `tag` refuses `needed` pages over
+/// `usage` (owed: every refusing group would admit with its finalizing
+/// pages gone), `None` when it admits.
+fn pages_refusal<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    tag: &crate::task::quota::ChargeTag,
+    needed: usize,
+    mut usage: impl FnMut(crate::object::ObjectId) -> usize,
+) -> Option<bool> {
+    let class = crate::task::quota::MEMORY_PAGES_CLASS;
+    tasks.admit_quota(tag, class, needed, &mut usage).err()?;
+    Some(
+        tasks.quota_refusal_owed(tag, class, needed, usage, |group| {
+            usize::try_from(registry.finalizing_pages_of(group)).unwrap_or(usize::MAX)
+        }),
+    )
+}
+
+/// Whether refusals are owed, given what each part of one admission found
+/// (`Some(owed)` for a part that refuses, `None` for one that admits): at
+/// least one part refuses and every part that refuses is owed.
+fn refusal_owed(parts: &[Option<bool>]) -> bool {
+    parts.iter().any(Option::is_some) && parts.iter().all(|part| part.is_none_or(|owed| owed))
+}
+
+/// Whether [`admit_memory_object`] refusing `pages` for `process` now is
+/// owed (DW2 §13.12 part b): it refuses for quota, and in each of its two
+/// classes (one MemoryObject and its pages) every group that refuses would
+/// admit with its finalizing objects or pages gone. `false` when it admits,
+/// or refuses for any other reason.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime waits out an owed refusal")
+)]
+pub(crate) fn memory_object_refusal_owed<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+    pages: u64,
+) -> bool {
+    let (Ok(tag), Ok(needed)) = (tasks.charge_tag(process), usize::try_from(pages)) else {
+        return false;
+    };
+    let class = crate::task::quota::object_class(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT)
+        .expect("a MemoryObject has a limited class");
+    let objects = tasks
+        .admit_quota(&tag, class, 1, |group| registry.charged(group, class))
+        .err()
+        .map(|_| {
+            tasks.quota_refusal_owed(
+                &tag,
+                class,
+                1,
+                |group| registry.charged(group, class),
+                |group| registry.finalizing_objects_of(group, class),
+            )
+        });
+    let pages = pages_refusal(registry, tasks, &tag, needed, |group| {
+        registry.charged_pages(group)
+    });
+    refusal_owed(&[objects, pages])
+}
+
+/// Whether [`admit_charged_pages`] refusing `frames` for `object` now is
+/// owed (DW2 §13.12 part b): it refuses for quota, and every group that
+/// refuses would admit with its finalizing pages gone.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime waits out an owed refusal")
+)]
+pub(crate) fn charged_pages_refusal_owed<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    object: crate::object::ObjectId,
+    frames: u64,
+) -> bool {
+    let (Ok((tag, _)), Ok(needed)) = (registry.charge(object), usize::try_from(frames)) else {
+        return false;
+    };
+    refusal_owed(&[pages_refusal(registry, tasks, &tag, needed, |group| {
+        registry.charged_pages(group)
+    })])
+}
+
+/// Whether [`admit_charged_pages_together`] refusing now is owed (DW2
+/// §13.12 part b): it refuses for quota, and each of its two admissions
+/// that refuses (the second counting the first's pages in a group both
+/// tags share, as the admission does) would admit with its groups'
+/// finalizing pages gone.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime waits out an owed refusal")
+)]
+pub(crate) fn charged_pages_together_refusal_owed<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    first: (crate::object::ObjectId, u64),
+    second: (crate::object::ObjectId, u64),
+) -> bool {
+    let (Ok((first_tag, _)), Ok((second_tag, _))) =
+        (registry.charge(first.0), registry.charge(second.0))
+    else {
+        return false;
+    };
+    let (Ok(first_needed), Ok(second_needed)) =
+        (usize::try_from(first.1), usize::try_from(second.1))
+    else {
+        return false;
+    };
+    let first_part = (first_needed != 0)
+        .then(|| {
+            pages_refusal(registry, tasks, &first_tag, first_needed, |group| {
+                registry.charged_pages(group)
+            })
+        })
+        .flatten();
+    let second_part = (second_needed != 0)
+        .then(|| {
+            pages_refusal(registry, tasks, &second_tag, second_needed, |group| {
+                let shared = first_tag.groups().any(|first| first == group);
+                registry
+                    .charged_pages(group)
+                    .saturating_add(if shared { first_needed } else { 0 })
+            })
+        })
+        .flatten();
+    refusal_owed(&[first_part, second_part])
+}
+
 /// Adds `frames` admitted frames to the object's page weight.
 pub(crate) fn record_charged_pages<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
