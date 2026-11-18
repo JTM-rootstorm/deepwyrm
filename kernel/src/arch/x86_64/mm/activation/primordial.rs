@@ -3060,6 +3060,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 }),
                         );
                     }
+                    runtime.stop_barrier();
                     runtime.begin_pending_remote_termination();
                     break PendingRemoteProcessTermination {
                         phase: prepared.phase,
@@ -4827,6 +4828,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Marks this CPU as owning a pending remote termination, in the prepare
     /// hold that publishes its Stops (DW2 §10.16 revision 2 item 1).
+    /// The Stop barrier (DW2 §13.16 part e3): a hold that has published a
+    /// Stop to another CPU locks and unlocks P once, beneath T, before it
+    /// reads or changes anything in P's value and before it ends. A fast
+    /// serve reads its Stop mailbox and its scheduler-current under P, so
+    /// once this returns the stopped CPU's fast serve either ended before
+    /// it or sees the Stop, and makes no other until it has taken it.
+    fn stop_barrier(&mut self) {
+        drop(self.paging.lock());
+    }
+
     fn begin_pending_remote_termination(&mut self) {
         assert!(
             !core::mem::replace(&mut self.own.pending_remote_termination, true),
@@ -8022,6 +8033,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             }
                         }
                     }
+                    runtime.stop_barrier();
                     // No Stop is published to this CPU until its completion
                     // hold clears this (DW2 §10.16 revision 2 item 1).
                     runtime.begin_pending_remote_termination();
