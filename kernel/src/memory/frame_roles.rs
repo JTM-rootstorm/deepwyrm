@@ -38,9 +38,7 @@ mod storage;
 #[path = "frame_roles/tables.rs"]
 mod tables;
 use chain::ChainState;
-#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use index::OnDemandCommit;
-pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory};
+pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory, OnDemandCommit};
 use index::{INDEX_RUN_THRESHOLD, IndexEntryLink, IndexRootLink, IndexRootState, RootUse};
 pub(crate) use storage::MAX_GROWTH_PARTS;
 #[cfg(test)]

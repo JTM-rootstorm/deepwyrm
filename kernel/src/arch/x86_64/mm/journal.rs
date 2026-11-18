@@ -31,6 +31,8 @@ mod publisher;
 pub(crate) use pin_tracked::{PinTrackedError, PinTrackedTarget};
 
 use crate::memory::physical::BASE_PAGE_SIZE;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use publisher::TouchedLeaf;
 pub(crate) use publisher::{X86AddressSpacePublishError, X86AddressSpacePublisher};
 #[cfg(test)]
 use publisher::{first_mapping_start, mapping_at, next_boundary, next_mapping_start};
