@@ -553,6 +553,19 @@ fn await_remote_stop_permits(
     permits
 }
 
+/// What the first part of a hold of T at a safe point found
+/// (`RuntimeCarrierFacade::safe_point_hold`, DW2 §13.13 part b).
+enum SafePointHold {
+    /// This CPU's mailbox holds a Stop.
+    Stop,
+    /// A terminal scheduler-current is on this CPU: release T and try again.
+    TerminalCurrent,
+    /// The scheduler-current Thread's root must be switched to.
+    Switch(PreparedSchedulerRootSwitch),
+    /// The scheduler-current Thread's root is already active.
+    Ready,
+}
+
 struct RuntimeCarrierFacade<
     'runtime,
     'roles,
@@ -795,9 +808,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         prepared: Option<PreparedSchedulerRootSwitch>,
     ) {
-        let Some(prepared) = prepared else {
-            return;
-        };
+        if let Some(prepared) = prepared {
+            self.execute_scheduler_root_switch_detached(prepared, false);
+        }
+    }
+
+    /// Executes a prepared scheduler root switch with T released, then
+    /// commits it in a hold of its own under `on_root_switch_flight`; a
+    /// switch that fails before CR3 is cancelled in that hold and panics.
+    /// With `take_stop`, the commit's hold then takes this CPU's mailbox
+    /// notification and the result is `false` for a Stop; without it the
+    /// mailbox is not read and the result is `true`. The one switch tail of
+    /// both safe-point shapes and of the remote-stop reconciliation.
+    // Out of line: its locals stay out of the frames that inline the
+    // synchronising wrapper, which the stack oracles measure.
+    #[inline(never)]
+    fn execute_scheduler_root_switch_detached(
+        &mut self,
+        prepared: PreparedSchedulerRootSwitch,
+        take_stop: bool,
+    ) -> bool {
         let executed = match prepared.execute(self.runtime.guard_free()) {
             Ok(executed) => executed,
             Err(failure) => {
@@ -810,6 +840,45 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let mut guard = self.runtime.lock();
         let mut runtime = guard.on_root_switch_flight(&mut self.owned);
         runtime.commit_scheduler_root_switch(executed);
+        !(take_stop
+            && matches!(
+                crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+            ))
+    }
+
+    /// The first part of every hold of T at a safe point (DW2 §13.13 part
+    /// b): a Stop in this CPU's mailbox, then a terminal scheduler-current
+    /// on `cpu`, then whether the scheduler-current Thread's root must be
+    /// switched to. `Ready` means the root is already active and the hold
+    /// may go on to its work.
+    #[inline(always)]
+    fn safe_point_hold(
+        runtime: &mut PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+        cpu: crate::cpu::CpuIndex,
+    ) -> SafePointHold {
+        if matches!(
+            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
+            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
+        ) {
+            return SafePointHold::Stop;
+        }
+        if runtime
+            .core
+            .shared
+            .execution
+            .terminal_scheduler_current_on(&runtime.core.tasks, cpu)
+            .unwrap_or_else(|error| {
+                panic!("scheduler-current terminal state lookup failed: {error:?}")
+            })
+            .is_some()
+        {
+            return SafePointHold::TerminalCurrent;
+        }
+        match runtime.prepare_scheduler_root_switch() {
+            None => SafePointHold::Ready,
+            Some(prepared) => SafePointHold::Switch(prepared),
+        }
     }
 
     /// Reconciles the logical scheduler root after acknowledged remote Stops.
@@ -873,58 +942,38 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     /// Synchronizes the scheduler-current root without crossing an already
-    /// published remote Stop. Terminal preparation deliberately moves a
-    /// remote current's execution resources while retaining its scheduler
-    /// claim until the target acknowledges that Stop. Both publishers (the
-    /// termination dispatch and the exception path) publish the Stop inside
-    /// the preparation's hold, so this hold sees that Stop whenever it sees
-    /// the terminal current; the wait below is kept as a fail-safe for a
-    /// terminal current without a Stop, which no path produces today.
+    /// published remote Stop, and releases T; `false` for a Stop. Terminal
+    /// preparation deliberately moves a remote current's execution
+    /// resources while retaining its scheduler claim until the target
+    /// acknowledges that Stop. Both publishers (the termination dispatch
+    /// and the exception path) publish the Stop inside the preparation's
+    /// hold, so this hold sees that Stop whenever it sees the terminal
+    /// current; the wait below is kept as a fail-safe for a terminal current
+    /// without a Stop, which no path produces today.
+    ///
+    /// This is the detached shape, for callers that take T again themselves
+    /// afterwards (or never): one hold makes the checks of
+    /// [`Self::safe_point_hold`] and, when the root is already active,
+    /// returns `true` as it releases T; when a switch is prepared it is
+    /// executed and committed by [`Self::execute_scheduler_root_switch_detached`],
+    /// whose commit hold takes the Stop check. The other shape,
+    /// [`Self::with_synchronized_runtime_at_safe_point`], runs its operation
+    /// in the hold that found the root active (DW2 §13.13 part b).
     fn synchronize_scheduler_current_at_safe_point_detached(&mut self) -> bool {
         let prepared = loop {
             let mut guard = self.runtime.lock();
             let mut runtime = guard.on(&mut self.owned);
-            if matches!(
-                crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-                crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-            ) {
-                return false;
-            }
-            if runtime
-                .core
-                .shared
-                .execution
-                .terminal_scheduler_current_on(&runtime.core.tasks, self.cpu)
-                .unwrap_or_else(|error| {
-                    panic!("scheduler-current terminal state lookup failed: {error:?}")
-                })
-                .is_some()
-            {
-                drop(guard);
-                core::hint::spin_loop();
-                continue;
-            }
-            break runtime.prepare_scheduler_root_switch();
-        };
-        let Some(prepared) = prepared else {
-            return true;
-        };
-        let executed = match prepared.execute(self.runtime.guard_free()) {
-            Ok(executed) => executed,
-            Err(failure) => {
-                let mut guard = self.runtime.lock();
-                let mut runtime = guard.on_root_switch_flight(&mut self.owned);
-                let error = runtime.cancel_scheduler_root_switch(failure);
-                panic!("detached scheduler root switch failed before CR3: {error:?}")
+            match Self::safe_point_hold(&mut runtime, self.cpu) {
+                SafePointHold::Stop => return false,
+                SafePointHold::TerminalCurrent => {
+                    drop(guard);
+                    core::hint::spin_loop();
+                }
+                SafePointHold::Ready => return true,
+                SafePointHold::Switch(prepared) => break prepared,
             }
         };
-        let mut guard = self.runtime.lock();
-        let mut runtime = guard.on_root_switch_flight(&mut self.owned);
-        runtime.commit_scheduler_root_switch(executed);
-        !matches!(
-            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        )
+        self.execute_scheduler_root_switch_detached(prepared, true)
     }
 
     /// Family A (design §11.2.3, D1 commit 5): a syscall that needs no
@@ -2663,10 +2712,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
-    /// Runs one scheduler-current transaction under the same runtime guard as
-    /// the final Stop arbitration. This closes both detached windows: a Stop
-    /// published before root synchronization and one published after the CR3
-    /// operation but before the caller reacquires runtime authority.
+    /// Runs one scheduler-current transaction in the same hold of T as the
+    /// final Stop arbitration and the root synchronization (DW2 §13.13 part
+    /// b); `Err` for a Stop, and `operation` then does not run. The hold
+    /// makes the checks of [`Self::safe_point_hold`]. When the
+    /// scheduler-current Thread's root is already active, which is every
+    /// ordinary call, `operation` runs in that hold: one hold of T. When a
+    /// root switch is prepared, T is released, the switch is executed and
+    /// committed by [`Self::execute_scheduler_root_switch_detached`] (whose
+    /// commit hold also takes a Stop), and the hold is taken again from the
+    /// top. A Stop published before the root synchronization, or after the
+    /// CR3 operation, is therefore seen in the hold that would run
+    /// `operation`.
     // Inlined into each caller, as it was when the ordinary syscall path was its
     // only caller: the family-A and family-B helpers (D1 commits 5 and 6) add
     // instances, and an out-of-line instance would add a frame and a return
@@ -2678,24 +2735,35 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             &mut PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
         ) -> T,
     ) -> Result<T, ()> {
-        if !self.synchronize_scheduler_current_at_safe_point_detached() {
-            return Err(());
+        loop {
+            let prepared = {
+                let mut guard = self.runtime.lock();
+                let mut runtime = guard.on(&mut self.owned);
+                match Self::safe_point_hold(&mut runtime, self.cpu) {
+                    SafePointHold::Stop => return Err(()),
+                    SafePointHold::TerminalCurrent => {
+                        drop(guard);
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    SafePointHold::Switch(prepared) => prepared,
+                    SafePointHold::Ready => {
+                        #[cfg(deepwyrm_dw1e_platform)]
+                        if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                            runtime
+                                .service_q35_retirement_at_bsp_safe_point()
+                                .unwrap_or_else(|_| {
+                                    panic!("DW1-E2C deferred finalizer safe-point drifted")
+                                });
+                        }
+                        return Ok(operation(&mut runtime));
+                    }
+                }
+            };
+            if !self.execute_scheduler_root_switch_detached(prepared, true) {
+                return Err(());
+            }
         }
-        let mut guard = self.runtime.lock();
-        let mut runtime = guard.on(&mut self.owned);
-        if matches!(
-            crate::arch::x86_64::idle::take_current_notification_at_safe_point(),
-            crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
-        ) {
-            return Err(());
-        }
-        #[cfg(deepwyrm_dw1e_platform)]
-        if self.cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-            runtime
-                .service_q35_retirement_at_bsp_safe_point()
-                .unwrap_or_else(|_| panic!("DW1-E2C deferred finalizer safe-point drifted"));
-        }
-        Ok(operation(&mut runtime))
     }
 
     /// A safe point between two steps of a call in steps (DW2 §10.8 item 1).
