@@ -6,6 +6,8 @@ use super::super::super::MapError;
 use super::*;
 use crate::memory::address_region::{AddressRegion, AddressSpaceTransactionError, Mapping};
 use crate::memory::frame_roles::IndexMemory;
+use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
+use crate::memory::usercopy::{UserPinError, UserPinTracker};
 use crate::object::InternalRef;
 use std::boxed::Box;
 use std::collections::BTreeSet;
@@ -17,7 +19,12 @@ const PAGES: u64 = 4;
 const SPAN: u64 = PAGES * BASE_PAGE_SIZE;
 const ALIAS: u64 = START + SPAN;
 
-type Publisher<'a> = X86AddressSpacePublisher<'a, FakeTarget, 4, 64, 3, 32, 4>;
+type Publisher<'a, T = FakeTarget> = X86AddressSpacePublisher<'a, T, 4, 64, 3, 32, 4>;
+
+/// The pin tracker a touch's target is wrapped over, as the live target is.
+type Pins = UserPinTracker<4>;
+/// The live target's shape over the fake one.
+type Tracked<'a> = PinTrackedTarget<'a, FakeTarget, 4>;
 
 /// Index pages as physical memory: zero once zeroed, written entries after.
 #[derive(Default)]
@@ -210,14 +217,14 @@ impl Fixture {
         unsafe_code,
         reason = "the keys were issued for the root and region this binds"
     )]
-    fn publisher<'a>(
+    fn publisher<'a, T: AtomicPageTableTarget<Error: core::fmt::Debug>>(
         roles: &'a mut FrameRoleManager<4, 64>,
         root: TableIdentity,
         page_tables: &'a PageTableRoot,
         candidates: &'a mut [Option<TableCandidateGrant>; 3],
         region: &AddressRegion<2>,
-        target: &'a mut FakeTarget,
-    ) -> Publisher<'a> {
+        target: &'a mut T,
+    ) -> Publisher<'a, T> {
         // SAFETY: the keys were issued for the root and region this binds.
         unsafe {
             X86AddressSpacePublisher::new(
@@ -350,51 +357,83 @@ impl Fixture {
             .expect("a mapping covers the touch")
     }
 
+    /// Runs `touch` with this fixture's fake target wrapped in a pin-tracked
+    /// target over `pins`, as the live target is, and puts it back.
+    fn with_pins<R>(
+        &mut self,
+        pins: &Pins,
+        touch: impl FnOnce(&mut Self, &mut Tracked<'_>) -> R,
+    ) -> R {
+        let mut tracked = PinTrackedTarget {
+            scratch: core::mem::take(&mut self.target),
+            pins,
+            address_space: self.region.address_space_key(),
+            span: None,
+        };
+        let result = touch(self, &mut tracked);
+        assert!(tracked.span.is_none(), "a touch left a mutation span held");
+        self.target = tracked.scratch;
+        result
+    }
+
     /// A serve's touch at `address` through the journal, as the serve made
     /// it before DW2 §13.16 part e1: the table count, then the commit of
     /// object page `commit` if any, then, when no table is missing, the
-    /// journal's publish of the leaf.
-    fn touch_through_journal(&mut self, address: u64, commit: Option<u64>) -> Touch {
-        let tables = {
-            let mut publisher = Self::publisher(
-                &mut self.roles,
-                self.root,
-                &self.page_tables,
-                &mut self.candidates,
-                &self.region,
-                &mut self.target,
-            );
-            publisher.touch_table_cost(address)
-        };
-        if let Some(page) = commit {
-            self.commit(page);
-        }
-        let published = (tables == Ok(0)).then(|| self.touch(address));
-        (tables, published)
+    /// journal's publish of the leaf. The target is pin-tracked over `pins`.
+    fn touch_through_journal(&mut self, address: u64, commit: Option<u64>, pins: &Pins) -> Touch {
+        let mapping = self.mapping_at(address);
+        self.with_pins(pins, |fixture, target| {
+            let tables = Self::publisher(
+                &mut fixture.roles,
+                fixture.root,
+                &fixture.page_tables,
+                &mut fixture.candidates,
+                &fixture.region,
+                target,
+            )
+            .touch_table_cost(address);
+            if let Some(page) = commit {
+                fixture.commit(page);
+            }
+            let published = (tables == Ok(0)).then(|| {
+                Self::publisher(
+                    &mut fixture.roles,
+                    fixture.root,
+                    &fixture.page_tables,
+                    &mut fixture.candidates,
+                    &fixture.region,
+                    target,
+                )
+                .publish_touched_leaf(&mapping, address)
+            });
+            (tables, published)
+        })
     }
 
     /// The same touch through one walk and one write (DW2 §13.16 part e1):
     /// find, the commit through the same publisher, write.
-    fn touch_through_find(&mut self, address: u64, commit: Option<u64>) -> Touch {
+    fn touch_through_find(&mut self, address: u64, commit: Option<u64>, pins: &Pins) -> Touch {
         let mapping = self.mapping_at(address);
         let backing = self.backing;
-        let mut publisher = Self::publisher(
-            &mut self.roles,
-            self.root,
-            &self.page_tables,
-            &mut self.candidates,
-            &self.region,
-            &mut self.target,
-        );
-        let found = publisher.find_touched_leaf(&mapping, address);
-        if let Some(page) = commit {
-            publisher.commit_on_demand_page(backing, page).unwrap();
-        }
-        match found {
-            Ok(TouchedLeaf::Found(place)) => (Ok(0), Some(publisher.write_touched_leaf(place))),
-            Ok(TouchedLeaf::MissingTables(tables)) => (Ok(tables), None),
-            Err(error) => (Err(error), None),
-        }
+        self.with_pins(pins, |fixture, target| {
+            let mut publisher = Self::publisher(
+                &mut fixture.roles,
+                fixture.root,
+                &fixture.page_tables,
+                &mut fixture.candidates,
+                &fixture.region,
+                target,
+            );
+            let found = publisher.find_touched_leaf(&mapping, address);
+            if let Some(page) = commit {
+                publisher.commit_on_demand_page(backing, page).unwrap();
+            }
+            match found {
+                Ok(TouchedLeaf::Found(place)) => (Ok(0), Some(publisher.write_touched_leaf(place))),
+                Ok(TouchedLeaf::MissingTables(tables)) => (Ok(tables), None),
+                Err(error) => (Err(error), None),
+            }
+        })
     }
 
     /// Publishes the leaf a touch at `address` needs.
@@ -767,8 +806,8 @@ fn a_root_refuses_an_entry_naming_another_owners_table() {
 /// A serve's touch: the table count (or the walk's error) and, when no
 /// table was missing, the leaf's publish.
 type Touch = (
-    Result<usize, X86AddressSpacePublishError<()>>,
-    Option<Result<bool, X86AddressSpacePublishError<()>>>,
+    Result<usize, X86AddressSpacePublishError<PinTrackedError<()>>>,
+    Option<Result<bool, X86AddressSpacePublishError<PinTrackedError<()>>>>,
 );
 
 const ACCESSED_DIRTY: u64 = (1 << 5) | (1 << 6);
@@ -806,13 +845,42 @@ fn touch_both_ways(
     address: u64,
     commit: Option<u64>,
 ) -> (Touch, Fixture) {
+    touch_both_ways_holding(make, address, commit, hold_nothing)
+}
+
+/// Anything a test holds on a pin tracker while a touch runs, released when
+/// it is dropped.
+trait Held {}
+impl<T> Held for T {}
+
+/// What a touch runs beside: nothing held.
+fn hold_nothing<'p>(_: &Fixture, _: &'p Pins) -> Box<dyn Held + 'p> {
+    Box::new(())
+}
+
+/// As [`touch_both_ways`], with each fixture's target pin-tracked over its
+/// own tracker, on which `hold` holds something for the touch's length.
+fn touch_both_ways_holding(
+    make: impl Fn() -> Fixture,
+    address: u64,
+    commit: Option<u64>,
+    hold: for<'p> fn(&Fixture, &'p Pins) -> Box<dyn Held + 'p>,
+) -> (Touch, Fixture) {
     let mut journal = make();
     let mut direct = make();
     assert_eq!(direct.target.entries, journal.target.entries);
-    let through_journal = journal.touch_through_journal(address, commit);
+    let journal_pins = Pins::new();
+    let direct_pins = Pins::new();
+    let through_journal = {
+        let _held = hold(&journal, &journal_pins);
+        journal.touch_through_journal(address, commit, &journal_pins)
+    };
     let applied = direct.target.applied.len();
     let invalidated = direct.target.invalidated.len();
-    let through_find = direct.touch_through_find(address, commit);
+    let through_find = {
+        let _held = hold(&direct, &direct_pins);
+        direct.touch_through_find(address, commit, &direct_pins)
+    };
     assert_eq!(through_find, through_journal);
     assert_eq!(direct.target.entries, journal.target.entries);
     let stores = direct.target.applied.len() - applied;
@@ -855,7 +923,7 @@ fn one_walk_and_one_store_publish_an_empty_leaf_as_the_journal_does() {
             let mut fixture = with_tables(Fixture::new());
             fixture.commit(0);
             assert_eq!(
-                fixture.touch_through_find(START, None),
+                fixture.touch_through_find(START, None, &Pins::new()),
                 (Ok(0), Some(Ok(true)))
             );
             fixture
@@ -1079,6 +1147,106 @@ fn one_walk_writes_the_leaf_each_protection_needs() {
         assert_eq!(leaf & NO_EXECUTE_BIT == 0, protection.executable());
         assert_eq!(leaf & USER_BIT, USER_BIT);
     }
+}
+
+/// A readable word at `address`, for a user pin.
+fn word(address: u64) -> UserRange {
+    UserRange::new(
+        UserAddressSpace::x86_64_four_level(BASE_PAGE_SIZE).unwrap(),
+        address,
+        4,
+        4,
+        UserAccess::READ,
+        EmptyAddressRule::Reject,
+    )
+    .unwrap()
+}
+
+/// A user pin on a word of `START`'s page.
+fn hold_pin<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
+    Box::new(
+        pins.pin_owned(fixture.region.address_space_key(), word(START + 8))
+            .unwrap(),
+    )
+}
+
+/// Another mutation's permit, over page 3 of the same mapping.
+fn hold_mutation<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
+    Box::new(
+        pins.begin_mutation(
+            fixture.region.address_space_key(),
+            START + 3 * BASE_PAGE_SIZE,
+            BASE_PAGE_SIZE,
+        )
+        .unwrap(),
+    )
+}
+
+/// The address space reserved for teardown.
+fn hold_teardown<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
+    Box::new(
+        pins.reserve_teardown(fixture.region.address_space_key())
+            .unwrap(),
+    )
+}
+
+/// The journal's `apply` reserves the page it publishes against user pins,
+/// another mutation and a teardown reservation; the one store reserves the
+/// same page and is refused with the same error, writing nothing.
+#[test]
+fn one_store_is_refused_where_the_journal_reserves_its_page() {
+    const REFUSED: Touch = (
+        Ok(0),
+        Some(Err(X86AddressSpacePublishError::Journal(
+            OwnedPageTableJournalError::Target(PinTrackedError::Pin(UserPinError::Conflict)),
+        ))),
+    );
+    for hold in [hold_pin, hold_mutation, hold_teardown] {
+        // The page committed in the serve's hold, and before it.
+        for (commit, committed) in [(Some(0), false), (None, true)] {
+            let (result, fixture) = touch_both_ways_holding(
+                || {
+                    let mut fixture = with_tables(Fixture::new());
+                    if committed {
+                        fixture.commit(0);
+                    }
+                    fixture
+                },
+                START,
+                commit,
+                hold,
+            );
+            assert_eq!(result, REFUSED);
+            assert_eq!(fixture.leaf(START), None);
+        }
+    }
+    // An already-present leaf reserves nothing, in either path.
+    let (result, _) = touch_both_ways_holding(
+        || {
+            let mut fixture = with_tables(Fixture::new());
+            fixture.commit(0);
+            fixture.touch(START).unwrap();
+            fixture
+        },
+        START,
+        None,
+        hold_pin,
+    );
+    assert_eq!(result, (Ok(0), Some(Ok(false))));
+}
+
+#[test]
+fn one_store_releases_its_page_after_writing() {
+    let mut fixture = with_tables(Fixture::new());
+    let pins = Pins::new();
+    assert_eq!(
+        fixture.touch_through_find(START, Some(0), &pins),
+        (Ok(0), Some(Ok(true)))
+    );
+    let space = fixture.region.address_space_key();
+    drop(pins.begin_mutation(space, START, BASE_PAGE_SIZE).unwrap());
+    let pin = pins.pin_owned(space, word(START + 8)).unwrap();
+    pins.release_owned(space, pin).unwrap();
 }
 
 #[path = "release_tests.rs"]

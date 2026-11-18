@@ -499,9 +499,14 @@ where
     /// leaf apart from the accessed and dirty bits and `FrameMismatch` when
     /// it is another; then, for an empty leaf, `map_page`'s checks and the
     /// journal's authentication of the path; and then writes the entry
-    /// `map_page` would, through `apply`, with no invalidation: empty to
-    /// present needs none, and changes no pinned translation. One new leaf
-    /// under existing tables changes no frame role.
+    /// `map_page` would, through `apply`, with no invalidation (empty to
+    /// present needs none), inside a mutation span over exactly this page,
+    /// which the target reserves against user pins, another mutation and a
+    /// teardown reservation as the journal's `apply` reserves the page it
+    /// invalidates; a refusal is returned as the journal returns it, and
+    /// the span is ended on every path after it was begun. An
+    /// already-present leaf reserves nothing, as in the journal path. One
+    /// new leaf under existing tables changes no frame role.
     #[cfg_attr(
         not(all(target_os = "none", target_arch = "x86_64")),
         allow(
@@ -603,11 +608,25 @@ where
                 MapError::TableClaimRejected,
             ));
         }
-        self.target
-            .apply(&[JournalWrite::new(path[3], index, entry)], &[])
-            .map_err(|error| {
-                X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
-            })?;
+        // The journal's `apply` reserves the page it invalidates against
+        // user pins, another mutation and a teardown reservation before it
+        // stores; this store reserves exactly that page, in its place, and
+        // a refusal is the journal's error for it. This span is the store's
+        // own: it is begun and ended here, apart from the batch path's
+        // `span_held`, and is ended only if it was begun.
+        let published = self
+            .target
+            .begin_mutation_span(address, BASE_PAGE_SIZE)
+            .and_then(|()| {
+                let stored = self
+                    .target
+                    .apply(&[JournalWrite::new(path[3], index, entry)], &[]);
+                self.target.end_mutation_span();
+                stored
+            });
+        published.map_err(|error| {
+            X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
+        })?;
         Ok(true)
     }
 
