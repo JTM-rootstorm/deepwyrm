@@ -8686,7 +8686,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.owned.root_switch_epoch,
         );
         let served = {
-            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut access = self
+                .paging
+                .guard_free_fault_access(self.runtime.guard_free());
             let mut paging = access.lock();
             let mut fast = LiveFastServe {
                 value: Some(paging.guard_free_value()),
@@ -8702,7 +8704,20 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let outcome = match served {
             Ok(FastServed::Served) => UserPageFaultOutcome::Served,
             Ok(FastServed::AlreadyPresent) => UserPageFaultOutcome::AlreadyPresent,
-            Err(_) => return None,
+            Err(decline) => {
+                use super::fault_window::FastDecline;
+                use step_report::WindowDecline;
+                step_report::window_declined(match decline {
+                    FastDecline::Identity => WindowDecline::Identity,
+                    FastDecline::Mapping => WindowDecline::Mapping,
+                    FastDecline::Tables => WindowDecline::Tables,
+                    FastDecline::Credit => WindowDecline::Credit,
+                    FastDecline::Memory => WindowDecline::Memory,
+                    FastDecline::Leaf => WindowDecline::Leaf,
+                    FastDecline::Return => WindowDecline::Return,
+                });
+                return None;
+            }
         };
         // Authorised through present leaves in the serve's P hold; no
         // reschedule was requested when the scheduler was asked under it.
@@ -9604,9 +9619,13 @@ pub(super) fn enter(
     // The paging authority's lock, P, lives in its own permanent storage beside the runtime
     // authority's, outside the value T guards, and is reached only beneath a T guard (D1 commit 3).
     let paging: &'static PagingLock<RuntimePaging<'static, RANGE_CAPACITY, ROLE_CAPACITY>> =
-        PRIMORDIAL_PAGING.init(PagingLock::new(
+        PRIMORDIAL_PAGING.init(PagingLock::new_timed(
             active,
             user_access::service_local_tlb_shootdown,
+            super::runtime_authority::PagingTiming {
+                now: paging_timing_now,
+                released: paging_released,
+            },
         ));
     // Permanent storage (S2K-4, reset R2D): the lock and the carrier it guards live in one-shot
     // static storage for the kernel's lifetime, not on the boot stack. Built in place there (S2K
@@ -12802,6 +12821,15 @@ type FaultCharges = (
 /// is exhaustion; it leaves the charges in `refused` for the caller to ask
 /// whether the refusal is owed (DW2 §13.12 part b). The object and Process
 /// are live here.
+/// P's timing, as T's is taken (DW2 §13.16 part e3, the `p-lock` line).
+fn paging_timing_now() -> Option<u64> {
+    Some(step_report::ticks())
+}
+
+fn paging_released(source: super::runtime_authority::PagingSource, waited: Option<u64>, held: u64) {
+    step_report::p_lock_released(source as usize, waited, held);
+}
+
 /// The fast serve's paging (DW2 §13.16 part e3): P's value, taken
 /// guard-free, until the session for the window's copied root is built
 /// from it; then that session.
@@ -12827,6 +12855,7 @@ struct LiveFastServe<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAP
 
 /// The fast serve's publisher, for steps 4 to 7 under one borrow.
 struct LiveFastLeaf<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    cpu: usize,
     publisher: crate::arch::x86_64::mm::X86AddressSpacePublisher<
         'a,
         user_access::TrackedActiveTarget<'v>,
@@ -12889,6 +12918,24 @@ impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fau
     fn write(&mut self, place: Self::Place) -> Option<bool> {
         self.publisher.write_touched_leaf(place).ok()
     }
+
+    fn stamp(&mut self, stamp: super::fault_window::FastStamp) {
+        fast_stamp(self.cpu, stamp);
+    }
+}
+
+/// The fast serve's step-report stamp on `cpu`.
+fn fast_stamp(cpu: usize, stamp: super::fault_window::FastStamp) {
+    use super::fault_window::FastStamp;
+    use step_report::FastFaultStamp;
+    step_report::fast_stamped(
+        cpu,
+        match stamp {
+            FastStamp::Checked => FastFaultStamp::Checked,
+            FastStamp::Committed => FastFaultStamp::Committed,
+            FastStamp::Written => FastFaultStamp::Written,
+        },
+    );
 }
 
 impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
@@ -12946,7 +12993,10 @@ impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &mut self.candidates,
             )
             .ok()
-            .map(|publisher| LiveFastLeaf { publisher })
+            .map(|publisher| LiveFastLeaf {
+                cpu: self.cpu.index(),
+                publisher,
+            })
     }
 
     fn spend(&mut self, frames: u64) {
@@ -12960,6 +13010,10 @@ impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.session
             .as_mut()
             .is_some_and(|session| self.frame.validate_and_sanitize(session).is_ok())
+    }
+
+    fn stamp(&mut self, stamp: super::fault_window::FastStamp) {
+        fast_stamp(self.cpu.index(), stamp);
     }
 }
 

@@ -85,7 +85,9 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         &mut self,
         charges: &mut impl crate::memory::address_region::WindowCharges,
     ) -> usize {
-        self.session.windows.close_all(charges)
+        let closed = self.session.windows.close_all(charges);
+        crate::arch::x86_64::step_report::windows_changed(0, closed as u64);
+        closed
     }
 
     /// Opens, tops up or replaces CPU slot `cpu`'s fault window after a
@@ -96,7 +98,12 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         opening: crate::memory::address_region::WindowOpening<super::UserCopyRoot>,
         charges: &mut impl crate::memory::address_region::WindowCharges,
     ) -> crate::memory::address_region::WindowOpened {
-        self.session.windows.open(cpu, opening, charges)
+        let opened = self.session.windows.open(cpu, opening, charges);
+        crate::arch::x86_64::step_report::windows_changed(
+            u64::from(opened.opened),
+            u64::from(opened.closed),
+        );
+        opened
     }
 
     /// Whether any user pin or mutation holds part of `address_space`.
@@ -890,7 +897,9 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         address_space: crate::memory::address_region::AddressSpaceKey,
         charges: &mut impl crate::memory::address_region::WindowCharges,
     ) -> crate::memory::address_region::WindowsClosed {
-        self.windows.close_address_space(address_space, charges)
+        let closed = self.windows.close_address_space(address_space, charges);
+        crate::arch::x86_64::step_report::windows_changed(0, closed.closed() as u64);
+        closed
     }
 
     /// CPU slot `cpu`'s fault window, copied (DW2 §13.16 part e3).

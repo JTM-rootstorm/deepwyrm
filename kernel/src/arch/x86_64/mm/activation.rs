@@ -2610,8 +2610,11 @@ mod live_sessions {
             address_space: crate::memory::address_region::AddressSpaceKey,
             charges: &mut impl crate::memory::address_region::WindowCharges,
         ) -> crate::memory::address_region::WindowsClosed {
-            self.fault_windows
-                .close_address_space(address_space, charges)
+            let closed = self
+                .fault_windows
+                .close_address_space(address_space, charges);
+            crate::arch::x86_64::step_report::windows_changed(0, closed.closed() as u64);
+            closed
         }
 
         /// Closes every CPU's fault window, for a hold that holds P with no
@@ -2620,7 +2623,9 @@ mod live_sessions {
             &mut self,
             charges: &mut impl crate::memory::address_region::WindowCharges,
         ) -> usize {
-            self.fault_windows.close_all(charges)
+            let closed = self.fault_windows.close_all(charges);
+            crate::arch::x86_64::step_report::windows_changed(0, closed as u64);
+            closed
         }
 
         /// P's fault windows, to read.
