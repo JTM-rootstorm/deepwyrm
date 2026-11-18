@@ -8380,13 +8380,18 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.terminate_exception_with_remote_stops(record.task_exception().resource_policy())
     }
 
+    /// One hold of T serves the fault and, when the outcome returns to the
+    /// program, authorises the frame's return and reads the reschedule
+    /// request (DW2 §13.13 part c). A Stop at the safe point is `Retry`.
     fn serve_user_page_fault(
         &mut self,
         cr2: u64,
         error: u64,
-    ) -> crate::syscall::native::UserPageFaultOutcome {
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> crate::syscall::native::FaultPass {
+        let cpu = self.cpu;
         self.with_synchronized_runtime_at_safe_point(|runtime| {
-            let outcome = runtime.serve_user_page_fault(cr2, error);
+            let mut outcome = runtime.serve_user_page_fault(cr2, error);
             // A touch refused while a dead job's teardown or an object's
             // finalization is owed frees owed memory first (§10.10 item 7,
             // §10.12 item 6): this entry's one step, in a whole drain, then
@@ -8402,11 +8407,28 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             {
                 step_report::allow_teardown_step(runtime.cpu().index());
                 let _ = runtime.drain_finalizers();
-                return crate::syscall::native::UserPageFaultOutcome::Released;
+                outcome = crate::syscall::native::UserPageFaultOutcome::Released;
             }
-            outcome
+            crate::syscall::native::FaultPass::new(outcome, || {
+                // The frame is validated against the mappings this hold
+                // published the leaf in.
+                let authorized = runtime.authorize_timer_return(frame);
+                // As `has_reschedule_request` does: the BSP drains a
+                // general Timer's completion before a woken Thread may
+                // return to userspace.
+                let reschedule = authorized.is_ok() && {
+                    if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+                        runtime.service_pending_timer_expiries_on_bootstrap();
+                    }
+                    runtime.has_reschedule_request()
+                };
+                crate::syscall::native::FaultReturn {
+                    authorized,
+                    reschedule,
+                }
+            })
         })
-        .unwrap_or(crate::syscall::native::UserPageFaultOutcome::Retry)
+        .unwrap_or(crate::syscall::native::FaultPass::retry())
     }
 
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> ! {

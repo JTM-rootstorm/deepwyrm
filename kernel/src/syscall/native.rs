@@ -1550,6 +1550,122 @@ pub(crate) enum UserPageFaultOutcome {
     Retry,
 }
 
+impl UserPageFaultOutcome {
+    /// Whether the fault gate returns to the faulting instruction after
+    /// this outcome: `Served`, `AlreadyPresent` and `Released`.
+    pub(crate) const fn returns_to_program(self) -> bool {
+        matches!(self, Self::Served | Self::AlreadyPresent | Self::Released)
+    }
+}
+
+/// What the hold that served a fault decided about the return to the
+/// program (DW2 §13.13 part c).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FaultReturn {
+    /// The fault frame's return, authorised against the scheduler-current
+    /// Thread's mappings in the hold that served the fault.
+    pub(crate) authorized: Result<(), crate::arch::x86_64::syscall::UserReturnError>,
+    /// This CPU has a reschedule request; read only when `authorized` is
+    /// `Ok`, and `false` otherwise.
+    pub(crate) reschedule: bool,
+}
+
+/// One pass of the runtime's fault serve (DW2 §13.13 part c): the outcome
+/// and, exactly when the outcome returns to the program, the return's
+/// authorisation and the reschedule read made in the same hold. Built only
+/// through [`FaultPass::new`] and [`FaultPass::retry`], so a returning
+/// outcome without its return, or a return without a returning outcome,
+/// cannot be built.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FaultPass {
+    outcome: UserPageFaultOutcome,
+    returning: Option<FaultReturn>,
+}
+
+impl FaultPass {
+    /// A pass that ended as `outcome`; `returning` decides the return and
+    /// runs exactly when `outcome` returns to the program.
+    pub(crate) fn new(
+        outcome: UserPageFaultOutcome,
+        returning: impl FnOnce() -> FaultReturn,
+    ) -> Self {
+        Self {
+            outcome,
+            returning: outcome.returns_to_program().then(returning),
+        }
+    }
+
+    /// A pass that could not reach a safe point (a Stop): the gate polls
+    /// and comes again.
+    pub(crate) const fn retry() -> Self {
+        Self {
+            outcome: UserPageFaultOutcome::Retry,
+            returning: None,
+        }
+    }
+
+    pub(crate) const fn outcome(&self) -> UserPageFaultOutcome {
+        self.outcome
+    }
+
+    /// `Some` exactly when [`Self::outcome`] returns to the program.
+    pub(crate) const fn returning(&self) -> Option<FaultReturn> {
+        self.returning
+    }
+}
+
+/// What the fault gate does after one pass of the serve (DW2 §13.13 part
+/// c).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FaultGateAction {
+    /// Poll for a Stop and serve again.
+    Retry,
+    /// End the process with the fault's exception record.
+    EndException,
+    /// End the process with `DW_TERMINATION_RESOURCE_POLICY`.
+    EndResourceFault,
+    /// The return was refused: end through the invalid-return path.
+    InvalidReturn(crate::arch::x86_64::syscall::UserReturnError),
+    /// Return to the faulting instruction, preempting first when
+    /// `reschedule`.
+    Return { reschedule: bool },
+}
+
+/// The fault gate's decision for `pass` (DW2 §13.13 part c).
+pub(crate) fn fault_gate_action(pass: &FaultPass) -> FaultGateAction {
+    match (pass.outcome, pass.returning) {
+        (UserPageFaultOutcome::Retry, _) => FaultGateAction::Retry,
+        (UserPageFaultOutcome::Unserved, _) => FaultGateAction::EndException,
+        (UserPageFaultOutcome::Exhausted(_), _) => FaultGateAction::EndResourceFault,
+        (
+            UserPageFaultOutcome::Served
+            | UserPageFaultOutcome::AlreadyPresent
+            | UserPageFaultOutcome::Released,
+            Some(FaultReturn {
+                authorized: Err(error),
+                ..
+            }),
+        ) => FaultGateAction::InvalidReturn(error),
+        (
+            UserPageFaultOutcome::Served
+            | UserPageFaultOutcome::AlreadyPresent
+            | UserPageFaultOutcome::Released,
+            Some(FaultReturn {
+                authorized: Ok(()),
+                reschedule,
+            }),
+        ) => FaultGateAction::Return { reschedule },
+        // `FaultPass::new` gives every returning outcome its return, so this
+        // arm is never taken; it fails closed if it were.
+        (
+            UserPageFaultOutcome::Served
+            | UserPageFaultOutcome::AlreadyPresent
+            | UserPageFaultOutcome::Released,
+            None,
+        ) => FaultGateAction::EndException,
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "plan-producing runtime methods carry physical-current and fixed-entry obligations that safe Rust cannot encode"
@@ -1638,10 +1754,24 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
     }
 
     /// Serves a CPL3 page fault at `cr2` with error code `error` if it lies
-    /// on an on-demand page the faulting access may touch (DW2 M6 §8.5). A
-    /// runtime without on-demand objects serves none.
-    fn serve_user_page_fault(&mut self, _cr2: u64, _error: u64) -> UserPageFaultOutcome {
-        UserPageFaultOutcome::Unserved
+    /// on an on-demand page the faulting access may touch (DW2 M6 §8.5).
+    /// When the outcome returns to the program, the same hold of the
+    /// runtime authorises `frame`'s return and reads the reschedule request
+    /// (DW2 §13.13 part c), as this default would with the trait's own
+    /// methods. A runtime without on-demand objects serves none.
+    fn serve_user_page_fault(
+        &mut self,
+        _cr2: u64,
+        _error: u64,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> FaultPass {
+        FaultPass::new(UserPageFaultOutcome::Unserved, || {
+            let authorized = self.authorize_timer_return(frame);
+            FaultReturn {
+                authorized,
+                reschedule: authorized.is_ok() && self.has_reschedule_request(),
+            }
+        })
     }
 
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> !

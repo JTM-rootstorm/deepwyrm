@@ -1732,8 +1732,8 @@ unsafe fn native_runtime_user_page_fault<
     cr2: u64,
     error: u64,
 ) {
-    use crate::arch::x86_64::step_report::{self, FaultPass};
-    use crate::syscall::native::UserPageFaultOutcome;
+    use crate::arch::x86_64::step_report;
+    use crate::syscall::native::{FaultGateAction, UserPageFaultOutcome, fault_gate_action};
     // The step report times this fault from here (DW2 §13.5).
     let cpu = current_cpu_index();
     if let Some(cpu) = cpu {
@@ -1750,64 +1750,68 @@ unsafe fn native_runtime_user_page_fault<
         untimed();
         end_user_page_fault::<R>(context, TerminalAction::UserException(record));
     }
-    let outcome = loop {
+    // One pass is one hold of T (DW2 §13.13 parts b and c): the serve and,
+    // for an outcome that returns, the frame's authorisation and the
+    // reschedule read.
+    let (action, served) = loop {
         poll_timer_return_stop(context);
         // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the fault gate has no other
         // Rust frame on this CPU that holds one.
         let runtime = unsafe { &mut *context.cast::<R>() };
-        let outcome = runtime.serve_user_page_fault(cr2, error);
-        step_report::fault_pass(match outcome {
-            UserPageFaultOutcome::Served => FaultPass::Served,
-            UserPageFaultOutcome::AlreadyPresent => FaultPass::AlreadyPresent,
-            UserPageFaultOutcome::Released => FaultPass::Released,
-            UserPageFaultOutcome::Retry => FaultPass::Retry,
-            UserPageFaultOutcome::Unserved => FaultPass::Unserved,
-            UserPageFaultOutcome::Exhausted(_) => FaultPass::Exhausted,
+        let pass = runtime.serve_user_page_fault(cr2, error, frame);
+        step_report::fault_pass(match pass.outcome() {
+            UserPageFaultOutcome::Served => step_report::FaultPass::Served,
+            UserPageFaultOutcome::AlreadyPresent => step_report::FaultPass::AlreadyPresent,
+            UserPageFaultOutcome::Released => step_report::FaultPass::Released,
+            UserPageFaultOutcome::Retry => step_report::FaultPass::Retry,
+            UserPageFaultOutcome::Unserved => step_report::FaultPass::Unserved,
+            UserPageFaultOutcome::Exhausted(_) => step_report::FaultPass::Exhausted,
         });
-        match outcome {
-            UserPageFaultOutcome::Retry => continue,
-            outcome => break outcome,
+        match fault_gate_action(&pass) {
+            FaultGateAction::Retry => continue,
+            action => {
+                break (
+                    action,
+                    matches!(pass.outcome(), UserPageFaultOutcome::Served),
+                );
+            }
         }
     };
-    match outcome {
+    let has_request = match action {
         // Served, or published by another touch since this one faulted: the
         // leaf now grants the access. A served fault was a not-present one,
         // so the retry either succeeds or faults on a present leaf, which is
         // never served; it cannot loop here (DW2 M6 §8.5).
-        UserPageFaultOutcome::Served
-        | UserPageFaultOutcome::AlreadyPresent
-        | UserPageFaultOutcome::Released => {}
-        UserPageFaultOutcome::Unserved => {
+        FaultGateAction::Return { reschedule } => reschedule,
+        FaultGateAction::EndException => {
             untimed();
             end_user_page_fault::<R>(context, TerminalAction::UserException(record));
         }
-        UserPageFaultOutcome::Exhausted(_) => {
+        FaultGateAction::EndResourceFault => {
             untimed();
             end_user_page_fault::<R>(context, TerminalAction::UserResourceFault(record));
         }
-        UserPageFaultOutcome::Retry => unreachable!("the serve loop retries"),
+        FaultGateAction::InvalidReturn(error) => {
+            untimed();
+            invalid_bound_return::<R>(context, error);
+        }
+        FaultGateAction::Retry => unreachable!("the serve loop retries"),
+    };
+    // The fault's time ends here: its return part holds the authorisation,
+    // the reschedule read and T's release.
+    if let Some(cpu) = cpu {
+        step_report::fault_returned(cpu, served);
     }
     // Return as the timer gate does, but without a fresh quantum: a thread
     // that faults often must still expire. Only a switch arms one, for the
     // Thread that resumes.
-    poll_timer_return_stop(context);
-    {
-        // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
-        let runtime = unsafe { &mut *context.cast::<R>() };
-        if let Err(error) = runtime.authorize_timer_return(frame) {
-            untimed();
-            invalid_bound_return::<R>(context, error);
-        }
-    }
-    // The fault's time ends here, before the reschedule check.
-    if let Some(cpu) = cpu {
-        step_report::fault_returned(cpu, matches!(outcome, UserPageFaultOutcome::Served));
-    }
-    let has_request = {
-        // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
-        let runtime = unsafe { &mut *context.cast::<R>() };
-        runtime.has_reschedule_request()
-    };
+    //
+    // No Stop poll sits between the serve's hold and here (DW2 §13.13 part
+    // c). A Stop published after that hold is taken by the final poll
+    // below: `prepare_preemption` returns `Return` for a Stop published
+    // before its hold, and a Stop published after it is refused at
+    // publication while its switch is prepared. On the switch path the
+    // resumed Thread's timer gate loop polls its own mailbox.
     if has_request {
         let plan = {
             // SAFETY: [CARRIER] scoped reborrow; the previous one has ended.
