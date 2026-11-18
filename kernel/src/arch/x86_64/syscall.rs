@@ -59,15 +59,15 @@ pub(crate) use live::enter_native_syscall_runtime;
 pub(crate) use live::{
     SyscallInstallError, bind_current_thread_stack, bind_native_runtime_carrier_for_slot,
     bind_native_runtime_user_exception_handler, bind_running_native_runtime_carrier_for_slot,
-    clear_tsc_aux_at_cpu_entry, current_binding_generation, current_bound_kernel_stack,
-    current_cpu_index_for_diagnostics, current_cpu_index_for_scheduler_request,
-    current_cpu_is_on_terminal_reaper_stack, current_native_usercopy_is_quiescent,
-    enter_bound_idle_scheduler, enter_bound_validated_user, enter_published_native_syscall_runtime,
-    first_run_thread_entry_rip, handoff_current_rendezvous_from_carrier, install_syscall_boundary,
+    current_binding_generation, current_bound_kernel_stack, current_cpu_index_for_diagnostics,
+    current_cpu_index_for_scheduler_request, current_cpu_is_on_terminal_reaper_stack,
+    current_native_usercopy_is_quiescent, enter_bound_idle_scheduler, enter_bound_validated_user,
+    enter_published_native_syscall_runtime, first_run_thread_entry_rip,
+    handoff_current_rendezvous_from_carrier, install_syscall_boundary,
     install_syscall_boundary_for_slot, kernel_alignment_flag_is_clear,
-    native_runtime_carrier_lifecycle, publish_current_quantum_expiry,
-    release_native_runtime_carrier_for_slot, supervisor_protections_record,
-    validate_live_syscall_boundary,
+    native_runtime_carrier_lifecycle, prepare_cpu_identity_at_cpu_entry,
+    publish_current_quantum_expiry, release_native_runtime_carrier_for_slot,
+    supervisor_protections_record, validate_live_syscall_boundary,
 };
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use runtime_binding::RuntimeCarrierLifecycle;

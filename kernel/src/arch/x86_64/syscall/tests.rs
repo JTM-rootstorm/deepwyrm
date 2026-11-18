@@ -384,6 +384,33 @@ fn tsc_aux_support_follows_cpuid() {
     );
 }
 
+/// DW2 §13.13 part d: once the BSP has chosen RDPID, only a CPU reporting
+/// RDPID may run a CPU-index lookup; before that choice, or with no RDPID in
+/// use, every CPU may.
+#[test]
+fn only_a_cpu_with_rdpid_may_join_once_the_bsp_chose_it() {
+    let none = TscAuxSupport {
+        msr: false,
+        rdpid: false,
+    };
+    let rdtscp_only = TscAuxSupport {
+        msr: true,
+        rdpid: false,
+    };
+    let rdpid = TscAuxSupport {
+        msr: true,
+        rdpid: true,
+    };
+    // The BSP did not choose RDPID (or has not yet): every CPU may join.
+    assert!(cpu_may_join(false, none));
+    assert!(cpu_may_join(false, rdtscp_only));
+    assert!(cpu_may_join(false, rdpid));
+    // The BSP chose RDPID: only a CPU reporting it may join.
+    assert!(!cpu_may_join(true, none));
+    assert!(!cpu_may_join(true, rdtscp_only));
+    assert!(cpu_may_join(true, rdpid));
+}
+
 /// DW2 §13.13 part d: an RDPID value names slot `value - 1` only when it is
 /// in range and that slot is installed; otherwise the GS pair answers.
 #[test]

@@ -240,6 +240,14 @@ pub(crate) const fn tsc_aux_support(
     }
 }
 
+/// Whether a CPU may run any CPU-index lookup at all (DW2 §13.13 part d).
+/// Once the BSP has chosen RDPID for the CPU index (`bsp_chose_rdpid`),
+/// every lookup on every CPU executes RDPID, so a CPU that does not report
+/// it would raise #UD at its first lookup. Such a CPU may not join.
+pub(crate) const fn cpu_may_join(bsp_chose_rdpid: bool, support: TscAuxSupport) -> bool {
+    !bsp_chose_rdpid || support.rdpid
+}
+
 /// The CPU index an RDPID value names (DW2 §13.13 part d), or `None` for
 /// the GS-pair lookup to answer instead. `value` is slot plus one, so it
 /// names slot `value - 1` only if it is in `1..=slot_count` and that slot is

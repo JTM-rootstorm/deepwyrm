@@ -11,8 +11,8 @@ use crate::syscall::native::DivergentCarrier;
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
 use super::msr::{
     IA32_EFER, IA32_TSC_AUX, SyscallMsrAccess, SyscallMsrPlan, SyscallMsrPlanError,
-    SyscallMsrProgramError, TscAuxSupport, cpu_index_from_tsc_aux, program_and_verify,
-    tsc_aux_support, verify,
+    SyscallMsrProgramError, TscAuxSupport, cpu_index_from_tsc_aux, cpu_may_join,
+    program_and_verify, tsc_aux_support, verify,
 };
 use super::runtime_binding::{
     RuntimeCarrierClaimError, RuntimeCarrierClaims, RuntimeCarrierLifecycle,
@@ -783,7 +783,7 @@ fn current_cpu_index() -> Option<usize> {
         // installs while it is set reports RDPID too (`install_syscall_boundary_for_slot`).
         let value = unsafe { read_processor_id() };
         // The value names this CPU only once its own install wrote it: every CPU zeroes
-        // IA32_TSC_AUX at its entry (`clear_tsc_aux_at_cpu_entry`), and its install writes its
+        // IA32_TSC_AUX at its entry (`prepare_cpu_identity_at_cpu_entry`), and its install writes its
         // slot plus one before publishing that slot INSTALLED. Anything else falls back.
         if let Some(cpu_index) = cpu_index_from_tsc_aux(
             value,
@@ -846,7 +846,11 @@ fn local_tsc_aux_support() -> TscAuxSupport {
 
 /// Zeroes IA32_TSC_AUX on a CPU that has it (DW2 M8 step 3d, §13.13 part
 /// d), so a value left by firmware or an earlier OS cannot name an installed
-/// slot before this CPU's own install writes its slot plus one.
+/// slot before this CPU's own install writes its slot plus one. Then says
+/// whether this CPU may run a CPU-index lookup at all: `false` iff the BSP
+/// has already chosen RDPID and this CPU does not report it, so its first
+/// lookup would raise #UD ([`cpu_may_join`]). On `false` the caller must
+/// stop the CPU before anything that can look up the CPU index or panic.
 ///
 /// Every CPU calls it as the first thing of its first Rust frame: the BSP in
 /// `dw_kernel_rust_entry`, an AP in `dw_x86_64_ap_higher_half_entry`. Nothing
@@ -863,12 +867,15 @@ fn local_tsc_aux_support() -> TscAuxSupport {
     unsafe_code,
     reason = "WRMSR zeroes IA32_TSC_AUX at a CPU's entry, before its install"
 )]
-pub(crate) unsafe fn clear_tsc_aux_at_cpu_entry() {
-    if local_tsc_aux_support().msr {
+#[must_use = "a CPU that may not join must be stopped before any CPU-index lookup"]
+pub(crate) unsafe fn prepare_cpu_identity_at_cpu_entry() -> bool {
+    let support = local_tsc_aux_support();
+    if support.msr {
         // SAFETY: [ASM] CPL0 (this function's contract) and the CPU reports RDTSCP or RDPID, so
         // IA32_TSC_AUX exists; zero is a valid value.
         unsafe { write_msr(IA32_TSC_AUX, 0) };
     }
+    cpu_may_join(RDPID_CPU_INDEX.load(Ordering::Acquire), support)
 }
 
 /// Returns the installed logical CPU slot selected by the current

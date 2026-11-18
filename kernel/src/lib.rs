@@ -239,8 +239,12 @@ extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id:
     // identity or panic (DW2 §13.13 part d): only `ap_trampoline.S` precedes it, with no IDT of
     // ours loaded. An AP passes the trampoline once: the BSP starts each AP once and then retires
     // the trampoline mapping.
-    unsafe {
-        arch::x86_64::syscall::clear_tsc_aux_at_cpu_entry();
+    if !unsafe { arch::x86_64::syscall::prepare_cpu_identity_at_cpu_entry() } {
+        // This CPU lacks the RDPID the BSP chose, so any CPU-index lookup here would raise #UD.
+        // The registry is not told: nothing that could look up the CPU index, or panic, may run
+        // on this CPU. It halts at once; the BSP sees it stay `Starting`, and its wait for this
+        // AP to park times out and fails the boot.
+        park_h1_application_processor();
     }
     let cpu_index = cpu_index as usize;
     let Ok(local_apic_id) = u8::try_from(local_apic_id) else {
