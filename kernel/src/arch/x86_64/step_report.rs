@@ -112,6 +112,22 @@ pub(crate) enum FaultPass {
 
 const FAULT_PASSES: usize = 6;
 
+/// A call that met a refusal owed work could admit and took the owed step
+/// instead of returning it (DW2 §13.12 part b), for the `admission-waits`
+/// line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionWait {
+    /// `memory_object_create`'s first hold, or its final hold restarting it.
+    Create = 0,
+    /// A step of `memory_object_commit`, of a fill-in or of `dma_map`'s
+    /// commit.
+    Commit = 1,
+    /// A user page fault.
+    Fault = 2,
+}
+
+const ADMISSION_WAITS: usize = 3;
+
 /// The parts of a served fault's time, in the `faults` line's order: sync
 /// (the gate's entry to the inner serve's start: the stop poll, taking T
 /// and the safe point's checks), lookup, admit, commit, tables (to
@@ -279,6 +295,9 @@ pub(crate) struct StepTally<const CPUS: usize> {
     /// §13.12 part a): see [`StepTally::usage_checked`]. Zero until it is
     /// recorded.
     usage_check: AtomicU64,
+    /// Passes that met an owed refusal and took the owed step, by
+    /// [`AdmissionWait`].
+    admission_waits: [AtomicU64; ADMISSION_WAITS],
 }
 
 /// The fields of [`StepTally::backing_allocated`]'s packed record. 24 bits
@@ -346,6 +365,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
             commit_take: AtomicU64::new(0),
             commit_rest: AtomicU64::new(0),
             usage_check: AtomicU64::new(0),
+            admission_waits: [const { AtomicU64::new(0) }; ADMISSION_WAITS],
         }
     }
 
@@ -583,6 +603,22 @@ impl<const CPUS: usize> StepTally<CPUS> {
         );
     }
 
+    /// A pass of `wait`'s kind met an owed refusal and took the owed step.
+    pub(crate) fn admission_waited(&self, wait: AdmissionWait) {
+        self.admission_waits[wait as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The `admission-waits` line: always written.
+    fn write_admission_line(&self, mut line: impl FnMut(core::fmt::Arguments<'_>)) {
+        let [create, commit, fault] = self
+            .admission_waits
+            .each_ref()
+            .map(|count| count.load(Ordering::Relaxed));
+        line(format_args!(
+            "admission-waits create={create} commit={commit} fault={fault}"
+        ));
+    }
+
     /// The `usage-check` line, only once [`Self::usage_checked`] recorded.
     fn write_usage_line(&self, mut line: impl FnMut(core::fmt::Arguments<'_>)) {
         let packed = self.usage_check.load(Ordering::Relaxed);
@@ -597,8 +633,8 @@ impl<const CPUS: usize> StepTally<CPUS> {
     }
 
     /// Writes the whole report's line bodies in order: the step lines, the
-    /// finalization lines, the measurement's lines, the usage check if it
-    /// was recorded, then the closing lines, whose values `closing` reads
+    /// finalization lines, the measurement's lines, the admission waits,
+    /// the usage check if it was recorded, then the closing lines, whose values `closing` reads
     /// only once every line before them is written (see
     /// [`write_closing_lines`]).
     pub(crate) fn write_report(
@@ -611,6 +647,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
         self.write_lines(&mut line);
         self.write_finalize_lines(now, &mut line);
         self.write_measure_lines(tsc_hz, &mut line);
+        self.write_admission_line(&mut line);
         self.write_usage_line(&mut line);
         let (timer_arm, records_dropped) = closing();
         write_closing_lines(timer_arm, records_dropped, line);
@@ -1223,6 +1260,12 @@ mod live {
         TALLY.t_lock_released(cpu, drain_source(cpu), released);
     }
 
+    /// A pass met an owed refusal and took the owed step (see
+    /// [`StepTally::admission_waited`]).
+    pub(crate) fn admission_waited(wait: super::AdmissionWait) {
+        TALLY.admission_waited(wait);
+    }
+
     /// The power-off hold's usage check (see
     /// [`StepTally::usage_checked`]).
     pub(crate) fn usage_checked(groups: usize, mismatches: usize) {
@@ -1272,12 +1315,12 @@ mod live {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
-    after_safe_point, allow_teardown_step, at_safe_point, backing_allocated, backing_made,
-    call_ended, commit_step, fault_entered, fault_pass, fault_pass_began, fault_returned,
-    fault_stamped, fault_untimed, fill_in_served, finalize_hold_ended, finalize_queued,
-    finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended, report,
-    set_drain_source, step_began, t_lock_released, t_lock_served, take_teardown_step, ticks, timed,
-    timed_nested, usage_checked,
+    admission_waited, after_safe_point, allow_teardown_step, at_safe_point, backing_allocated,
+    backing_made, call_ended, commit_step, fault_entered, fault_pass, fault_pass_began,
+    fault_returned, fault_stamped, fault_untimed, fill_in_served, finalize_hold_ended,
+    finalize_queued, finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended,
+    report, set_drain_source, step_began, t_lock_released, t_lock_served, take_teardown_step,
+    ticks, timed, timed_nested, usage_checked,
 };
 
 #[cfg(test)]
@@ -2206,8 +2249,8 @@ mod tests {
         tally.t_lock_released(1, DrainSource::Gate, 3_000);
         let (out, before_closing) = report(&tally);
         // Every line before the closing lines is written by then.
-        assert_eq!(before_closing, 9 + 6 + 4);
-        assert_eq!(out.len(), 9 + 6 + 4 + 2);
+        assert_eq!(before_closing, 9 + 6 + 4 + 1);
+        assert_eq!(out.len(), 9 + 6 + 4 + 1 + 2);
         assert_eq!(out[8], "backing-alloc-longest-us=0 runs=0 pages=0");
         assert_eq!(out[14], "owed-wakes=0 unsent=0 queue=0 retirement=0");
         assert!(out[15].starts_with("faults served="));
@@ -2217,12 +2260,35 @@ mod tests {
             "t-lock cpu=1 source=gate count=1 waited=1 wait-us=1 wait-longest-us=1 held-us=2 held-longest-us=2"
         );
         assert!(out[18].starts_with("commit-steps "));
+        assert_eq!(out[19], "admission-waits create=0 commit=0 fault=0");
         assert_eq!(
-            out[19..],
+            out[20..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
         assert!(!out.iter().any(|line| line.starts_with("usage-check")));
-        assert!(!out.iter().any(|line| line.starts_with("admission")));
+    }
+
+    /// DW2 §13.12 part b: the admission waits are counted by kind and
+    /// written after the measurement's lines, before the usage check.
+    #[test]
+    fn admission_waits_are_counted_by_kind_before_the_usage_check() {
+        let tally = StepTally::<2>::new();
+        tally.admission_waited(AdmissionWait::Create);
+        for _ in 0..3 {
+            tally.admission_waited(AdmissionWait::Commit);
+        }
+        for _ in 0..2 {
+            tally.admission_waited(AdmissionWait::Fault);
+        }
+        tally.usage_checked(1, 0);
+        let (out, _) = report(&tally);
+        assert!(out[17].starts_with("commit-steps "));
+        assert_eq!(out[18], "admission-waits create=1 commit=3 fault=2");
+        assert_eq!(out[19], "usage-check groups=1 mismatches=0");
+        assert_eq!(
+            out[20..],
+            ["timer-arm retries=2 deferred=3", "records-dropped=0"]
+        );
     }
 
     /// DW2 §13.12 part a: the power-off hold's usage check is printed after
@@ -2233,22 +2299,23 @@ mod tests {
         let tally = StepTally::<2>::new();
         tally.usage_checked(0, 0);
         let (out, before_closing) = report(&tally);
-        assert_eq!(before_closing, 9 + 6 + 3 + 1);
+        assert_eq!(before_closing, 9 + 6 + 3 + 1 + 1);
         assert_eq!(
             out[17],
             "commit-steps count=0 admit-us=0 take-us=0 rest-us=0"
         );
-        assert_eq!(out[18], "usage-check groups=0 mismatches=0");
+        assert_eq!(out[18], "admission-waits create=0 commit=0 fault=0");
+        assert_eq!(out[19], "usage-check groups=0 mismatches=0");
         assert_eq!(
-            out[19..],
+            out[20..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
 
         tally.usage_checked(12, 3);
-        assert_eq!(report(&tally).0[18], "usage-check groups=12 mismatches=3");
+        assert_eq!(report(&tally).0[19], "usage-check groups=12 mismatches=3");
         tally.usage_checked(usize::MAX, usize::MAX);
         assert_eq!(
-            report(&tally).0[18],
+            report(&tally).0[19],
             "usage-check groups=2147483647 mismatches=2147483647"
         );
     }
