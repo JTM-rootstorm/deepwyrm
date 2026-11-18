@@ -1161,6 +1161,7 @@ fn object_get_info_v1_impl<
     if let Err(error) = preflight_user_output(user, required_range, 8) {
         return usercopy_status(error);
     }
+    // This path serves no fault under P alone, so it has no window credit.
     let encoded = match object_info_query(
         registry,
         memory,
@@ -1170,6 +1171,7 @@ fn object_get_info_v1_impl<
         current_process,
         handle,
         topic,
+        &|_| 0,
     ) {
         Ok(encoded) => encoded,
         Err(status) => return status,
@@ -1228,6 +1230,7 @@ pub(crate) fn object_get_info_v1_query_with_device_objects<
     current_process: ProcessKey,
     handle: DwHandle,
     topic: u32,
+    credit: &dyn Fn(crate::object::ObjectId) -> u64,
 ) -> Result<super::abi_bytes::EncodedObjectInfo, DwStatus> {
     object_info_query(
         registry,
@@ -1238,6 +1241,7 @@ pub(crate) fn object_get_info_v1_query_with_device_objects<
         current_process,
         handle,
         topic,
+        credit,
     )
 }
 
@@ -1307,6 +1311,7 @@ fn object_info_query<
     current_process: ProcessKey,
     handle: DwHandle,
     topic: u32,
+    credit: &dyn Fn(crate::object::ObjectId) -> u64,
 ) -> Result<super::abi_bytes::EncodedObjectInfo, DwStatus> {
     let table = match tasks.process_handles(current_process) {
         Ok(table) => table,
@@ -1315,14 +1320,14 @@ fn object_info_query<
     let result = match (devices, interrupts) {
         (Some(devices), Some(interrupts)) => {
             crate::service::object_get_info_v1_with_tasks_and_device_objects(
-                table, registry, memory, tasks, devices, interrupts, handle, topic,
+                table, registry, memory, tasks, devices, interrupts, handle, topic, credit,
             )
         }
         (Some(devices), None) => crate::service::object_get_info_v1_with_tasks_and_devices(
-            table, registry, memory, tasks, devices, handle, topic,
+            table, registry, memory, tasks, devices, handle, topic, credit,
         ),
         (None, None) => crate::service::object_get_info_v1_with_tasks(
-            table, registry, memory, tasks, handle, topic,
+            table, registry, memory, tasks, handle, topic, credit,
         ),
         (None, Some(_)) => {
             panic!("Interrupt object info cannot be wired without DeviceResource info")
@@ -2873,6 +2878,62 @@ impl<
             .unwrap_or_else(|error| {
                 panic!("a fault window's object rejected its weight: {error:?}")
             });
+    }
+}
+
+/// The fault windows' credit, each with its object's charge tag read under
+/// T, for a group's usage as it would stand with every window closed (DW2
+/// §13.16 part e3): a window counts toward a group exactly when its
+/// object's weight does, that is when the object's tag names the group.
+#[cfg_attr(
+    not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+    allow(dead_code, reason = "only the live runtime reads fault windows")
+)]
+pub(crate) struct WindowCredit<const CPUS: usize> {
+    windows: [Option<(crate::object::charge::ChargeTag, u64)>; CPUS],
+}
+
+#[cfg_attr(
+    not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+    allow(dead_code, reason = "only the live runtime reads fault windows")
+)]
+impl<const CPUS: usize> WindowCredit<CPUS> {
+    /// No credit: for a read that reports no usage.
+    pub(crate) const fn none() -> Self {
+        Self {
+            windows: [None; CPUS],
+        }
+    }
+
+    /// Reads `windows` (under P) and each window's object's tag (under T).
+    /// A window's object is live while the window exists.
+    pub(crate) fn of<R: Copy, const OBJECTS: usize>(
+        windows: &crate::memory::address_region::FaultWindows<R, CPUS>,
+        registry: &ObjectRegistry<OBJECTS>,
+    ) -> Self {
+        let mut credit = Self {
+            windows: [None; CPUS],
+        };
+        for (slot, window) in credit.windows.iter_mut().zip(windows.windows()) {
+            let (tag, _) = registry
+                .charge(window.object())
+                .unwrap_or_else(|error| panic!("a fault window's object is not live: {error:?}"));
+            *slot = Some((tag, window.credit()));
+        }
+        credit
+    }
+
+    /// The credit counted in `group`'s kept usage.
+    pub(crate) fn toward(&self, group: crate::object::ObjectId) -> u64 {
+        self.windows
+            .iter()
+            .flatten()
+            .filter(|(tag, _)| tag.names(group))
+            .fold(0_u64, |total, &(_, credit)| {
+                total
+                    .checked_add(credit)
+                    .unwrap_or_else(|| panic!("fault window credit overflowed"))
+            })
     }
 }
 

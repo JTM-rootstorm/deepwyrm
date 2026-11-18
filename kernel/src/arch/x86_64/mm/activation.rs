@@ -2577,6 +2577,20 @@ mod live_sessions {
             self.fault_windows
                 .close_address_space(address_space, charges)
         }
+
+        /// Closes every CPU's fault window, for a hold that holds P with no
+        /// session (DW2 §13.16 part e3). Returns how many it closed.
+        pub(crate) fn close_all_fault_windows(
+            &mut self,
+            charges: &mut impl crate::memory::address_region::WindowCharges,
+        ) -> usize {
+            self.fault_windows.close_all(charges)
+        }
+
+        /// P's fault windows, to read.
+        pub(crate) fn fault_windows(&self) -> &user_access::LiveFaultWindows {
+            &self.fault_windows
+        }
     }
 
     #[cfg(deepwyrm_integrated)]

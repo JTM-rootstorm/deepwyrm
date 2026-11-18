@@ -536,6 +536,7 @@ fn creation_binds_exact_parent_source_and_immutable_info() {
             &fixture.interrupts,
             handle,
             DW_OBJECT_INFO_INTERRUPT_V1,
+            &|_| 0,
         ),
         Ok(crate::service::ObjectInfoResult::Interrupt(info))
     );

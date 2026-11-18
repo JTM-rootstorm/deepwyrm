@@ -12114,6 +12114,7 @@ fn a_split_object_info_query_matches_the_combined_adapter() {
             process,
             handle,
             DW_OBJECT_INFO_BASIC_V1,
+            &|_| 0,
         ) {
             Ok(encoded) => {
                 object_get_info_v1_copy_out(&mut split, required, &encoded, info_address, out_size)
@@ -15092,6 +15093,7 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
             process,
             handle,
             DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1,
+            &|_| 0,
         )
     };
     let read = |encoded: &super::super::abi_bytes::EncodedObjectInfo| {
@@ -15148,4 +15150,152 @@ fn task_group_memory_info_reports_budget_and_scopes_free_frames_to_the_root() {
         );
     }
     drop((jobs_owner, job_owner));
+}
+
+/// DW2 §13.16 part e3, as decided: a TaskGroup's memory record reports
+/// usage as it would stand with every fault window closed, so opening,
+/// topping up and spending a window never move the reported usage away
+/// from the frames committed, while admission still counts the credit.
+#[test]
+fn task_group_memory_info_reports_usage_with_every_fault_window_closed() {
+    use crate::memory::address_region::{
+        AddressSpaceKey, FaultWindows, Protection, WindowOpening, test_mapping,
+    };
+    use deepwyrm_abi::{DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1, DW_TASK_GROUP_LIMIT_MEMORY_PAGES};
+
+    let memory = MemoryObjectAuthority::<1, 1>::new();
+    let mut registry = ObjectRegistry::<32>::new();
+    let mut tasks = TaskAuthority::<3, 1, 1, 8>::new();
+    let (_root, root_owner) = tasks.create_root_group(&mut registry).unwrap();
+    let (job, job_ref) = tasks
+        .create_child_group(&mut registry, &root_owner)
+        .unwrap();
+    let job_owner = registry.retain_internal_from_handle(&job_ref).unwrap();
+    let (process, process_ref) = tasks.create_process(&mut registry, &job_owner).unwrap();
+    let table = tasks.process_handles_mut(process).unwrap();
+    let job_handle = table
+        .install(job_ref, DwRights(DW_RIGHT_INSPECT.0))
+        .unwrap();
+    let process_handle = table
+        .install(process_ref, DwRights(DW_RIGHT_INSPECT.0))
+        .unwrap();
+    tasks
+        .lower_group_limit(job, DW_TASK_GROUP_LIMIT_MEMORY_PAGES, 1000)
+        .unwrap();
+    // An on-demand object charged to the job, its index root committed.
+    let object = registry
+        .create(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT)
+        .unwrap()
+        .id();
+    registry
+        .set_charge_tag(object, tasks.charge_tag(process).unwrap())
+        .unwrap();
+    registry.set_charge_pages(object, 1).unwrap();
+    let mut committed = 1_u64;
+
+    let mut windows = FaultWindows::<(), 2>::new();
+    let mapping = test_mapping(
+        AddressSpaceKey::for_test(5, 1),
+        0x40_0000,
+        300,
+        Protection::READ_WRITE,
+    );
+    let opening = |address| WindowOpening {
+        thread: crate::task::ThreadKey::from_object_id(object),
+        process,
+        root_epoch: 1,
+        root: (),
+        mapping,
+        object,
+        address,
+    };
+    let reported = |registry: &mut ObjectRegistry<32>, windows: &FaultWindows<(), 2>| {
+        let credit = crate::syscall::WindowCredit::of(windows, registry);
+        let encoded = object_info_query(
+            registry,
+            &memory,
+            &tasks,
+            None,
+            None,
+            process,
+            job_handle,
+            DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1,
+            &|group| credit.toward(group),
+        )
+        .unwrap();
+        let bytes = encoded.bytes();
+        let u64_at =
+            |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        (u64_at(16), u64_at(24))
+    };
+    let charges = |registry: &mut ObjectRegistry<32>| -> u64 {
+        u64::try_from(registry.charged_pages(job.object_id())).unwrap()
+    };
+    assert_eq!(
+        reported(&mut registry, &windows),
+        (committed, 1000 - committed)
+    );
+
+    // Opening charges 64 frames ahead: admission sees them, the record not.
+    windows.open(
+        0,
+        opening(0x40_0000),
+        &mut crate::syscall::RegistryWindowCharges {
+            registry: &mut registry,
+            tasks: &tasks,
+        },
+    );
+    assert_eq!(charges(&mut registry), committed + 64);
+    assert_eq!(
+        reported(&mut registry, &windows),
+        (committed, 1000 - committed)
+    );
+
+    // Fast serves spend the credit under P alone; the weight stays, the
+    // committed frames rise, and the record follows them.
+    for frames in [1, 2, 1] {
+        windows.spend(0, frames);
+        committed += frames;
+        assert_eq!(charges(&mut registry), 1 + 64);
+        assert_eq!(
+            reported(&mut registry, &windows),
+            (committed, 1000 - committed)
+        );
+    }
+
+    // Topping up charges the difference again; the record does not move.
+    windows.open(
+        0,
+        opening(0x40_0000 + 10 * 4096),
+        &mut crate::syscall::RegistryWindowCharges {
+            registry: &mut registry,
+            tasks: &tasks,
+        },
+    );
+    assert_eq!(windows.window(0).unwrap().credit(), 64);
+    assert_eq!(charges(&mut registry), committed + 64);
+    assert_eq!(
+        reported(&mut registry, &windows),
+        (committed, 1000 - committed)
+    );
+
+    // Closing returns the credit: kept and reported agree again.
+    windows.close_all(&mut crate::syscall::RegistryWindowCharges {
+        registry: &mut registry,
+        tasks: &tasks,
+    });
+    assert_eq!(charges(&mut registry), committed);
+    assert_eq!(
+        reported(&mut registry, &windows),
+        (committed, 1000 - committed)
+    );
+
+    let mut cleanup = CleanupQueue::<32>::new();
+    for handle in [process_handle, job_handle] {
+        assert_eq!(
+            handle_close(&mut registry, &mut tasks, process, handle, &mut cleanup),
+            DW_STATUS_SUCCESS
+        );
+    }
+    drop((job_owner, root_owner));
 }

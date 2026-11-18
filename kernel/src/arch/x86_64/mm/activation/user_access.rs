@@ -79,6 +79,26 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.session.close_fault_windows(address_space, charges)
     }
 
+    /// Closes every CPU's fault window, before a quota refusal is decided
+    /// (DW2 §13.16 part e3). Returns how many it closed.
+    pub(crate) fn close_all_fault_windows(
+        &mut self,
+        charges: &mut impl crate::memory::address_region::WindowCharges,
+    ) -> usize {
+        self.session.windows.close_all(charges)
+    }
+
+    /// Opens, tops up or replaces CPU slot `cpu`'s fault window after a
+    /// serve under T and P (DW2 §13.16 part e3).
+    pub(crate) fn open_fault_window(
+        &mut self,
+        cpu: usize,
+        opening: crate::memory::address_region::WindowOpening<super::UserCopyRoot>,
+        charges: &mut impl crate::memory::address_region::WindowCharges,
+    ) -> crate::memory::address_region::WindowOpened {
+        self.session.windows.open(cpu, opening, charges)
+    }
+
     /// Whether any user pin or mutation holds part of `address_space`.
     pub(crate) fn pins_hold_any(
         &self,

@@ -733,6 +733,7 @@ fn object_info_reports_exact_immutable_identity_and_range() {
             &resources,
             handle,
             DW_OBJECT_INFO_DEVICE_RESOURCE_V1,
+            &|_| 0,
         ),
         Ok(ObjectInfoResult::DeviceResource(
             deepwyrm_abi::DwDeviceResourceInfoV1 {

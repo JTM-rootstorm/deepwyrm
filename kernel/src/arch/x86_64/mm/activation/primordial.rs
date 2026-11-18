@@ -1313,13 +1313,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Some(pages) => {
                 let process = runtime.own.scheduled().process;
                 let thread = runtime.own.scheduled().thread;
-                if crate::syscall::reserve_memory_object_pages(
-                    &mut runtime.core.registry,
-                    &runtime.core.tasks,
-                    process,
-                    pages,
-                    thread,
-                ) {
+                let reserve = |runtime: &mut PrimordialRuntimeCarrier<
+                    '_,
+                    '_,
+                    RANGE_CAPACITY,
+                    ROLE_CAPACITY,
+                >| {
+                    crate::syscall::reserve_memory_object_pages(
+                        &mut runtime.core.registry,
+                        &runtime.core.tasks,
+                        process,
+                        pages,
+                        thread,
+                    )
+                };
+                // A quota refusal closes every fault window and reserves
+                // once more (DW2 §13.16 part e3).
+                if reserve(runtime) || (runtime.close_all_fault_windows() != 0 && reserve(runtime))
+                {
                     true
                 } else if runtime.create_refusal_owed(process, pages) {
                     runtime.take_owed_step(step_report::AdmissionWait::Create);
@@ -1385,6 +1396,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut restart = false;
             let (status, released_pin) = match (request, atomic_pin) {
                 (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
+                    // The adapter's admission is the one that counts: if
+                    // the quota would refuse it now, every fault window is
+                    // closed first (DW2 §13.16 part e3).
+                    if let Some(pages) = restartable {
+                        let process = runtime.own.scheduled().process;
+                        if !crate::syscall::memory_object_quota_allows(
+                            &runtime.core.registry,
+                            &runtime.core.tasks,
+                            process,
+                            pages,
+                        ) {
+                            runtime.close_all_fault_windows();
+                        }
+                    }
                     let mut access = crate::syscall::DeferredMemoryObjectAccess::new(
                         core::mem::replace(
                             &mut deferred,
@@ -6563,6 +6588,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
+    /// Takes P and closes every fault window, before a quota refusal is
+    /// decided in a hold that holds T and not P (DW2 §13.16 part e3).
+    /// Returns how many it closed.
+    fn close_all_fault_windows(&mut self) -> usize {
+        let mut paging = self.paging.lock();
+        paging.close_all_fault_windows(&mut crate::syscall::RegistryWindowCharges {
+            registry: &mut self.core.registry,
+            tasks: &self.core.tasks,
+        })
+    }
+
     /// `finish_quiesced_process_root_retirement` without its drain: the
     /// releases go to the cleanup queue for the drain that ran this step
     /// (DW2 §10.10 item 4), so no drain calls itself.
@@ -8580,7 +8616,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cpu = self.cpu;
         self.with_synchronized_runtime_at_safe_point(|runtime| {
             let mut refused = None;
-            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused);
+            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused, true);
             // A touch refused when owed work could admit it frees owed
             // memory first (§10.10 item 7, §10.12 item 6, DW2 §13.12 part
             // b): a quota refusal the refusing groups' finalizing pages
@@ -10050,6 +10086,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         handle: deepwyrm_abi::DwHandle,
         topic: u32,
     ) -> Result<crate::syscall::EncodedObjectInfo, deepwyrm_abi::DwStatus> {
+        // A TaskGroup's usage is reported as it would stand with every
+        // fault window closed (DW2 §13.16 part e3): the windows are read
+        // with P taken here, and none is closed for a read.
+        let credit = if topic == deepwyrm_abi::DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 {
+            let paging = self.paging.lock();
+            crate::syscall::WindowCredit::of(paging.fault_windows(), &self.core.registry)
+        } else {
+            crate::syscall::WindowCredit::none()
+        };
         crate::syscall::object_get_info_v1_query_with_device_objects(
             &mut self.core.registry,
             &self.core.memory,
@@ -10059,6 +10104,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.scheduled().process,
             handle,
             topic,
+            &|group| credit.toward(group),
         )
     }
 
@@ -10743,11 +10789,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// that admission refuses for quota, `refused` is given the two charges
     /// it admitted together, for the caller to ask whether the refusal is
     /// owed (DW2 §13.12 part b); it is left alone otherwise.
+    ///
+    /// A quota refusal first closes every fault window and admits once
+    /// more, so credit is never the reason a touch is refused; and with
+    /// `open_window` (the fault gate's serve, not a fill-in's) a touch that
+    /// leaves its page present opens or tops up this CPU's fault window
+    /// for the rest of the mapping (DW2 §13.16 part e3).
     fn serve_user_page_fault(
         &mut self,
         cr2: u64,
         error: u64,
         refused: &mut Option<FaultCharges>,
+        open_window: bool,
     ) -> crate::syscall::native::UserPageFaultOutcome {
         use crate::memory::frame_roles::FrameRoleError;
         use crate::syscall::native::UserPageFaultOutcome as Outcome;
@@ -10785,6 +10838,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let backing = mapping.backing().backing_identity();
         let page =
             (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE;
+        // The window this touch opens, its identity copied here under T
+        // (DW2 §13.16 part e3).
+        let opening = open_window.then(|| crate::memory::address_region::WindowOpening {
+            thread,
+            process,
+            root_epoch: self.owned.root_switch_epoch,
+            root: self
+                .own
+                .active_root
+                .as_ref()
+                .expect("active root")
+                .usercopy_root(),
+            mapping,
+            object,
+            address,
+        });
         let mut paging = self.paging.lock();
         let mut session = paging.page_table_mutation_session(
             self.own.active_root.as_ref().expect("active root"),
@@ -10803,7 +10872,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let mut empty: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
             [const { None }; 3];
-        let tables = 'found: {
+        // Whether this hold closed every window for a refusal already.
+        let mut windows_closed = false;
+        let tables = 'found: loop {
             let Ok(mut publisher) =
                 session.publisher::<3>(mapping.address_space(), mapping.region(), &mut empty)
             else {
@@ -10819,14 +10890,36 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Every table exists (DW2 §13.16 part e1): the page alone is
             // admitted, committed through this publisher, and its leaf is
             // written into the place the walk found, with one store.
-            if let Err(outcome) = admit_fault_charges(
+            match admit_fault_charges(
                 cpu,
                 &self.core.registry,
                 &self.core.tasks,
                 ((object, cost), (process.object_id(), 0)),
                 refused,
             ) {
-                return outcome;
+                Ok(()) => {}
+                // Credit is never the reason a touch is refused: every
+                // window is closed, and the touch is walked and admitted
+                // once more (DW2 §13.16 part e3).
+                Err(Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+                    if !windows_closed =>
+                {
+                    drop(place);
+                    drop(publisher);
+                    windows_closed = true;
+                    let closed = session.close_all_fault_windows(
+                        &mut crate::syscall::RegistryWindowCharges {
+                            registry: &mut self.core.registry,
+                            tasks: &self.core.tasks,
+                        },
+                    );
+                    if closed != 0 {
+                        *refused = None;
+                        continue;
+                    }
+                    return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
+                }
+                Err(outcome) => return outcome,
             }
             if cost != 0 {
                 let committed = publisher.commit_on_demand_page(backing, page);
@@ -10850,7 +10943,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // As below: a present leaf that is not exactly this page's is
             // not a race this serves, and only a page committed in this hold
             // could not have had one.
-            return match publisher.write_touched_leaf(place) {
+            let outcome = match publisher.write_touched_leaf(place) {
                 Ok(published) if published || cost != 0 => {
                     step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
                     Outcome::Served
@@ -10858,18 +10951,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Ok(_) => Outcome::AlreadyPresent,
                 Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Map(
                     crate::arch::x86_64::mm::MapError::FrameMismatch,
-                )) if cost == 0 => Outcome::Unserved,
+                )) if cost == 0 => return Outcome::Unserved,
                 Err(error) => panic!("an on-demand fault could not publish its leaf: {error:?}"),
             };
+            drop(publisher);
+            if let Some(opening) = opening {
+                session.open_fault_window(
+                    cpu,
+                    opening,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
+            }
+            return outcome;
         };
-        // Admit both, together, before taking a frame (§8.4).
-        if let Err(outcome) = admit_fault_charges(
+        // Admit both, together, before taking a frame (§8.4). A quota
+        // refusal closes every window and admits once more (DW2 §13.16
+        // part e3).
+        let mut admitted = admit_fault_charges(
             cpu,
             &self.core.registry,
             &self.core.tasks,
             ((object, cost), (process.object_id(), tables)),
             refused,
-        ) {
+        );
+        if matches!(
+            admitted,
+            Err(Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+        ) && !windows_closed
+            && session.close_all_fault_windows(&mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            }) != 0
+        {
+            *refused = None;
+            admitted = admit_fault_charges(
+                cpu,
+                &self.core.registry,
+                &self.core.tasks,
+                ((object, cost), (process.object_id(), tables)),
+                refused,
+            );
+        }
+        if let Err(outcome) = admitted {
             return outcome;
         }
         if cost != 0 {
@@ -10946,12 +11072,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 built,
             );
         }
-        if published || cost != 0 {
+        let outcome = if published || cost != 0 {
             step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
             Outcome::Served
         } else {
             Outcome::AlreadyPresent
+        };
+        if let Some(opening) = opening {
+            session.open_fault_window(
+                cpu,
+                opening,
+                &mut crate::syscall::RegistryWindowCharges {
+                    registry: &mut self.core.registry,
+                    tasks: &self.core.tasks,
+                },
+            );
         }
+        outcome
     }
 
     /// One hold of a syscall's fill-in phase (DW2 M6 §8.6): serves, as a
@@ -10992,7 +11129,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             step_report::fill_in_served();
             let mut refused = None;
             if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
-                self.serve_user_page_fault(page, error, &mut refused)
+                self.serve_user_page_fault(page, error, &mut refused, false)
             {
                 if !self.serve_refusal_owed(status, refused) {
                     return Err(status);
@@ -11058,9 +11195,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.active_root.as_ref().expect("active root"),
             process,
         );
+        let teardown_owed = !self.core.owed_teardown.is_empty();
+        let admit_began = step_report::ticks();
+        // The whole step first. A quota refusal closes every fault window
+        // and admits once more, so credit is never the reason a commit is
+        // refused (DW2 §13.16 part e3).
+        let whole = {
+            let cost = session
+                .on_demand_commit_range_cost(backing, first, count)
+                .map_err(|_| DW_STATUS_BAD_STATE)?;
+            let admitted = if cost == 0 {
+                Ok(())
+            } else {
+                crate::syscall::admit_charged_pages(
+                    &self.core.registry,
+                    &self.core.tasks,
+                    object,
+                    cost,
+                )
+            };
+            match admitted {
+                Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+                    if session.close_all_fault_windows(
+                        &mut crate::syscall::RegistryWindowCharges {
+                            registry: &mut self.core.registry,
+                            tasks: &self.core.tasks,
+                        },
+                    ) != 0 =>
+                {
+                    crate::syscall::admit_charged_pages(
+                        &self.core.registry,
+                        &self.core.tasks,
+                        object,
+                        cost,
+                    )
+                    .map(|()| cost)
+                }
+                admitted => admitted.map(|()| cost),
+            }
+        };
         let registry = &self.core.registry;
         let tasks = &self.core.tasks;
-        let teardown_owed = !self.core.owed_teardown.is_empty();
         let cost_of = |pages: u64| {
             session
                 .on_demand_commit_range_cost(backing, first, pages)
@@ -11075,8 +11250,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         // The whole step, or else the longest start of it the quota admits,
         // so a commit still fills the quota exactly: at most ten admissions.
-        let admit_began = step_report::ticks();
-        let (admitted, cost, mut result) = match admit(count) {
+        let (admitted, cost, mut result) = match whole {
             Ok(cost) => (count, cost, Ok(())),
             // Owed: owed work could admit the whole step, so nothing is
             // committed and the step is taken again after the owed step.
