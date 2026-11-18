@@ -901,6 +901,17 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.has_reschedule_request_on(cpu)
     }
 
+    /// `thread` is `cpu`'s scheduler-current and Running, and no reschedule
+    /// is requested for `cpu`, all read in one hold of the scheduler's lock
+    /// (DW2 §13.16 part e3).
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live fast serve asks it")
+    )]
+    pub(crate) fn runs_undisturbed_on(&self, cpu: SchedulerCpuId, thread: ThreadKey) -> bool {
+        self.scheduler.runs_undisturbed_on(cpu, thread)
+    }
+
     pub(crate) fn preemption_snapshot_on(
         &self,
         cpu: SchedulerCpuId,

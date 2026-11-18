@@ -435,6 +435,16 @@ impl<'v, P> GuardFreeValue<'v, P> {
     pub(super) fn into_inner(self) -> &'v mut P {
         self.value
     }
+
+    /// The value, to read, before it is consumed (the fast serve reads its
+    /// fault window before it builds its session, DW2 §13.16 part e3).
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live fast serve reads it")
+    )]
+    pub(super) fn value(&self) -> &P {
+        self.value
+    }
 }
 
 impl<P> PagingGuard<'_, P, GuardFreeOnly> {

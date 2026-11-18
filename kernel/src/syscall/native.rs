@@ -1774,6 +1774,21 @@ pub(crate) trait NativeSyscallFrameRuntime: NativeSyscallHandler {
         })
     }
 
+    /// Serves a CPL3 page fault inside this CPU's fault window with the
+    /// paging lock alone (DW2 §13.16 part e3), before the serve under the
+    /// runtime authority. `None` means "take the serve under T", which is
+    /// what a runtime without fault windows always answers. A `Some` pass
+    /// is `Served` or `AlreadyPresent`, its frame's return authorised
+    /// through present leaves, with no reschedule.
+    fn serve_user_page_fault_fast(
+        &mut self,
+        _cr2: u64,
+        _error: u64,
+        _frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Option<FaultPass> {
+        None
+    }
+
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> !
     where
         Self: Sized;

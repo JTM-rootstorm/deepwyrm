@@ -684,6 +684,19 @@ pub(crate) struct ActiveScratchTarget<I> {
     _not_send_sync: core::marker::PhantomData<*mut ()>,
 }
 
+/// Why a live process session could not be built (DW2 §13.16 part e3): the
+/// fast serve declines on each; every other caller panics as before.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveSessionError {
+    /// This CPU has no installed architecture slot.
+    NoCpuBinding,
+    /// The copied root is not this CPU's current root of the Process.
+    Root(RootBindingError),
+    /// This CPU's scratch target could not be selected.
+    Scratch(LiveActiveTargetError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveActiveTargetError {
     Busy,
@@ -2515,18 +2528,43 @@ mod live_sessions {
         /// primordial runtime only through [`GuardFreeValue`]'s constructor, and
         /// every other constructor here wraps it in a session with no usercopy
         /// (or is compiled only into evidence or guest builds).
-        #[allow(
-            unsafe_code,
-            reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
-        )]
         fn build_live_session(
             &mut self,
             active_root: address_space::UserCopyRoot,
             process: crate::task::ProcessKey,
         ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            self.try_build_live_session(active_root, process)
+                .unwrap_or_else(|error| match error {
+                    LiveSessionError::NoCpuBinding => {
+                        panic!("usercopy has no current architecture CPU binding")
+                    }
+                    LiveSessionError::Root(error) => {
+                        panic!("process usercopy root is not current on this CPU: {error:?}")
+                    }
+                    LiveSessionError::Scratch(error) => {
+                        panic!("usercopy scratch CPU selection failed: {error:?}")
+                    }
+                })
+        }
+
+        /// [`Self::build_live_session`] returning every mismatch instead of
+        /// panicking, for the fast serve, whose copied root may be stale and
+        /// which then declines (DW2 §13.16 part e3).
+        #[allow(
+            unsafe_code,
+            reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
+        )]
+        fn try_build_live_session(
+            &mut self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> Result<
+            LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+            LiveSessionError,
+        > {
             let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 .and_then(crate::cpu::CpuIndex::new)
-                .unwrap_or_else(|| panic!("usercopy has no current architecture CPU binding"));
+                .ok_or(LiveSessionError::NoCpuBinding)?;
             let observed_root: u64;
             unsafe {
                 core::arch::asm!(
@@ -2538,15 +2576,13 @@ mod live_sessions {
             let (root, identity, address_space) = self
                 .root_bindings
                 .usercopy_root_for_process(&self.root, active_root, cpu, observed_root, process)
-                .unwrap_or_else(|error| {
-                    panic!("process usercopy root is not current on this CPU: {error:?}")
-                });
+                .map_err(LiveSessionError::Root)?;
             let scratch = self
                 .target
                 .current_scratch_target()
-                .unwrap_or_else(|error| panic!("usercopy scratch CPU selection failed: {error:?}"));
+                .map_err(LiveSessionError::Scratch)?;
             let target = &mut self.target;
-            LiveProcessAddressSpace {
+            Ok(LiveProcessAddressSpace {
                 root: root as *const PageTableRoot,
                 primordial_root: &self.root,
                 identity,
@@ -2563,7 +2599,7 @@ mod live_sessions {
                 journal: &mut *self.journal,
                 windows: &mut self.fault_windows,
                 _root: core::marker::PhantomData,
-            }
+            })
         }
 
         /// Closes every CPU's fault window copied from `address_space`'s
@@ -2609,6 +2645,30 @@ mod live_sessions {
             process: crate::task::ProcessKey,
         ) -> LiveProcessAddressSpace<'v, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
             self.into_inner().build_live_session(active_root, process)
+        }
+
+        /// CPU slot `cpu`'s fault window, copied (DW2 §13.16 part e3).
+        pub(crate) fn fault_window(
+            &self,
+            cpu: usize,
+        ) -> Option<crate::memory::address_region::FaultWindow<address_space::UserCopyRoot>>
+        {
+            self.value().fault_windows.window(cpu).copied()
+        }
+
+        /// The usercopy session for `process` from a copied root identity,
+        /// or why it cannot be built: the fast serve's, which declines on
+        /// any mismatch rather than panicking (DW2 §13.16 part e3).
+        pub(crate) fn try_usercopy_process_address_space(
+            self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> Result<
+            LiveProcessAddressSpace<'v, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+            LiveSessionError,
+        > {
+            self.into_inner()
+                .try_build_live_session(active_root, process)
         }
     }
 }

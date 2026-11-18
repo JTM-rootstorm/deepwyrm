@@ -1869,7 +1869,12 @@ unsafe fn native_runtime_user_page_fault<
         // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the fault gate has no other
         // Rust frame on this CPU that holds one.
         let runtime = unsafe { &mut *context.cast::<R>() };
-        let pass = runtime.serve_user_page_fault(cr2, error, frame);
+        // The fast serve first, with P alone inside this CPU's fault
+        // window (DW2 §13.16 part e3); `None` is the serve under T.
+        let pass = match runtime.serve_user_page_fault_fast(cr2, error, frame) {
+            Some(pass) => pass,
+            None => runtime.serve_user_page_fault(cr2, error, frame),
+        };
         step_report::fault_pass(match pass.outcome() {
             UserPageFaultOutcome::Served => step_report::FaultPass::Served,
             UserPageFaultOutcome::AlreadyPresent => step_report::FaultPass::AlreadyPresent,

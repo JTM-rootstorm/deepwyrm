@@ -8667,6 +8667,51 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         .unwrap_or(crate::syscall::native::FaultPass::retry())
     }
 
+    /// The fast serve (DW2 §13.16 part e3): with P alone, taken through a
+    /// `GuardFree`, a touch inside this CPU's fault window is served by the
+    /// nine steps of [`super::fault_window::serve_fast`]. It reads nothing
+    /// of T's value: its window, P's value, this CPU's owner-local state,
+    /// the scheduler and the stationary shared authorities. `None` on any
+    /// decline: the gate then takes the serve under T.
+    fn serve_user_page_fault_fast(
+        &mut self,
+        cr2: u64,
+        error: u64,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Option<crate::syscall::native::FaultPass> {
+        use super::fault_window::FastServed;
+        use crate::syscall::native::{FaultPass, FaultReturn, UserPageFaultOutcome};
+        let executing = (
+            self.owned.physically_executing.thread,
+            self.owned.root_switch_epoch,
+        );
+        let served = {
+            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut fast = LiveFastServe {
+                value: Some(paging.guard_free_value()),
+                session: None,
+                cpu: self.cpu,
+                executing,
+                shared: self.shared,
+                frame,
+                candidates: [const { None }; 3],
+            };
+            super::fault_window::serve_fast(&mut fast, cr2, error)
+        };
+        let outcome = match served {
+            Ok(FastServed::Served) => UserPageFaultOutcome::Served,
+            Ok(FastServed::AlreadyPresent) => UserPageFaultOutcome::AlreadyPresent,
+            Err(_) => return None,
+        };
+        // Authorised through present leaves in the serve's P hold; no
+        // reschedule was requested when the scheduler was asked under it.
+        Some(FaultPass::new(outcome, || FaultReturn {
+            authorized: Ok(()),
+            reschedule: false,
+        }))
+    }
+
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> ! {
         let mut carrier = this;
         let this = carrier.get();
@@ -12757,6 +12802,167 @@ type FaultCharges = (
 /// is exhaustion; it leaves the charges in `refused` for the caller to ask
 /// whether the refusal is owed (DW2 §13.12 part b). The object and Process
 /// are live here.
+/// The fast serve's paging (DW2 §13.16 part e3): P's value, taken
+/// guard-free, until the session for the window's copied root is built
+/// from it; then that session.
+struct LiveFastServe<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    value: Option<
+        super::runtime_authority::GuardFreeValue<
+            'v,
+            RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+        >,
+    >,
+    session:
+        Option<user_access::LiveProcessAddressSpace<'v, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    cpu: crate::cpu::CpuIndex,
+    /// The Thread this CPU physically executes and its root-switch epoch,
+    /// both owner-local.
+    executing: (Option<ThreadKey>, u64),
+    shared: &'static PrimordialRuntimeShared,
+    frame: &'f mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    /// The publisher's table candidates: none, as the fast serve builds no
+    /// table.
+    candidates: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
+}
+
+/// The fast serve's publisher, for steps 4 to 7 under one borrow.
+struct LiveFastLeaf<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    publisher: crate::arch::x86_64::mm::X86AddressSpacePublisher<
+        'a,
+        user_access::TrackedActiveTarget<'v>,
+        RANGE_CAPACITY,
+        ROLE_CAPACITY,
+        3,
+        { user_access::LIVE_JOURNAL_ENTRIES },
+        { user_access::LIVE_JOURNAL_INVALIDATIONS },
+    >,
+}
+
+/// The backing and object page a touch at `address` of `mapping` names.
+fn fast_page(
+    mapping: &crate::memory::address_region::Mapping,
+    address: u64,
+) -> (crate::memory::frame_roles::BackingIdentity, u64) {
+    (
+        mapping.backing().backing_identity(),
+        (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE,
+    )
+}
+
+impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fault_window::FastLeaf
+    for LiveFastLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type Place = crate::arch::x86_64::mm::TouchedLeafPlace<'a>;
+
+    fn find(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<Self::Place> {
+        match self.publisher.find_touched_leaf(mapping, address) {
+            Ok(crate::arch::x86_64::mm::TouchedLeaf::Found(place)) => Some(place),
+            Ok(crate::arch::x86_64::mm::TouchedLeaf::MissingTables(_)) | Err(_) => None,
+        }
+    }
+
+    fn cost(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<u64> {
+        let (backing, page) = fast_page(mapping, address);
+        self.publisher.on_demand_commit_cost(backing, page).ok()
+    }
+
+    fn commit(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<u64> {
+        let (backing, page) = fast_page(mapping, address);
+        self.publisher
+            .commit_on_demand_page(backing, page)
+            .ok()
+            .map(|commit| commit.frames)
+    }
+
+    fn write(&mut self, place: Self::Place) -> Option<bool> {
+        self.publisher.write_touched_leaf(place).ok()
+    }
+}
+
+impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    super::fault_window::FastServePaging<super::UserCopyRoot>
+    for LiveFastServe<'v, 'roles, 'f, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type Leaf<'a>
+        = LiveFastLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
+    where
+        Self: 'a;
+
+    fn window(&self) -> Option<crate::memory::address_region::FaultWindow<super::UserCopyRoot>> {
+        match (&self.value, &self.session) {
+            (_, Some(session)) => session.fault_window(self.cpu.index()),
+            (Some(value), None) => value.fault_window(self.cpu.index()),
+            (None, None) => None,
+        }
+    }
+
+    fn executing(&self) -> (Option<ThreadKey>, u64) {
+        self.executing
+    }
+
+    fn open_session(&mut self, root: super::UserCopyRoot, process: ProcessKey) -> bool {
+        let Some(value) = self.value.take() else {
+            return false;
+        };
+        match value.try_usercopy_process_address_space(root, process) {
+            Ok(session) => {
+                self.session = Some(session);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn scheduler_allows(&mut self, thread: ThreadKey) -> bool {
+        self.shared.execution.runs_undisturbed_on(self.cpu, thread)
+            && !crate::arch::x86_64::idle::current_stop_requested()
+            && (self.cpu != crate::cpu::CpuIndex::BOOTSTRAP
+                || self
+                    .shared
+                    .timer_expiries
+                    .lock()
+                    .iter()
+                    .all(Option::is_none))
+    }
+
+    fn leaf(&mut self, mapping: &crate::memory::address_region::Mapping) -> Option<Self::Leaf<'_>> {
+        let session = self.session.as_mut()?;
+        session
+            .publisher::<3>(
+                mapping.address_space(),
+                mapping.region(),
+                &mut self.candidates,
+            )
+            .ok()
+            .map(|publisher| LiveFastLeaf { publisher })
+    }
+
+    fn spend(&mut self, frames: u64) {
+        self.session
+            .as_mut()
+            .unwrap_or_else(|| panic!("a fast serve committed without its session"))
+            .spend_fault_window(self.cpu.index(), frames);
+    }
+
+    fn validate_return(&mut self) -> bool {
+        self.session
+            .as_mut()
+            .is_some_and(|session| self.frame.validate_and_sanitize(session).is_ok())
+    }
+}
+
 fn admit_fault_charges(
     cpu: usize,
     registry: &Registry,

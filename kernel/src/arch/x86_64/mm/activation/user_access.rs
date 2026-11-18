@@ -893,6 +893,20 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.windows.close_address_space(address_space, charges)
     }
 
+    /// CPU slot `cpu`'s fault window, copied (DW2 §13.16 part e3).
+    pub(crate) fn fault_window(
+        &self,
+        cpu: usize,
+    ) -> Option<crate::memory::address_region::FaultWindow<super::UserCopyRoot>> {
+        self.windows.window(cpu).copied()
+    }
+
+    /// Under P alone: CPU slot `cpu`'s window's credit falls by the
+    /// `frames` a commit took (DW2 §13.16 part e3).
+    pub(crate) fn spend_fault_window(&mut self, cpu: usize, frames: u64) {
+        self.windows.spend(cpu, frames);
+    }
+
     /// Retargets only the scratch-walk validation identity. Raw usercopy must
     /// already be complete before this is called; the hardware-active root and
     /// its residency token remain unchanged until the scheduler selects the
