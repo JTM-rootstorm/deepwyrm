@@ -36,6 +36,7 @@ struct HostPlatform {
     roles: FrameRoleManager<16, 64>,
     allocations: Vec<HostAllocation>,
     mappings: Vec<HostMapping>,
+    windows: crate::memory::address_region::FaultWindows<(), 1>,
 }
 
 impl HostPlatform {
@@ -44,12 +45,21 @@ impl HostPlatform {
             roles: synthetic_frame_role_manager(0x10_0000, 256),
             allocations: Vec::new(),
             mappings: Vec::new(),
+            windows: crate::memory::address_region::FaultWindows::new(),
         }
     }
 }
 
 impl PrimordialPlatform for HostPlatform {
     type Error = &'static str;
+
+    fn close_fault_windows<C: crate::memory::address_region::WindowCharges>(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        charges: &mut C,
+    ) -> crate::memory::address_region::WindowsClosed {
+        self.windows.close_address_space(address_space, charges)
+    }
 
     #[allow(
         unsafe_code,
@@ -574,13 +584,29 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
         .chain(core::iter::once(monitor.stack_range))
     {
         let region = regions
-            .region_mut_for_quiesced_teardown(&tasks, &proof, monitor.root_key)
+            .region_mut_for_quiesced_teardown(
+                &tasks,
+                &proof,
+                monitor.root_key,
+                crate::memory::address_region::test_windows_closed(
+                    regions
+                        .region(monitor.root_key)
+                        .unwrap()
+                        .address_space_key(),
+                ),
+            )
             .unwrap();
         platform.unmap(region, &mut memory, &mut registry, address, byte_len);
     }
     let drained = execution
         .blocked_operations_drained(&tasks, &proof)
         .unwrap();
+    let closed = crate::memory::address_region::test_windows_closed(
+        regions
+            .region(monitor.root_key)
+            .unwrap()
+            .address_space_key(),
+    );
     let root_pin = regions
         .retire_quiesced_root(
             &mut tasks,
@@ -588,6 +614,7 @@ fn concrete_authority_adapter_commits_real_init_transfer_and_exact_start_state()
             &proof,
             execution.blocked_operations(),
             drained,
+            closed,
         )
         .unwrap();
     let root_release = registry.release_internal(root_pin).unwrap().unwrap();

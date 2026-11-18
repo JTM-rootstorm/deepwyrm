@@ -3782,6 +3782,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
 {
     type Error = user_access::LiveUserAccessError;
 
+    fn close_fault_windows<C: crate::memory::address_region::WindowCharges>(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        charges: &mut C,
+    ) -> crate::memory::address_region::WindowsClosed {
+        self.active.close_fault_windows(address_space, charges)
+    }
+
     fn allocate_zeroed_backing(
         &mut self,
         page_count: u64,
@@ -6082,10 +6090,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
+                // No window copied from this address space outlives the
+                // change (DW2 §13.16 part e3): closed in each iteration.
+                let closed = user.close_fault_windows(
+                    address_space,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
                 let region = self
                     .core
                     .regions
-                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key, closed)
                     .map_err(|_| ())?;
                 let mut publisher = user
                     .publisher::<PRIMORDIAL_TABLE_CANDIDATES>(
@@ -6203,10 +6220,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let length = mapping.byte_len();
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
+                // No window copied from this address space outlives the
+                // change (DW2 §13.16 part e3): closed in each iteration.
+                let closed = user.close_fault_windows(
+                    address_space,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
                 let region = self
                     .core
                     .regions
-                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key, closed)
                     .map_err(|_| ())?;
                 let mut publisher = user
                     .publisher::<PRIMORDIAL_TABLE_CANDIDATES>(
@@ -6476,13 +6502,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .next()
             .copied();
         if let Some(mapping) = mapping {
+            let closed = paging.close_fault_windows(
+                address_space,
+                &mut crate::syscall::RegistryWindowCharges {
+                    registry: &mut self.core.registry,
+                    tasks: &self.core.tasks,
+                },
+            );
             let publisher = paging
                 .retiring_teardown_publisher(process, address_space, proof)
                 .unwrap_or_else(|error| panic!("an owed root's teardown publisher: {error:?}"));
             let region = self
                 .core
                 .regions
-                .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key, closed)
                 .unwrap_or_else(|error| panic!("an owed root's region: {error:?}"));
             let releases = region
                 .remove_mapping_detached(
@@ -6513,6 +6546,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// Takes P and closes every CPU's fault window copied from
+    /// `address_space`'s mapping records, for a hold that holds T and not P
+    /// (DW2 §13.16 part e3).
+    fn close_fault_windows(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> crate::memory::address_region::WindowsClosed {
+        let mut paging = self.paging.lock();
+        paging.close_fault_windows(
+            address_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            },
+        )
+    }
+
     /// `finish_quiesced_process_root_retirement` without its drain: the
     /// releases go to the cleanup queue for the drain that ran this step
     /// (DW2 §10.10 item 4), so no drain calls itself.
@@ -6525,6 +6575,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<(), ()> {
         self.teardown_child_root_under_initiator(process, address_space)
             .map_err(|_| ())?;
+        let closed = self.close_fault_windows(address_space);
         let root_pin = self
             .core
             .regions
@@ -6534,6 +6585,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 proof,
                 self.core.shared.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .map_err(|_| ())?;
         self.core.cleanup.push_optional(
@@ -6607,6 +6659,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.teardown_child_root_under_initiator(process, address_space)
                 .map_err(|_| ())?;
         }
+        let closed = self.close_fault_windows(address_space);
         let root_pin = self
             .core
             .regions
@@ -6616,6 +6669,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 proof,
                 self.core.shared.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .map_err(|_| ())?;
         if process == self.core.primordial_process {
@@ -7223,6 +7277,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.core.memory.active_lease_count() != 0 {
             return Err(0x7000_000a_u32);
         }
+        let closed = self.close_fault_windows(address_space);
         let root_pin = self
             .core
             .regions
@@ -7232,6 +7287,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &proof,
                 self.core.shared.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .map_err(|_| 0x7000_000b_u32)?;
         self.core.cleanup.push_optional(
@@ -11204,6 +11260,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
+                // No window copied from the target's mapping records
+                // outlives this step's change (DW2 §13.16 part e3).
+                let closed = session.close_fault_windows(
+                    target.address_space,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
                 if session
                     .select_process_for_return_validation(target.process)
                     .is_err()
@@ -11276,6 +11341,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             protection,
                             room,
                             held,
+                            closed,
                         );
                         let published = publisher.finish_deferred();
                         shootdown = Self::settle_or_defer_shootdown(
@@ -11337,6 +11403,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
+        // No window copied from the target's mapping records outlives this
+        // step's change (DW2 §13.16 part e3).
+        let closed = session.close_fault_windows(
+            target.address_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            },
+        );
         if session
             .select_process_for_return_validation(target.process)
             .is_err()
@@ -11376,6 +11451,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 address,
                 byte_len,
                 held,
+                closed,
             );
             let published = publisher.finish_deferred();
             let shootdown = Self::settle_or_defer_shootdown(
@@ -11430,6 +11506,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
+        // No window copied from the target's mapping records outlives this
+        // step's change (DW2 §13.16 part e3).
+        let closed = session.close_fault_windows(
+            target.address_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            },
+        );
         if session
             .select_process_for_return_validation(target.process)
             .is_err()
@@ -11470,6 +11555,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 byte_len,
                 protections,
                 held,
+                closed,
             );
             let published = publisher.finish_deferred();
             let shootdown = Self::settle_or_defer_shootdown(

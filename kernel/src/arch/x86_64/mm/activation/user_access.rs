@@ -21,6 +21,10 @@ pub(crate) const LIVE_JOURNAL_INVALIDATIONS: usize = super::primordial::PRIMORDI
 /// storage that the paging state lends to each session beneath P.
 pub(crate) type LiveJournalStorage =
     crate::arch::x86_64::mm::JournalStorage<LIVE_JOURNAL_ENTRIES, LIVE_JOURNAL_INVALIDATIONS>;
+/// The live fault windows (DW2 §13.16 part e3): one per CPU, carrying the
+/// guard-free usercopy's root identity, in P's value.
+pub(crate) type LiveFaultWindows =
+    crate::memory::address_region::FaultWindows<super::UserCopyRoot, { crate::cpu::CPU_CAPACITY }>;
 
 static LIVE_TLB_MAILBOXES: [LiveTlbMailbox; crate::cpu::CPU_CAPACITY] =
     [const { LiveTlbMailbox::new() }; crate::cpu::CPU_CAPACITY];
@@ -63,6 +67,16 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         level: TableLevel,
     ) -> Result<TableCandidateGrant, LiveUserAccessError> {
         self.session.prepare_table_candidate(level)
+    }
+
+    /// Closes every CPU's fault window copied from `address_space`'s
+    /// mapping records (DW2 §13.16 part e3).
+    pub(crate) fn close_fault_windows(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        charges: &mut impl crate::memory::address_region::WindowCharges,
+    ) -> crate::memory::address_region::WindowsClosed {
+        self.session.close_fault_windows(address_space, charges)
     }
 
     /// Whether any user pin or mutation holds part of `address_space`.
@@ -551,6 +565,9 @@ pub(crate) struct LiveProcessAddressSpace<
     pub(super) target: TrackedActiveTarget<'borrow>,
     /// The journal every publisher of this session stages into (D7).
     pub(super) journal: &'borrow mut LiveJournalStorage,
+    /// P's fault windows (DW2 §13.16 part e3), reached through the session
+    /// so a hold can close them while its session lives.
+    pub(super) windows: &'borrow mut LiveFaultWindows,
     pub(super) _root: core::marker::PhantomData<&'root mut ()>,
 }
 
@@ -843,6 +860,17 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             pins,
             reservation,
         )
+    }
+
+    /// Closes every CPU's fault window copied from `address_space`'s
+    /// mapping records, returning their credit through `charges` (DW2
+    /// §13.16 part e3).
+    pub(crate) fn close_fault_windows(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        charges: &mut impl crate::memory::address_region::WindowCharges,
+    ) -> crate::memory::address_region::WindowsClosed {
+        self.windows.close_address_space(address_space, charges)
     }
 
     /// Retargets only the scratch-walk validation identity. Raw usercopy must

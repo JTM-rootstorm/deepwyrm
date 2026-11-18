@@ -787,8 +787,18 @@ mod tests {
 
         let blocked = crate::task::BlockedOperationRegistry::<2>::new();
         let drained = blocked.drained(process).unwrap();
+        let closed = crate::memory::address_region::test_windows_closed(
+            regions
+                .region(
+                    crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                        tasks.root_region(process).unwrap().unwrap(),
+                    ),
+                )
+                .unwrap()
+                .address_space_key(),
+        );
         let region_pin = regions
-            .retire_exited_root(&mut tasks, process, &blocked, drained)
+            .retire_exited_root(&mut tasks, process, &blocked, drained, closed)
             .unwrap();
         let region_final = registry.release_internal(region_pin).unwrap().unwrap();
         {

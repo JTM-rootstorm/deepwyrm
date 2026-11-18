@@ -197,12 +197,22 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         owner,
         deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
     );
+    let closed = setup.close_fault_windows(
+        regions
+            .region(root_region)
+            .unwrap_or_else(|_| fail(detail))
+            .address_space_key(),
+        &mut crate::syscall::RegistryWindowCharges {
+            registry: &mut *registry,
+            tasks: &*tasks,
+        },
+    );
     let lease = tasks
         .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
     let result = {
         let region = regions
-            .region_mut_for_operation(tasks, &lease, root_region)
+            .region_mut_for_operation(tasks, &lease, root_region, closed)
             .unwrap_or_else(|_| fail(detail));
         let authorization = memory
             .issue_map_authorization(
@@ -249,12 +259,22 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     candidates: &mut [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
     detail: u32,
 ) {
+    let closed = setup.close_fault_windows(
+        regions
+            .region(root_region)
+            .unwrap_or_else(|_| fail(detail))
+            .address_space_key(),
+        &mut crate::syscall::RegistryWindowCharges {
+            registry: &mut *registry,
+            tasks: &*tasks,
+        },
+    );
     let lease = tasks
         .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
     let result = {
         let region = regions
-            .region_mut_for_operation(tasks, &lease, root_region)
+            .region_mut_for_operation(tasks, &lease, root_region, closed)
             .unwrap_or_else(|_| fail(detail));
         let mut publisher = setup
             .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
@@ -393,6 +413,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         roles: &mut *active.target.roles,
         scratch: &mut scratch,
         journal: crate::arch::x86_64::mm::JournalStorage::new(),
+        windows: &mut active.fault_windows,
         _not_send_sync: core::marker::PhantomData,
     };
     if let Err(detail) = setup.validate_live_kernel_guard_layout() {

@@ -1392,7 +1392,14 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
     let operation = tasks.acquire_process_operation(process).unwrap();
     assert!(
         regions
-            .region_mut_for_operation(&tasks, &operation, region_key)
+            .region_mut_for_operation(
+                &tasks,
+                &operation,
+                region_key,
+                crate::memory::address_region::test_windows_closed(
+                    regions.region(region_key).unwrap().address_space_key()
+                )
+            )
             .is_ok()
     );
     assert!(
@@ -1412,7 +1419,14 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
     // new mapping/atomic setup cannot start.
     assert!(
         regions
-            .region_mut_for_operation(&tasks, &operation, region_key)
+            .region_mut_for_operation(
+                &tasks,
+                &operation,
+                region_key,
+                crate::memory::address_region::test_windows_closed(
+                    regions.region(region_key).unwrap().address_space_key()
+                )
+            )
             .is_ok()
     );
     assert_eq!(
@@ -1436,21 +1450,37 @@ fn root_region_handle_close_preserves_address_space_until_process_exit() {
             .is_none()
     );
     assert!(matches!(
-        regions.region_mut_for_live_process(&tasks, region_key),
+        regions.region_mut_for_live_process(
+            &tasks,
+            region_key,
+            crate::memory::address_region::test_windows_closed(
+                regions.region(region_key).unwrap().address_space_key()
+            )
+        ),
         Err(AddressRegionObjectError::Task(TaskError::BadState))
     ));
 
     let quiescence = tasks.process_quiescence_proof(process).unwrap();
     assert!(
         regions
-            .region_mut_for_quiesced_teardown(&tasks, &quiescence, region_key)
+            .region_mut_for_quiesced_teardown(
+                &tasks,
+                &quiescence,
+                region_key,
+                crate::memory::address_region::test_windows_closed(
+                    regions.region(region_key).unwrap().address_space_key()
+                )
+            )
             .is_ok()
     );
 
     let blocked = crate::task::BlockedOperationRegistry::<2>::new();
     let drained = blocked.drained_after_quiesce(&tasks, &quiescence).unwrap();
+    let closed = crate::memory::address_region::test_windows_closed(
+        regions.region(region_key).unwrap().address_space_key(),
+    );
     let runtime_pin = regions
-        .retire_quiesced_root(&mut tasks, process, &quiescence, &blocked, drained)
+        .retire_quiesced_root(&mut tasks, process, &quiescence, &blocked, drained, closed)
         .unwrap();
     let region_final = registry.release_internal(runtime_pin).unwrap().unwrap();
     let finalization = regions

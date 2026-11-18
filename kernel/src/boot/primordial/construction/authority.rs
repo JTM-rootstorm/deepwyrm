@@ -11,7 +11,8 @@ use crate::ipc::{
 };
 use crate::memory::address_region::{
     AddressRegion, AddressRegionObjectAuthority, AddressRegionObjectError, AddressRegionObjectKey,
-    AddressSpaceAuthority, PreparedRootRegion, Protection,
+    AddressSpaceAuthority, AddressSpaceKey, PreparedRootRegion, Protection, WindowCharges,
+    WindowsClosed,
 };
 use crate::memory::frame_roles::ObjectBackingGrant;
 use crate::memory::object::{
@@ -84,6 +85,16 @@ pub(crate) trait PrimordialPlatform {
         virtual_start: u64,
         byte_len: u64,
     );
+
+    /// Closes the fault windows of `address_space` in the paging value this
+    /// platform builds, returning the proof a mapping change consumes (DW2
+    /// §13.16 part e3). Construction runs before any fault is served, so
+    /// the table is empty; this is still the one way to the proof.
+    fn close_fault_windows<C: WindowCharges>(
+        &mut self,
+        address_space: AddressSpaceKey,
+        charges: &mut C,
+    ) -> WindowsClosed;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +312,26 @@ where
 
     fn root_key(&self) -> Result<AddressRegionObjectKey, AuthorityPrimordialError<P::Error>> {
         self.root_key.ok_or(AuthorityPrimordialError::State)
+    }
+
+    /// Closes the fault windows of `key`'s address space through the
+    /// platform's paging value (DW2 §13.16 part e3).
+    fn windows_closed(
+        &mut self,
+        key: AddressRegionObjectKey,
+    ) -> Result<WindowsClosed, AuthorityPrimordialError<P::Error>> {
+        let address_space = self
+            .regions
+            .region(key)
+            .map_err(AuthorityPrimordialError::Region)?
+            .address_space_key();
+        let mut charges = crate::syscall::RegistryWindowCharges {
+            registry: &mut *self.registry,
+            tasks: &*self.tasks,
+        };
+        Ok(self
+            .platform
+            .close_fault_windows(address_space, &mut charges))
     }
 
     fn create_page_object(
@@ -558,6 +589,7 @@ where
             .take()
             .ok_or(AuthorityPrimordialError::State)?;
         let key = self.root_key()?;
+        let closed = self.windows_closed(key)?;
         let process = self
             .process
             .as_ref()
@@ -569,7 +601,7 @@ where
             .map_err(AuthorityPrimordialError::Task)?;
         let region = match self
             .regions
-            .region_mut_for_operation(self.tasks, &lease, key)
+            .region_mut_for_operation(self.tasks, &lease, key, closed)
         {
             Ok(region) => region,
             Err(error) => {
@@ -611,6 +643,7 @@ where
     fn map_stack(&mut self, layout: PrimordialStackLayout) -> Result<(), Self::Error> {
         let object = self.stack.take().ok_or(AuthorityPrimordialError::State)?;
         let key = self.root_key()?;
+        let closed = self.windows_closed(key)?;
         let process = self
             .process
             .as_ref()
@@ -622,7 +655,7 @@ where
             .map_err(AuthorityPrimordialError::Task)?;
         let region = match self
             .regions
-            .region_mut_for_operation(self.tasks, &lease, key)
+            .region_mut_for_operation(self.tasks, &lease, key, closed)
         {
             Ok(region) => region,
             Err(error) => {
@@ -1034,9 +1067,12 @@ where
                 .tasks
                 .acquire_process_operation(process)
                 .expect("prepared primordial Process accepts rollback operation");
+            let closed = self
+                .windows_closed(key)
+                .unwrap_or_else(|_| panic!("prepared primordial root remains live"));
             let region = self
                 .regions
-                .region_mut_for_operation(self.tasks, &lease, key)
+                .region_mut_for_operation(self.tasks, &lease, key, closed)
                 .expect("prepared primordial root remains live");
             self.platform
                 .unmap(region, self.memory, self.registry, start, len);
@@ -1064,9 +1100,12 @@ where
                     .tasks
                     .acquire_process_operation(process)
                     .expect("prepared primordial Process accepts rollback operation");
+                let closed = self
+                    .windows_closed(key)
+                    .unwrap_or_else(|_| panic!("prepared primordial root remains live"));
                 let region = self
                     .regions
-                    .region_mut_for_operation(self.tasks, &lease, key)
+                    .region_mut_for_operation(self.tasks, &lease, key, closed)
                     .expect("prepared primordial root remains live");
                 self.platform
                     .unmap(region, self.memory, self.registry, start, len);

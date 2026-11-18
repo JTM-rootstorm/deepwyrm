@@ -1,6 +1,7 @@
 use super::*;
 use deepwyrm_abi::{DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_PROCESS, DW_TASK_STATE_EXITED};
 
+use super::WindowsClosed;
 use crate::object::{
     CreationRef, FinalRelease, HandleRef, InternalRef, ObjectId, ObjectRegistry,
     ObjectRegistryError,
@@ -188,7 +189,9 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         &mut self,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         key: AddressRegionObjectKey,
+        closed: WindowsClosed,
     ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        self.consume_windows_closed(key, closed)?;
         let process = ProcessKey::from_object_id(self.record(key)?.process);
         if tasks
             .process_info(process)
@@ -214,7 +217,9 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         lease: &ProcessOperationLease,
         key: AddressRegionObjectKey,
+        closed: WindowsClosed,
     ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        self.consume_windows_closed(key, closed)?;
         let process = ProcessKey::from_object_id(self.record(key)?.process);
         tasks
             .validate_process_operation(lease, process)
@@ -361,7 +366,9 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         &mut self,
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         key: AddressRegionObjectKey,
+        closed: WindowsClosed,
     ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        self.consume_windows_closed(key, closed)?;
         let process = ProcessKey::from_object_id(self.record(key)?.process);
         if tasks
             .process_info(process)
@@ -384,7 +391,9 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         proof: &ProcessQuiescenceProof,
         key: AddressRegionObjectKey,
+        closed: WindowsClosed,
     ) -> Result<&mut AddressRegion<SLOTS>, AddressRegionObjectError> {
+        self.consume_windows_closed(key, closed)?;
         let process = ProcessKey::from_object_id(self.record(key)?.process);
         tasks
             .validate_process_quiescence(proof, process)
@@ -409,6 +418,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         &mut self,
         tasks: &mut TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
         process: ProcessKey,
+        closed: WindowsClosed,
     ) -> Result<InternalRef, AddressRegionObjectError> {
         if tasks
             .process_info(process)
@@ -427,6 +437,13 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
                     .is_some_and(|record| record.process == process.object_id())
             })
             .ok_or(AddressRegionObjectError::WrongProcess)?;
+        closed.consume_for(
+            self.records[slot]
+                .as_ref()
+                .expect("located root region")
+                .region
+                .address_space_key(),
+        );
         let object = self.records[slot]
             .as_ref()
             .expect("located root region")
@@ -482,11 +499,12 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         process: ProcessKey,
         blocked: &BlockedOperationRegistry<BLOCKED>,
         drained: BlockedOperationsDrained,
+        closed: WindowsClosed,
     ) -> Result<InternalRef, AddressRegionObjectError> {
         blocked
             .validate_drained(&drained, process)
             .map_err(AddressRegionObjectError::BlockedOperation)?;
-        self.retire_exited_root_inner(tasks, process)
+        self.retire_exited_root_inner(tasks, process, closed)
     }
 
     pub(crate) fn retire_quiesced_root<
@@ -502,6 +520,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         proof: &ProcessQuiescenceProof,
         blocked: &BlockedOperationRegistry<BLOCKED>,
         drained: BlockedOperationsDrained,
+        closed: WindowsClosed,
     ) -> Result<InternalRef, AddressRegionObjectError> {
         blocked
             .validate_drained_after_quiesce(tasks, proof, &drained)
@@ -509,7 +528,7 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         tasks
             .validate_process_quiescence(proof, process)
             .map_err(AddressRegionObjectError::Task)?;
-        self.retire_exited_root_inner(tasks, process)
+        self.retire_exited_root_inner(tasks, process, closed)
     }
 
     pub(crate) fn take_finalization<const SPACES: usize, const REGIONS: usize>(
@@ -576,6 +595,19 @@ impl<const OBJECTS: usize, const SLOTS: usize> AddressRegionObjectAuthority<OBJE
         Ok(self.records[slot]
             .as_mut()
             .expect("validated AddressRegion payload slot"))
+    }
+
+    /// Consumes the proof that no fault window copied from `key`'s address
+    /// space exists (DW2 §13.16 part e3), which must name that address
+    /// space. Every function here that hands out a mutable region or
+    /// retires a root takes one first.
+    fn consume_windows_closed(
+        &self,
+        key: AddressRegionObjectKey,
+        closed: WindowsClosed,
+    ) -> Result<(), AddressRegionObjectError> {
+        closed.consume_for(self.record(key)?.region.address_space_key());
+        Ok(())
     }
 }
 

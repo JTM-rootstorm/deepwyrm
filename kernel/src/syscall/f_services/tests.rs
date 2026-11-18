@@ -694,9 +694,20 @@ fn retire_created_process(
 
     let blocked = crate::task::BlockedOperationRegistry::<EXECUTION>::new();
     let drained = blocked.drained(child).unwrap();
+    let closed = crate::memory::address_region::test_windows_closed(
+        fixture
+            .regions
+            .region(
+                crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                    fixture.tasks.root_region(child).unwrap().unwrap(),
+                ),
+            )
+            .unwrap()
+            .address_space_key(),
+    );
     let runtime_pin = fixture
         .regions
-        .retire_exited_root(&mut fixture.tasks, child, &blocked, drained)
+        .retire_exited_root(&mut fixture.tasks, child, &blocked, drained, closed)
         .unwrap();
     let root_final = fixture
         .registry

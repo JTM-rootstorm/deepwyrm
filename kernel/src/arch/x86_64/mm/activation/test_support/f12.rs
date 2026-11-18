@@ -268,12 +268,22 @@ fn map_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         owner,
         deepwyrm_abi::dw_object_compatible_rights(deepwyrm_abi::DW_OBJECT_TYPE_MEMORY_OBJECT),
     );
+    let closed = setup.close_fault_windows(
+        regions
+            .region(root_region)
+            .unwrap_or_else(|_| fail(detail))
+            .address_space_key(),
+        &mut crate::syscall::RegistryWindowCharges {
+            registry: &mut *registry,
+            tasks: &*tasks,
+        },
+    );
     let lease = tasks
         .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
     let result = {
         let region = regions
-            .region_mut_for_operation(tasks, &lease, root_region)
+            .region_mut_for_operation(tasks, &lease, root_region, closed)
             .unwrap_or_else(|_| fail(detail));
         let authorization = memory
             .issue_map_authorization(
@@ -320,12 +330,22 @@ fn protect_page<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
     candidates: &mut [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
     detail: u32,
 ) {
+    let closed = setup.close_fault_windows(
+        regions
+            .region(root_region)
+            .unwrap_or_else(|_| fail(detail))
+            .address_space_key(),
+        &mut crate::syscall::RegistryWindowCharges {
+            registry: &mut *registry,
+            tasks: &*tasks,
+        },
+    );
     let lease = tasks
         .acquire_process_operation(process)
         .unwrap_or_else(|_| fail(detail));
     let result = {
         let region = regions
-            .region_mut_for_operation(tasks, &lease, root_region)
+            .region_mut_for_operation(tasks, &lease, root_region, closed)
             .unwrap_or_else(|_| fail(detail));
         let mut publisher = setup
             .bind_test_publisher(region.address_space_key(), region.region_key(), candidates)
@@ -555,6 +575,7 @@ fn build_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize
         roles: &mut *active.target.roles,
         scratch: &mut scratch,
         journal: crate::arch::x86_64::mm::JournalStorage::new(),
+        windows: &mut active.fault_windows,
         _not_send_sync: core::marker::PhantomData,
     };
     if let Err(detail) = setup.validate_live_kernel_guard_layout() {
@@ -1210,6 +1231,26 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                             .execution
                             .blocked_operations_drained(&self.tasks, &proof)
                             .unwrap_or_else(|_| fail(0xba));
+                        let child_space = self
+                            .regions
+                            .region(
+                                crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                                    self.tasks
+                                        .root_region(child)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| fail(0xbb)),
+                                ),
+                            )
+                            .unwrap_or_else(|_| fail(0xbb))
+                            .address_space_key();
+                        let closed = self.active.close_fault_windows(
+                            child_space,
+                            &mut crate::syscall::RegistryWindowCharges {
+                                registry: &mut self.registry,
+                                tasks: &self.tasks,
+                            },
+                        );
                         let root_pin = self
                             .regions
                             .retire_quiesced_root(
@@ -1218,6 +1259,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandl
                                 &proof,
                                 self.execution.blocked_operations(),
                                 drained,
+                                closed,
                             )
                             .unwrap_or_else(|_| fail(0xbb));
                         self.cleanup.push_optional(
@@ -1322,6 +1364,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             roles: &mut *self.active.target.roles,
             scratch: &mut scratch,
             journal: crate::arch::x86_64::mm::JournalStorage::new(),
+            windows: &mut self.active.fault_windows,
             _not_send_sync: core::marker::PhantomData,
         };
         let mut candidates = [None, None, None];
@@ -1330,9 +1373,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             (F12_USER_DATA, 0xcc),
             (F12_USER_STACK_BOTTOM, 0xd4),
         ] {
+            let closed = setup.close_fault_windows(
+                self.regions
+                    .region(self.root_region)
+                    .unwrap_or_else(|_| fail(detail))
+                    .address_space_key(),
+                &mut crate::syscall::RegistryWindowCharges {
+                    registry: &mut self.registry,
+                    tasks: &self.tasks,
+                },
+            );
             let region = self
                 .regions
-                .region_mut_for_quiesced_teardown(&self.tasks, proof, self.root_region)
+                .region_mut_for_quiesced_teardown(&self.tasks, proof, self.root_region, closed)
                 .unwrap_or_else(|_| fail(detail));
             let mut publisher = setup
                 .bind_test_publisher(
@@ -1528,6 +1581,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .blocked_operations_drained(&self.tasks, &proof)
             .unwrap_or_else(|_| fail(0xef));
         self.unmap_main_userspace(&proof, &drained);
+        let main_space = self
+            .regions
+            .region(self.root_region)
+            .unwrap_or_else(|_| fail(0xf0))
+            .address_space_key();
+        let closed = self.active.close_fault_windows(
+            main_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.registry,
+                tasks: &self.tasks,
+            },
+        );
         let root_pin = self
             .regions
             .retire_quiesced_root(
@@ -1536,6 +1601,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &proof,
                 self.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .unwrap_or_else(|_| fail(0xf0));
         self.cleanup.push_optional(

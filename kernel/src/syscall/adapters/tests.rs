@@ -2435,6 +2435,9 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_map(
                 &mut user,
                 &mut publisher,
@@ -2449,6 +2452,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
                 DwUserAddress(BASE + 0x300),
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2468,6 +2472,9 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_map(
                 &mut user,
                 &mut publisher,
@@ -2482,6 +2489,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
                 DwUserAddress(BASE + 0x300),
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2505,6 +2513,9 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_protect(
                 &mut publisher,
                 &mut registry,
@@ -2517,6 +2528,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 4096,
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2527,6 +2539,9 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_unmap(
                 &mut publisher,
                 &mut registry,
@@ -2538,6 +2553,7 @@ fn address_region_map_preflights_copyout_and_preserves_mapping_leases() {
                 DwUserAddress(mapped),
                 4096,
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2700,6 +2716,9 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_map(
                 &mut user,
                 &mut publisher,
@@ -2714,6 +2733,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
                 DwUserAddress(BASE + 0x300),
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2726,6 +2746,9 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_protect(
                 &mut publisher,
                 &mut registry,
@@ -2738,6 +2761,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 4096,
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2757,6 +2781,9 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_protect(
                 &mut publisher,
                 &mut registry,
@@ -2769,6 +2796,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 4096,
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2793,6 +2821,9 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_protect(
                 &mut publisher,
                 &mut registry,
@@ -2805,6 +2836,7 @@ fn delegated_child_region_maps_under_child_gate_and_exact_publisher() {
                 4096,
                 DW_MEMORY_PROTECTION_READ.0,
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -2895,6 +2927,9 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
         replacements: 0,
     };
     let mut held = HeldReleases::new();
+    let closed = crate::memory::address_region::test_windows_closed(
+        crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+    );
     assert_eq!(
         address_region_map(
             &mut user,
@@ -2910,6 +2945,7 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
             u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
             DwUserAddress(BASE + 0x300),
             &mut held,
+            closed,
         ),
         DW_STATUS_SUCCESS
     );
@@ -2950,6 +2986,9 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
             &coherency,
             &mut driver,
         );
+    let closed = crate::memory::address_region::test_windows_closed(
+        crate::memory::address_region::AddressSpacePublisher::address_space_key(&coherent),
+    );
     assert_eq!(
         address_region_unmap(
             &mut coherent,
@@ -2962,6 +3001,7 @@ fn a_family_g_unmap_holds_its_final_release_until_merged() {
             DwUserAddress(mapped),
             4096,
             &mut held,
+            closed,
         ),
         DW_STATUS_SUCCESS
     );
@@ -3951,6 +3991,9 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
     assert_eq!(
         {
             let mut held = HeldReleases::new();
+            let closed = crate::memory::address_region::test_windows_closed(
+                crate::memory::address_region::AddressSpacePublisher::address_space_key(&publisher),
+            );
             let result = address_region_map(
                 &mut user,
                 &mut publisher,
@@ -3965,6 +4008,7 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
                 u64::from(deepwyrm_abi::DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE),
                 DwUserAddress(BASE + 0x300),
                 &mut held,
+                closed,
             );
             held.merge_without_shootdown(&mut registry, &mut cleanup);
             result
@@ -4028,7 +4072,14 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
         .blocked_operations_drained(&tasks, &proof)
         .unwrap();
     let releases = regions
-        .region_mut_for_quiesced_teardown(&tasks, &proof, root_key)
+        .region_mut_for_quiesced_teardown(
+            &tasks,
+            &proof,
+            root_key,
+            crate::memory::address_region::test_windows_closed(
+                regions.region(root_key).unwrap().address_space_key(),
+            ),
+        )
         .unwrap()
         .unmap(&mut memory, &mut registry, &mut publisher, mapped, 4096)
         .unwrap()
@@ -4051,6 +4102,9 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
             .is_none()
         );
     }
+    let closed = crate::memory::address_region::test_windows_closed(
+        regions.region(root_key).unwrap().address_space_key(),
+    );
     let root_pin = regions
         .retire_quiesced_root(
             &mut tasks,
@@ -4058,6 +4112,7 @@ fn final_external_thread_exit_preserves_process_identity_for_mapped_root_recycli
             &proof,
             execution.blocked_operations(),
             drained,
+            closed,
         )
         .unwrap();
     let root_final = registry.release_internal(root_pin).unwrap().unwrap();
@@ -10602,9 +10657,20 @@ fn retire_f10_created_process(
 
     let blocked = crate::task::BlockedOperationRegistry::<2>::new();
     let drained = blocked.drained(child).unwrap();
+    let closed = crate::memory::address_region::test_windows_closed(
+        fixture
+            .regions
+            .region(
+                crate::memory::address_region::AddressRegionObjectKey::from_object_id(
+                    fixture.tasks.root_region(child).unwrap().unwrap(),
+                ),
+            )
+            .unwrap()
+            .address_space_key(),
+    );
     let runtime_pin = fixture
         .regions
-        .retire_exited_root(&mut fixture.tasks, child, &blocked, drained)
+        .retire_exited_root(&mut fixture.tasks, child, &blocked, drained, closed)
         .unwrap();
     let root_final = fixture
         .registry

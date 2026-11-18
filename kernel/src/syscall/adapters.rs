@@ -2817,6 +2817,65 @@ pub(crate) fn record_charged_pages<const OBJECTS: usize>(
         .unwrap_or_else(|error| panic!("an admitted object rejected its weight: {error:?}"));
 }
 
+/// The registry's side of a fault window's charge (DW2 §13.16 part e3):
+/// admission against the object's tag, and its page weight, changed only
+/// under T. Every change is checked; an object that is not live panics.
+pub(crate) struct RegistryWindowCharges<
+    'a,
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+> {
+    pub(crate) registry: &'a mut ObjectRegistry<OBJECTS>,
+    pub(crate) tasks: &'a TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+}
+
+impl<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+> crate::memory::address_region::WindowCharges
+    for RegistryWindowCharges<'_, OBJECTS, GROUPS, PROCESSES, THREADS, HANDLES>
+{
+    fn admit(&self, object: crate::object::ObjectId, frames: u64) -> bool {
+        admit_charged_pages(self.registry, self.tasks, object, frames).is_ok()
+    }
+
+    fn add(&mut self, object: crate::object::ObjectId, frames: u64) {
+        let (_, pages) = self
+            .registry
+            .charge(object)
+            .unwrap_or_else(|error| panic!("a fault window's object is not live: {error:?}"));
+        let pages = pages
+            .checked_add(frames)
+            .unwrap_or_else(|| panic!("a fault window's credit overflowed its object's weight"));
+        self.registry
+            .set_charge_pages(object, pages)
+            .unwrap_or_else(|error| {
+                panic!("a fault window's object rejected its weight: {error:?}")
+            });
+    }
+
+    fn subtract(&mut self, object: crate::object::ObjectId, frames: u64) {
+        let (_, pages) = self
+            .registry
+            .charge(object)
+            .unwrap_or_else(|error| panic!("a fault window's object is not live: {error:?}"));
+        let pages = pages
+            .checked_sub(frames)
+            .unwrap_or_else(|| panic!("a fault window's credit exceeded its object's weight"));
+        self.registry
+            .set_charge_pages(object, pages)
+            .unwrap_or_else(|error| {
+                panic!("a fault window's object rejected its weight: {error:?}")
+            });
+    }
+}
+
 fn release_held_lookup_pin<const OBJECTS: usize>(
     registry: &mut ObjectRegistry<OBJECTS>,
     pin: crate::object::InternalRef,

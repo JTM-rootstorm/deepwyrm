@@ -81,6 +81,8 @@ pub(crate) use adapters::{
     wait_one_syscall,
 };
 
+#[cfg(deepwyrm_integrated)]
+pub(crate) use adapters::RegistryWindowCharges;
 #[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
 pub(crate) use adapters::clock_get;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]

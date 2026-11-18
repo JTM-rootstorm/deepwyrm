@@ -309,6 +309,7 @@ fn build_smoke_runtime<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY:
         roles: &mut *active.target.roles,
         scratch: &mut scratch,
         journal: crate::arch::x86_64::mm::JournalStorage::new(),
+        windows: &mut active.fault_windows,
         _not_send_sync: core::marker::PhantomData,
     };
     if let Err(detail) = setup.validate_live_kernel_guard_layout() {

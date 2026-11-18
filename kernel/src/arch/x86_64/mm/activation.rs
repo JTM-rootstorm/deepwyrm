@@ -624,6 +624,9 @@ pub(crate) struct ActiveDeepPaging<A> {
     /// one session at a time, so the paging lock P serializes its use.
     #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     journal: &'static mut user_access::LiveJournalStorage,
+    /// One fault window per CPU (DW2 §13.16 part e3), so P serializes them.
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+    fault_windows: user_access::LiveFaultWindows,
 }
 
 /// The live journal's storage: the kernel's one live paging state takes it
@@ -2558,8 +2561,21 @@ mod live_sessions {
                     span: None,
                 },
                 journal: &mut *self.journal,
+                windows: &mut self.fault_windows,
                 _root: core::marker::PhantomData,
             }
+        }
+
+        /// Closes every CPU's fault window copied from `address_space`'s
+        /// mapping records, returning their credit through `charges`, for a
+        /// hold that holds P with no session (DW2 §13.16 part e3).
+        pub(crate) fn close_fault_windows(
+            &mut self,
+            address_space: crate::memory::address_region::AddressSpaceKey,
+            charges: &mut impl crate::memory::address_region::WindowCharges,
+        ) -> crate::memory::address_region::WindowsClosed {
+            self.fault_windows
+                .close_address_space(address_space, charges)
         }
     }
 
@@ -2815,6 +2831,8 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             root_bindings: AddressSpaceRootBindings::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             kernel_execution_roots: KernelExecutionRoots::new(),
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+            fault_windows: user_access::LiveFaultWindows::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             journal: {
                 #[allow(

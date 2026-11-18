@@ -627,6 +627,7 @@ pub(crate) fn address_region_map<
     args_size: u64,
     out_address: DwUserAddress,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -660,6 +661,7 @@ where
         args,
         protection,
         held,
+        closed,
     )
 }
 
@@ -691,6 +693,7 @@ fn address_region_map_preflighted<
     args: deepwyrm_abi::DwAddressRegionMapArgsV1,
     protection: crate::memory::address_region::Protection,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -708,6 +711,7 @@ where
         protection,
         args.byte_len.0,
         held,
+        closed,
     ) {
         Ok(address) => {
             output.commit(&encode_u64(address));
@@ -745,6 +749,7 @@ pub(crate) fn address_region_map_model<
     protection: crate::memory::address_region::Protection,
     room: u64,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> Result<u64, DwStatus>
 where
     P::Error: AddressSpacePublishStatus,
@@ -800,7 +805,8 @@ where
             ));
         }
     };
-    let region = match regions.region_mut_for_operation(tasks, &operation_lease, region_key) {
+    let region = match regions.region_mut_for_operation(tasks, &operation_lease, region_key, closed)
+    {
         Ok(region) => region,
         Err(error) => {
             tasks
@@ -922,6 +928,7 @@ pub(crate) fn address_region_map_prepared_model<
     protection: crate::memory::address_region::Protection,
     room: u64,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> Result<u64, DwStatus>
 where
     P::Error: AddressSpacePublishStatus,
@@ -940,6 +947,7 @@ where
         protection,
         room,
         held,
+        closed,
     )
 }
 
@@ -968,6 +976,7 @@ pub(crate) fn address_region_unmap<
     address: DwUserAddress,
     byte_len: u64,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -1000,7 +1009,7 @@ where
             return task_status(error);
         }
     };
-    let region = match regions.region_mut_for_operation(tasks, &operation_lease, key) {
+    let region = match regions.region_mut_for_operation(tasks, &operation_lease, key, closed) {
         Ok(region) => region,
         Err(error) => {
             tasks
@@ -1055,6 +1064,7 @@ pub(crate) fn address_region_unmap_prepared<
     address: DwUserAddress,
     byte_len: u64,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -1073,6 +1083,7 @@ where
         address,
         byte_len,
         held,
+        closed,
     )
 }
 pub(crate) fn address_region_protect<
@@ -1101,6 +1112,7 @@ pub(crate) fn address_region_protect<
     byte_len: u64,
     protections: u32,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -1143,7 +1155,7 @@ where
             return task_status(error);
         }
     };
-    let region = match regions.region_mut_for_operation(tasks, &operation_lease, key) {
+    let region = match regions.region_mut_for_operation(tasks, &operation_lease, key, closed) {
         Ok(region) => region,
         Err(error) => {
             tasks
@@ -1199,6 +1211,7 @@ pub(crate) fn address_region_protect_prepared<
     byte_len: u64,
     protections: u32,
     held: &mut HeldReleases<OBJECTS>,
+    closed: crate::memory::address_region::WindowsClosed,
 ) -> DwStatus
 where
     P::Error: AddressSpacePublishStatus,
@@ -1218,5 +1231,6 @@ where
         byte_len,
         protections,
         held,
+        closed,
     )
 }
