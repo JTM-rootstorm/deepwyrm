@@ -1104,156 +1104,232 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             _ => (None, false),
         };
         let cpu = self.cpu;
-        let Ok(((phase, root, process), quota_allows)) = self
-            .with_synchronized_runtime_at_safe_point(|runtime| {
-                if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                    runtime.service_pending_timer_expiries_on_bootstrap();
+        // The pages the create's admission charges.
+        let charged = backing_pages.map(|pages| if on_demand { 1 } else { pages });
+        // Whether the last pass took an owed step, which lets the next safe
+        // point yield: none has when the call starts or resumes.
+        let mut waited = false;
+        // A create whose final hold met an owed refusal starts again here
+        // (DW2 §13.12 part b).
+        loop {
+            // The first hold. A create's is a step safe point in a loop: a
+            // refusal owed work could admit takes the hold's owed step and the
+            // loop comes again, and may yield after it (DW2 §13.12 part b).
+            let ((phase, root, process), quota_allows) = loop {
+                let pass = if charged.is_some() {
+                    self.at_step_safe_point(waited, StepCall::Create, |runtime, yielding| {
+                        Self::deferred_first_hold(runtime, cpu, yielding, charged)
+                    })
+                } else {
+                    self.with_synchronized_runtime_at_safe_point(|runtime| {
+                        Self::deferred_first_hold(runtime, cpu, false, None)
+                    })
+                };
+                if charged.is_some() && !matches!(pass, Ok(FirstHold::Owed)) {
+                    // An owed step's timing ends at the next safe point; any
+                    // other pass ends the create's waiting here.
+                    step_report::call_ended(cpu.index(), None);
                 }
-                let prepared = runtime.prepare_guard_free_usercopy();
-                // Frames are allocated only for a request its quota admits
-                // now; the adapter's admission under the next hold decides.
-                // Admitted pages stay reserved until the final hold, so a
-                // concurrent create cannot allocate past the limit (§7.3 R7).
-                let allows = backing_pages.is_none_or(|pages| {
-                    let process = runtime.own.scheduled().process;
-                    crate::syscall::reserve_memory_object_pages(
-                        &mut runtime.core.registry,
-                        &runtime.core.tasks,
-                        process,
-                        if on_demand { 1 } else { pages },
-                        runtime.own.scheduled().thread,
-                    )
-                });
-                (prepared, allows)
-            })
-        else {
-            return Some(Err(()));
-        };
-        // Every range the adapter will preflight, or `None` if one cannot be
-        // formed (the adapter then fails at that range, before any pin).
-        let (ranges, formed) = deferred_output_ranges(outputs);
-        let (atomic_pin, pinned, backing) = {
-            let mut access = self.paging.guard_free_access(self.runtime.guard_free());
-            let mut paging = access.lock();
-            let mut user = paging
-                .guard_free_value()
-                .usercopy_process_address_space(root, process);
-            let atomic_pin = match request {
-                NativeSyscallRequest::AtomicWake { address, .. } => Some(
-                    crate::syscall::FAtomicUserAccess::pin_atomic_u32(&mut user, address),
-                ),
-                _ => None,
+                match pass {
+                    Err(()) => return Some(Err(())),
+                    // Nothing is reserved, pinned or allocated: the call is
+                    // parked as its request and runs again from its start.
+                    Ok(FirstHold::Yield) => {
+                        return Some(Ok(self.park_call(ParkedCall::Admission { request })));
+                    }
+                    Ok(FirstHold::Owed) => waited = true,
+                    Ok(FirstHold::Ready(prepared, allows)) => break (prepared, allows),
+                }
             };
-            let pinned = if !formed || matches!(atomic_pin, Some(Err(_))) {
-                None
-            } else {
-                let mut owned = [None, None, None];
-                let mut complete = true;
-                for (index, range) in ranges.into_iter().enumerate() {
-                    let Some(range) = range else {
-                        continue;
-                    };
-                    match user.preflight_owned_output(range) {
-                        Ok(output) => owned[index] = Some(output),
-                        Err(_) => {
-                            complete = false;
-                            break;
+            // Every range the adapter will preflight, or `None` if one cannot be
+            // formed (the adapter then fails at that range, before any pin).
+            let (ranges, formed) = deferred_output_ranges(outputs);
+            let (atomic_pin, pinned, backing) = {
+                let mut access = self.paging.guard_free_access(self.runtime.guard_free());
+                let mut paging = access.lock();
+                let mut user = paging
+                    .guard_free_value()
+                    .usercopy_process_address_space(root, process);
+                let atomic_pin = match request {
+                    NativeSyscallRequest::AtomicWake { address, .. } => Some(
+                        crate::syscall::FAtomicUserAccess::pin_atomic_u32(&mut user, address),
+                    ),
+                    _ => None,
+                };
+                let pinned = if !formed || matches!(atomic_pin, Some(Err(_))) {
+                    None
+                } else {
+                    let mut owned = [None, None, None];
+                    let mut complete = true;
+                    for (index, range) in ranges.into_iter().enumerate() {
+                        let Some(range) = range else {
+                            continue;
+                        };
+                        match user.preflight_owned_output(range) {
+                            Ok(output) => owned[index] = Some(output),
+                            Err(_) => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        for output in owned.into_iter().flatten() {
+                            user.discard_owned_output(output).unwrap_or_else(|_| {
+                                panic!("partial deferred output discard drifted")
+                            });
+                        }
+                        None
+                    } else {
+                        Some(owned)
+                    }
+                };
+                let backing = match (backing_pages, &pinned) {
+                    // Refused by quota, or every reservation slot is held (owed
+                    // backings hold them too, DW2 §12.11 part 2 item 8): no
+                    // frames. Should the adapter admit after all (usage fell in
+                    // between), the request fails, not panics.
+                    (Some(_), Some(_)) if !quota_allows => {
+                        Some(Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+                    }
+                    // An index root, zeroed as it is allocated (DW2 M6).
+                    (Some(page_count), Some(_)) if on_demand => Some(
+                        user.allocate_on_demand_backing(page_count)
+                            .map(EarlyBacking::Ready)
+                            .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
+                    ),
+                    // The first hold of its allocation here: at most 16 runs,
+                    // and an index root if they do not cover it. The rest is
+                    // built on, then zeroed, in steps below (DW2 M4b, §12.11
+                    // part 2). The call alone is timed for the step report: it
+                    // is one hold of P that no step covers (§12.11 part 1).
+                    (Some(page_count), Some(_)) => Some({
+                        let began = step_report::now();
+                        let allocation = user.begin_backing(page_count);
+                        let ended = step_report::now();
+                        if let Ok(allocation) = &allocation {
+                            step_report::backing_allocated(
+                                began,
+                                ended,
+                                allocation.run_count(),
+                                allocation.pages(),
+                            );
+                        }
+                        allocation
+                            .map(EarlyBacking::Unzeroed)
+                            .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+                    }),
+                    _ => None,
+                };
+                (atomic_pin, pinned, backing)
+            };
+            // An eager backing is built on and zeroed in steps, which may yield
+            // (DW2 §10.8, §12.11 part 2 item 5).
+            let (phase, root, process, backing, abandoned) = match backing {
+                Some(Ok(EarlyBacking::Unzeroed(allocation))) => {
+                    match self.zero_backing_in_steps(phase, root, process, allocation, 0) {
+                        Zeroing::Done {
+                            phase,
+                            root,
+                            process,
+                            backing,
+                        } => {
+                            let (backing, abandoned) = settled_backing(backing);
+                            (phase, root, process, Some(backing), abandoned)
+                        }
+                        Zeroing::Yielded { allocation, first } => {
+                            self.discard_deferred_pins(root, process, pinned);
+                            return Some(Ok(self.park_call(ParkedCall::Create(ParkedCreate {
+                                request,
+                                allocation,
+                                first,
+                                backing_pages: backing_pages.unwrap_or(0),
+                            }))));
+                        }
+                        Zeroing::Stopped(allocation) => {
+                            self.discard_deferred_pins(root, process, pinned);
+                            self.abandon_create(allocation);
+                            return Some(Err(()));
                         }
                     }
                 }
-                if !complete {
-                    for output in owned.into_iter().flatten() {
-                        user.discard_owned_output(output)
-                            .unwrap_or_else(|_| panic!("partial deferred output discard drifted"));
-                    }
-                    None
+                Some(Ok(EarlyBacking::Ready(grant))) => {
+                    (phase, root, process, Some(Ok(grant)), None)
+                }
+                Some(Err(status)) => (phase, root, process, Some(Err(status)), None),
+                None => (phase, root, process, None, None),
+            };
+            // The final hold may restart a create whose backing was made, or
+            // was not tried because its quota refused (DW2 §13.12 part b); not
+            // one whose frames could not be had, which would only take and
+            // abandon them again.
+            let restartable = charged.filter(|_| {
+                abandoned.is_none() && (matches!(backing, Some(Ok(_))) || !quota_allows)
+            });
+            match self.finish_deferred_output(
+                request,
+                phase,
+                (root, process),
+                atomic_pin,
+                pinned,
+                ranges,
+                backing_pages,
+                (backing, abandoned),
+                restartable,
+            ) {
+                Some(ready) => return Some(Ok(ready)),
+                // The final hold took an owed step.
+                None => waited = true,
+            }
+        }
+    }
+
+    /// One pass of a family-B call's first hold (D1 commit 6): it checks
+    /// the Thread, reserves the phase and copies the root identity. For a
+    /// create that will allocate (`charged`: the pages its admission
+    /// charges), it first reserves those pages: frames are allocated only
+    /// for a request its quota admits now, and admitted pages stay reserved
+    /// until the final hold, so a concurrent create cannot allocate past
+    /// the limit (§7.3 R7); the adapter's admission under the final hold
+    /// decides. A quota refusal owed work could admit takes the hold's owed
+    /// step and reserves nothing (DW2 §13.12 part b); any other refusal
+    /// goes on, unreserved, to fail in the adapter as before. `yielding`:
+    /// the quantum ended at this safe point, so nothing is done.
+    #[inline(always)]
+    fn deferred_first_hold(
+        runtime: &mut PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+        cpu: crate::cpu::CpuIndex,
+        yielding: bool,
+        charged: Option<u64>,
+    ) -> FirstHold {
+        if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
+            runtime.service_pending_timer_expiries_on_bootstrap();
+        }
+        if yielding {
+            return FirstHold::Yield;
+        }
+        let allows = match charged {
+            None => true,
+            Some(pages) => {
+                let process = runtime.own.scheduled().process;
+                let thread = runtime.own.scheduled().thread;
+                if crate::syscall::reserve_memory_object_pages(
+                    &mut runtime.core.registry,
+                    &runtime.core.tasks,
+                    process,
+                    pages,
+                    thread,
+                ) {
+                    true
+                } else if runtime.create_refusal_owed(process, pages) {
+                    runtime.take_owed_step(step_report::AdmissionWait::Create);
+                    return FirstHold::Owed;
                 } else {
-                    Some(owned)
-                }
-            };
-            let backing = match (backing_pages, &pinned) {
-                // Refused by quota, or every reservation slot is held (owed
-                // backings hold them too, DW2 §12.11 part 2 item 8): no
-                // frames. Should the adapter admit after all (usage fell in
-                // between), the request fails, not panics.
-                (Some(_), Some(_)) if !quota_allows => {
-                    Some(Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
-                }
-                // An index root, zeroed as it is allocated (DW2 M6).
-                (Some(page_count), Some(_)) if on_demand => Some(
-                    user.allocate_on_demand_backing(page_count)
-                        .map(EarlyBacking::Ready)
-                        .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES),
-                ),
-                // The first hold of its allocation here: at most 16 runs,
-                // and an index root if they do not cover it. The rest is
-                // built on, then zeroed, in steps below (DW2 M4b, §12.11
-                // part 2). The call alone is timed for the step report: it
-                // is one hold of P that no step covers (§12.11 part 1).
-                (Some(page_count), Some(_)) => Some({
-                    let began = step_report::now();
-                    let allocation = user.begin_backing(page_count);
-                    let ended = step_report::now();
-                    if let Ok(allocation) = &allocation {
-                        step_report::backing_allocated(
-                            began,
-                            ended,
-                            allocation.run_count(),
-                            allocation.pages(),
-                        );
-                    }
-                    allocation
-                        .map(EarlyBacking::Unzeroed)
-                        .map_err(|_| deepwyrm_abi::DW_STATUS_NO_RESOURCES)
-                }),
-                _ => None,
-            };
-            (atomic_pin, pinned, backing)
-        };
-        // An eager backing is built on and zeroed in steps, which may yield
-        // (DW2 §10.8, §12.11 part 2 item 5).
-        let (phase, root, process, backing, abandoned) = match backing {
-            Some(Ok(EarlyBacking::Unzeroed(allocation))) => {
-                match self.zero_backing_in_steps(phase, root, process, allocation, 0) {
-                    Zeroing::Done {
-                        phase,
-                        root,
-                        process,
-                        backing,
-                    } => {
-                        let (backing, abandoned) = settled_backing(backing);
-                        (phase, root, process, Some(backing), abandoned)
-                    }
-                    Zeroing::Yielded { allocation, first } => {
-                        self.discard_deferred_pins(root, process, pinned);
-                        return Some(Ok(self.park_call(ParkedCall::Create(ParkedCreate {
-                            request,
-                            allocation,
-                            first,
-                            backing_pages: backing_pages.unwrap_or(0),
-                        }))));
-                    }
-                    Zeroing::Stopped(allocation) => {
-                        self.discard_deferred_pins(root, process, pinned);
-                        self.abandon_create(allocation);
-                        return Some(Err(()));
-                    }
+                    false
                 }
             }
-            Some(Ok(EarlyBacking::Ready(grant))) => (phase, root, process, Some(Ok(grant)), None),
-            Some(Err(status)) => (phase, root, process, Some(Err(status)), None),
-            None => (phase, root, process, None, None),
         };
-        Some(Ok(self.finish_deferred_output(
-            request,
-            phase,
-            (root, process),
-            atomic_pin,
-            pinned,
-            ranges,
-            backing_pages,
-            (backing, abandoned),
-        )))
+        FirstHold::Ready(runtime.prepare_guard_free_usercopy(), allows)
     }
 
     /// The last hold of a family-B call, then its pins' settlement with P
@@ -1262,6 +1338,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// (`abandoned`), and one the adapter rolled back, are abandoned in
     /// that hold, with P beneath T, so an index among them is owed and
     /// stays charged (DW2 §12.11 part 2 items 5 to 8).
+    ///
+    /// A create given `restartable` (the pages its admission charges) whose
+    /// adapter refuses for quota when owed work could admit it (another
+    /// Thread took the room after the first hold) does not return the
+    /// refusal (DW2 §13.12 part b): its backing is abandoned as a refused
+    /// create's is, its phase is committed, the hold takes its owed step,
+    /// its pins are let go, and `None` is returned for the caller to start
+    /// the call again from its first hold.
     #[allow(
         clippy::too_many_arguments,
         reason = "the family-B state built before the last hold, in one place"
@@ -1279,7 +1363,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Option<Result<ObjectBackingGrant, deepwyrm_abi::DwStatus>>,
             Option<crate::memory::frame_roles::BackingAllocation>,
         ),
-    ) -> crate::syscall::native::ReturnReady {
+        restartable: Option<u64>,
+    ) -> Option<crate::syscall::native::ReturnReady> {
         let pin_taken = matches!(atomic_pin, Some(Ok(_)));
         let mut deferred =
             crate::memory::usercopy::DeferredUserOutput::batch(pinned.as_ref().map(|_| ranges));
@@ -1297,6 +1382,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .core
                 .registry
                 .release_reserved_pages(thread.object_id());
+            let mut restart = false;
             let (status, released_pin) = match (request, atomic_pin) {
                 (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
                     let mut access = crate::syscall::DeferredMemoryObjectAccess::new(
@@ -1310,6 +1396,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     let status = runtime.run_deferred_output_with(request, &mut access);
                     let (output, unused) = access.into_parts();
                     deferred = output;
+                    // Asked before the backing is abandoned, whose frames
+                    // would then count as finalizing.
+                    restart = status == deepwyrm_abi::DW_STATUS_NO_RESOURCES
+                        && restartable.is_some_and(|pages| {
+                            let process = runtime.own.scheduled().process;
+                            runtime.create_refusal_owed(process, pages)
+                        });
                     if let Some(grant) = unused {
                         runtime.abandon_rolled_back_backing(grant);
                     }
@@ -1333,15 +1426,25 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 _ => unreachable!("deferred atomic pin classification drifted"),
             };
             runtime.commit_runtime_phase(phase);
-            (
-                runtime.ready_to_return(NativeSyscallResult::returning(status)),
-                released_pin,
-            )
+            if restart {
+                runtime.take_owed_step(step_report::AdmissionWait::Create);
+                runtime.end_hold(crate::syscall::HoldEnd::Drain);
+                (None, released_pin)
+            } else {
+                (
+                    Some(runtime.ready_to_return(NativeSyscallResult::returning(status))),
+                    released_pin,
+                )
+            }
         };
         assert_eq!(
             released_pin.is_some(),
             pin_taken,
             "a deferred atomic pin was not returned for release"
+        );
+        assert!(
+            ready.is_some() || deferred.written_at(0).is_none(),
+            "a restarted create wrote its output"
         );
         if released_pin.is_some() || pinned.is_some() {
             let mut access = self.paging.guard_free_access(self.runtime.guard_free());
@@ -2422,7 +2525,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         resource,
                         access,
                     ) else {
-                        return Some(Ok(true));
+                        return Some(Ok(CommitStep::Done));
                     };
                     committed = true;
                     Some(runtime.commit_on_demand_step(
@@ -2442,11 +2545,13 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         let cursor = FillCursor::Dma { next: Some(next) };
                         return Some(Ok(self.park_call(ParkedCall::FillIn { request, cursor })));
                     }
-                    Ok(Some(Ok(true))) => {
+                    Ok(Some(Ok(CommitStep::Done))) => {
                         step_report::call_ended(cpu.index(), committed.then_some(StepCall::Commit));
                         break;
                     }
-                    Ok(Some(Ok(false))) => stepped = true,
+                    // An owed step counts as the step that lets the call
+                    // yield (DW2 §13.12 part b).
+                    Ok(Some(Ok(CommitStep::More | CommitStep::Owed))) => stepped = true,
                     Ok(Some(Err(
                         status @ (deepwyrm_abi::DW_STATUS_NO_RESOURCES
                         | deepwyrm_abi::DW_STATUS_NO_MEMORY),
@@ -2523,8 +2628,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     &mut next,
                 );
                 Some(match result {
-                    Ok(false) => None,
-                    Ok(true) => Some(
+                    Ok(CommitStep::More | CommitStep::Owed) => None,
+                    Ok(CommitStep::Done) => Some(
                         runtime.ready_to_return(NativeSyscallResult::returning(DW_STATUS_SUCCESS)),
                     ),
                     Err(status) => {
@@ -6923,13 +7028,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 ParkedCall::Region(steps) => step_call(&steps.request()),
                 ParkedCall::Commit { .. } => StepCall::Commit,
                 ParkedCall::FillIn { .. } => StepCall::FillIn,
-                ParkedCall::Create(_) => StepCall::Create,
+                ParkedCall::Create(_) | ParkedCall::Admission { .. } => StepCall::Create,
             });
             let allocation = match call {
                 ParkedCall::Create(create) => Some(create.allocation),
-                ParkedCall::Region(_) | ParkedCall::Commit { .. } | ParkedCall::FillIn { .. } => {
-                    None
-                }
+                ParkedCall::Region(_)
+                | ParkedCall::Commit { .. }
+                | ParkedCall::FillIn { .. }
+                | ParkedCall::Admission { .. } => None,
             };
             self.settle_abandoned_call(thread, allocation);
         }
@@ -7920,6 +8026,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 None => self.serve_request(request),
             },
             ParkedCall::Create(create) => self.resume_create(create),
+            // As the dispatch runs it: its fill-in, then the call.
+            ParkedCall::Admission { request } => match self.fill_in_user_buffers(request) {
+                Some(handled) => handled,
+                None => self.serve_request(request),
+            },
         }
     }
 
@@ -8019,7 +8130,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     return Err(());
                 }
             };
-        Ok(self.finish_deferred_output(
+        let restartable = (abandoned.is_none() && backing.is_ok()).then_some(backing_pages);
+        match self.finish_deferred_output(
             request,
             phase,
             (root, process),
@@ -8028,7 +8140,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             ranges,
             Some(backing_pages),
             (Some(backing), abandoned),
-        ))
+            restartable,
+        ) {
+            Some(ready) => Ok(ready),
+            // Started again from its first hold (DW2 §13.12 part b).
+            None => self
+                .handle_deferred_output(request)
+                .expect("a parked create is a family-B call"),
+        }
     }
 
     /// Commits `phase` and ends the syscall with `status`.
@@ -8404,22 +8523,22 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::syscall::native::FaultPass {
         let cpu = self.cpu;
         self.with_synchronized_runtime_at_safe_point(|runtime| {
-            let mut outcome = runtime.serve_user_page_fault(cr2, error);
-            // A touch refused while a dead job's teardown or an object's
-            // finalization is owed frees owed memory first (§10.10 item 7,
-            // §10.12 item 6): this entry's one step, in a whole drain, then
-            // the touch comes again. The finalize step is the hold's one
-            // (DW2 §12.11 part 2 item 11): if this hold's safe point already
-            // ran it, this drain skips it, `Released` is still returned, the
-            // touch comes again and the next hold steps.
-            if matches!(
-                outcome,
-                crate::syscall::native::UserPageFaultOutcome::Exhausted(_)
-            ) && (!runtime.core.owed_teardown.is_empty()
-                || runtime.core.memory.finalization_owed())
+            let mut refused = None;
+            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused);
+            // A touch refused when owed work could admit it frees owed
+            // memory first (§10.10 item 7, §10.12 item 6, DW2 §13.12 part
+            // b): a quota refusal the refusing groups' finalizing pages
+            // would admit, or one while a dead job's teardown is owed, and a
+            // frame refused while any finalization or teardown is owed.
+            // This entry's one step, in a whole drain, then the touch comes
+            // again. The finalize step is the hold's one (DW2 §12.11 part 2
+            // item 11): if this hold's safe point already ran it, this drain
+            // skips it, `Released` is still returned, the touch comes again
+            // and the next hold steps.
+            if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) = outcome
+                && runtime.serve_refusal_owed(status, refused)
             {
-                step_report::allow_teardown_step(runtime.cpu().index());
-                let _ = runtime.drain_finalizers();
+                runtime.take_owed_step(step_report::AdmissionWait::Fault);
                 outcome = crate::syscall::native::UserPageFaultOutcome::Released;
             }
             crate::syscall::native::FaultPass::new(outcome, || {
@@ -10564,11 +10683,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// then P (DW2 M6 §8.5). In this one hold it finds the mapping, checks
     /// the access against its protection, admits the page and any index
     /// nodes against the object's creator and any page tables against this
-    /// Process, commits the page, and publishes its one leaf here.
+    /// Process, commits the page, and publishes its one leaf here. When
+    /// that admission refuses for quota, `refused` is given the two charges
+    /// it admitted together, for the caller to ask whether the refusal is
+    /// owed (DW2 §13.12 part b); it is left alone otherwise.
     fn serve_user_page_fault(
         &mut self,
         cr2: u64,
         error: u64,
+        refused: &mut Option<FaultCharges>,
     ) -> crate::syscall::native::UserPageFaultOutcome {
         use crate::memory::frame_roles::FrameRoleError;
         use crate::syscall::native::UserPageFaultOutcome as Outcome;
@@ -10648,6 +10771,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         match admitted {
             Ok(()) => {}
             Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
+                *refused = Some(((object, cost), (process.object_id(), tables)));
                 return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
             }
             Err(_) => return Outcome::Unserved,
@@ -10770,10 +10894,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             let error = USER | if write { WRITE } else { 0 };
             step_report::fill_in_served();
+            let mut refused = None;
             if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
-                self.serve_user_page_fault(page, error)
+                self.serve_user_page_fault(page, error, &mut refused)
             {
-                return Err(status);
+                if !self.serve_refusal_owed(status, refused) {
+                    return Err(status);
+                }
+                // Owed (DW2 §13.12 part b): the hold takes its owed step,
+                // and this page is served again after the next safe point.
+                *next = page;
+                self.take_owed_step(step_report::AdmissionWait::Commit);
+                return Ok(());
             }
         }
         Ok(())
@@ -10785,8 +10917,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// all at once or, past the quota, the longest start of it that fits;
     /// the frames taken are charged to its weight (DW2 M6 §8.4). A step is
     /// at most 2 MiB, so a hold zeroes at most that and scans the registry
-    /// at most ten times, not once a page (§8.11 R1). `Ok(true)` when the
-    /// whole range is done.
+    /// at most ten times, not once a page (§8.11 R1).
+    ///
+    /// A refusal owed work could admit is not returned (DW2 §13.12 part
+    /// b): when the whole step's admission is refused and the refusal is
+    /// owed, nothing is committed, `*next` stays, and the hold takes its
+    /// owed step; when a frame cannot be taken (`NO_MEMORY`) while any
+    /// finalization or teardown is owed, the pages committed before it stay
+    /// committed and charged, `*next` is the page that failed, and the hold
+    /// takes its owed step. Either is [`CommitStep::Owed`].
     fn commit_on_demand_step(
         &mut self,
         memory_object: deepwyrm_abi::DwHandle,
@@ -10794,7 +10933,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         byte_len: u64,
         required: deepwyrm_abi::DwRights,
         next: &mut u64,
-    ) -> Result<bool, deepwyrm_abi::DwStatus> {
+    ) -> Result<CommitStep, deepwyrm_abi::DwStatus> {
         // The step report's commit-step stamps (DW2 §13.5): a step that
         // reaches its end is one sample.
         let began = step_report::ticks();
@@ -10810,7 +10949,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             required,
         )?
         else {
-            return Ok(true);
+            return Ok(CommitStep::Done);
         };
         // The target checked the range lies in the object and is aligned.
         let page_size = u64::from(deepwyrm_abi::DW_BASE_PAGE_SIZE);
@@ -10825,10 +10964,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         );
         let registry = &self.core.registry;
         let tasks = &self.core.tasks;
-        let admit = |pages: u64| -> Result<u64, deepwyrm_abi::DwStatus> {
-            let cost = session
+        let teardown_owed = !self.core.owed_teardown.is_empty();
+        let cost_of = |pages: u64| {
+            session
                 .on_demand_commit_range_cost(backing, first, pages)
-                .map_err(|_| DW_STATUS_BAD_STATE)?;
+                .map_err(|_| DW_STATUS_BAD_STATE)
+        };
+        let admit = |pages: u64| -> Result<u64, deepwyrm_abi::DwStatus> {
+            let cost = cost_of(pages)?;
             if cost != 0 {
                 crate::syscall::admit_charged_pages(registry, tasks, object, cost)?;
             }
@@ -10839,6 +10982,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let admit_began = step_report::ticks();
         let (admitted, cost, mut result) = match admit(count) {
             Ok(cost) => (count, cost, Ok(())),
+            // Owed: owed work could admit the whole step, so nothing is
+            // committed and the step is taken again after the owed step.
+            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+                if teardown_owed
+                    || crate::syscall::charged_pages_refusal_owed(
+                        registry,
+                        tasks,
+                        object,
+                        cost_of(count)?,
+                    ) =>
+            {
+                drop(session);
+                drop(paging);
+                self.take_owed_step(step_report::AdmissionWait::Commit);
+                return Ok(CommitStep::Owed);
+            }
             Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
                 let (mut fits, mut fits_cost, mut refused) = (0, 0, count);
                 while refused - fits > 1 {
@@ -10879,7 +11038,90 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::syscall::record_charged_pages(&mut self.core.registry, object, frames);
         }
         step_report::commit_step(began, admit_began, admit_ended, taken, step_report::ticks());
-        result.map(|()| *next >= end)
+        // P is let go before an owed step, whose drain takes it again.
+        drop(session);
+        drop(paging);
+        match result {
+            Ok(()) if *next >= end => Ok(CommitStep::Done),
+            Ok(()) => Ok(CommitStep::More),
+            Err(deepwyrm_abi::DW_STATUS_NO_MEMORY)
+                if self.refusal_owed(deepwyrm_abi::DW_STATUS_NO_MEMORY, |_| false) =>
+            {
+                self.take_owed_step(step_report::AdmissionWait::Commit);
+                Ok(CommitStep::Owed)
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    /// Takes the hold's owed step for a refusal owed work could admit (DW2
+    /// §13.12 part b), as the fault's wrapper does: this entry's one
+    /// teardown step is allowed, then a whole drain runs, whose finalize
+    /// step is the hold's one. Counted as one admission wait of `wait`'s
+    /// kind.
+    fn take_owed_step(&mut self, wait: step_report::AdmissionWait) {
+        step_report::admission_waited(wait);
+        step_report::allow_teardown_step(self.cpu().index());
+        let _ = self.drain_finalizers();
+    }
+
+    /// Whether a refusal with `status` is owed (DW2 §13.12 part b): for
+    /// `NO_RESOURCES`, a dead job's teardown is owed or `quota_owed` says
+    /// owed work could admit the refused charge; for `NO_MEMORY`, any
+    /// finalization or teardown is owed. Any other status is not owed.
+    fn refusal_owed(
+        &self,
+        status: deepwyrm_abi::DwStatus,
+        quota_owed: impl FnOnce(&Self) -> bool,
+    ) -> bool {
+        match status {
+            deepwyrm_abi::DW_STATUS_NO_RESOURCES => {
+                !self.core.owed_teardown.is_empty() || quota_owed(self)
+            }
+            deepwyrm_abi::DW_STATUS_NO_MEMORY => {
+                !self.core.owed_teardown.is_empty() || self.core.memory.finalization_owed()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a create of `pages` charged pages for `process` that its
+    /// quota refuses now is owed (DW2 §13.12 part b). `false` when the
+    /// quota admits it, so a refusal for any other reason is not.
+    fn create_refusal_owed(&self, process: ProcessKey, pages: u64) -> bool {
+        !crate::syscall::memory_object_quota_allows(
+            &self.core.registry,
+            &self.core.tasks,
+            process,
+            pages,
+        ) && self.refusal_owed(deepwyrm_abi::DW_STATUS_NO_RESOURCES, |runtime| {
+            crate::syscall::memory_object_refusal_owed(
+                &runtime.core.registry,
+                &runtime.core.tasks,
+                process,
+                pages,
+            )
+        })
+    }
+
+    /// Whether a fault's or fill-in's `Exhausted(status)` is owed: the
+    /// quota half asks the two charges the serve admitted together
+    /// (`refused`, set only for its quota refusal).
+    fn serve_refusal_owed(
+        &self,
+        status: deepwyrm_abi::DwStatus,
+        refused: Option<FaultCharges>,
+    ) -> bool {
+        self.refusal_owed(status, |runtime| {
+            refused.is_some_and(|(first, second)| {
+                crate::syscall::charged_pages_together_refusal_owed(
+                    &runtime.core.registry,
+                    &runtime.core.tasks,
+                    first,
+                    second,
+                )
+            })
+        })
     }
 
     fn map_memory(
@@ -12154,7 +12396,49 @@ enum ParkedCall {
     },
     /// `MemoryObjectCreate` zeroing its eager backing.
     Create(ParkedCreate),
+    /// `MemoryObjectCreate` waiting, at its first hold, for owed work to
+    /// admit it (DW2 §13.12 part b): nothing is reserved, pinned or
+    /// allocated, and it resumes by running `request` from its start.
+    Admission { request: NativeSyscallRequest },
 }
+
+/// How one pass of a family-B call's first hold ended (DW2 §13.12 part b).
+enum FirstHold {
+    /// The phase and user root, and whether a create's quota admitted it.
+    Ready(
+        (
+            crate::arch::x86_64::syscall::RuntimePhaseReservation,
+            super::UserCopyRoot,
+            ProcessKey,
+        ),
+        bool,
+    ),
+    /// A create's reservation met an owed refusal; the hold took its owed
+    /// step and the pass comes again.
+    Owed,
+    /// The quantum ended at the safe point: the call parks.
+    Yield,
+}
+
+/// How one commit step's hold ended (DW2 M6 §8.2, §13.12 part b).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitStep {
+    /// The whole range is committed.
+    Done,
+    /// The step committed its pages; more remain.
+    More,
+    /// The step met a refusal owed work could admit and took the hold's
+    /// owed step instead; it is taken again at the next safe point.
+    Owed,
+}
+
+/// The two charges a fault's serve admits together, each an object and its
+/// pages (DW2 M6 §8.4): the page and its index nodes against the object,
+/// and the page tables against the Process.
+type FaultCharges = (
+    (crate::object::ObjectId, u64),
+    (crate::object::ObjectId, u64),
+);
 
 /// Where a fill-in continues (DW2 M6 §8.6).
 #[derive(Clone, Copy)]

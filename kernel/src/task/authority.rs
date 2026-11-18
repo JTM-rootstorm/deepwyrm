@@ -1587,6 +1587,56 @@ impl<const GROUPS: usize, const PROCESSES: usize, const THREADS: usize, const HA
         Ok(())
     }
 
+    /// Whether a refusal of `needed` more of `class` for a creator tagged
+    /// `tag` is owed (DW2 §13.12 part b): some limited group in the tag
+    /// refuses now (`usage + needed > limit`), and every group that refuses
+    /// would admit with its finalizing weight of the class gone
+    /// (`usage - finalizing + needed <= limit`), so owed work could admit
+    /// it. `false` when no group refuses, or when one would still refuse.
+    /// `usage` is the figure [`Self::admit_quota`] is given; `finalizing`
+    /// is the part of it that owed finalization will free. Groups are
+    /// skipped as [`Self::admit_quota`] skips them.
+    #[cfg_attr(
+        not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live runtime waits out an owed refusal")
+    )]
+    pub(crate) fn quota_refusal_owed(
+        &self,
+        tag: &ChargeTag,
+        class: usize,
+        needed: usize,
+        mut usage: impl FnMut(ObjectId) -> usize,
+        mut finalizing: impl FnMut(ObjectId) -> usize,
+    ) -> bool {
+        let mut refused = false;
+        for object in tag.groups() {
+            let Ok(slot) = self.group_slot(TaskGroupKey(object)) else {
+                continue;
+            };
+            let limit = self.groups[slot]
+                .as_ref()
+                .expect("validated group slot")
+                .limits[class];
+            if limit == quota::UNLIMITED {
+                continue;
+            }
+            let limit = limit as usize;
+            let used = usage(object);
+            if used.saturating_add(needed) <= limit {
+                continue;
+            }
+            refused = true;
+            if used
+                .saturating_sub(finalizing(object))
+                .saturating_add(needed)
+                > limit
+            {
+                return false;
+            }
+        }
+        refused
+    }
+
     /// DW2 M5: `group`'s MEMORY_PAGES limit and usage, the least headroom
     /// (limit minus usage) over the groups at and above it that limit
     /// MEMORY_PAGES, and whether it is the root TaskGroup. `usage` is the
