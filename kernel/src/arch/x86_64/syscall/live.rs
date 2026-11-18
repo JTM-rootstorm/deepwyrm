@@ -1712,6 +1712,13 @@ fn end_user_page_fault<
 /// Serves a CPL3 page fault on an on-demand page and returns to the faulting
 /// instruction, or ends the process (DW2 M6 §8.5). Every fault the runtime
 /// does not serve ends with the record the terminal path would have built.
+///
+/// A fault, like a syscall, does not run `validate_live_syscall_boundary`
+/// itself: it relies on the timer gate's check, which runs before every
+/// `iretq` of a timer interrupt taken from userspace (DW2 §13.13 part a).
+/// That is sound because the checked control registers and MSRs are
+/// writable only at CPL0 and no path a fault runs writes them, so a fault
+/// cannot leave them other than the kernel installed them.
 #[allow(
     unsafe_code,
     reason = "the fault frame stays on the current Thread's bound stack; carrier reborrows are scoped"
@@ -1745,7 +1752,6 @@ unsafe fn native_runtime_user_page_fault<
     }
     let outcome = loop {
         poll_timer_return_stop(context);
-        validate_live_syscall_boundary().unwrap_or_else(|_| halt_forever());
         // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the fault gate has no other
         // Rust frame on this CPU that holds one.
         let runtime = unsafe { &mut *context.cast::<R>() };
