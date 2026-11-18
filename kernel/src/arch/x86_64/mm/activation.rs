@@ -85,6 +85,13 @@ mod production_pools;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 #[path = "activation/tlb_mailbox.rs"]
 mod tlb_mailbox;
+// The fast serve's decision (DW2 §13.16 part e3), host-compiled under `test`.
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+#[path = "activation/fault_window.rs"]
+mod fault_window;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
