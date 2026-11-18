@@ -10,7 +10,7 @@ fn root() -> PathBuf {
 }
 
 #[test]
-fn syscall_assembly_is_freestanding_and_calls_only_the_rust_dispatch() {
+fn syscall_assembly_remains_freestanding() {
     let clang = host_tools::clang();
     let output = std::env::temp_dir().join(format!("deepwyrm-e4-syscall-{}.o", std::process::id()));
     let status = Command::new(&clang)
