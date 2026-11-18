@@ -666,6 +666,44 @@ mod usage {
     }
 
     #[test]
+    fn a_group_that_ends_with_tagged_objects_alive_is_compared_at_its_end() {
+        let mut registry = ObjectRegistry::<6>::new();
+        let parent = group(&mut registry, ChargeTag::EMPTY);
+        let child = group(&mut registry, tag(&[parent.id()]));
+        let charge = tag(&[child.id(), parent.id()]);
+        let object = charged(&mut registry, DW_OBJECT_TYPE_MEMORY_OBJECT, charge, 6);
+        assert!(registry.reserve_owed_backing_pages(7, charge, 2));
+        assert_eq!(registry.usage_mismatches(), (2, 0));
+        close_and_release(&mut registry, child);
+        assert_eq!((registry.ended_groups, registry.ended_mismatches), (1, 0));
+        // One live group now, one compared at its end.
+        assert_eq!(registry.usage_mismatches(), (2, 0));
+        // An object that is not a group adds nothing when it ends.
+        registry.end_owed_backing_reservation(7);
+        close_and_release(&mut registry, object);
+        assert_eq!((registry.ended_groups, registry.ended_mismatches), (1, 0));
+        close_and_release(&mut registry, parent);
+        assert_eq!(registry.usage_mismatches(), (2, 0));
+    }
+
+    #[test]
+    fn a_figure_wrong_when_its_group_ends_is_counted_then() {
+        let mut registry = ObjectRegistry::<4>::new();
+        let owner = group(&mut registry, ChargeTag::EMPTY);
+        let _object = charged(&mut registry, DW_OBJECT_TYPE_EVENT, tag(&[owner.id()]), 3);
+        let slot = registry.slot_of(owner.id()).unwrap();
+        registry.finalizing_pages[slot] = 5;
+        registry.usage_objects[slot][MEMORY] = 2;
+        let last = registry.release_handle(owner).unwrap().unwrap();
+        registry.complete_finalization(last).unwrap();
+        assert_eq!((registry.ended_groups, registry.ended_mismatches), (1, 2));
+        assert_eq!(registry.usage_mismatches(), (1, 2));
+        // The slot's entries were zeroed with it: nothing is left wrong.
+        assert_eq!(registry.finalizing_pages[slot], 0);
+        assert_eq!(registry.usage_objects[slot], [0; OBJECT_CLASSES]);
+    }
+
+    #[test]
     #[should_panic(expected = "release: a group's usage pages 0 cannot Remove 3")]
     fn a_figure_that_would_fall_below_zero_panics_naming_the_write() {
         let mut registry = ObjectRegistry::<4>::new();
@@ -747,6 +785,8 @@ mod usage {
         let mut owed: Vec<(u64, u64)> = Vec::new();
         let mut next_key = 1u64;
         let mut deepest = 0usize;
+        // TaskGroup slots released, each compared at its end.
+        let mut released = 0usize;
 
         for _ in 0..steps {
             match rng.below(17) {
@@ -838,6 +878,9 @@ mod usage {
                         continue;
                     };
                     let (last, _) = finalizing.swap_remove(index);
+                    if last.object_type() == DW_OBJECT_TYPE_TASK_GROUP {
+                        released += 1;
+                    }
                     registry.complete_finalization(last).unwrap();
                 }
                 // A create reserves its pages (replacing what it held).
@@ -892,9 +935,13 @@ mod usage {
                 // A create charged and then cancelled before it is bound.
                 13 => {
                     let charge = tags[rng.below(tags.len())];
-                    let Ok(creation) = registry.create(TYPES[rng.below(TYPES.len())]) else {
+                    let object_type = TYPES[rng.below(TYPES.len())];
+                    let Ok(creation) = registry.create(object_type) else {
                         continue;
                     };
+                    if object_type == DW_OBJECT_TYPE_TASK_GROUP {
+                        released += 1;
+                    }
                     registry.set_charge_tag(creation.id(), charge).unwrap();
                     registry
                         .set_charge_pages(creation.id(), rng.next() % 8)
@@ -923,7 +970,10 @@ mod usage {
             .iter()
             .filter(|object| object.handle.object_type() == DW_OBJECT_TYPE_TASK_GROUP)
             .count();
-        assert_eq!(registry.usage_mismatches(), (groups, 0));
+        assert_eq!(registry.ended_mismatches, 0);
+        assert_eq!(registry.ended_groups, released);
+        assert!(released > 0, "the run ended groups");
+        assert_eq!(registry.usage_mismatches(), (groups + released, 0));
         assert_eq!(
             deepest, MAX_LIMITED_ANCESTORS,
             "the run reached the deepest tag"

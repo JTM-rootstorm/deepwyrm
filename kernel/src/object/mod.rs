@@ -304,6 +304,11 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     notice_head: usize,
     notice_len: usize,
     notice_queued: [bool; CAPACITY],
+    /// TaskGroups whose kept usage was compared with the scan as their slot
+    /// was released, and the figures that differed then (DW2 §13.12 part
+    /// a): the groups that end before power-off are checked too.
+    ended_groups: usize,
+    ended_mismatches: usize,
 }
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
@@ -328,6 +333,8 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             notice_head: 0,
             notice_len: 0,
             notice_queued: [false; CAPACITY],
+            ended_groups: 0,
+            ended_mismatches: 0,
         }
     }
 
@@ -895,14 +902,19 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     }
 
     /// The kernel's check of kept usage (DW2 §13.12 part a): every live
-    /// TaskGroup's four figures against a scan. Returns the groups compared
-    /// and the figures that differ; the step report's last hold prints it.
+    /// TaskGroup's four figures against a scan now, with those compared as
+    /// each ended TaskGroup's slot was released. Returns the groups
+    /// compared and the figures that differed; the step report's last hold
+    /// prints it.
     pub(crate) fn usage_mismatches(&self) -> (usize, usize) {
         let mut mismatches = 0usize;
         let groups = self.compare_usage(false, |_, _, _, _, _| {
             mismatches = mismatches.saturating_add(1);
         });
-        (groups, mismatches)
+        (
+            groups.saturating_add(self.ended_groups),
+            mismatches.saturating_add(self.ended_mismatches),
+        )
     }
 
     /// Panics, naming the group, the figure and both values, if any live
@@ -1284,6 +1296,17 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             _ => return Err(ObjectRegistryError::NotFinalizing),
         }
 
+        // A TaskGroup ends: its figures are compared with the scan one last
+        // time before they are zeroed, counted, not asserted, so the
+        // report says what was found.
+        if final_release.object_type == deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP {
+            let mut mismatches = 0usize;
+            self.compare_slot_usage(slot, final_release.id, &mut |_, _, _, _, _| {
+                mismatches = mismatches.saturating_add(1);
+            });
+            self.ended_groups = self.ended_groups.saturating_add(1);
+            self.ended_mismatches = self.ended_mismatches.saturating_add(mismatches);
+        }
         // A finalizing slot is released: its object and its remaining
         // weight leave its groups' usage and their finalizing part.
         self.change_usage(
