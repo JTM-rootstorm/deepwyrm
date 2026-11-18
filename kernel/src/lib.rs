@@ -235,6 +235,13 @@ fn fail_h1_application_processor(cpu_index: usize, reason: u32) -> ! {
     reason = "the AP consumes its private descriptor and machine-register slot before publication"
 )]
 extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id: u32) -> ! {
+    // SAFETY: CPL0 at this AP's first Rust instruction, before anything that can report a CPU's
+    // identity or panic (DW2 §13.13 part d): only `ap_trampoline.S` precedes it, with no IDT of
+    // ours loaded. An AP passes the trampoline once: the BSP starts each AP once and then retires
+    // the trampoline mapping.
+    unsafe {
+        arch::x86_64::syscall::clear_tsc_aux_at_cpu_entry();
+    }
     let cpu_index = cpu_index as usize;
     let Ok(local_apic_id) = u8::try_from(local_apic_id) else {
         park_h1_application_processor();

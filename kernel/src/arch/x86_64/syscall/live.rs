@@ -3,15 +3,16 @@
 use core::cell::UnsafeCell;
 use core::convert::Infallible;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::memory::kernel_stack::KernelStackBounds;
 use crate::syscall::native::DivergentCarrier;
 
 use super::frame::{PerCpuEntryState, RawSyscallFrame, ValidatedUserReturn};
 use super::msr::{
-    IA32_EFER, SyscallMsrAccess, SyscallMsrPlan, SyscallMsrPlanError, SyscallMsrProgramError,
-    program_and_verify, verify,
+    IA32_EFER, IA32_TSC_AUX, SyscallMsrAccess, SyscallMsrPlan, SyscallMsrPlanError,
+    SyscallMsrProgramError, TscAuxSupport, cpu_index_from_tsc_aux, program_and_verify,
+    tsc_aux_support, verify,
 };
 use super::runtime_binding::{
     RuntimeCarrierClaimError, RuntimeCarrierClaims, RuntimeCarrierLifecycle,
@@ -26,8 +27,8 @@ use crate::arch::x86_64::user_state::{
 // justifications by its bracketed tag.
 //
 // [ASM] Inline assembly here runs only in kernel code, at CPL0. CR0/CR4 moves, RDMSR/WRMSR of the
-// SYSCALL and GS-base MSRs, PUSHFQ/POP, and copying RSP neither read nor write memory Rust can
-// observe, so `nomem` is accurate for them. The STI;HLT;CLI idle window is the exception and
+// SYSCALL and GS-base MSRs and IA32_TSC_AUX, RDPID, PUSHFQ/POP, and copying RSP neither read nor
+// write memory Rust can observe, so `nomem` is accurate for them. The STI;HLT;CLI idle window is the exception and
 // omits `nomem`; see `wait_for_suspend_interrupt`. The kernel target (`x86_64-unknown-none`,
 // `red_zone = false` in `kernel/arch/x86_64/layout.toml`) has no red zone, so PUSHFQ, and any
 // interrupt taken inside a STI window, only write below RSP.
@@ -104,6 +105,13 @@ const RFLAGS_IF: u64 = 1 << 9;
 const CPUID_EXTENDED_FEATURES: u32 = 0x8000_0001;
 const CPUID_SYSCALL_SYSRET: u32 = 1 << 11;
 const RFLAGS_AC: u64 = 1 << 18;
+
+/// Whether `current_cpu_index` asks RDPID first (DW2 M8 step 3d, §13.13
+/// part d). Decided once, by the BSP's install from its own CPUID, and set
+/// after its boundary MSRs, IA32_TSC_AUX among them, are programmed and read
+/// back. An AP whose CPU lacks RDPID while this is set fails its install.
+/// Until it is set, every lookup is the GS pair's.
+static RDPID_CPU_INDEX: AtomicBool = AtomicBool::new(false);
 
 /// A CPU-private native-dispatch window.  e1 may latch while this is held,
 /// but no safe-point may consume Stop/HoldSafe until the dispatch has dropped
@@ -770,6 +778,21 @@ fn cpu_index_for_entry_state_address(address: u64) -> Option<usize> {
     reason = "RDMSR reads the current CPU's architectural GS base pair without mutating it"
 )]
 fn current_cpu_index() -> Option<usize> {
+    if RDPID_CPU_INDEX.load(Ordering::Relaxed) {
+        // SAFETY: [ASM] the flag is set only on a BSP that reports RDPID, and every AP that
+        // installs while it is set reports RDPID too (`install_syscall_boundary_for_slot`).
+        let value = unsafe { read_processor_id() };
+        // The value names this CPU only once its own install wrote it: every CPU zeroes
+        // IA32_TSC_AUX at its entry (`clear_tsc_aux_at_cpu_entry`), and its install writes its
+        // slot plus one before publishing that slot INSTALLED. Anything else falls back.
+        if let Some(cpu_index) = cpu_index_from_tsc_aux(
+            value,
+            crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT,
+            |slot| INSTALL_STATE[slot].load(Ordering::Acquire) == INSTALLED,
+        ) {
+            return Some(cpu_index);
+        }
+    }
     // SAFETY: [ASM] IA32_GS_BASE exists on every x86-64 CPU and reading it has no side effects.
     let gs_base = unsafe { read_msr(super::msr::IA32_GS_BASE) };
     cpu_index_for_entry_state_address(gs_base).or_else(|| {
@@ -778,6 +801,74 @@ fn current_cpu_index() -> Option<usize> {
         let kernel_gs_base = unsafe { read_msr(super::msr::IA32_KERNEL_GS_BASE) };
         cpu_index_for_entry_state_address(kernel_gs_base)
     })
+}
+
+/// Executes RDPID: IA32_TSC_AUX, zero-extended.
+///
+/// # Safety
+///
+/// The CPU reports RDPID (CPUID leaf 7 subleaf 0 ECX bit 22); otherwise the
+/// instruction raises #UD.
+#[allow(unsafe_code, reason = "RDPID reads IA32_TSC_AUX without side effects")]
+#[inline(always)]
+unsafe fn read_processor_id() -> u64 {
+    let value: u64;
+    // SAFETY: [ASM] RDPID (F3 0F C7 /7) writes only its register operand; the caller guarantees
+    // the CPU has it.
+    unsafe {
+        core::arch::asm!(
+            "rdpid {}",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+/// This CPU's CPUID answer for IA32_TSC_AUX and RDPID. Runs CPUID, which
+/// cannot fault or panic, so it is safe at a CPU's first instruction.
+fn local_tsc_aux_support() -> TscAuxSupport {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let max_basic = __cpuid(0).eax;
+    let leaf7_ecx = if max_basic >= 7 {
+        __cpuid_count(7, 0).ecx
+    } else {
+        0
+    };
+    let max_extended = __cpuid(0x8000_0000).eax;
+    let extended_edx = if max_extended >= CPUID_EXTENDED_FEATURES {
+        __cpuid(CPUID_EXTENDED_FEATURES).edx
+    } else {
+        0
+    };
+    tsc_aux_support(max_basic, leaf7_ecx, max_extended, extended_edx)
+}
+
+/// Zeroes IA32_TSC_AUX on a CPU that has it (DW2 M8 step 3d, §13.13 part
+/// d), so a value left by firmware or an earlier OS cannot name an installed
+/// slot before this CPU's own install writes its slot plus one.
+///
+/// Every CPU calls it as the first thing of its first Rust frame: the BSP in
+/// `dw_kernel_rust_entry`, an AP in `dw_x86_64_ap_higher_half_entry`. Nothing
+/// of ours that can report a CPU's identity runs before it: before it run
+/// only `entry.S` (BSP) or `ap_trampoline.S` (AP), which load a stack and
+/// segment state, switch modes and jump, with no IDT of ours loaded and no
+/// Rust code, so no exception or panic of ours can be reported there. It
+/// runs CPUID and WRMSR only: no allocation, no logging, no panic.
+///
+/// # Safety
+///
+/// CPL0, at the CPU's entry, before any of its CPU-identity lookups.
+#[allow(
+    unsafe_code,
+    reason = "WRMSR zeroes IA32_TSC_AUX at a CPU's entry, before its install"
+)]
+pub(crate) unsafe fn clear_tsc_aux_at_cpu_entry() {
+    if local_tsc_aux_support().msr {
+        // SAFETY: [ASM] CPL0 (this function's contract) and the CPU reports RDTSCP or RDPID, so
+        // IA32_TSC_AUX exists; zero is a valid value.
+        unsafe { write_msr(IA32_TSC_AUX, 0) };
+    }
 }
 
 /// Returns the installed logical CPU slot selected by the current
@@ -939,6 +1030,12 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
         if !cpu_supports_syscall() {
             return Err(SyscallInstallError::UnsupportedCpu);
         }
+        // Decided once for this CPU (DW2 §13.13 part d). Once the BSP has chosen RDPID for the
+        // CPU index, every CPU reads it, so a CPU without it cannot join.
+        let tsc_aux_support = local_tsc_aux_support();
+        if cpu_index != 0 && RDPID_CPU_INDEX.load(Ordering::Acquire) && !tsc_aux_support.rdpid {
+            return Err(SyscallInstallError::UnsupportedCpu);
+        }
         let fp_mode = crate::arch::x86_64::user_state::plan_local_fp_mode()
             .map_err(SyscallInstallError::FpMode)?;
         // SAFETY: CPL0 and IF clear were just checked, which is what the callee's CR0 write needs.
@@ -974,9 +1071,16 @@ pub(crate) unsafe fn install_syscall_boundary_for_slot(
             syscall_entry_address(),
             compat_syscall_entry_address(),
             entry_state_base,
+            // The slot plus one, so zero stays "not installed".
+            tsc_aux_support.msr.then(|| cpu_index as u64 + 1),
         )
         .map_err(SyscallInstallError::InvalidMsrPlan)?;
         program_and_verify(&mut access, plan).map_err(map_program_error)?;
+        if cpu_index == 0 && tsc_aux_support.rdpid {
+            // Before this slot is published INSTALLED, so the first RDPID that can answer finds
+            // the value just read back.
+            RDPID_CPU_INDEX.store(true, Ordering::Release);
+        }
         let expected = EXPECTED_PLAN
             .get(cpu_index)
             .ok_or(SyscallInstallError::DescriptorState)?;

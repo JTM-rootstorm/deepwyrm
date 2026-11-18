@@ -230,6 +230,7 @@ fn e4_msr_plan_is_exact_and_preserves_efer() {
         0xffff_ffff_8000_1000,
         0xffff_ffff_8000_3000,
         0xffff_ffff_8000_2000,
+        None,
     )
     .unwrap();
     assert_eq!(plan.efer, 0x501);
@@ -241,6 +242,174 @@ fn e4_msr_plan_is_exact_and_preserves_efer() {
     assert_eq!(plan.kernel_gs_base, 0);
     assert_eq!(plan.cstar, 0xffff_ffff_8000_3000);
     assert_eq!(plan.sysenter_cs, 0);
+    assert_eq!(plan.tsc_aux, None);
+    assert_eq!(plan.expected(IA32_TSC_AUX), None);
+}
+
+fn plan_with_tsc_aux(tsc_aux: Option<u64>) -> SyscallMsrPlan {
+    SyscallMsrPlan::new(
+        0x100,
+        0xffff_ffff_8000_1000,
+        0xffff_ffff_8000_3000,
+        0xffff_ffff_8000_2000,
+        tsc_aux,
+    )
+    .unwrap()
+}
+
+/// DW2 §13.13 part d: a CPU with RDTSCP or RDPID gets its slot plus one in
+/// IA32_TSC_AUX, written before SCE is enabled and read back.
+#[test]
+fn tsc_aux_is_programmed_and_verified_where_the_cpu_has_it() {
+    let plan = plan_with_tsc_aux(Some(3));
+    assert_eq!(plan.expected(IA32_TSC_AUX), Some(3));
+    let mut access = FakeMsr::default();
+    program_and_verify(&mut access, plan).unwrap();
+    assert_eq!(access.writes.len(), 12);
+    assert_eq!(access.writes.first(), Some(&(IA32_TSC_AUX, 3)));
+    assert_eq!(access.writes.last(), Some(&(IA32_EFER, plan.efer)));
+    verify(&mut access, plan).unwrap();
+}
+
+/// A wrong TSC_AUX, another CPU's identity or zero, fails verification.
+#[test]
+fn a_wrong_tsc_aux_fails_verification() {
+    let plan = plan_with_tsc_aux(Some(2));
+    let mut access = FakeMsr::default();
+    program_and_verify(&mut access, plan).unwrap();
+    for wrong in [0, 1, 3] {
+        access.values.insert(IA32_TSC_AUX, wrong);
+        assert_eq!(
+            verify(&mut access, plan),
+            Err(SyscallMsrProgramError::Readback {
+                msr: IA32_TSC_AUX,
+                expected: 2,
+                observed: wrong,
+            })
+        );
+    }
+    access.values.insert(IA32_TSC_AUX, 2);
+    verify(&mut access, plan).unwrap();
+}
+
+/// Records every MSR read, so a test can show one is never touched.
+#[derive(Default)]
+struct ReadLog {
+    msr: FakeMsr,
+    reads: std::vec::Vec<u32>,
+}
+
+impl SyscallMsrAccess for ReadLog {
+    type Error = ();
+
+    fn read(&mut self, msr: u32) -> Result<u64, Self::Error> {
+        self.reads.push(msr);
+        self.msr.read(msr)
+    }
+
+    fn write(&mut self, msr: u32, value: u64) -> Result<(), Self::Error> {
+        self.msr.write(msr, value)
+    }
+}
+
+/// On a CPU without RDTSCP and RDPID the MSR does not exist: the plan
+/// neither writes nor reads it, whatever a read would return.
+#[test]
+fn a_cpu_without_the_feature_neither_writes_nor_reads_tsc_aux() {
+    let plan = plan_with_tsc_aux(None);
+    let mut access = ReadLog::default();
+    program_and_verify(&mut access, plan).unwrap();
+    access.msr.values.insert(IA32_TSC_AUX, 7);
+    verify(&mut access, plan).unwrap();
+    assert!(
+        access
+            .msr
+            .writes
+            .iter()
+            .all(|&(msr, _)| msr != IA32_TSC_AUX)
+    );
+    assert!(!access.reads.contains(&IA32_TSC_AUX));
+    assert_eq!(access.msr.writes.len(), 11);
+}
+
+/// Zero means "not installed", so no plan may install it.
+#[test]
+fn a_zero_tsc_aux_identity_is_refused() {
+    assert_eq!(
+        SyscallMsrPlan::new(
+            0x100,
+            0xffff_ffff_8000_1000,
+            0xffff_ffff_8000_3000,
+            0xffff_ffff_8000_2000,
+            Some(0),
+        ),
+        Err(SyscallMsrPlanError::ZeroCpuIdentity)
+    );
+}
+
+/// The CPUID decision: the MSR exists with RDTSCP or RDPID; RDPID is used
+/// only where reported; a leaf above its maximum is not consulted.
+#[test]
+fn tsc_aux_support_follows_cpuid() {
+    let none = TscAuxSupport {
+        msr: false,
+        rdpid: false,
+    };
+    let rdtscp_only = TscAuxSupport {
+        msr: true,
+        rdpid: false,
+    };
+    let rdpid = TscAuxSupport {
+        msr: true,
+        rdpid: true,
+    };
+    assert_eq!(tsc_aux_support(7, 0, 0x8000_0001, 0), none);
+    assert_eq!(
+        tsc_aux_support(7, 0, 0x8000_0001, CPUID_RDTSCP),
+        rdtscp_only
+    );
+    assert_eq!(tsc_aux_support(7, CPUID_RDPID, 0x8000_0001, 0), rdpid);
+    assert_eq!(
+        tsc_aux_support(7, CPUID_RDPID, 0x8000_0008, CPUID_RDTSCP),
+        rdpid
+    );
+    // Leaf 7 or 0x8000_0001 not reported: its register is ignored.
+    assert_eq!(
+        tsc_aux_support(6, CPUID_RDPID, 0x8000_0000, CPUID_RDTSCP),
+        none
+    );
+    assert_eq!(
+        tsc_aux_support(6, CPUID_RDPID, 0x8000_0001, CPUID_RDTSCP),
+        rdtscp_only
+    );
+}
+
+/// DW2 §13.13 part d: an RDPID value names slot `value - 1` only when it is
+/// in range and that slot is installed; otherwise the GS pair answers.
+#[test]
+fn an_rdpid_value_names_a_cpu_only_when_valid_and_installed() {
+    let all_installed = |_slot: usize| true;
+    // A valid value.
+    assert_eq!(cpu_index_from_tsc_aux(1, 4, all_installed), Some(0));
+    assert_eq!(cpu_index_from_tsc_aux(4, 4, all_installed), Some(3));
+    // Zero: no slot installed on this CPU.
+    assert_eq!(cpu_index_from_tsc_aux(0, 4, all_installed), None);
+    // Out of range.
+    assert_eq!(cpu_index_from_tsc_aux(5, 4, all_installed), None);
+    assert_eq!(cpu_index_from_tsc_aux(u64::MAX, 4, all_installed), None);
+    // A slot not installed.
+    assert_eq!(cpu_index_from_tsc_aux(3, 4, |slot| slot != 2), None);
+    assert_eq!(cpu_index_from_tsc_aux(2, 4, |slot| slot != 2), Some(1));
+    // The installed test is asked only of the slot named, and never out of range.
+    let mut asked = std::vec::Vec::new();
+    assert_eq!(
+        cpu_index_from_tsc_aux(9, 4, |slot| {
+            asked.push(slot);
+            true
+        }),
+        None
+    );
+    assert!(asked.is_empty());
 }
 
 #[test]
@@ -250,6 +419,7 @@ fn e4_msr_programming_enables_sce_last_and_verifies_readback() {
         0xffff_ffff_8000_1000,
         0xffff_ffff_8000_3000,
         0xffff_ffff_8000_2000,
+        None,
     )
     .unwrap();
     let mut access = FakeMsr::default();
@@ -278,6 +448,7 @@ fn e4_live_validation_requires_strict_kernel_gs_orientation() {
         0xffff_ffff_8000_1000,
         0xffff_ffff_8000_3000,
         0xffff_ffff_8000_2000,
+        None,
     )
     .unwrap();
     let mut access = FakeMsr::default();
@@ -327,6 +498,7 @@ fn a_thread_fs_base_is_user_state_not_a_boundary_invariant() {
         0xffff_ffff_8000_1000,
         0xffff_ffff_8000_3000,
         0xffff_ffff_8000_2000,
+        None,
     )
     .unwrap();
     let mut access = FakeMsr::default();
