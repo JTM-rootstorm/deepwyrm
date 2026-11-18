@@ -16,8 +16,16 @@
 )]
 #[unsafe(no_mangle)]
 pub(crate) extern "sysv64" fn dw_kernel_rust_entry(boot_info_physical: u64) -> ! {
+    // SAFETY: CPL0 at the BSP's first Rust instruction, before anything that can report a CPU's
+    // identity or panic (DW2 §13.13 part d): only `entry.S`'s stack load and flag clears precede it.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    unsafe {
+        // The BSP runs before the RDPID choice can be made, so this is always true here.
+        let _ = super::syscall::prepare_cpu_identity_at_cpu_entry();
+    }
     // SAFETY: the assembly shim established CPL0, the kernel-owned stack, and
-    // IF=0. This is the first Rust architecture action and precedes descriptor
+    // IF=0. After the TSC_AUX clear above, this is the first Rust architecture
+    // action, and precedes descriptor
     // installation, BootInfo reads, and transition-paging attestation.
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     unsafe {
