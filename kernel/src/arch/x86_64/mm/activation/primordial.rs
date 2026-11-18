@@ -5041,6 +5041,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .any_process_unexited_except(retirement.retired_process)
             {
                 let _ = crate::debug::emit_early_system_empty_record();
+                self.check_usage_for_report();
                 return PreparedTerminalStep::Final(PreparedTerminalHandoff::PowerOff);
             }
             if crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
@@ -5214,8 +5215,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // could finish a run. Power the platform off instead, once the
             // facade has dropped the guard; the fallback inside is the halt
             // loop this replaced.
+            self.check_usage_for_report();
             PreparedTerminalHandoff::PowerOff
         }
+    }
+
+    /// In the hold that decides to power off, the last hold before the step
+    /// report is written: every live TaskGroup's kept usage against a scan
+    /// of the registry, recorded for the report's `usage-check` line (DW2
+    /// §13.12 part a). Both `PowerOff` handoffs call it, and the report is
+    /// written only on the power-off path.
+    #[cfg(not(feature = "test-support"))]
+    fn check_usage_for_report(&self) {
+        let (groups, mismatches) = self.core.registry.usage_mismatches();
+        crate::arch::x86_64::step_report::usage_checked(groups, mismatches);
     }
 
     fn reserve_runtime_phase(&self) -> crate::arch::x86_64::syscall::RuntimePhaseReservation {

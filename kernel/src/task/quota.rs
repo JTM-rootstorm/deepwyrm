@@ -4,15 +4,18 @@
 //! anywhere in the group's subtree create after it is set: live objects of
 //! the class, or concurrently registered wait items. Limits only fall.
 //!
-//! Usage is never counted up and down. Each object created by a process
-//! records, in its registry slot, the limited TaskGroups above that process
-//! (its [`ChargeTag`]). A group's usage is the number of live slots whose tag
-//! names it, so a finalized object stops counting the moment its slot is
-//! released, with no separate release path to get wrong. Wait usage is
-//! derived the same way, from the waiting threads of the live wait entries.
-//! A tag keeps naming a TaskGroup after that group dies; its key carries a
-//! generation and is never reissued, so the tag can neither count against
-//! another group nor escape its live ancestors, which it also names.
+//! Each object created by a process records, in its registry slot, the
+//! limited TaskGroups above that process (its [`ChargeTag`]). A group's
+//! usage is what the live and finalizing slots and the page reservations
+//! whose tag names it are charged. The registry keeps it per group, at the
+//! group's own slot, changed by every write of a tag, a weight, a
+//! reservation or a slot's state, and checked against a scan of the slots
+//! (DW2 §13.12 part a). A finalized object stops counting the moment its
+//! slot is released. Wait usage is derived from the waiting threads of the
+//! live wait entries. A tag keeps naming a TaskGroup after that group dies;
+//! its key carries a generation and is never reissued, so the tag can
+//! neither count against another group nor escape its live ancestors,
+//! which it also names.
 
 use deepwyrm_abi::{
     DW_TASK_GROUP_LIMIT_CLASS_COUNT, DW_TASK_GROUP_LIMIT_MEMORY_PAGES,
@@ -32,6 +35,8 @@ const _: () = {
     assert!(WAIT_CLASS == 7);
     assert!(MEMORY_PAGES_CLASS == 8);
     assert!(LIMIT_CLASSES == 9);
+    // The object classes are the ones below the wait class.
+    assert!(crate::object::charge::OBJECT_CLASSES == WAIT_CLASS);
 };
 
 /// Why a quota admission refused.
