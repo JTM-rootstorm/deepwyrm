@@ -89,9 +89,9 @@ pub(super) trait HoldEndCheck {
 pub(super) struct RuntimeAuthorityLock<T> {
     tickets: TicketPair,
     handles_taken: AtomicBool,
-    /// Called on every iteration of the ticket spin (D1 commit 4): see
-    /// [`SpinService`].
-    spin_service: SpinService,
+    /// Called on every iteration of the ticket spin (D1 commit 4), with the
+    /// spinning handle's CPU slot: see [`CpuSpinService`].
+    spin_service: CpuSpinService,
     value: UnsafeCell<T>,
 }
 
@@ -105,6 +105,14 @@ pub(super) struct RuntimeAuthorityLock<T> {
 /// interrupt it stands in for could have been taken.
 pub(super) type SpinService = fn();
 
+/// The runtime lock's [`SpinService`], given the CPU slot of the handle that
+/// spins (DW2 M8 step 3d, §13.13 part d), so a spin need not read the CPU's
+/// identity from the GS pair. The slot is the executing CPU's: a handle is
+/// minted for one CPU slot and is that CPU's only way to take the lock (see
+/// [`RuntimeAuthorityLock::handles`]). The live kernel passes
+/// `user_access::service_local_tlb_shootdown_for_slot`.
+pub(super) type CpuSpinService = fn(u32);
+
 // SAFETY: `value` is initialized before any AP carrier is released, never
 // moved afterward, and every access is serialized by the ticket pair. This is the
 // explicit DW0-H bridge for authorities whose types intentionally do not claim
@@ -112,7 +120,7 @@ pub(super) type SpinService = fn();
 unsafe impl<T> Sync for RuntimeAuthorityLock<T> {}
 
 impl<T> RuntimeAuthorityLock<T> {
-    pub(super) const fn new(value: T, spin_service: SpinService) -> Self {
+    pub(super) const fn new(value: T, spin_service: CpuSpinService) -> Self {
         Self {
             tickets: TicketPair {
                 next_ticket: AtomicU64::new(0),
@@ -134,7 +142,7 @@ impl<T> RuntimeAuthorityLock<T> {
     /// reading nothing through it. Afterwards `*slot` is fully initialized.
     pub(super) unsafe fn init_in_place(
         slot: *mut Self,
-        spin_service: SpinService,
+        spin_service: CpuSpinService,
         value: impl FnOnce(*mut T),
     ) {
         // SAFETY: `slot` is valid for writes of `Self` (this function's contract); `init_fields!`
@@ -171,7 +179,12 @@ impl<T> RuntimeAuthorityLock<T> {
         }
         // The handle at index `cpu` is CPU slot `cpu`'s: the live kernel
         // hands handle `n` to the carrier facade of `CpuIndex` `n`, the index
-        // the step report keys its per-CPU records by.
+        // the step report keys its per-CPU records by. A facade runs only on
+        // its own CPU: the BSP uses facade 0's handle before the APs are
+        // released, and afterwards each CPU reaches its facade through the
+        // carrier published in its own entry record, re-read after every
+        // context switch. So the handle's slot is the executing CPU, which
+        // the spin service relies on.
         core::array::from_fn(|cpu| RuntimeAuthorityHandle {
             lock: self,
             cpu: u32::try_from(cpu).unwrap_or(u32::MAX),
@@ -206,7 +219,9 @@ impl<T> RuntimeAuthorityLock<T> {
             if ticketed.is_none() {
                 ticketed = T::timing_now();
             }
-            (self.spin_service)();
+            // `cpu` is the executing CPU's slot (see `handles`), so the
+            // service finds this CPU's mailbox without reading its identity.
+            (self.spin_service)(cpu);
             core::hint::spin_loop();
         }
         T::hold_served(cpu, ticketed);
@@ -573,6 +588,8 @@ mod tests {
 
     fn no_service() {}
 
+    fn no_cpu_service(_cpu: u32) {}
+
     impl HoldEndCheck for () {
         fn check_hold_end(&self, _taken: &'static core::panic::Location<'static>) {}
     }
@@ -610,7 +627,7 @@ mod tests {
                 shared: crate::syscall::CleanupQueue::new(),
                 services: crate::syscall::CleanupQueue::new(),
             },
-            no_service,
+            no_cpu_service,
         );
         let [mut handle] = lock.handles::<1>();
         let mut registry = crate::object::ObjectRegistry::<4>::new();
@@ -689,7 +706,7 @@ mod tests {
     /// The initiator holds the runtime authority while the target spins on it.
     fn runtime_initiator_is_acknowledged(
         mailbox: &'static ModelMailbox,
-        spin_service: SpinService,
+        spin_service: CpuSpinService,
     ) -> bool {
         let lock = RuntimeAuthorityLock::new(0_u32, spin_service);
         let [mut initiator, mut target] = lock.handles::<2>();
@@ -733,11 +750,43 @@ mod tests {
     fn a_runtime_lock_spinner_acknowledges_only_when_its_spin_services_the_mailbox() {
         assert!(!runtime_initiator_is_acknowledged(
             &RUNTIME_UNSERVICED,
-            no_service
+            no_cpu_service
         ));
-        assert!(runtime_initiator_is_acknowledged(&RUNTIME_SERVICED, || {
+        assert!(runtime_initiator_is_acknowledged(&RUNTIME_SERVICED, |_| {
             RUNTIME_SERVICED.service()
         }));
+    }
+
+    /// Every slot the runtime lock's spin service was called with, as a bit
+    /// mask, and how many calls there were (DW2 §13.13 part d).
+    static SPUN_SLOTS: AtomicU64 = AtomicU64::new(0);
+    static SPIN_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    fn note_spinning_slot(cpu: u32) {
+        SPUN_SLOTS.fetch_or(1 << cpu, Ordering::AcqRel);
+        SPIN_CALLS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// DW2 §13.13 part d: a contended acquisition calls the spin service with
+    /// the spinning handle's CPU slot, and only that slot; an acquisition
+    /// served at once calls it not at all.
+    #[test]
+    fn the_runtime_spin_service_is_given_the_spinning_handles_slot() {
+        let lock = RuntimeAuthorityLock::new(0_u32, note_spinning_slot);
+        let [mut holder, _, mut spinner] = lock.handles::<3>();
+        *holder.lock() += 1;
+        assert_eq!(SPIN_CALLS.load(Ordering::Acquire), 0);
+        std::thread::scope(|scope| {
+            let guard = holder.lock();
+            let waiter = scope.spawn(move || *spinner.lock() += 1);
+            while SPIN_CALLS.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
+            drop(guard);
+            waiter.join().expect("spinning thread");
+        });
+        assert_eq!(SPUN_SLOTS.load(Ordering::Acquire), 1 << 2);
+        assert_eq!(*holder.lock(), 2);
     }
 
     #[test]
@@ -753,7 +802,7 @@ mod tests {
 
     #[test]
     fn a_handle_serializes_the_value_and_releases_on_drop() {
-        let lock = RuntimeAuthorityLock::new(1_u32, no_service);
+        let lock = RuntimeAuthorityLock::new(1_u32, no_cpu_service);
         let [mut first, mut second] = lock.handles::<2>();
         {
             let mut guard = first.lock();
@@ -775,7 +824,7 @@ mod tests {
         // SAFETY: the storage is a fresh local, valid for writes and unreferenced, and the closure
         // writes the whole `[u32; 2]`.
         let lock = unsafe {
-            RuntimeAuthorityLock::init_in_place(storage.as_mut_ptr(), no_service, |value| {
+            RuntimeAuthorityLock::init_in_place(storage.as_mut_ptr(), no_cpu_service, |value| {
                 value.write([3, 4])
             });
             storage.assume_init_ref()
@@ -791,7 +840,7 @@ mod tests {
     /// released when its guard drops, while T stays held.
     #[test]
     fn paging_is_taken_beneath_the_runtime_guard_and_released() {
-        let lock = RuntimeAuthorityLock::new(1_u32, no_service);
+        let lock = RuntimeAuthorityLock::new(1_u32, no_cpu_service);
         let paging = PagingLock::new(10_u32, no_service);
         let [mut handle] = lock.handles::<1>();
         let mut guard = handle.lock();
@@ -811,7 +860,7 @@ mod tests {
 
     #[test]
     fn handles_are_minted_once() {
-        let lock = RuntimeAuthorityLock::new((), no_service);
+        let lock = RuntimeAuthorityLock::new((), no_cpu_service);
         let _handles = lock.handles::<4>();
         let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = lock.handles::<4>();
@@ -821,7 +870,7 @@ mod tests {
 
     #[test]
     fn the_published_address_is_the_adjacent_ticket_pair() {
-        let lock = RuntimeAuthorityLock::new([0_u8; 64], no_service);
+        let lock = RuntimeAuthorityLock::new([0_u8; 64], no_cpu_service);
         let [mut handle] = lock.handles::<1>();
         drop(handle.lock());
         let pair = lock.ticket_pair_address().cast::<u64>();
@@ -839,7 +888,7 @@ mod tests {
     /// released on a settlement, and is free again afterwards.
     #[test]
     fn s_outlives_t_and_p_and_is_released_only_on_a_settlement() {
-        let lock = RuntimeAuthorityLock::new((), no_service);
+        let lock = RuntimeAuthorityLock::new((), no_cpu_service);
         let paging = PagingLock::new((), no_service);
         let initiator_lock = ShootdownInitiatorLock::new(no_service);
         let [mut handle] = lock.handles::<1>();

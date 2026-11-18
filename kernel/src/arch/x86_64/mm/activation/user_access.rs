@@ -451,6 +451,35 @@ pub(crate) fn service_local_tlb_shootdown() {
     else {
         return;
     };
+    service_local_tlb_shootdown_on(cpu);
+}
+
+/// [`service_local_tlb_shootdown`] for a spin that already knows its CPU
+/// (DW2 M8 step 3d, §13.13 part d): the runtime authority's ticket spin,
+/// whose handle carries its CPU slot. It reads no MSR.
+///
+/// `slot` must be the executing CPU's. The ready test stands in for the
+/// installed test the other entry makes: the transport is made ready only
+/// after every live CPU's carrier is bound, and binding requires that CPU's
+/// boundary to be installed, so once ready every live slot is installed. A
+/// slot outside the CPU bound has no mailbox and nothing to acknowledge.
+pub(crate) fn service_local_tlb_shootdown_for_slot(slot: u32) {
+    if !live_tlb_shootdown_is_ready() {
+        return;
+    }
+    let Some(cpu) = usize::try_from(slot)
+        .ok()
+        .and_then(crate::cpu::CpuIndex::new)
+    else {
+        return;
+    };
+    service_local_tlb_shootdown_on(cpu);
+}
+
+/// Acknowledges `cpu`'s pending TLB shootdown, if one is published: what
+/// [`service_local_tlb_shootdown`] does once it has found its CPU. `cpu` must
+/// be the executing CPU, and the transport ready.
+pub(crate) fn service_local_tlb_shootdown_on(cpu: crate::cpu::CpuIndex) {
     if LiveTlbShootdownDriver::mailbox(cpu).is_published() {
         service_tlb_mailbox_on(cpu);
     }
