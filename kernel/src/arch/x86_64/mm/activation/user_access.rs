@@ -196,38 +196,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::runtime_aut
 {
 }
 
-/// A fault's serve validates the return of the frame it serves against its
-/// own session, in its own P hold (DW2 §13.16 part e2): the read-only walks
-/// of [`ReturnValidationSession`], over the same live session, after the
-/// serve has selected the faulting Process for return validation.
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::arch::x86_64::syscall::UserReturnMappingValidation
-    for PageTableMutationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
-{
-    fn executable_at(&mut self, address: u64) -> bool {
-        crate::arch::x86_64::syscall::UserReturnMappingValidation::executable_at(
-            &mut self.session,
-            address,
-        )
-    }
-
-    fn writable_byte_below(&mut self, stack_pointer: u64) -> bool {
-        crate::arch::x86_64::syscall::UserReturnMappingValidation::writable_byte_below(
-            &mut self.session,
-            stack_pointer,
-        )
-    }
-}
-
-impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
-    crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation
-    for PageTableMutationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
-{
-    fn process_key(&self) -> crate::task::ProcessKey {
-        crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation::process_key(&self.session)
-    }
-}
-
 /// A pin-settlement session (D1 commit 9): releases a suspended operation's
 /// owned output pin, or atomic-word pin, without writing it. A stop that
 /// retires a suspended syscall discards its pins under the runtime authority;

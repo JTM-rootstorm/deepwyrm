@@ -8524,14 +8524,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cpu = self.cpu;
         self.with_synchronized_runtime_at_safe_point(|runtime| {
             let mut refused = None;
-            let mut authorized = None;
-            let mut outcome = runtime.serve_user_page_fault(
-                cr2,
-                error,
-                &mut refused,
-                Some(&mut *frame),
-                &mut authorized,
-            );
+            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused);
             // A touch refused when owed work could admit it frees owed
             // memory first (§10.10 item 7, §10.12 item 6, DW2 §13.12 part
             // b): a quota refusal the refusing groups' finalizing pages
@@ -8550,24 +8543,8 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             }
             crate::syscall::native::FaultPass::new(outcome, || {
                 // The frame is validated against the mappings this hold
-                // published the leaf in: a served or already-present touch
-                // in the serve's own P hold and session (DW2 §13.16 part
-                // e2), a release after its owed step here.
-                let authorized = match outcome {
-                    crate::syscall::native::UserPageFaultOutcome::Released => {
-                        runtime.authorize_timer_return(frame)
-                    }
-                    crate::syscall::native::UserPageFaultOutcome::Served
-                    | crate::syscall::native::UserPageFaultOutcome::AlreadyPresent => authorized
-                        .unwrap_or_else(|| panic!("a returning serve authorised no return")),
-                    // `FaultPass::new` runs this only for an outcome that
-                    // returns to the program.
-                    crate::syscall::native::UserPageFaultOutcome::Unserved
-                    | crate::syscall::native::UserPageFaultOutcome::Exhausted(_)
-                    | crate::syscall::native::UserPageFaultOutcome::Retry => {
-                        panic!("a fault's return was authorised for {outcome:?}")
-                    }
-                };
+                // published the leaf in.
+                let authorized = runtime.authorize_timer_return(frame);
                 // As `has_reschedule_request` does: the BSP drains a
                 // general Timer's completion before a woken Thread may
                 // return to userspace.
@@ -10710,20 +10687,11 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// that admission refuses for quota, `refused` is given the two charges
     /// it admitted together, for the caller to ask whether the refusal is
     /// owed (DW2 §13.12 part b); it is left alone otherwise.
-    ///
-    /// With a `frame` (the fault gate's), an outcome that returns to the
-    /// program, `Served` or `AlreadyPresent`, also has the frame's return
-    /// authorised against this serve's own session before its P guard is
-    /// dropped, as `authorize_timer_return` authorises it, and the result
-    /// is put in `authorized` (DW2 §13.16 part e2). Any other outcome leaves
-    /// the frame and `authorized` alone.
     fn serve_user_page_fault(
         &mut self,
         cr2: u64,
         error: u64,
         refused: &mut Option<FaultCharges>,
-        frame: Option<&mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame>,
-        authorized: &mut Option<Result<(), crate::arch::x86_64::syscall::UserReturnError>>,
     ) -> crate::syscall::native::UserPageFaultOutcome {
         use crate::memory::frame_roles::FrameRoleError;
         use crate::syscall::native::UserPageFaultOutcome as Outcome;
@@ -10732,12 +10700,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         const FETCH: u64 = 1 << 4;
         // The step report's stamps (DW2 §13.5), taken only while this CPU's
         // fault gate is timing a fault, so a fill-in's serves read no clock.
-        let this_cpu = self.cpu();
-        let cpu = this_cpu.index();
+        let cpu = self.cpu().index();
         step_report::fault_pass_began(cpu);
-        let scheduled = self.own.scheduled();
-        let process = scheduled.process;
-        let thread = scheduled.thread;
+        let process = self.own.scheduled().process;
+        let thread = self.own.scheduled().thread;
         if self.core.tasks.thread_process(thread) != Ok(process)
             || self.core.shared.execution.current_thread_on(self.cpu()) != Some(thread)
         {
@@ -10828,7 +10794,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // As below: a present leaf that is not exactly this page's is
             // not a race this serves, and only a page committed in this hold
             // could not have had one.
-            let outcome = match publisher.write_touched_leaf(place) {
+            return match publisher.write_touched_leaf(place) {
                 Ok(published) if published || cost != 0 => {
                     step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
                     Outcome::Served
@@ -10836,22 +10802,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Ok(_) => Outcome::AlreadyPresent,
                 Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Map(
                     crate::arch::x86_64::mm::MapError::FrameMismatch,
-                )) if cost == 0 => return Outcome::Unserved,
+                )) if cost == 0 => Outcome::Unserved,
                 Err(error) => panic!("an on-demand fault could not publish its leaf: {error:?}"),
             };
-            if let Some(frame) = frame {
-                *authorized = Some(authorize_served_return(
-                    &self.core.tasks,
-                    &self.core.shared.execution,
-                    this_cpu,
-                    scheduled,
-                    &self.core.regions,
-                    &self.core.memory,
-                    &mut session,
-                    frame,
-                ));
-            }
-            return outcome;
         };
         // Admit both, together, before taking a frame (§8.4).
         if let Err(outcome) = admit_fault_charges(
@@ -10937,25 +10890,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 built,
             );
         }
-        let outcome = if published || cost != 0 {
+        if published || cost != 0 {
             step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
             Outcome::Served
         } else {
             Outcome::AlreadyPresent
-        };
-        if let Some(frame) = frame {
-            *authorized = Some(authorize_served_return(
-                &self.core.tasks,
-                &self.core.shared.execution,
-                this_cpu,
-                scheduled,
-                &self.core.regions,
-                &self.core.memory,
-                &mut session,
-                frame,
-            ));
         }
-        outcome
     }
 
     /// One hold of a syscall's fill-in phase (DW2 M6 §8.6): serves, as a
@@ -10996,7 +10936,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             step_report::fill_in_served();
             let mut refused = None;
             if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
-                self.serve_user_page_fault(page, error, &mut refused, None, &mut None)
+                self.serve_user_page_fault(page, error, &mut refused)
             {
                 if !self.serve_refusal_owed(status, refused) {
                     return Err(status);
@@ -12565,40 +12505,6 @@ fn admit_fault_charges(
         }
         Err(_) => Err(Outcome::Unserved),
     }
-}
-
-/// Authorises the return of the frame a fault's serve returns to, against
-/// that serve's own session and in its P hold (DW2 §13.16 part e2): the
-/// identity checks and the on-demand allowance of `authorize_timer_return`,
-/// without its second acquisition of P and second session.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the serve's T-held authorities are borrowed field by field beside its held session"
-)]
-fn authorize_served_return<M: crate::arch::x86_64::syscall::ProcessUserReturnMappingValidation>(
-    tasks: &Tasks,
-    execution: &ExecutionDomain<EXECUTION_THREADS>,
-    cpu: crate::cpu::CpuIndex,
-    scheduled: ScheduledIdentity,
-    regions: &Regions,
-    memory: &Memory,
-    mappings: &mut M,
-    frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
-) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
-    if tasks.thread_process(scheduled.thread) != Ok(scheduled.process)
-        || execution.current_thread_on(cpu) != Some(scheduled.thread)
-    {
-        return Err(crate::arch::x86_64::syscall::UserReturnError::BindingChanged);
-    }
-    let demand = |process, address, execute| {
-        regions.on_demand_return_allowed(process, address, execute, |object| {
-            memory.object_is_on_demand(object)
-        })
-    };
-    frame.validate_and_sanitize(&mut OnDemandReturn {
-        inner: mappings,
-        demand: &demand,
-    })
 }
 
 /// Where a fill-in continues (DW2 M6 §8.6).
