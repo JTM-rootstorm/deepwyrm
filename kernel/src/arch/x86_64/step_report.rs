@@ -264,8 +264,9 @@ pub(crate) struct StepTally<const CPUS: usize> {
     t_lock_wait: [AtomicU64; CPUS],
     /// Per CPU and drain source, [`T_LOCK_FIGURES`], times in ticks.
     t_lock: [[[AtomicU64; T_LOCK_FIGURES]; SOURCES]; CPUS],
-    /// Registry scans by `charged_pages` and by `charged`, and the capacity
-    /// of the registry scanned.
+    /// Registry scans made for an admission, and the capacity of the
+    /// registry scanned. Since DW2 §13.12 part a admission reads kept usage
+    /// and makes none, so nothing records them and the line prints zero.
     page_scans: AtomicU64,
     object_scans: AtomicU64,
     scan_slots: AtomicU64,
@@ -487,18 +488,6 @@ impl<const CPUS: usize> StepTally<CPUS> {
         }
         held_sum.fetch_add(held, Ordering::Relaxed);
         held_longest.fetch_max(held, Ordering::Relaxed);
-    }
-
-    /// `ObjectRegistry::charged_pages` scanned a registry of `slots` slots.
-    pub(crate) fn page_scanned(&self, slots: usize) {
-        self.page_scans.fetch_add(1, Ordering::Relaxed);
-        self.scan_slots.store(slots as u64, Ordering::Relaxed);
-    }
-
-    /// `ObjectRegistry::charged` scanned a registry of `slots` slots.
-    pub(crate) fn object_scanned(&self, slots: usize) {
-        self.object_scans.fetch_add(1, Ordering::Relaxed);
-        self.scan_slots.store(slots as u64, Ordering::Relaxed);
     }
 
     /// A commit step began at `began`, admitted from `admit_began` to
@@ -1209,16 +1198,6 @@ mod live {
         TALLY.t_lock_released(cpu, drain_source(cpu), released);
     }
 
-    /// `ObjectRegistry::charged_pages` scanned `slots` slots.
-    pub(crate) fn page_scanned(slots: usize) {
-        TALLY.page_scanned(slots);
-    }
-
-    /// `ObjectRegistry::charged` scanned `slots` slots.
-    pub(crate) fn object_scanned(slots: usize) {
-        TALLY.object_scanned(slots);
-    }
-
     /// A commit step's five [`ticks`] stamps (see
     /// [`StepTally::commit_step`]).
     pub(crate) fn commit_step(
@@ -1265,9 +1244,9 @@ pub(crate) use live::{
     after_safe_point, allow_teardown_step, at_safe_point, backing_allocated, backing_made,
     call_ended, commit_step, fault_entered, fault_pass, fault_pass_began, fault_returned,
     fault_stamped, fault_untimed, fill_in_served, finalize_hold_ended, finalize_queued,
-    finalize_stepped, finalize_waited, now, object_scanned, owed, owed_wake, page_scanned,
-    parked_call_ended, report, set_drain_source, step_began, t_lock_released, t_lock_served,
-    take_teardown_step, ticks, timed, timed_nested,
+    finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended, report,
+    set_drain_source, step_began, t_lock_released, t_lock_served, take_teardown_step, ticks, timed,
+    timed_nested,
 };
 
 #[cfg(test)]
@@ -2118,20 +2097,6 @@ mod tests {
         let tally = StepTally::<2>::new();
         tally.fault_total.store(u64::MAX, Ordering::Relaxed);
         assert!(measure_lines_at(&tally, 4_000_000_000)[0].contains(" total-us=4611686018427387 "));
-    }
-
-    #[test]
-    fn admission_scans_are_counted_with_the_registry_capacity() {
-        let tally = StepTally::<2>::new();
-        for _ in 0..5 {
-            tally.page_scanned(640);
-        }
-        tally.object_scanned(640);
-        tally.object_scanned(640);
-        assert_eq!(
-            measure_lines(&tally)[2],
-            "admission page-scans=5 object-scans=2 slots=640 reservations=64"
-        );
     }
 
     #[test]

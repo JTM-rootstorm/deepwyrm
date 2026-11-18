@@ -280,6 +280,20 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
     /// reservation to its owed backing, which keeps it until they are freed
     /// (DW2 §12.11 part 2 item 8).
     reserved: [Option<(ReservationHolder, charge::ChargeTag, u64)>; RESERVATION_THREADS],
+    /// Per slot, for the group that holds it, the pages charged to it: the
+    /// weights of the live and finalizing slots whose tag names it, and the
+    /// reservations whose tag names it (DW2 §13.12 part a). Every write
+    /// goes through [`Self::change_usage`]; zeroed when the slot is
+    /// released, so whatever holds the slot next starts from zero.
+    usage_pages: [u64; CAPACITY],
+    /// Per slot, for the group that holds it, the live and finalizing
+    /// objects of each object class charged to it.
+    usage_objects: [[u16; charge::OBJECT_CLASSES]; CAPACITY],
+    /// The part of `usage_pages` held by finalizing objects and by owed
+    /// backings' reservations: freed by owed work, not by a live owner.
+    finalizing_pages: [u64; CAPACITY],
+    /// The part of `usage_objects` that is finalizing.
+    finalizing_objects: [[u16; charge::OBJECT_CLASSES]; CAPACITY],
     /// MemoryObject slots whose last handle is gone while internal
     /// references remain, noted at each such release for the release-on-
     /// unmap step (DW2 §10.9 item 4). A slot is queued at most once: its
@@ -294,12 +308,22 @@ pub(crate) struct ObjectRegistry<const CAPACITY: usize> {
 
 impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     pub(crate) fn new() -> Self {
+        const {
+            assert!(
+                CAPACITY <= u16::MAX as usize,
+                "a group's object counts fit u16 only while the registry does"
+            );
+        }
         Self {
             domain: mint_registry_domain(),
             slots: [EMPTY_SLOT; CAPACITY],
             tags: [charge::ChargeTag::EMPTY; CAPACITY],
             pages: [0; CAPACITY],
             reserved: [None; RESERVATION_THREADS],
+            usage_pages: [0; CAPACITY],
+            usage_objects: [[0; charge::OBJECT_CLASSES]; CAPACITY],
+            finalizing_pages: [0; CAPACITY],
+            finalizing_objects: [[0; charge::OBJECT_CLASSES]; CAPACITY],
             notices: [0; CAPACITY],
             notice_head: 0,
             notice_len: 0,
@@ -412,8 +436,26 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             .find(|(holder, _, _)| *holder == ReservationHolder::Thread(thread))
         {
             Some(reservation) => {
+                let (_, tag, held) = *reservation;
                 reservation.0 = ReservationHolder::OwedBacking(backing);
                 reservation.2 = pages;
+                let operation = "rekey_reservation_to_owed_backing";
+                self.change_usage(
+                    tag,
+                    Direction::Remove,
+                    None,
+                    held,
+                    Figures::Usage,
+                    operation,
+                );
+                self.change_usage(
+                    tag,
+                    Direction::Add,
+                    None,
+                    pages,
+                    Figures::UsageAndFinalizing,
+                    operation,
+                );
                 true
             }
             None => false,
@@ -452,6 +494,15 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             .2
             .checked_sub(pages)
             .ok_or(ObjectRegistryError::ReferenceCountUnderflow)?;
+        let tag = reservation.1;
+        self.change_usage(
+            tag,
+            Direction::Remove,
+            None,
+            pages,
+            Figures::UsageAndFinalizing,
+            "lower_owed_backing_pages",
+        );
         Ok(())
     }
 
@@ -470,6 +521,14 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         match self.reserved.iter_mut().find(|slot| slot.is_none()) {
             Some(slot) => {
                 *slot = Some((holder, tag, pages));
+                self.change_usage(
+                    tag,
+                    Direction::Add,
+                    None,
+                    pages,
+                    reservation_figures(holder),
+                    "reserve",
+                );
                 true
             }
             None => false,
@@ -477,10 +536,93 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     }
 
     fn end_reservation(&mut self, holder: ReservationHolder) {
-        for slot in &mut self.reserved {
-            if slot.is_some_and(|(owner, _, _)| owner == holder) {
-                *slot = None;
+        for index in 0..RESERVATION_THREADS {
+            let Some((owner, tag, pages)) = self.reserved[index] else {
+                continue;
+            };
+            if owner == holder {
+                self.reserved[index] = None;
+                self.change_usage(
+                    tag,
+                    Direction::Remove,
+                    None,
+                    pages,
+                    reservation_figures(owner),
+                    "end_reservation",
+                );
             }
+        }
+    }
+
+    /// The slot `group` holds now: `None` when the identity is of another
+    /// registry, out of range, of an older generation, or its slot is
+    /// vacant or retired.
+    fn held_group_slot(&self, group: ObjectId) -> Option<usize> {
+        let slot = self.reference_slot(group).ok()?;
+        let (_, generation) = decode_object_id(group.raw)?;
+        let entry = &self.slots[slot];
+        (entry.generation == generation
+            && matches!(entry.state, SlotState::Live(_) | SlotState::Finalizing(_)))
+        .then_some(slot)
+    }
+
+    /// The one rule for every write of usage (DW2 §13.12 part a): one
+    /// object of `class` (if any) and `pages` pages are added to or removed
+    /// from `figures` of each group `tag` names, at that group's slot,
+    /// only while the slot holds that group; a group gone changes nothing.
+    /// A group named twice is changed once, as a scan counts it once. An
+    /// overflow or underflow is a bookkeeping bug and panics naming
+    /// `operation`.
+    fn change_usage(
+        &mut self,
+        tag: charge::ChargeTag,
+        direction: Direction,
+        class: Option<usize>,
+        pages: u64,
+        figures: Figures,
+        operation: &'static str,
+    ) {
+        if class.is_none() && pages == 0 {
+            return;
+        }
+        for (index, group) in tag.groups().enumerate() {
+            if tag.groups().take(index).any(|earlier| earlier == group) {
+                continue;
+            }
+            let Some(slot) = self.held_group_slot(group) else {
+                continue;
+            };
+            if figures != Figures::Finalizing {
+                apply_usage_change(
+                    &mut self.usage_pages[slot],
+                    &mut self.usage_objects[slot],
+                    direction,
+                    class,
+                    pages,
+                    operation,
+                    "usage",
+                );
+            }
+            if figures != Figures::Usage {
+                apply_usage_change(
+                    &mut self.finalizing_pages[slot],
+                    &mut self.finalizing_objects[slot],
+                    direction,
+                    class,
+                    pages,
+                    operation,
+                    "finalizing",
+                );
+            }
+        }
+    }
+
+    /// The object class of the object in `slot`, live or finalizing.
+    fn slot_class(&self, slot: usize) -> Option<usize> {
+        match self.slots[slot].state {
+            SlotState::Live(live) => charge::object_class(live.object_type),
+            SlotState::Finalizing(object_type) => charge::object_class(object_type),
+            SlotState::Vacant | SlotState::Retired => None,
         }
     }
 
@@ -550,7 +692,26 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         {
             return Err(ObjectRegistryError::StaleReference);
         }
+        let class = self.slot_class(slot);
+        let pages = self.pages[slot];
+        let old = self.tags[slot];
+        self.change_usage(
+            old,
+            Direction::Remove,
+            class,
+            pages,
+            Figures::Usage,
+            "set_charge_tag",
+        );
         self.tags[slot] = tag;
+        self.change_usage(
+            tag,
+            Direction::Add,
+            class,
+            pages,
+            Figures::Usage,
+            "set_charge_tag",
+        );
         Ok(())
     }
 
@@ -570,7 +731,21 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         {
             return Err(ObjectRegistryError::StaleReference);
         }
+        let old = self.pages[slot];
         self.pages[slot] = pages;
+        let (direction, difference) = if pages >= old {
+            (Direction::Add, pages - old)
+        } else {
+            (Direction::Remove, old - pages)
+        };
+        self.change_usage(
+            self.tags[slot],
+            direction,
+            None,
+            difference,
+            Figures::Usage,
+            "set_charge_pages",
+        );
         Ok(())
     }
 
@@ -595,6 +770,14 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         self.pages[slot] = self.pages[slot]
             .checked_sub(frames)
             .ok_or(ObjectRegistryError::ReferenceCountUnderflow)?;
+        self.change_usage(
+            self.tags[slot],
+            Direction::Remove,
+            None,
+            frames,
+            Figures::UsageAndFinalizing,
+            "lower_finalizing_charge_pages",
+        );
         Ok(())
     }
 
@@ -616,12 +799,138 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         Ok((self.tags[slot], self.pages[slot]))
     }
 
-    /// Pages of live and finalizing objects charged to `group`. A
-    /// finalizing MemoryObject still holds its frames, so it still counts.
+    /// Pages charged to `group`: of its live and finalizing objects and its
+    /// reservations. A finalizing MemoryObject still holds its frames, so
+    /// it still counts. Zero once `group` no longer holds its slot.
     pub(crate) fn charged_pages(&self, group: ObjectId) -> usize {
-        // Counted for the step report's admission line (DW2 §13.5).
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-        crate::arch::x86_64::step_report::page_scanned(CAPACITY);
+        #[cfg(test)]
+        self.assert_group_matches_scan(group);
+        let pages = self
+            .held_group_slot(group)
+            .map_or(0, |slot| self.usage_pages[slot]);
+        usize::try_from(pages).unwrap_or(usize::MAX)
+    }
+
+    /// Live and finalizing objects of `class` charged to `group`. Zero once
+    /// `group` no longer holds its slot.
+    pub(crate) fn charged(&self, group: ObjectId, class: usize) -> usize {
+        #[cfg(test)]
+        self.assert_group_matches_scan(group);
+        self.held_group_slot(group)
+            .and_then(|slot| self.usage_objects[slot].get(class))
+            .map_or(0, |&count| usize::from(count))
+    }
+
+    /// The part of [`Self::charged_pages`] held by `group`'s finalizing
+    /// objects and owed backings: pages owed work will free.
+    pub(crate) fn finalizing_pages_of(&self, group: ObjectId) -> u64 {
+        self.held_group_slot(group)
+            .map_or(0, |slot| self.finalizing_pages[slot])
+    }
+
+    /// The part of [`Self::charged`] that is finalizing.
+    pub(crate) fn finalizing_objects_of(&self, group: ObjectId, class: usize) -> usize {
+        self.held_group_slot(group)
+            .and_then(|slot| self.finalizing_objects[slot].get(class))
+            .map_or(0, |&count| usize::from(count))
+    }
+
+    /// For every slot holding a live TaskGroup (with `every_live`, every
+    /// live slot), compares the four kept figures with the same figures
+    /// found by scanning the slots and reservations, calling `mismatch`
+    /// with the group, the figure, the class (for an object count), the
+    /// kept value and the scanned value for each that differs. Returns how
+    /// many slots it compared. Its scans are not counted as admission's.
+    fn compare_usage(
+        &self,
+        every_live: bool,
+        mut mismatch: impl FnMut(ObjectId, &'static str, Option<usize>, u64, u64),
+    ) -> usize {
+        let mut compared = 0;
+        for slot in 0..CAPACITY {
+            let entry = self.slots[slot];
+            let SlotState::Live(live) = entry.state else {
+                continue;
+            };
+            if !every_live && live.object_type != deepwyrm_abi::DW_OBJECT_TYPE_TASK_GROUP {
+                continue;
+            }
+            let Some(raw) = encode_object_id(slot, entry.generation) else {
+                continue;
+            };
+            self.compare_slot_usage(slot, ObjectId::new(self.domain, raw), &mut mismatch);
+            compared += 1;
+        }
+        compared
+    }
+
+    fn compare_slot_usage(
+        &self,
+        slot: usize,
+        group: ObjectId,
+        mismatch: &mut impl FnMut(ObjectId, &'static str, Option<usize>, u64, u64),
+    ) {
+        let widen = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        let scanned = widen(self.charged_pages_by_scan(group));
+        if self.usage_pages[slot] != scanned {
+            mismatch(group, "usage pages", None, self.usage_pages[slot], scanned);
+        }
+        let (finalizing_pages, finalizing_objects) = self.finalizing_by_scan(group);
+        let kept = self.finalizing_pages_of(group);
+        if kept != finalizing_pages {
+            mismatch(group, "finalizing pages", None, kept, finalizing_pages);
+        }
+        for (class, &finalizing) in finalizing_objects.iter().enumerate() {
+            let kept = u64::from(self.usage_objects[slot][class]);
+            let scanned = widen(self.charged_by_scan(group, class));
+            if kept != scanned {
+                mismatch(group, "usage objects", Some(class), kept, scanned);
+            }
+            let kept = widen(self.finalizing_objects_of(group, class));
+            let scanned = widen(finalizing);
+            if kept != scanned {
+                mismatch(group, "finalizing objects", Some(class), kept, scanned);
+            }
+        }
+    }
+
+    /// The kernel's check of kept usage (DW2 §13.12 part a): every live
+    /// TaskGroup's four figures against a scan. Returns the groups compared
+    /// and the figures that differ; the step report's last hold prints it.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the step report's last hold, in the primordial facade, is its caller (DW2 §13.12 part a); that call is made in another lane"
+        )
+    )]
+    pub(crate) fn usage_mismatches(&self) -> (usize, usize) {
+        let mut mismatches = 0usize;
+        let groups = self.compare_usage(false, |_, _, _, _, _| {
+            mismatches = mismatches.saturating_add(1);
+        });
+        (groups, mismatches)
+    }
+
+    /// Panics, naming the group, the figure and both values, if any live
+    /// slot's kept usage differs from a scan.
+    #[cfg(test)]
+    pub(crate) fn assert_usage_matches_scan(&self) {
+        self.compare_usage(true, usage_mismatch_panic);
+    }
+
+    /// As [`Self::assert_usage_matches_scan`], for `group` alone, if it
+    /// holds its slot.
+    #[cfg(test)]
+    fn assert_group_matches_scan(&self, group: ObjectId) {
+        if let Some(slot) = self.held_group_slot(group) {
+            self.compare_slot_usage(slot, group, &mut usage_mismatch_panic);
+        }
+    }
+
+    /// Pages charged to `group`, found by scanning the slots and the
+    /// reservations: what [`Self::charged_pages`] keeps, for the checks.
+    fn charged_pages_by_scan(&self, group: ObjectId) -> usize {
         self.slots
             .iter()
             .zip(&self.tags)
@@ -644,11 +953,9 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             )
     }
 
-    /// Live and finalizing objects of `class` charged to `group`.
-    pub(crate) fn charged(&self, group: ObjectId, class: usize) -> usize {
-        // Counted for the step report's admission line (DW2 §13.5).
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-        crate::arch::x86_64::step_report::object_scanned(CAPACITY);
+    /// Live and finalizing objects of `class` charged to `group`, found by
+    /// scanning the slots: what [`Self::charged`] keeps, for the checks.
+    fn charged_by_scan(&self, group: ObjectId, class: usize) -> usize {
         self.slots
             .iter()
             .zip(&self.tags)
@@ -661,6 +968,34 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
                 charge::object_class(object_type) == Some(class) && tag.names(group)
             })
             .count()
+    }
+
+    /// The finalizing part of `group`'s usage, found by scanning: the
+    /// weights of finalizing slots whose tag names it with the owed
+    /// backings' reservations whose tag names it, and the finalizing
+    /// objects of each class. What [`Self::finalizing_pages_of`] and
+    /// [`Self::finalizing_objects_of`] keep, for the checks.
+    fn finalizing_by_scan(&self, group: ObjectId) -> (u64, [usize; charge::OBJECT_CLASSES]) {
+        let mut pages = 0u64;
+        let mut objects = [0usize; charge::OBJECT_CLASSES];
+        for slot in 0..CAPACITY {
+            let SlotState::Finalizing(object_type) = self.slots[slot].state else {
+                continue;
+            };
+            if !self.tags[slot].names(group) {
+                continue;
+            }
+            pages = pages.saturating_add(self.pages[slot]);
+            if let Some(class) = charge::object_class(object_type) {
+                objects[class] += 1;
+            }
+        }
+        for &(holder, tag, held) in self.reserved.iter().flatten() {
+            if matches!(holder, ReservationHolder::OwedBacking(_)) && tag.names(group) {
+                pages = pages.saturating_add(held);
+            }
+        }
+        (pages, objects)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -956,11 +1291,27 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
             _ => return Err(ObjectRegistryError::NotFinalizing),
         }
 
+        // A finalizing slot is released: its object and its remaining
+        // weight leave its groups' usage and their finalizing part.
+        self.change_usage(
+            self.tags[slot],
+            Direction::Remove,
+            self.slot_class(slot),
+            self.pages[slot],
+            Figures::UsageAndFinalizing,
+            "release",
+        );
+        let entry = &mut self.slots[slot];
         entry.state = if next_generation(entry.generation).is_some() {
             SlotState::Vacant
         } else {
             SlotState::Retired
         };
+        // Whatever the slot held, a group's figures end with it.
+        self.usage_pages[slot] = 0;
+        self.usage_objects[slot] = [0; charge::OBJECT_CLASSES];
+        self.finalizing_pages[slot] = 0;
+        self.finalizing_objects[slot] = [0; charge::OBJECT_CLASSES];
         Ok(())
     }
     fn validate_reference(
@@ -1079,6 +1430,16 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         };
         if becomes_final {
             self.slots[slot].state = SlotState::Finalizing(object_type);
+            // Its object and its weight stay in its groups' usage, now as
+            // finalizing.
+            self.change_usage(
+                self.tags[slot],
+                Direction::Add,
+                charge::object_class(object_type),
+                self.pages[slot],
+                Figures::Finalizing,
+                "release to finalizing",
+            );
             return Ok(Some(FinalRelease { id, object_type }));
         }
         // A MemoryObject left with internal references and no handle may
@@ -1255,6 +1616,75 @@ impl payload_cleanup_seal::Sealed for crate::ipc::ChannelPayloadCleanup {
 }
 #[cfg(deepwyrm_integrated)]
 impl PayloadCleanupProof for crate::ipc::ChannelPayloadCleanup {}
+
+/// Whether a usage change adds or removes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Direction {
+    Add,
+    Remove,
+}
+
+/// Which of a group's figures a usage change applies to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Figures {
+    /// Its usage only: a live object or a create's reservation.
+    Usage,
+    /// Only the finalizing part: an object passing from live to finalizing.
+    Finalizing,
+    /// Both: what is finalizing, or an owed backing's reservation.
+    UsageAndFinalizing,
+}
+
+/// A reservation counts in its groups' usage; an owed backing's, whose
+/// frames owed steps free, also in their finalizing part.
+const fn reservation_figures(holder: ReservationHolder) -> Figures {
+    match holder {
+        ReservationHolder::Thread(_) => Figures::Usage,
+        ReservationHolder::OwedBacking(_) => Figures::UsageAndFinalizing,
+    }
+}
+
+/// Applies one usage change to one group's pages and object counts.
+fn apply_usage_change(
+    pages_entry: &mut u64,
+    objects_entry: &mut [u16; charge::OBJECT_CLASSES],
+    direction: Direction,
+    class: Option<usize>,
+    pages: u64,
+    operation: &'static str,
+    figure: &'static str,
+) {
+    let held = *pages_entry;
+    *pages_entry = match direction {
+        Direction::Add => held.checked_add(pages),
+        Direction::Remove => held.checked_sub(pages),
+    }
+    .unwrap_or_else(|| {
+        panic!("{operation}: a group's {figure} pages {held} cannot {direction:?} {pages}")
+    });
+    if let Some(class) = class {
+        let count = &mut objects_entry[class];
+        let held = *count;
+        *count = match direction {
+            Direction::Add => held.checked_add(1),
+            Direction::Remove => held.checked_sub(1),
+        }
+        .unwrap_or_else(|| {
+            panic!("{operation}: a group's {figure} objects of class {class} ({held}) cannot {direction:?} one")
+        });
+    }
+}
+
+#[cfg(test)]
+fn usage_mismatch_panic(
+    group: ObjectId,
+    figure: &'static str,
+    class: Option<usize>,
+    kept: u64,
+    scanned: u64,
+) {
+    panic!("group {group:?}: {figure} (class {class:?}) is kept as {kept} but scans as {scanned}");
+}
 
 fn next_generation(generation: u32) -> Option<u32> {
     generation.checked_add(1).filter(|next| *next != 0)

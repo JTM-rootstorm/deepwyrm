@@ -13,19 +13,33 @@ use super::ObjectId;
 /// process with more is refused, so a tag never drops one.
 pub(crate) const MAX_LIMITED_ANCESTORS: usize = 4;
 
+/// The object types limited by count, each at its class. The class values
+/// are the ABI's `DW_TASK_GROUP_LIMIT_*` constants.
+const CLASSED_TYPES: &[DwObjectType] = &[
+    DW_OBJECT_TYPE_CHANNEL,
+    DW_OBJECT_TYPE_EVENT,
+    DW_OBJECT_TYPE_TIMER,
+    DW_OBJECT_TYPE_MEMORY_OBJECT,
+    DW_OBJECT_TYPE_THREAD,
+    DW_OBJECT_TYPE_PROCESS,
+    DW_OBJECT_TYPE_TASK_GROUP,
+];
+
+/// How many classes [`object_class`] can return: every class it returns is
+/// below this.
+pub(crate) const OBJECT_CLASSES: usize = CLASSED_TYPES.len();
+
 /// The object class an object type is limited under, if any. The class
 /// values are the ABI's `DW_TASK_GROUP_LIMIT_*` constants.
 pub(crate) const fn object_class(object_type: DwObjectType) -> Option<usize> {
-    match object_type {
-        DW_OBJECT_TYPE_CHANNEL => Some(0),
-        DW_OBJECT_TYPE_EVENT => Some(1),
-        DW_OBJECT_TYPE_TIMER => Some(2),
-        DW_OBJECT_TYPE_MEMORY_OBJECT => Some(3),
-        DW_OBJECT_TYPE_THREAD => Some(4),
-        DW_OBJECT_TYPE_PROCESS => Some(5),
-        DW_OBJECT_TYPE_TASK_GROUP => Some(6),
-        _ => None,
+    let mut class = 0;
+    while class < CLASSED_TYPES.len() {
+        if CLASSED_TYPES[class].0 == object_type.0 {
+            return Some(class);
+        }
+        class += 1;
     }
+    None
 }
 
 /// The limited TaskGroups above the creating process, nearest first.
