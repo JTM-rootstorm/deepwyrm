@@ -25,7 +25,7 @@ const FETCH: u64 = 1 << 4;
 const PAGE_MASK: u64 = !(crate::memory::physical::BASE_PAGE_SIZE - 1);
 
 /// Why the fast serve left a fault to the serve under T, by step (DW2
-/// §13.16's `fault-windows` line).
+/// §13.16's `fault-declines` line).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FastDecline {
     /// Steps 1 and 2: no window, another Thread or root, no session, a

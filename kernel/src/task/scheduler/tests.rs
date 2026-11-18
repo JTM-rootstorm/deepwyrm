@@ -4202,10 +4202,11 @@ fn a_wake_preemption_whose_woken_thread_was_stolen_keeps_the_runner() {
 }
 
 /// DW2 §13.16 part e3: the fast serve's one question of the scheduler is
-/// answered in one hold: this Thread is this CPU's current and Running, and
-/// no reschedule is requested for this CPU.
+/// answered in one hold: this Thread is this CPU's current (a current
+/// Thread is Running: `running` is the claim), and no reschedule is
+/// requested for this CPU.
 #[test]
-fn a_thread_runs_undisturbed_only_while_current_running_and_unrequested() {
+fn a_thread_runs_undisturbed_only_while_current_and_unrequested() {
     let scheduler = CooperativeScheduler::<4>::new();
     let mut registry = ObjectRegistry::<16>::new();
     let running = thread_key(&mut registry);

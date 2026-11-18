@@ -159,7 +159,7 @@ const FAST_STAMPS: usize = 3;
 const FAST_PARTS: usize = 4;
 
 /// Why the fast serve declined (DW2 §13.16 part e3), in the
-/// `fault-windows` line's order.
+/// `fault-declines` line's order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowDecline {
     Identity = 0,
@@ -748,10 +748,14 @@ impl<const CPUS: usize> StepTally<CPUS> {
             .window_declines
             .each_ref()
             .map(|count| count.load(Ordering::Relaxed));
+        // Two lines, so neither can pass a record's 192 bytes.
         line(format_args!(
-            "fault-windows opened={} closed={} declined-identity={identity} declined-mapping={mapping} declined-tables={tables} declined-credit={credit} declined-memory={memory} declined-leaf={leaf} declined-return={declined_return}",
+            "fault-windows opened={} closed={}",
             self.windows_opened.load(Ordering::Relaxed),
             self.windows_closed.load(Ordering::Relaxed),
+        ));
+        line(format_args!(
+            "fault-declines identity={identity} mapping={mapping} tables={tables} credit={credit} memory={memory} leaf={leaf} return={declined_return}"
         ));
         for (cpu, sources) in self.t_lock.iter().enumerate() {
             for (name, figures) in SOURCE_NAMES.iter().zip(sources) {
@@ -2181,7 +2185,8 @@ mod tests {
                 "faults served=0 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
-                "fault-windows opened=0 closed=0 declined-identity=0 declined-mapping=0 declined-tables=0 declined-credit=0 declined-memory=0 declined-leaf=0 declined-return=0",
+                "fault-windows opened=0 closed=0",
+                "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
                 "commit-steps count=0 admit-us=0 take-us=0 rest-us=0",
             ]
         );
@@ -2347,14 +2352,14 @@ mod tests {
         tally.t_lock_released(4, DrainSource::Gate, us(2));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[4..7],
+            lines[5..8],
             [
                 "t-lock cpu=0 source=syscall count=3 waited=2 wait-us=10 wait-longest-us=7 held-us=19 held-longest-us=10",
                 "t-lock cpu=0 source=idle count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "t-lock cpu=1 source=fault count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
             ]
         );
-        assert!(lines[7].starts_with("commit-steps "));
+        assert!(lines[8].starts_with("commit-steps "));
     }
 
     #[test]
@@ -2377,7 +2382,8 @@ mod tests {
                 "faults served=1 total-us=1000 longest-us=1000 sync-us=100 lookup-us=100 admit-us=100 commit-us=200 tables-us=300 return-us=200",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
-                "fault-windows opened=0 closed=0 declined-identity=0 declined-mapping=0 declined-tables=0 declined-credit=0 declined-memory=0 declined-leaf=0 declined-return=0",
+                "fault-windows opened=0 closed=0",
+                "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
                 // 2,999 ticks is under one microsecond: whole µs, rounded down.
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
                 "commit-steps count=1 admit-us=1 take-us=1 rest-us=2",
@@ -2390,7 +2396,8 @@ mod tests {
                 "faults served=1 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
-                "fault-windows opened=0 closed=0 declined-identity=0 declined-mapping=0 declined-tables=0 declined-credit=0 declined-memory=0 declined-leaf=0 declined-return=0",
+                "fault-windows opened=0 closed=0",
+                "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=0 held-longest-us=0",
                 "commit-steps count=1 admit-us=0 take-us=0 rest-us=0",
             ]
@@ -2419,7 +2426,7 @@ mod tests {
         tally.commit_step(0, us(10), us(30), us(530), us(540));
         tally.commit_step(us(1_000), us(1_001), us(1_002), us(1_102), us(1_105));
         assert_eq!(
-            measure_lines(&tally)[4],
+            measure_lines(&tally)[5],
             "commit-steps count=2 admit-us=21 take-us=600 rest-us=24"
         );
     }
@@ -2453,7 +2460,7 @@ mod tests {
             slot.store(big, Ordering::Relaxed);
         }
         let lines = measure_lines(&tally);
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 7);
         for line in &lines {
             assert!(line.len() < 190, "{} bytes: {line}", line.len());
         }
@@ -2491,22 +2498,23 @@ mod tests {
         tally.t_lock_released(1, DrainSource::Gate, 3_000);
         let (out, before_closing) = report(&tally);
         // Every line before the closing lines is written by then.
-        assert_eq!(before_closing, 9 + 6 + 6 + 1);
-        assert_eq!(out.len(), 9 + 6 + 6 + 1 + 2);
+        assert_eq!(before_closing, 9 + 6 + 7 + 1);
+        assert_eq!(out.len(), 9 + 6 + 7 + 1 + 2);
         assert_eq!(out[8], "backing-alloc-longest-us=0 runs=0 pages=0");
         assert_eq!(out[14], "owed-wakes=0 unsent=0 queue=0 retirement=0");
         assert!(out[15].starts_with("faults served="));
         assert!(out[16].starts_with("faults-fast served="));
         assert!(out[17].starts_with("fault-passes "));
         assert!(out[18].starts_with("fault-windows "));
+        assert!(out[19].starts_with("fault-declines "));
         assert_eq!(
-            out[19],
+            out[20],
             "t-lock cpu=1 source=gate count=1 waited=1 wait-us=1 wait-longest-us=1 held-us=2 held-longest-us=2"
         );
-        assert!(out[20].starts_with("commit-steps "));
-        assert_eq!(out[21], "admission-waits create=0 commit=0 fault=0");
+        assert!(out[21].starts_with("commit-steps "));
+        assert_eq!(out[22], "admission-waits create=0 commit=0 fault=0");
         assert_eq!(
-            out[22..],
+            out[23..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
         assert!(!out.iter().any(|line| line.starts_with("usage-check")));
@@ -2526,11 +2534,11 @@ mod tests {
         }
         tally.usage_checked(1, 0);
         let (out, _) = report(&tally);
-        assert!(out[19].starts_with("commit-steps "));
-        assert_eq!(out[20], "admission-waits create=1 commit=3 fault=2");
-        assert_eq!(out[21], "usage-check groups=1 mismatches=0");
+        assert!(out[20].starts_with("commit-steps "));
+        assert_eq!(out[21], "admission-waits create=1 commit=3 fault=2");
+        assert_eq!(out[22], "usage-check groups=1 mismatches=0");
         assert_eq!(
-            out[22..],
+            out[23..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
     }
@@ -2543,23 +2551,23 @@ mod tests {
         let tally = StepTally::<2>::new();
         tally.usage_checked(0, 0);
         let (out, before_closing) = report(&tally);
-        assert_eq!(before_closing, 9 + 6 + 5 + 1 + 1);
+        assert_eq!(before_closing, 9 + 6 + 6 + 1 + 1);
         assert_eq!(
-            out[19],
+            out[20],
             "commit-steps count=0 admit-us=0 take-us=0 rest-us=0"
         );
-        assert_eq!(out[20], "admission-waits create=0 commit=0 fault=0");
-        assert_eq!(out[21], "usage-check groups=0 mismatches=0");
+        assert_eq!(out[21], "admission-waits create=0 commit=0 fault=0");
+        assert_eq!(out[22], "usage-check groups=0 mismatches=0");
         assert_eq!(
-            out[22..],
+            out[23..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
 
         tally.usage_checked(12, 3);
-        assert_eq!(report(&tally).0[21], "usage-check groups=12 mismatches=3");
+        assert_eq!(report(&tally).0[22], "usage-check groups=12 mismatches=3");
         tally.usage_checked(usize::MAX, usize::MAX);
         assert_eq!(
-            report(&tally).0[21],
+            report(&tally).0[22],
             "usage-check groups=2147483647 mismatches=2147483647"
         );
     }
@@ -2670,9 +2678,11 @@ mod tests {
                 tally.window_declined(decline);
             }
         }
+        let lines = measure_lines(&tally);
+        assert_eq!(lines[3], "fault-windows opened=3 closed=3");
         assert_eq!(
-            measure_lines(&tally)[3],
-            "fault-windows opened=3 closed=3 declined-identity=7 declined-mapping=1 declined-tables=2 declined-credit=3 declined-memory=4 declined-leaf=5 declined-return=6"
+            lines[4],
+            "fault-declines identity=7 mapping=1 tables=2 credit=3 memory=4 leaf=5 return=6"
         );
     }
 
@@ -2694,7 +2704,7 @@ mod tests {
         tally.t_lock_released(0, DrainSource::Fault, us(1));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[4..8],
+            lines[5..9],
             [
                 "t-lock cpu=0 source=fault count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "p-lock cpu=0 source=runtime count=1 waited=0 wait-us=0 held-us=5",
@@ -2702,6 +2712,37 @@ mod tests {
                 "p-lock cpu=1 source=usercopy count=1 waited=1 wait-us=0 held-us=4",
             ]
         );
-        assert!(lines[8].starts_with("commit-steps "));
+        assert!(lines[9].starts_with("commit-steps "));
+    }
+
+    /// The two fault-window lines, every counter at 17 digits, as the
+    /// report writes them, fit a diagnostic record's 192 bytes; that bound
+    /// is enough because a count cannot reach 10^17 in a boot (at one a
+    /// nanosecond that is about three years), and if a field is ever added
+    /// it is the format that must change, not this test.
+    #[test]
+    fn the_fault_window_lines_fit_a_record_up_to_seventeen_digit_counts() {
+        const LARGEST: u64 = 99_999_999_999_999_999;
+        let tally = StepTally::<2>::new();
+        for slot in [&tally.windows_opened, &tally.windows_closed]
+            .into_iter()
+            .chain(&tally.window_declines)
+        {
+            slot.store(LARGEST, Ordering::Relaxed);
+        }
+        let lines = measure_lines(&tally);
+        let windows = lines
+            .iter()
+            .find(|line| line.starts_with("fault-windows "))
+            .unwrap();
+        let declines = lines
+            .iter()
+            .find(|line| line.starts_with("fault-declines "))
+            .unwrap();
+        assert!(windows.ends_with(&std::format!("closed={LARGEST}")));
+        assert!(declines.ends_with(&std::format!("return={LARGEST}")));
+        for line in [windows, declines] {
+            assert!(line.len() <= 192, "{} bytes: {line}", line.len());
+        }
     }
 }
