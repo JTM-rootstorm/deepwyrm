@@ -112,8 +112,13 @@ pub(crate) enum FaultPass {
 
 const FAULT_PASSES: usize = 6;
 
-/// The parts of a served fault's time, in the line's order: sync, lookup,
-/// admit, commit, tables, return.
+/// The parts of a served fault's time, in the `faults` line's order: sync
+/// (the gate's entry to the inner serve's start: the stop poll, taking T
+/// and the safe point's checks), lookup, admit, commit, tables (to
+/// [`FaultStamp::ServeEnded`]), and return, from the end of tables to the
+/// gate's `fault_returned`: the drain rule, the frame's authorisation, the
+/// reschedule read and T's release, all in the serve's one hold since DW2
+/// §13.13 part c.
 const FAULT_PARTS: usize = 6;
 
 /// A T acquisition's figures, per CPU and drain source: count, how many
@@ -399,11 +404,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
         self.fill_in_serves.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `cpu`'s gate authorised its return at `now` (`None` when it read no
-    /// counter: a fault not timed or not served), after a fault whose final
-    /// pass was `served`: a served fault with the gate's entry and every
-    /// stamp of its last pass is one sample. The CPU's record is cleared
-    /// either way.
+    /// `cpu`'s gate had its last pass back, its return authorised in that
+    /// pass's hold, at `now` (`None` when it read no counter: a fault not
+    /// timed or not served), after a fault whose final pass was `served`: a
+    /// served fault with the gate's entry and every stamp of its last pass
+    /// is one sample. The CPU's record is cleared either way.
     pub(crate) fn fault_returned(&self, cpu: usize, served: bool, now: Option<u64>) {
         let (Some(entry), Some(stamps)) = (self.fault_entry.get(cpu), self.fault_stamps.get(cpu))
         else {
@@ -1190,7 +1195,7 @@ mod live {
         TALLY.fill_in_served();
     }
 
-    /// `cpu`'s gate authorised its return (see
+    /// `cpu`'s gate had its last pass back with its return authorised (see
     /// [`StepTally::fault_returned`]): one TSC read for a timed fault that
     /// was served, none otherwise.
     pub(crate) fn fault_returned(cpu: usize, served: bool) {

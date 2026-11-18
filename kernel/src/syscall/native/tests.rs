@@ -761,3 +761,281 @@ fn user_buffers_are_capped_at_what_the_syscall_copies() {
         Some(u64::from(DW_WAIT_MANY_MAX_ITEMS * DW_WAIT_ITEM_V1_SIZE))
     );
 }
+
+// The fault gate's decisions (DW2 §13.13 part c, §13.8's carried item).
+
+const RETURNING_OUTCOMES: [UserPageFaultOutcome; 3] = [
+    UserPageFaultOutcome::Served,
+    UserPageFaultOutcome::AlreadyPresent,
+    UserPageFaultOutcome::Released,
+];
+
+const ENDING_OUTCOMES: [UserPageFaultOutcome; 3] = [
+    UserPageFaultOutcome::Retry,
+    UserPageFaultOutcome::Unserved,
+    UserPageFaultOutcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY),
+];
+
+fn fault_return(
+    authorized: Result<(), crate::arch::x86_64::syscall::UserReturnError>,
+    reschedule: bool,
+) -> FaultReturn {
+    FaultReturn {
+        authorized,
+        reschedule,
+    }
+}
+
+#[test]
+fn fault_gate_action_ends_or_retries_every_outcome_that_does_not_return() {
+    assert_eq!(
+        fault_gate_action(&FaultPass::retry()),
+        FaultGateAction::Retry
+    );
+    let expected = [
+        FaultGateAction::Retry,
+        FaultGateAction::EndException,
+        FaultGateAction::EndResourceFault,
+    ];
+    for (outcome, expected) in ENDING_OUTCOMES.into_iter().zip(expected) {
+        let pass = FaultPass::new(outcome, || {
+            panic!("an outcome that does not return authorised a return")
+        });
+        assert_eq!(pass.outcome(), outcome);
+        assert_eq!(pass.returning(), None, "{outcome:?}");
+        assert_eq!(fault_gate_action(&pass), expected, "{outcome:?}");
+    }
+}
+
+#[test]
+fn fault_gate_action_returns_only_an_authorised_return_and_carries_its_reschedule() {
+    let refused = crate::arch::x86_64::syscall::UserReturnError::InstructionNotExecutable;
+    for outcome in RETURNING_OUTCOMES {
+        for reschedule in [false, true] {
+            let pass = FaultPass::new(outcome, || fault_return(Ok(()), reschedule));
+            assert_eq!(pass.returning(), Some(fault_return(Ok(()), reschedule)));
+            assert_eq!(
+                fault_gate_action(&pass),
+                FaultGateAction::Return { reschedule },
+                "{outcome:?}"
+            );
+        }
+        let pass = FaultPass::new(outcome, || fault_return(Err(refused), false));
+        assert_eq!(
+            fault_gate_action(&pass),
+            FaultGateAction::InvalidReturn(refused),
+            "{outcome:?}"
+        );
+    }
+}
+
+/// A runtime whose serve is scripted: it returns `outcome` and, as the live
+/// runtime does in the serve's hold, authorises the frame and reads the
+/// reschedule request only for an outcome that returns, counting each.
+struct ScriptedFaultRuntime {
+    outcome: UserPageFaultOutcome,
+    executable: bool,
+    reschedule: bool,
+    authorizations: usize,
+    reschedule_reads: usize,
+}
+
+impl ScriptedFaultRuntime {
+    fn new(outcome: UserPageFaultOutcome, executable: bool, reschedule: bool) -> Self {
+        Self {
+            outcome,
+            executable,
+            reschedule,
+            authorizations: 0,
+            reschedule_reads: 0,
+        }
+    }
+}
+
+impl NativeSyscallHandler for ScriptedFaultRuntime {
+    fn handle(&mut self, _request: NativeSyscallRequest) -> NativeSyscallResult {
+        panic!("unexpected synthetic syscall")
+    }
+}
+
+impl crate::arch::x86_64::syscall::UserReturnMappingValidation for ScriptedFaultRuntime {
+    fn executable_at(&mut self, _instruction_pointer: u64) -> bool {
+        self.executable
+    }
+
+    fn writable_byte_below(&mut self, _stack_pointer: u64) -> bool {
+        true
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the host fixture implements the runtime suspension boundary without producing a live plan"
+)]
+impl NativeSyscallFrameRuntime for ScriptedFaultRuntime {
+    type QuantumExpiry = super::NoQuantumExpiry;
+
+    fn has_reschedule_request(&mut self) -> bool {
+        self.reschedule_reads += 1;
+        self.reschedule
+    }
+
+    fn authorize_timer_return(
+        &mut self,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        self.authorizations += 1;
+        frame.validate_and_sanitize(self)
+    }
+
+    fn serve_user_page_fault(
+        &mut self,
+        _cr2: u64,
+        _error: u64,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> FaultPass {
+        let outcome = self.outcome;
+        FaultPass::new(outcome, || {
+            let authorized = self.authorize_timer_return(frame);
+            FaultReturn {
+                authorized,
+                reschedule: authorized.is_ok() && self.has_reschedule_request(),
+            }
+        })
+    }
+
+    fn authorize_return(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+        _current_binding_generation: u64,
+    ) -> Result<(), crate::arch::x86_64::syscall::UserReturnError> {
+        panic!("unexpected synthetic syscall return")
+    }
+
+    fn invalid_return(
+        &mut self,
+        _error: crate::arch::x86_64::syscall::UserReturnError,
+    ) -> crate::syscall::native::ExceptionTermination {
+        panic!("unexpected synthetic invalid return")
+    }
+
+    fn user_exception(
+        &mut self,
+        _record: crate::arch::x86_64::exceptions::UserExceptionRecord,
+    ) -> crate::syscall::native::ExceptionTermination {
+        panic!("unexpected synthetic user exception")
+    }
+
+    fn terminate_current(_this: DivergentCarrier<'_, Self>) -> ! {
+        panic!("unexpected synthetic termination")
+    }
+
+    fn enter_scheduled_fresh_thread(_this: DivergentCarrier<'_, Self>) -> ! {
+        panic!("unexpected synthetic fresh-thread entry")
+    }
+
+    unsafe fn prepare_suspend<'owner>(
+        &'owner mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeSuspendPlan<'owner> {
+        panic!("unexpected synthetic suspension")
+    }
+
+    unsafe fn poll_idle_suspend<'owner>(
+        &'owner mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeIdleSuspendPoll<'owner> {
+        panic!("unexpected synthetic idle suspension")
+    }
+
+    fn resume_suspended(
+        &mut self,
+        _frame: &mut crate::arch::x86_64::syscall::RawSyscallFrame,
+    ) -> NativeResumeOutcome {
+        panic!("unexpected synthetic resume")
+    }
+}
+
+fn fault_frame() -> crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame {
+    crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        rip: 0x4000,
+        cs: crate::arch::x86_64::syscall::USER_CODE_SELECTOR,
+        rflags: 0x202,
+        rsp: 0x8000,
+        ss: crate::arch::x86_64::syscall::USER_DATA_SELECTOR,
+    }
+}
+
+#[test]
+fn a_scripted_serve_authorises_and_reads_reschedule_exactly_for_returning_outcomes() {
+    for outcome in ENDING_OUTCOMES {
+        let mut runtime = ScriptedFaultRuntime::new(outcome, true, true);
+        let mut frame = fault_frame();
+        let pass = runtime.serve_user_page_fault(0x5000, 0b110, &mut frame);
+        assert_eq!(pass.outcome(), outcome);
+        assert_eq!(pass.returning(), None, "{outcome:?}");
+        assert_eq!(
+            (runtime.authorizations, runtime.reschedule_reads),
+            (0, 0),
+            "{outcome:?}"
+        );
+    }
+    for outcome in RETURNING_OUTCOMES {
+        for reschedule in [false, true] {
+            let mut runtime = ScriptedFaultRuntime::new(outcome, true, reschedule);
+            let mut frame = fault_frame();
+            let pass = runtime.serve_user_page_fault(0x5000, 0b110, &mut frame);
+            assert_eq!(pass.outcome(), outcome);
+            assert_eq!(pass.returning(), Some(fault_return(Ok(()), reschedule)));
+            assert_eq!((runtime.authorizations, runtime.reschedule_reads), (1, 1));
+            assert_eq!(
+                fault_gate_action(&pass),
+                FaultGateAction::Return { reschedule }
+            );
+        }
+        // A refused return reads no reschedule request and ends the
+        // process through the invalid-return path.
+        let mut runtime = ScriptedFaultRuntime::new(outcome, false, true);
+        let mut frame = fault_frame();
+        let pass = runtime.serve_user_page_fault(0x5000, 0b110, &mut frame);
+        let refused = crate::arch::x86_64::syscall::UserReturnError::InstructionNotExecutable;
+        assert_eq!(pass.returning(), Some(fault_return(Err(refused), false)));
+        assert_eq!((runtime.authorizations, runtime.reschedule_reads), (1, 0));
+        assert_eq!(
+            fault_gate_action(&pass),
+            FaultGateAction::InvalidReturn(refused)
+        );
+    }
+}
+
+#[test]
+fn the_default_serve_serves_nothing_and_authorises_no_return() {
+    // `FrameRuntime` keeps the trait's default serve and its panicking
+    // default `authorize_timer_return`, so an authorisation would panic.
+    let mut runtime = FrameRuntime {
+        handled: 0,
+        executable: true,
+        writable_stack: true,
+        invalid_return: None,
+    };
+    let mut frame = fault_frame();
+    let pass = runtime.serve_user_page_fault(0x5000, 0b110, &mut frame);
+    assert_eq!(pass.outcome(), UserPageFaultOutcome::Unserved);
+    assert_eq!(pass.returning(), None);
+    assert_eq!(fault_gate_action(&pass), FaultGateAction::EndException);
+}
