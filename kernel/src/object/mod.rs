@@ -897,13 +897,6 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     /// The kernel's check of kept usage (DW2 §13.12 part a): every live
     /// TaskGroup's four figures against a scan. Returns the groups compared
     /// and the figures that differ; the step report's last hold prints it.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the step report's last hold, in the primordial facade, is its caller (DW2 §13.12 part a); that call is made in another lane"
-        )
-    )]
     pub(crate) fn usage_mismatches(&self) -> (usize, usize) {
         let mut mismatches = 0usize;
         let groups = self.compare_usage(false, |_, _, _, _, _| {

@@ -269,18 +269,16 @@ pub(crate) struct StepTally<const CPUS: usize> {
     t_lock_wait: [AtomicU64; CPUS],
     /// Per CPU and drain source, [`T_LOCK_FIGURES`], times in ticks.
     t_lock: [[[AtomicU64; T_LOCK_FIGURES]; SOURCES]; CPUS],
-    /// Registry scans made for an admission, and the capacity of the
-    /// registry scanned. Since DW2 §13.12 part a admission reads kept usage
-    /// and makes none, so nothing records them and the line prints zero.
-    page_scans: AtomicU64,
-    object_scans: AtomicU64,
-    scan_slots: AtomicU64,
     /// Commit steps timed, and the sums of their admission, frame take and
     /// zeroing, and the rest, in ticks.
     commit_steps: AtomicU64,
     commit_admit: AtomicU64,
     commit_take: AtomicU64,
     commit_rest: AtomicU64,
+    /// The power-off hold's check of kept usage against the scan (DW2
+    /// §13.12 part a): see [`StepTally::usage_checked`]. Zero until it is
+    /// recorded.
+    usage_check: AtomicU64,
 }
 
 /// The fields of [`StepTally::backing_allocated`]'s packed record. 24 bits
@@ -295,6 +293,11 @@ const ALLOC_PAGES_BITS: u32 = 20;
 const ALLOC_RUNS_SHIFT: u32 = ALLOC_PAGES_BITS;
 const ALLOC_US_SHIFT: u32 = ALLOC_RUNS_BITS + ALLOC_PAGES_BITS;
 const _: () = assert!(ALLOC_US_BITS + ALLOC_RUNS_BITS + ALLOC_PAGES_BITS == u64::BITS);
+
+/// [`StepTally::usage_checked`]'s packed record: a flag bit, then two
+/// 31-bit counts.
+const USAGE_RECORDED: u64 = 1 << 63;
+const USAGE_FIELD: u64 = field_max(31);
 
 /// The largest value a field of `bits` bits holds.
 const fn field_max(bits: u32) -> u64 {
@@ -338,13 +341,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
             t_lock_wait: [const { AtomicU64::new(0) }; CPUS],
             t_lock: [const { [const { [const { AtomicU64::new(0) }; T_LOCK_FIGURES] }; SOURCES] };
                 CPUS],
-            page_scans: AtomicU64::new(0),
-            object_scans: AtomicU64::new(0),
-            scan_slots: AtomicU64::new(0),
             commit_steps: AtomicU64::new(0),
             commit_admit: AtomicU64::new(0),
             commit_take: AtomicU64::new(0),
             commit_rest: AtomicU64::new(0),
+            usage_check: AtomicU64::new(0),
         }
     }
 
@@ -522,14 +523,12 @@ impl<const CPUS: usize> StepTally<CPUS> {
 
     /// Writes the first-touch measurement's lines (DW2 §13.5): served
     /// faults, the gate's passes, T per CPU and source (a line only for a
-    /// nonzero count), admission's scans with `reservations`, the
-    /// reservation capacity, and commit steps. Times are converted from
+    /// nonzero count), and commit steps. Times are converted from
     /// ticks with `tsc_hz`, the boot's measured TSC rate; with none (0) they
     /// print as zero and the counts still print.
     pub(crate) fn write_measure_lines(
         &self,
         tsc_hz: u64,
-        reservations: usize,
         mut line: impl FnMut(core::fmt::Arguments<'_>),
     ) {
         let us = |value: &AtomicU64| ticks_to_us(value.load(Ordering::Relaxed), tsc_hz);
@@ -562,12 +561,6 @@ impl<const CPUS: usize> StepTally<CPUS> {
             }
         }
         line(format_args!(
-            "admission page-scans={} object-scans={} slots={} reservations={reservations}",
-            self.page_scans.load(Ordering::Relaxed),
-            self.object_scans.load(Ordering::Relaxed),
-            self.scan_slots.load(Ordering::Relaxed),
-        ));
-        line(format_args!(
             "commit-steps count={} admit-us={} take-us={} rest-us={}",
             self.commit_steps.load(Ordering::Relaxed),
             us(&self.commit_admit),
@@ -576,21 +569,49 @@ impl<const CPUS: usize> StepTally<CPUS> {
         ));
     }
 
+    /// The power-off hold compared `groups` live TaskGroups' kept usage
+    /// with the scan and found `mismatches` figures that differ (DW2
+    /// §13.12 part a). Each count is clamped to 31 bits; the top bit marks
+    /// the record as made, so a report that reached no power-off hold has
+    /// no `usage-check` line rather than one of zeros.
+    pub(crate) fn usage_checked(&self, groups: usize, mismatches: usize) {
+        let clamp =
+            |value: usize| u64::try_from(value).map_or(USAGE_FIELD, |value| value.min(USAGE_FIELD));
+        self.usage_check.store(
+            USAGE_RECORDED | (clamp(groups) << 31) | clamp(mismatches),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The `usage-check` line, only once [`Self::usage_checked`] recorded.
+    fn write_usage_line(&self, mut line: impl FnMut(core::fmt::Arguments<'_>)) {
+        let packed = self.usage_check.load(Ordering::Relaxed);
+        if packed & USAGE_RECORDED == 0 {
+            return;
+        }
+        line(format_args!(
+            "usage-check groups={} mismatches={}",
+            (packed >> 31) & USAGE_FIELD,
+            packed & USAGE_FIELD
+        ));
+    }
+
     /// Writes the whole report's line bodies in order: the step lines, the
-    /// finalization lines, the measurement's lines, then the closing lines,
-    /// whose values `closing` reads only once every line before them is
-    /// written (see [`write_closing_lines`]).
+    /// finalization lines, the measurement's lines, the usage check if it
+    /// was recorded, then the closing lines, whose values `closing` reads
+    /// only once every line before them is written (see
+    /// [`write_closing_lines`]).
     pub(crate) fn write_report(
         &self,
         now: Option<u64>,
         tsc_hz: u64,
-        reservations: usize,
         closing: impl FnOnce() -> ((u64, u64), u64),
         mut line: impl FnMut(core::fmt::Arguments<'_>),
     ) {
         self.write_lines(&mut line);
         self.write_finalize_lines(now, &mut line);
-        self.write_measure_lines(tsc_hz, reservations, &mut line);
+        self.write_measure_lines(tsc_hz, &mut line);
+        self.write_usage_line(&mut line);
         let (timer_arm, records_dropped) = closing();
         write_closing_lines(timer_arm, records_dropped, line);
     }
@@ -1129,7 +1150,6 @@ mod live {
         TALLY.write_report(
             now(),
             crate::time::measured_tsc_hz(),
-            crate::object::RESERVATION_THREADS,
             || {
                 (
                     crate::time::timer_arm_counts(),
@@ -1203,6 +1223,12 @@ mod live {
         TALLY.t_lock_released(cpu, drain_source(cpu), released);
     }
 
+    /// The power-off hold's usage check (see
+    /// [`StepTally::usage_checked`]).
+    pub(crate) fn usage_checked(groups: usize, mismatches: usize) {
+        TALLY.usage_checked(groups, mismatches);
+    }
+
     /// A commit step's five [`ticks`] stamps (see
     /// [`StepTally::commit_step`]).
     pub(crate) fn commit_step(
@@ -1251,7 +1277,7 @@ pub(crate) use live::{
     fault_stamped, fault_untimed, fill_in_served, finalize_hold_ended, finalize_queued,
     finalize_stepped, finalize_waited, now, owed, owed_wake, parked_call_ended, report,
     set_drain_source, step_began, t_lock_released, t_lock_served, take_teardown_step, ticks, timed,
-    timed_nested,
+    timed_nested, usage_checked,
 };
 
 #[cfg(test)]
@@ -1828,7 +1854,7 @@ mod tests {
 
     fn measure_lines_at(tally: &StepTally<2>, tsc_hz: u64) -> Vec<String> {
         let mut out = Vec::new();
-        tally.write_measure_lines(tsc_hz, 64, |arguments| {
+        tally.write_measure_lines(tsc_hz, |arguments| {
             out.push(std::fmt::format(arguments));
         });
         out
@@ -1876,7 +1902,6 @@ mod tests {
             [
                 "faults served=0 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0",
-                "admission page-scans=0 object-scans=0 slots=0 reservations=64",
                 "commit-steps count=0 admit-us=0 take-us=0 rest-us=0",
             ]
         );
@@ -2048,7 +2073,7 @@ mod tests {
                 "t-lock cpu=1 source=fault count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
             ]
         );
-        assert!(lines[5].starts_with("admission "));
+        assert!(lines[5].starts_with("commit-steps "));
     }
 
     #[test]
@@ -2072,7 +2097,6 @@ mod tests {
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0",
                 // 2,999 ticks is under one microsecond: whole µs, rounded down.
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
-                "admission page-scans=0 object-scans=0 slots=0 reservations=64",
                 "commit-steps count=1 admit-us=1 take-us=1 rest-us=2",
             ]
         );
@@ -2083,7 +2107,6 @@ mod tests {
                 "faults served=1 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0",
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=0 held-longest-us=0",
-                "admission page-scans=0 object-scans=0 slots=0 reservations=64",
                 "commit-steps count=1 admit-us=0 take-us=0 rest-us=0",
             ]
         );
@@ -2111,7 +2134,7 @@ mod tests {
         tally.commit_step(0, us(10), us(30), us(530), us(540));
         tally.commit_step(us(1_000), us(1_001), us(1_002), us(1_102), us(1_105));
         assert_eq!(
-            measure_lines(&tally)[3],
+            measure_lines(&tally)[2],
             "commit-steps count=2 admit-us=21 take-us=600 rest-us=24"
         );
     }
@@ -2124,8 +2147,6 @@ mod tests {
         for slot in [
             &tally.faults_served,
             &tally.fill_in_serves,
-            &tally.page_scans,
-            &tally.object_scans,
             &tally.commit_steps,
         ]
         .into_iter()
@@ -2140,7 +2161,6 @@ mod tests {
         {
             slot.store(big, Ordering::Relaxed);
         }
-        tally.scan_slots.store(99_999, Ordering::Relaxed);
         let [count, waited, times @ ..] = &tally.t_lock[1][DrainSource::Syscall as usize];
         count.store(many, Ordering::Relaxed);
         waited.store(many, Ordering::Relaxed);
@@ -2148,29 +2168,23 @@ mod tests {
             slot.store(big, Ordering::Relaxed);
         }
         let lines = measure_lines(&tally);
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 4);
         for line in &lines {
             assert!(line.len() < 190, "{} bytes: {line}", line.len());
         }
     }
 
-    /// The whole report, in order: the measurement's lines come after the
-    /// finalization lines and the closing lines are still last, with their
-    /// values read after every line before them.
-    #[test]
-    fn the_report_ends_with_the_closing_lines_after_the_measurement() {
-        let tally = StepTally::<2>::new();
-        tally.t_lock_served(1, Some(0), 1_000);
-        tally.t_lock_released(1, DrainSource::Gate, 3_000);
+    /// The whole report written by `tally`, and how many lines were written
+    /// when the closing lines' values were read.
+    fn report(tally: &StepTally<2>) -> (Vec<String>, usize) {
         let mut out: Vec<String> = Vec::new();
         let written = core::cell::Cell::new(0);
+        let mut before_closing = 0;
         tally.write_report(
             None,
             GHZ,
-            64,
             || {
-                // Every line before the closing lines is written by now.
-                assert_eq!(written.get(), 9 + 6 + 5);
+                before_closing = written.get();
                 ((2, 3), 0)
             },
             |arguments| {
@@ -2178,7 +2192,22 @@ mod tests {
                 out.push(std::fmt::format(arguments));
             },
         );
-        assert_eq!(out.len(), 9 + 6 + 5 + 2);
+        (out, before_closing)
+    }
+
+    /// The whole report, in order: the measurement's lines come after the
+    /// finalization lines and the closing lines are still last, with their
+    /// values read after every line before them. With no usage check
+    /// recorded there is no `usage-check` line at all.
+    #[test]
+    fn the_report_ends_with_the_closing_lines_after_the_measurement() {
+        let tally = StepTally::<2>::new();
+        tally.t_lock_served(1, Some(0), 1_000);
+        tally.t_lock_released(1, DrainSource::Gate, 3_000);
+        let (out, before_closing) = report(&tally);
+        // Every line before the closing lines is written by then.
+        assert_eq!(before_closing, 9 + 6 + 4);
+        assert_eq!(out.len(), 9 + 6 + 4 + 2);
         assert_eq!(out[8], "backing-alloc-longest-us=0 runs=0 pages=0");
         assert_eq!(out[14], "owed-wakes=0 unsent=0 queue=0 retirement=0");
         assert!(out[15].starts_with("faults served="));
@@ -2187,11 +2216,40 @@ mod tests {
             out[17],
             "t-lock cpu=1 source=gate count=1 waited=1 wait-us=1 wait-longest-us=1 held-us=2 held-longest-us=2"
         );
-        assert!(out[18].starts_with("admission "));
-        assert!(out[19].starts_with("commit-steps "));
+        assert!(out[18].starts_with("commit-steps "));
         assert_eq!(
-            out[20..],
+            out[19..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
+        );
+        assert!(!out.iter().any(|line| line.starts_with("usage-check")));
+        assert!(!out.iter().any(|line| line.starts_with("admission")));
+    }
+
+    /// DW2 §13.12 part a: the power-off hold's usage check is printed after
+    /// the measurement and before the closing lines, last record kept, its
+    /// counts clamped to their fields; zeros recorded still print.
+    #[test]
+    fn a_recorded_usage_check_is_written_before_the_closing_lines() {
+        let tally = StepTally::<2>::new();
+        tally.usage_checked(0, 0);
+        let (out, before_closing) = report(&tally);
+        assert_eq!(before_closing, 9 + 6 + 3 + 1);
+        assert_eq!(
+            out[17],
+            "commit-steps count=0 admit-us=0 take-us=0 rest-us=0"
+        );
+        assert_eq!(out[18], "usage-check groups=0 mismatches=0");
+        assert_eq!(
+            out[19..],
+            ["timer-arm retries=2 deferred=3", "records-dropped=0"]
+        );
+
+        tally.usage_checked(12, 3);
+        assert_eq!(report(&tally).0[18], "usage-check groups=12 mismatches=3");
+        tally.usage_checked(usize::MAX, usize::MAX);
+        assert_eq!(
+            report(&tally).0[18],
+            "usage-check groups=2147483647 mismatches=2147483647"
         );
     }
 
