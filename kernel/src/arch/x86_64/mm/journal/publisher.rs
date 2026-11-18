@@ -91,6 +91,47 @@ impl Leaf {
     }
 }
 
+/// What [`X86AddressSpacePublisher::find_touched_leaf`] found (DW2 §13.16
+/// part e1).
+#[cfg_attr(
+    not(all(target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "the live fault gate is its only reader outside tests"
+    )
+)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "made once a fault and consumed in the same hold, on the stack: the mapping it carries is what the write checks"
+)]
+pub(crate) enum TouchedLeaf<'a> {
+    /// All three tables above the leaf exist: where the leaf is, for
+    /// [`X86AddressSpacePublisher::write_touched_leaf`].
+    Found(TouchedLeafPlace<'a>),
+    /// This many page tables are missing, counted as `touch_table_cost`
+    /// counts them: the journal publishes this leaf.
+    MissingTables(usize),
+}
+
+/// Where a touched leaf is, found by one walk and not yet written (DW2
+/// §13.16 part e1). It is consumed by the one write it allows, and its
+/// lifetime is the publisher's borrow of its root, target and role manager:
+/// it cannot be written by a publisher made from a later borrow, and the
+/// root's tables cannot be changed by anything else while it exists.
+#[must_use = "a found leaf is written or dropped in the hold that found it"]
+pub(crate) struct TouchedLeafPlace<'a> {
+    mapping: Mapping,
+    page: VirtualPage,
+    /// The root, PDPT, PD and PT, as the walk decoded them.
+    path: [FrameAddress; 4],
+    /// A table appeared twice on the path.
+    revisits: bool,
+    /// The first table on the path that is not this root's own, at its level
+    /// and under its parent: the error the role manager gave.
+    unauthenticated: Option<FrameRoleError>,
+    _publisher: core::marker::PhantomData<fn(&'a ()) -> &'a ()>,
+}
+
 /// Sealed `AddressRegion` bridge for one typed x86 page-table root and region.
 pub(crate) struct X86AddressSpacePublisher<
     'a,
@@ -217,13 +258,10 @@ where
     /// after another CPU's touch.
     /// How many page tables publishing a leaf at `address` would build
     /// (DW2 M6 §8.4), so a caller can admit them before taking candidates.
-    #[cfg_attr(
-        not(all(target_os = "none", target_arch = "x86_64")),
-        allow(
-            dead_code,
-            reason = "the live fault gate is its only caller outside tests"
-        )
-    )]
+    /// The fault gate now has this count from `find_touched_leaf`'s one
+    /// walk (DW2 §13.16 part e1); the tests keep this as the journal path
+    /// that walk is compared with.
+    #[cfg(test)]
     pub(crate) fn touch_table_cost(
         &mut self,
         address: u64,
@@ -344,6 +382,251 @@ where
         journal
             .publish()
             .map_err(X86AddressSpacePublishError::Journal)?;
+        Ok(true)
+    }
+
+    /// One walk from the root to the leaf a touch at `address` of `mapping`
+    /// needs, writing nothing (DW2 §13.16 part e1). It reads and decodes
+    /// the three table entries as `touch_table_cost` does and fails as it
+    /// does, so `MissingTables(n)` is its count. When every table exists it
+    /// also authenticates each as the journal does (this root's own, at its
+    /// level, under its parent) and returns the leaf's place; what that
+    /// authentication and the walk found wrong is reported by
+    /// [`Self::write_touched_leaf`] where `publish_touched_leaf` reports
+    /// it, after the commit, so a serve's outcomes are the journal path's.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "the live fault gate is its only caller outside tests"
+        )
+    )]
+    pub(crate) fn find_touched_leaf(
+        &mut self,
+        mapping: &Mapping,
+        address: u64,
+    ) -> Result<TouchedLeaf<'a>, X86AddressSpacePublishError<T::Error>> {
+        let page =
+            VirtualPage::new(address).map_err(|_| X86AddressSpacePublishError::InvalidMapping)?;
+        // As `touch_table_cost`'s journal checks its root.
+        self.roles
+            .validate_table_identity(self.root_identity)
+            .map_err(X86AddressSpacePublishError::FrameRole)?;
+        // As `missing_tables`.
+        if page.address() == 0 {
+            return Err(X86AddressSpacePublishError::Map(MapError::PageZero));
+        }
+        let user = page.is_user_half();
+        let limit = self.root.physical_limit();
+        let mut path = [self.root.frame(); 4];
+        let mut parent = self.root_identity;
+        let mut revisits = false;
+        let mut unauthenticated = None;
+        for (depth, level) in (1..=3).rev().enumerate() {
+            let entry = self
+                .target
+                .read_entry(path[depth], page.index(level))
+                .map_err(|error| {
+                    X86AddressSpacePublishError::Map(MapError::Access(
+                        OwnedPageTableJournalError::Target(error),
+                    ))
+                })?;
+            if entry == 0 {
+                return Ok(TouchedLeaf::MissingTables(3 - depth));
+            }
+            // Strict: an ancestor of a user leaf without the user bit, or
+            // one with it above a supervisor leaf, fails here as it does in
+            // `missing_tables`.
+            let child = super::super::decode_intermediate(entry, user, limit)
+                .map_err(|_| X86AddressSpacePublishError::Map(MapError::InvalidPath))?;
+            revisits |= path[..=depth].contains(&child);
+            path[depth + 1] = child;
+            if unauthenticated.is_none() {
+                // As `validate_present_path` and `validate_plan`: the table
+                // is this root owner's, at the child level, and its parent
+                // is the table above it.
+                match self
+                    .roles
+                    .table_identity(
+                        self.root_identity.owner(),
+                        level_for_index(level - 1),
+                        child.address(),
+                    )
+                    .and_then(|table| {
+                        self.roles
+                            .validate_table_child(parent, table)
+                            .map(|()| table)
+                    }) {
+                    Ok(table) => parent = table,
+                    Err(error) => unauthenticated = Some(error),
+                }
+            }
+        }
+        Ok(TouchedLeaf::Found(TouchedLeafPlace {
+            mapping: *mapping,
+            page,
+            path,
+            revisits,
+            unauthenticated,
+            _publisher: core::marker::PhantomData,
+        }))
+    }
+
+    /// Commits object page `page` of the on-demand `backing` (DW2 M6 §8.4)
+    /// through this publisher's role manager, so a serve that found its
+    /// leaf's place commits the frame and writes the leaf under one borrow
+    /// (DW2 §13.16 part e1).
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "the live fault gate is its only caller outside tests"
+        )
+    )]
+    pub(crate) fn commit_on_demand_page(
+        &mut self,
+        backing: BackingIdentity,
+        page: u64,
+    ) -> Result<crate::memory::frame_roles::OnDemandCommit, FrameRoleError> {
+        self.roles.commit_on_demand_page(backing, page)
+    }
+
+    /// Writes the leaf `place` was found for, as `publish_touched_leaf`
+    /// would with every table present, and with one store (DW2 §13.16 part
+    /// e1). It makes `publish_touched_leaf`'s checks in its order and
+    /// returns its results: the mapping and the page's committed frame;
+    /// then the leaf, read once, `Ok(false)` when it is exactly this page's
+    /// leaf apart from the accessed and dirty bits and `FrameMismatch` when
+    /// it is another; then, for an empty leaf, `map_page`'s checks and the
+    /// journal's authentication of the path; and then writes the entry
+    /// `map_page` would, through `apply`, with no invalidation (empty to
+    /// present needs none), inside a mutation span over exactly this page,
+    /// which the target reserves against user pins, another mutation and a
+    /// teardown reservation as the journal's `apply` reserves the page it
+    /// invalidates; a refusal is returned as the journal returns it, and
+    /// the span is ended on every path after it was begun. An
+    /// already-present leaf reserves nothing, as in the journal path. One
+    /// new leaf under existing tables changes no frame role.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(
+            dead_code,
+            reason = "the live fault gate is its only caller outside tests"
+        )
+    )]
+    pub(crate) fn write_touched_leaf(
+        &mut self,
+        place: TouchedLeafPlace<'a>,
+    ) -> Result<bool, X86AddressSpacePublishError<T::Error>> {
+        let TouchedLeafPlace {
+            mapping,
+            page,
+            path,
+            revisits,
+            unauthenticated,
+            _publisher,
+        } = place;
+        // A place found under another root is no place of this one.
+        if path[0] != self.root.frame() {
+            return Err(X86AddressSpacePublishError::Identity);
+        }
+        let address = page.address();
+        validate_mapping_batch(
+            self.roles,
+            self.address_space,
+            self.region,
+            core::slice::from_ref(&mapping),
+        )?;
+        if address < mapping.virtual_start()
+            || address - mapping.virtual_start() >= mapping.byte_len()
+        {
+            return Err(X86AddressSpacePublishError::InvalidMapping);
+        }
+        // As the journal checks its root when it is made, before staging
+        // and before publishing; nothing in this hold changes it between.
+        self.roles
+            .validate_table_identity(self.root_identity)
+            .map_err(X86AddressSpacePublishError::FrameRole)?;
+        // The frame is the backing's page at this offset, resolved with
+        // the writability the leaf will carry: `authorize_leaf` and the
+        // journal's plan check resolve the same page again and compare.
+        let descriptor = page_descriptor(self.roles, &mapping, address, &mut None)?;
+        if !descriptor.on_demand {
+            return Err(X86AddressSpacePublishError::InvalidMapping);
+        }
+        let physical_start =
+            descriptor
+                .physical_start
+                .ok_or(X86AddressSpacePublishError::FrameRole(
+                    FrameRoleError::Absent,
+                ))?;
+        let limit = self.root.physical_limit();
+        let frame = super::super::FrameAddress::new(physical_start, limit)
+            .map_err(|_| X86AddressSpacePublishError::Map(MapError::FrameMismatch))?;
+        // As `present_leaf_matches`, on the walk `find_touched_leaf` made.
+        if revisits {
+            return Err(X86AddressSpacePublishError::Map(MapError::InvalidPath));
+        }
+        let index = page.index(0);
+        let leaf = self.target.read_entry(path[3], index).map_err(|error| {
+            X86AddressSpacePublishError::Map(MapError::Access(OwnedPageTableJournalError::Target(
+                error,
+            )))
+        })?;
+        let entry = super::super::leaf_entry(frame, descriptor.permissions);
+        if leaf != 0 {
+            super::super::decode_leaf::<OwnedPageTableJournalError<T::Error>>(
+                leaf,
+                page.is_user_half(),
+                limit,
+            )
+            .map_err(X86AddressSpacePublishError::Map)?;
+            if leaf & !(super::super::ACCESSED | super::super::DIRTY) != entry {
+                return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch));
+            }
+            // As `validate_present_path`: only through this root's own
+            // tables (§5.3a).
+            if let Some(error) = unauthenticated {
+                return Err(X86AddressSpacePublishError::Journal(
+                    OwnedPageTableJournalError::FrameRole(error),
+                ));
+            }
+            return Ok(false);
+        }
+        // As `map_page`: the policy, and a frame that is no table of the
+        // path. (`decode_intermediate` above already required each table
+        // entry present, not huge and with the user bit a user leaf needs.)
+        super::super::validate_mapping(page, descriptor.permissions)
+            .map_err(|error| X86AddressSpacePublishError::Map(super::super::policy_error(error)))?;
+        if path.contains(&frame) {
+            return Err(X86AddressSpacePublishError::Map(MapError::InvalidPath));
+        }
+        // As the journal's plan check, which refuses a plan through a table
+        // that is not this root's own.
+        if unauthenticated.is_some() {
+            return Err(X86AddressSpacePublishError::Map(
+                MapError::TableClaimRejected,
+            ));
+        }
+        // The journal's `apply` reserves the page it invalidates against
+        // user pins, another mutation and a teardown reservation before it
+        // stores; this store reserves exactly that page, in its place, and
+        // a refusal is the journal's error for it. This span is the store's
+        // own: it is begun and ended here, apart from the batch path's
+        // `span_held`, and is ended only if it was begun.
+        let published = self
+            .target
+            .begin_mutation_span(address, BASE_PAGE_SIZE)
+            .and_then(|()| {
+                let stored = self
+                    .target
+                    .apply(&[JournalWrite::new(path[3], index, entry)], &[]);
+                self.target.end_mutation_span();
+                stored
+            });
+        published.map_err(|error| {
+            X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
+        })?;
         Ok(true)
     }
 

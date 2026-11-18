@@ -10745,36 +10745,76 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let Ok(cost) = session.on_demand_commit_cost(backing, page) else {
             return Outcome::Unserved;
         };
-        let tables = {
-            let mut empty: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
-                [const { None }; 3];
+        let mut empty: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
+            [const { None }; 3];
+        let tables = 'found: {
             let Ok(mut publisher) =
                 session.publisher::<3>(mapping.address_space(), mapping.region(), &mut empty)
             else {
                 return Outcome::Unserved;
             };
-            match publisher.touch_table_cost(address) {
-                Ok(tables) => tables as u64,
+            let place = match publisher.find_touched_leaf(&mapping, address) {
+                Ok(crate::arch::x86_64::mm::TouchedLeaf::Found(place)) => place,
+                Ok(crate::arch::x86_64::mm::TouchedLeaf::MissingTables(tables)) => {
+                    break 'found tables as u64;
+                }
                 Err(_) => return Outcome::Unserved,
+            };
+            // Every table exists (DW2 §13.16 part e1): the page alone is
+            // admitted, committed through this publisher, and its leaf is
+            // written into the place the walk found, with one store.
+            if let Err(outcome) = admit_fault_charges(
+                cpu,
+                &self.core.registry,
+                &self.core.tasks,
+                ((object, cost), (process.object_id(), 0)),
+                refused,
+            ) {
+                return outcome;
             }
+            if cost != 0 {
+                let committed = publisher.commit_on_demand_page(backing, page);
+                step_report::fault_stamped(cpu, FaultStamp::CommitEnded);
+                match committed {
+                    Ok(commit) => crate::syscall::record_charged_pages(
+                        &mut self.core.registry,
+                        object,
+                        commit.frames,
+                    ),
+                    Err(
+                        FrameRoleError::Physical(_)
+                        | FrameRoleError::Capacity
+                        | FrameRoleError::InitializationFailed,
+                    ) => return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY),
+                    Err(_) => return Outcome::Unserved,
+                }
+            } else {
+                step_report::fault_stamped(cpu, FaultStamp::CommitEnded);
+            }
+            // As below: a present leaf that is not exactly this page's is
+            // not a race this serves, and only a page committed in this hold
+            // could not have had one.
+            return match publisher.write_touched_leaf(place) {
+                Ok(published) if published || cost != 0 => {
+                    step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
+                    Outcome::Served
+                }
+                Ok(_) => Outcome::AlreadyPresent,
+                Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Map(
+                    crate::arch::x86_64::mm::MapError::FrameMismatch,
+                )) if cost == 0 => Outcome::Unserved,
+                Err(error) => panic!("an on-demand fault could not publish its leaf: {error:?}"),
+            };
         };
-        // Admit both, together, before taking a frame (§8.4). Only a quota
-        // refusal is exhaustion; the object and Process are live here.
-        step_report::fault_stamped(cpu, FaultStamp::AdmitBegan);
-        let admitted = crate::syscall::admit_charged_pages_together(
+        // Admit both, together, before taking a frame (§8.4).
+        if let Err(outcome) = admit_fault_charges(
+            cpu,
             &self.core.registry,
             &self.core.tasks,
-            (object, cost),
-            (process.object_id(), tables),
-        );
-        step_report::fault_stamped(cpu, FaultStamp::AdmitEnded);
-        match admitted {
-            Ok(()) => {}
-            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
-                *refused = Some(((object, cost), (process.object_id(), tables)));
-                return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
-            }
-            Err(_) => return Outcome::Unserved,
+            ((object, cost), (process.object_id(), tables)),
+            refused,
+        ) {
+            return outcome;
         }
         if cost != 0 {
             let committed = session.commit_on_demand_page(backing, page);
@@ -12439,6 +12479,33 @@ type FaultCharges = (
     (crate::object::ObjectId, u64),
     (crate::object::ObjectId, u64),
 );
+
+/// Admits a fault's two charges together, before a frame is taken (DW2 M6
+/// §8.4), between the step report's admission stamps. Only a quota refusal
+/// is exhaustion; it leaves the charges in `refused` for the caller to ask
+/// whether the refusal is owed (DW2 §13.12 part b). The object and Process
+/// are live here.
+fn admit_fault_charges(
+    cpu: usize,
+    registry: &Registry,
+    tasks: &Tasks,
+    charges: FaultCharges,
+    refused: &mut Option<FaultCharges>,
+) -> Result<(), crate::syscall::native::UserPageFaultOutcome> {
+    use crate::syscall::native::UserPageFaultOutcome as Outcome;
+    step_report::fault_stamped(cpu, step_report::FaultStamp::AdmitBegan);
+    let admitted =
+        crate::syscall::admit_charged_pages_together(registry, tasks, charges.0, charges.1);
+    step_report::fault_stamped(cpu, step_report::FaultStamp::AdmitEnded);
+    match admitted {
+        Ok(()) => Ok(()),
+        Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
+            *refused = Some(charges);
+            Err(Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+        }
+        Err(_) => Err(Outcome::Unserved),
+    }
+}
 
 /// Where a fill-in continues (DW2 M6 §8.6).
 #[derive(Clone, Copy)]
