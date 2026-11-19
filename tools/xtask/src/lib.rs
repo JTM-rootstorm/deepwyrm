@@ -1,18 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod cli;
-mod harness;
 mod kernel_check;
 mod lint_ratchet;
 mod toolchain;
 
 use cli::*;
-use harness::*;
 use lint_ratchet::*;
 use toolchain::*;
 
@@ -28,14 +26,11 @@ const COMMANDS: &[&str] = &[
     "abi",
     "build",
     "image",
-    "run",
     "inspect-image",
-    "gdb",
     "test",
-    "guest-result",
     "toolchain",
 ];
-const TEST_TIERS: &[&str] = &["host", "guest", "integration"];
+const TEST_TIERS: &[&str] = &["host", "integration"];
 const HANDLE_HOST_TEST_FILTERS: &[&str] = &[
     "handle::",
     "service::",
@@ -110,14 +105,9 @@ const IPC_HOST_INTEGRATION_TESTS: &[&str] = &[
     "f11_ipc_ui",
     "f11_ownership_model",
 ];
-const HARNESS_CONFIG: &str = "tooling/guest-harness.toml";
-const TRUSTED_TOOLCHAIN_CONFIG: &str = "tooling/rust-toolchain.toml";
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_CONFIG_BYTES: usize = 64 * 1024;
-const MAX_SERIAL_BYTES: usize = 4 * 1024 * 1024;
 const HELP: &str = r#"Deepwyrm project tasks
 
-Status: host tooling plus DW0-B/C/D6 focused test and dry-run planning surfaces are available.
+Status: host tooling and focused host test surfaces are available.
 Build, image, and integration operations remain planned and are not implemented.
 
 Usage:
@@ -135,12 +125,6 @@ Commands:
   abi check                          Verify generated ABI artifacts have no drift
   test host [abi|memory|handles|tasks|ipc]
                                      Run host tests: unfiltered is the workspace
-  run --plan --request <path>        Emit the canonical QEMU run plan only
-  gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
-  test guest <selector> --plan --request <path>
-                                     Emit a filtered guest-test plan only
-  guest-result <serial-log> --request <path> --exit-status <code>
-                                     Classify one DWTEST1 terminal record and QEMU exit
   toolchain                          Report host tool availability
   build                              Build Deepwyrm [not implemented]
   image                              Construct boot media [not implemented]
@@ -153,11 +137,6 @@ Commands:
 enum Action {
     Help(Option<String>),
     Command(Invocation),
-    GuestResult {
-        serial_log: PathBuf,
-        request_path: PathBuf,
-        exit_status: i32,
-    },
     Toolchain,
     NotImplemented(String),
     UsageError(String),
@@ -173,7 +152,6 @@ enum Invocation {
     AbiGenerate,
     AbiCheck,
     HostTests(Option<HostTestFilter>),
-    HarnessPlan(HarnessKind, PathBuf, Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,144 +161,6 @@ enum HostTestFilter {
     Handles,
     Tasks,
     Ipc,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HarnessKind {
-    Run,
-    GuestTest,
-    Gdb,
-}
-
-impl HarnessKind {
-    const fn request_kind(self) -> &'static str {
-        match self {
-            Self::Run => "run",
-            Self::GuestTest => "guest-test",
-            Self::Gdb => "gdb",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct HarnessProfile {
-    name: String,
-    machine: String,
-    vcpu: u32,
-    memory_mib: u32,
-    timeout_seconds: u32,
-    gdb_port: u16,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct HarnessRequest {
-    kind: String,
-    profile: String,
-    selector: String,
-    test_id: u32,
-    timeout_seconds: u32,
-    serial_log: String,
-    result_json: String,
-    no_host_share: bool,
-    deepwyrm_revision: String,
-    deepwyrm_dirty: bool,
-    wyrmroot_revision: String,
-    wyrmroot_dirty: bool,
-    esp_image: String,
-    esp_sha256: String,
-    system_disk: String,
-    system_disk_sha256: String,
-    ovmf_code: String,
-    ovmf_code_sha256: String,
-    ovmf_vars: String,
-    ovmf_vars_sha256: String,
-    deepwyrm_elf: String,
-    deepwyrm_elf_sha256: String,
-    deepwyrm_symbols: String,
-    deepwyrm_symbols_sha256: String,
-    kernel_layout_sha256: String,
-    rust_toolchain_commit: String,
-    toolchain_config_sha256: String,
-    toolchain_root_manifest_sha256: String,
-    toolchain_cargo: String,
-    toolchain_cargo_sha256: String,
-    toolchain_rustc: String,
-    toolchain_rustc_sha256: String,
-    toolchain_rust_lld: String,
-    toolchain_rust_lld_sha256: String,
-    toolchain_sysroot_manifest: String,
-    toolchain_sysroot_manifest_sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GuestBuildSelection {
-    selector: String,
-    expected_test_id: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TrustedToolchain {
-    request_id: String,
-    rust_commit: String,
-    target: String,
-    config_path: PathBuf,
-    config_sha256: String,
-    artifact_root: PathBuf,
-    toolchain_root: PathBuf,
-    toolchain_tree_sha256: String,
-    root_manifest_path: PathBuf,
-    root_manifest_sha256: String,
-    cargo_path: PathBuf,
-    cargo_sha256: String,
-    rustc_path: PathBuf,
-    rustc_sha256: String,
-    rust_lld_path: PathBuf,
-    rust_lld_sha256: String,
-    rustc_driver_internal_library: TrustedArtifact,
-    llvm_internal_library: TrustedArtifact,
-    sysroot_manifest_path: PathBuf,
-    sysroot_manifest_sha256: String,
-    freestanding_core: Option<TrustedArtifact>,
-    freestanding_compiler_builtins: Option<TrustedArtifact>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TrustedArtifact {
-    path: PathBuf,
-    sha256: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GuestTerminalStatus {
-    Pass,
-    Fail,
-    Panic,
-}
-
-impl GuestTerminalStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Fail => "FAIL",
-            Self::Panic => "PANIC",
-        }
-    }
-
-    const fn debug_exit_status(self) -> i32 {
-        match self {
-            Self::Pass => 33,
-            Self::Fail => 35,
-            Self::Panic => 37,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GuestTerminalRecord {
-    status: GuestTerminalStatus,
-    test_id: u32,
-    detail: u32,
-    line: usize,
 }
 
 pub fn run<I, S>(args: I) -> io::Result<u8>
@@ -353,11 +193,6 @@ fn dispatch(action: Action) -> io::Result<u8> {
             Ok(0)
         }
         Action::Command(invocation) => run_invocation(invocation),
-        Action::GuestResult {
-            serial_log,
-            request_path,
-            exit_status,
-        } => parse_guest_result_file(&serial_log, &request_path, exit_status),
         Action::Toolchain => print_toolchain_diagnostics(),
         Action::NotImplemented(command) => {
             let mut stderr = io::stderr().lock();
@@ -474,9 +309,6 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                     command.args(["--workspace", "--all-targets"]);
                 }
             }
-        }
-        Invocation::HarnessPlan(kind, request_path, expected_selector) => {
-            return emit_harness_plan(kind, &request_path, expected_selector.as_deref());
         }
     };
 

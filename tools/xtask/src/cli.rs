@@ -27,10 +27,7 @@ pub(super) fn parse(args: &[String]) -> Action {
         "doc" if args.len() == 1 => Action::Command(Invocation::Rustdoc),
         "kernel-check" if args.len() == 1 => Action::Command(Invocation::KernelCheck),
         "abi" => parse_abi(&args[1..]),
-        "run" => parse_harness_command(HarnessKind::Run, &args[1..]),
-        "gdb" => parse_harness_command(HarnessKind::Gdb, &args[1..]),
         "test" => parse_test(&args[1..]),
-        "guest-result" => parse_guest_result(&args[1..]),
         "toolchain" if args.len() == 1 => Action::Toolchain,
         "toolchain" => Action::UsageError("`toolchain` accepts no arguments".into()),
         "build" | "image" | "inspect-image" if args.len() == 1 => {
@@ -52,25 +49,13 @@ pub(super) fn parse_abi(args: &[String]) -> Action {
     }
 }
 
-pub(super) fn parse_harness_command(kind: HarnessKind, args: &[String]) -> Action {
-    match args {
-        [plan, request_flag, request_path] if plan == "--plan" && request_flag == "--request" => {
-            Action::Command(Invocation::HarnessPlan(kind, request_path.into(), None))
-        }
-        _ => Action::UsageError(format!(
-            "`{}` requires `--plan --request <path>`; execution is unavailable",
-            kind.request_kind()
-        )),
-    }
-}
-
 pub(super) fn parse_test(args: &[String]) -> Action {
     let Some(tier) = args.first().map(String::as_str) else {
-        return Action::UsageError("`test` requires one of: host, guest, integration".into());
+        return Action::UsageError("`test` requires one of: host, integration".into());
     };
     if !TEST_TIERS.contains(&tier) {
         return Action::UsageError(format!(
-            "unknown test tier `{tier}`; expected host, guest, or integration"
+            "unknown test tier `{tier}`; expected host or integration"
         ));
     }
     match tier {
@@ -95,39 +80,8 @@ pub(super) fn parse_test(args: &[String]) -> Action {
             },
             _ => Action::UsageError("`test host` accepts at most one filter".into()),
         },
-        "guest" => match args {
-            [_, selector, plan, request_flag, request_path] if plan == "--plan" && request_flag == "--request" => {
-                if let Err(error) = validate_selector(selector) { return Action::UsageError(error); }
-                Action::Command(Invocation::HarnessPlan(HarnessKind::GuestTest, request_path.into(), Some(selector.into())))
-            }
-            _ => Action::UsageError("`test guest` requires `<selector> --plan --request <path>`; execution is unavailable".into()),
-        },
         "integration" if args.len() <= 2 => Action::NotImplemented(display_test_command(tier, args.get(1).map(String::as_str))),
         _ => Action::UsageError("`test integration` accepts at most one filter".into()),
-    }
-}
-
-pub(super) fn parse_guest_result(args: &[String]) -> Action {
-    match args {
-        [
-            serial_log,
-            request_flag,
-            request_path,
-            exit_flag,
-            exit_status,
-        ] if request_flag == "--request" && exit_flag == "--exit-status" => match exit_status
-            .parse()
-        {
-            Ok(exit_status) => Action::GuestResult {
-                serial_log: serial_log.into(),
-                request_path: request_path.into(),
-                exit_status,
-            },
-            Err(_) => Action::UsageError("`guest-result --exit-status` must be an integer".into()),
-        },
-        _ => Action::UsageError(
-            "`guest-result` requires `<serial-log> --request <path> --exit-status <code>`".into(),
-        ),
     }
 }
 
@@ -156,15 +110,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("test") => write!(
             writer,
-            "Usage: cargo xtask test <host|guest|integration> ...\n\nUnfiltered `test host` runs the workspace tests. Host filters are `abi`, `memory`, `handles`, `tasks`, and `ipc`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
-        ),
-        Some(command @ ("run" | "gdb")) => write!(
-            writer,
-            "Usage: cargo xtask {command} --plan --request <path>\n\nThis emits commands and evidence contracts; it never launches QEMU.\n"
-        ),
-        Some("guest-result") => write!(
-            writer,
-            "Usage: cargo xtask guest-result <serial-log> --request <path> --exit-status <code>\n\nClassifies one fixed-width DWTEST1 terminal record against the observed QEMU exit status. It does not prove capture freshness.\n"
+            "Usage: cargo xtask test <host|integration> ...\n\nUnfiltered `test host` runs the workspace tests. Host filters are `abi`, `memory`, `handles`, `tasks`, and `ipc`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite.\n"
         ),
         Some("toolchain") => write!(
             writer,

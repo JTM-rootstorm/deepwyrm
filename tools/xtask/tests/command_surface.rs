@@ -21,9 +21,6 @@ fn help_distinguishes_available_host_tooling_from_deferred_operations() {
         "test host",
         "memory",
         "handles",
-        "run --plan",
-        "gdb --plan",
-        "guest-result",
         "toolchain",
     ] {
         assert!(stdout.contains(command), "help omitted `{command}`");
