@@ -7,7 +7,7 @@
 #
 # Clippy rows: pinned host-lane `clippy --workspace --lib --tests` at warn level,
 # per package, each primary location once. Host Clippy does not see
-# `target_os = "none"` code or `test-support`/selector builds.
+# `target_os = "none"` code.
 #
 # Text rows: `unsafe {` blocks without `// SAFETY:` in the four preceding
 # lines, for target-only files host Clippy never compiles.

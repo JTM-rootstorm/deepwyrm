@@ -37,53 +37,9 @@ Host `build`, `check`, `clippy`, and `rustdoc` commands must select only
 `--all-targets`, binaries, and examples are rejected before Cargo so the
 freestanding kernel can never be admitted as a Linux-host binary by accident.
 
-Selector-configured kernel unit tests are the only host use of `test-support`.
-They must name the selector and use an explicit library-only test shape:
-
-```sh
-DEEPWYRM_GUEST_TEST_SELECTOR=bootstrap-registry-launch \
-DEEPWYRM_WYR1B_EVIDENCE_NONCE=D1B0A82700000001 \
-DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES=117 \
-    tools/pinned-cargo host test --locked -p deepwyrm-kernel \
-        --features test-support --lib <test-filter>
-```
-
-Selector 27 uses its distinct WRB1 relay and requires the frozen product nonce
-and measured selector-local bootfs ceiling:
-
-```sh
-DEEPWYRM_GUEST_TEST_SELECTOR=bootstrap-registry-launch \
-DEEPWYRM_WYR1B_EVIDENCE_NONCE=0123456789ABCDEF \
-DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES=64 \
-    tools/pinned-cargo host test --locked -p deepwyrm-kernel \
-        --features test-support --lib wyr1b_evidence
-```
-
-The example nonce and page count are illustrative. Wyrmroot product tooling
-must provide the frozen nonzero uppercase-hex nonce and exact measured
-canonical-decimal bootfs pages for the candidate it is building.
-
-Selector 32 shares the q35 platform with selector 31 but selects only the
-WRD1 collector. Its focused host gate is:
-
-```sh
-DEEPWYRM_GUEST_TEST_SELECTOR=native-console-streams \
-DEEPWYRM_WYR1D_EVIDENCE_NONCE=0123456789ABCDEF \
-    tools/pinned-cargo host test --locked --offline -p deepwyrm-kernel \
-        --features test-support --lib wyr1d_evidence
-```
-
-Use the same selector and nonce with `tools/pinned-cargo target check --locked
---offline -p deepwyrm-kernel --features test-support --target
-x86_64-unknown-none` for the freestanding integration check. Leave all DW1-E
-evidence environment variables absent; `DEEPWYRM_DW1E_E3B_FULL` belongs only
-to selector 31. The example nonce is test data, not a frozen product identity.
-
 The `target` lane is the accepted Wyrmroot Rust fork for freestanding product
-and guest-test artifacts. Its command must select the freestanding target
-explicitly; selector builds must pair `test-support` with the canonical named
-selector environment. Central build/image tooling remains responsible for the
-full selector environment and artifact provenance.
+artifacts. Its command must select the freestanding target explicitly. Central
+build/image tooling remains responsible for artifact provenance.
 
 Both lane identities pin `.tmp/cargo-home/offline-v1`, and each pins its own
 `.tmp/cargo-target/` directory. Caller omission of `CARGO_HOME` and

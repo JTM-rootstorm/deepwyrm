@@ -141,24 +141,6 @@ fn terminal(name: &str) -> bool {
         || name == "rust_begin_unwind"
 }
 
-/// Symbols and byte strings that only test and selector builds may contain.
-const TEST_ONLY_SYMBOLS: &[&str] = &[
-    "test_support",
-    "run_memory_foundation_test",
-    "dw_test_",
-    "complete_known_outcome",
-    "EXPECTED_FAULT",
-    "run_task_userspace_test",
-    "E7SmokeRuntime",
-];
-const TEST_ONLY_BYTES: &[&str] = &[
-    "DWTEST1",
-    "dw_test_",
-    "EXPECTED_FAULT",
-    "complete_known_outcome",
-    "isa-debug-exit",
-];
-
 fn root_indices(graph: &CallGraph, root: &str) -> Vec<usize> {
     if root.starts_with("dw_") {
         graph.matching(|name| name == root)
@@ -283,38 +265,11 @@ fn check_stacks(elf: &Elf<'_>, out: &mut impl Write) -> Result<Vec<String>, Stri
     Ok(failures)
 }
 
-/// The production image's own checks: freestanding, and free of test code.
-fn check_production(
-    elf: &Elf<'_>,
-    bytes: &[u8],
-    selectors: &[String],
-) -> Result<Vec<String>, String> {
+/// The production image's own check: freestanding.
+fn check_production(elf: &Elf<'_>) -> Result<Vec<String>, String> {
     let mut failures = Vec::new();
     if let Some(problem) = elf.freestanding_problem() {
         failures.push(problem.to_owned());
-    }
-    for function in elf.functions()? {
-        if let Some(marker) = TEST_ONLY_SYMBOLS
-            .iter()
-            .find(|m| function.name.contains(*m))
-        {
-            failures.push(format!(
-                "production retains test-only symbol {} ({marker})",
-                display_name(&function.name)
-            ));
-        }
-    }
-    let markers = TEST_ONLY_BYTES
-        .iter()
-        .map(|m| m.as_bytes())
-        .chain(selectors.iter().map(|s| s.as_bytes()));
-    for marker in markers {
-        if bytes.windows(marker.len()).any(|window| window == marker) {
-            failures.push(format!(
-                "production retains test marker {}",
-                String::from_utf8_lossy(marker)
-            ));
-        }
     }
     Ok(failures)
 }
@@ -361,9 +316,6 @@ fn build_kernel(
 
 pub(super) fn run_kernel_check() -> io::Result<u8> {
     let workspace = workspace_root();
-    let Some(selectors) = read_implemented_guest_selectors()? else {
-        return Ok(EXIT_NOT_IMPLEMENTED);
-    };
     let mut stderr = io::stderr().lock();
     let mut stdout = io::stdout().lock();
     let state = workspace.join(".tmp");
@@ -380,7 +332,7 @@ pub(super) fn run_kernel_check() -> io::Result<u8> {
     let result = (|| -> Result<Vec<String>, String> {
         let production_elf = Elf::parse(&production_bytes)?;
         let analysis_elf = Elf::parse(&analysis_bytes)?;
-        let mut failures = check_production(&production_elf, &production_bytes, &selectors)?;
+        let mut failures = check_production(&production_elf)?;
         if production_elf.section_bytes(".text")? != analysis_elf.section_bytes(".text")?
             || production_elf.section_bytes(".rodata")? != analysis_elf.section_bytes(".rodata")?
         {

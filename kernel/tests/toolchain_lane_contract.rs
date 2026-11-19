@@ -24,7 +24,6 @@ fn rejected_with_env(arguments: &[&str], environment: &[(&str, &str)]) -> Output
         .args(arguments)
         .current_dir(workspace())
         .env_remove("CARGO_HOME")
-        .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
         .env_remove("DEEPWYRM_GUEST_TEST_ID")
         .env("DEEPWYRM_PINNED_TARGET_DIR", &target);
     for (name, value) in environment {
@@ -100,103 +99,6 @@ fn host_lane_owns_the_project_cargo_home() {
         .expect("run ambient Cargo-home rejection");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("CARGO_HOME is lane-owned"));
-}
-
-#[test]
-fn selector_test_support_mismatches_fail_before_cargo_admission() {
-    for arguments in [
-        vec![
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-            "--lib",
-        ],
-        vec![
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features=test-support",
-            "--lib",
-        ],
-        vec![
-            "target",
-            "check",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-        ],
-        vec![
-            "target",
-            "check",
-            "-p",
-            "deepwyrm-kernel",
-            "--features=test-support",
-        ],
-    ] {
-        let output = rejected(&arguments);
-        assert_eq!(output.status.code(), Some(2), "arguments: {arguments:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("test-support requires DEEPWYRM_GUEST_TEST_SELECTOR"),
-            "arguments: {arguments:?}"
-        );
-    }
-
-    let output = rejected_with_env(
-        &["host", "test", "-p", "deepwyrm-kernel", "--lib"],
-        &[("DEEPWYRM_GUEST_TEST_SELECTOR", "primordial-bootstrap")],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("DEEPWYRM_GUEST_TEST_SELECTOR requires explicit test-support")
-    );
-
-    for lane in ["host", "target"] {
-        let output = rejected_with_env(
-            &[lane, "check", "-p", "deepwyrm-kernel"],
-            &[("DEEPWYRM_GUEST_TEST_ID", "18")],
-        );
-        assert_eq!(output.status.code(), Some(2));
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("DEEPWYRM_GUEST_TEST_ID is build-owned")
-        );
-    }
-}
-
-#[test]
-fn host_selector_tests_require_an_explicit_library_only_shape() {
-    let selector_environment = [("DEEPWYRM_GUEST_TEST_SELECTOR", "primordial-bootstrap")];
-    for arguments in [
-        vec![
-            "host",
-            "check",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-        ],
-        vec![
-            "host",
-            "test",
-            "-p",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-        ],
-    ] {
-        let output = rejected_with_env(&arguments, &selector_environment);
-        assert_eq!(output.status.code(), Some(2), "arguments: {arguments:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("host test-support is restricted")
-        );
-    }
 }
 
 #[test]

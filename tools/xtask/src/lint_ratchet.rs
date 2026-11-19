@@ -35,7 +35,7 @@ pub(super) const SAFETY_TEXT_FILES: [&str; 2] = [
 pub(super) const TEST_TEXT_COUNTER: &str = "test-attribute-in-target-only-file";
 /// Kernel source files that only a `target_os = "none"` build compiles: their
 /// module declarations are target-gated without `test`, or they sit under a
-/// module that is. No host test build (workspace or any selector) sees them.
+/// module that is. No host test build sees them.
 ///
 /// Derived at S2K-0 (deepwyrm 4341464) from every `mod` declaration in
 /// `kernel/src` whose cfg names `target_os = "none"` without `test`, and
