@@ -28,9 +28,6 @@ pub(crate) fn drop_one_record_for_test() {
 
 struct FakePort {
     ready: bool,
-    final_write_count_for_drain: Option<usize>,
-    drain_polls_before_empty: usize,
-    drain_poll_count: usize,
     writes: [(u16, u8); 2048],
     write_count: usize,
 }
@@ -39,9 +36,6 @@ impl FakePort {
     const fn ready() -> Self {
         Self {
             ready: true,
-            final_write_count_for_drain: None,
-            drain_polls_before_empty: 0,
-            drain_poll_count: 0,
             writes: [(0, 0); 2048],
             write_count: 0,
         }
@@ -50,9 +44,6 @@ impl FakePort {
     const fn stalled() -> Self {
         Self {
             ready: false,
-            final_write_count_for_drain: None,
-            drain_polls_before_empty: 0,
-            drain_poll_count: 0,
             writes: [(0, 0); 2048],
             write_count: 0,
         }
@@ -76,18 +67,7 @@ impl crate::arch::x86_64::io_port::BytePortIo for FakePort {
             return 0;
         }
 
-        let mut status = LINE_STATUS_THR_EMPTY;
-        match self.final_write_count_for_drain {
-            Some(final_write_count) if self.write_count >= final_write_count => {
-                self.drain_poll_count += 1;
-                if self.drain_poll_count > self.drain_polls_before_empty {
-                    status |= LINE_STATUS_TRANSMITTER_EMPTY;
-                }
-            }
-            Some(_) => {}
-            None => status |= LINE_STATUS_TRANSMITTER_EMPTY,
-        }
-        status
+        LINE_STATUS_THR_EMPTY | LINE_STATUS_TRANSMITTER_EMPTY
     }
 
     fn write_u8(&mut self, port: u16, value: u8) {
@@ -126,17 +106,6 @@ fn translates_newlines_and_times_out_without_unbounded_polling() {
     let mut stalled = Com1::with_poll_limit(FakePort::stalled(), 3);
     assert_eq!(stalled.write_bytes(b"x"), Err(SerialError::TransmitTimeout));
     assert_eq!(stalled.io.write_count, 0);
-}
-
-#[test]
-fn test_evidence_writer_transmits_the_exact_85_byte_record() {
-    const RECORD_BYTES: usize = 85;
-    let record = [b'E'; RECORD_BYTES];
-    let mut serial = Com1::new(FakePort::ready());
-    write_bounded_test_evidence_record(&mut serial, &record).unwrap();
-    let port = serial.io;
-    assert_eq!(port.write_count, RECORD_BYTES);
-    assert_eq!(&port.bytes()[..RECORD_BYTES], &record);
 }
 
 #[test]

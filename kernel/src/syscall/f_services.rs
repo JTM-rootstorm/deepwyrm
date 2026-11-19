@@ -1,7 +1,7 @@
 //! Shared DW0-F native service composition.
 //!
-//! This module wires the already-validated F adapters into one selector-neutral
-//! dispatch surface.  The owning target runtime still supplies the current
+//! This module wires the already-validated F adapters into one dispatch
+//! surface.  The owning target runtime still supplies the current
 //! Process/Thread, address-space access, stationary IRQ-visible authorities,
 //! and typed finalizer routing.
 

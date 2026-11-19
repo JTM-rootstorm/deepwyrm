@@ -76,13 +76,19 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
             "object_registry_ui",
             "memory_authority_ui",
             "task_authority_ui",
-            "x86_64_activation_contract",
             "x86_64_entry_contract",
             "x86_64_syscall_contract",
             "x86_64_exception_contract",
-            "x86_64_memory_guest_contract",
         ]
     );
+}
+
+#[test]
+fn every_task_host_integration_test_names_an_existing_test_file() {
+    for name in TASK_HOST_INTEGRATION_TESTS {
+        let path = workspace_root().join(format!("kernel/tests/{name}.rs"));
+        assert!(path.is_file(), "{} does not exist", path.display());
+    }
 }
 
 #[test]

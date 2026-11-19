@@ -516,7 +516,7 @@ fn with_bootstrap_local_apic<T>(
 #[cfg(deepwyrm_dw1e_platform)]
 #[deny(
     dead_code,
-    reason = "`time` allows dead code crate-wide; if this escapes its platform cfg, the synthetic-interrupt selector's check row must fail"
+    reason = "`time` allows dead code crate-wide; if this goes unused on the q35 platform, every kernel-target build fails, the production warning gate included"
 )]
 pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
     with_bootstrap_local_apic(|controller, registers| {
@@ -530,7 +530,7 @@ pub(crate) fn q35_bsp_vector_is_clear() -> Result<bool, LiveTimeError> {
 #[cfg(deepwyrm_dw1e_platform)]
 #[deny(
     dead_code,
-    reason = "`time` allows dead code crate-wide; if this escapes its platform cfg, the synthetic-interrupt selector's check row must fail"
+    reason = "`time` allows dead code crate-wide; if this goes unused on the q35 platform, every kernel-target build fails, the production warning gate included"
 )]
 pub(crate) fn q35_current_cpu_is_bsp() -> Result<bool, LiveTimeError> {
     Ok(installed_current_cpu_index()? == CpuIndex::BOOTSTRAP)
@@ -567,7 +567,7 @@ pub(crate) fn notify_q35_bsp_retirement_check(
         .map_err(|_| LiveTimeError::IpiTransport)
 }
 
-/// Terminal freeze is selector-private work, not Interrupt retirement. Its
+/// Terminal freeze is not Interrupt retirement. Its
 /// exact state remains in the q35 source/evidence authorities; e1 is only a
 /// remote wake and never occupies the retirement carrier.
 #[cfg(deepwyrm_dw1e_platform)]
@@ -1996,7 +1996,7 @@ pub(crate) extern "sysv64" fn dw_x86_64_timer_interrupt_dispatch() {
     // e1 IPI that actually reaches a halted target CPU is sent by
     // `drain_runnable_work_notifications`. Every other staging path drains on
     // its own return -- `dispatch_native` for syscalls, `poll_idle_suspend` for
-    // the kernel root, the selector-private raw wrappers for theirs -- but this
+    // the kernel root -- but this
     // interrupt has no such return. It resumes whatever CPU0 was doing, which
     // may be ring 3 for an unbounded time, so nothing else on this CPU is
     // guaranteed to reach a drain. Without this one a `Timeout` winner can be

@@ -95,8 +95,6 @@ impl Write for PanicReasonBuffer {
 pub(crate) enum SerialError {
     Busy,
     TransmitTimeout,
-    #[cfg(test)]
-    TransmitDrainTimeout,
 }
 
 impl<P: BytePortIo> Com1<P> {
@@ -132,18 +130,6 @@ impl<P: BytePortIo> Com1<P> {
         Ok(())
     }
 
-    /// Writes protocol bytes exactly as supplied, including any line endings.
-    ///
-    /// This is for fixed machine records such as test completion markers;
-    /// human diagnostics should use [`Self::write_bytes`] for CRLF output.
-    #[cfg(test)]
-    pub fn write_raw_bytes(&mut self, bytes: &[u8]) -> Result<(), SerialError> {
-        for &byte in bytes {
-            self.write_hardware_byte(byte)?;
-        }
-        Ok(())
-    }
-
     fn write_hardware_byte(&mut self, byte: u8) -> Result<(), SerialError> {
         for _ in 0..self.poll_limit {
             if self.io.read_u8(COM1_BASE + LINE_STATUS) & LINE_STATUS_THR_EMPTY != 0 {
@@ -152,16 +138,6 @@ impl<P: BytePortIo> Com1<P> {
             }
         }
         Err(SerialError::TransmitTimeout)
-    }
-
-    #[cfg(test)]
-    fn wait_until_transmitter_drained(&mut self) -> Result<(), SerialError> {
-        for _ in 0..self.poll_limit {
-            if self.io.read_u8(COM1_BASE + LINE_STATUS) & LINE_STATUS_TRANSMITTER_EMPTY != 0 {
-                return Ok(());
-            }
-        }
-        Err(SerialError::TransmitDrainTimeout)
     }
 }
 
@@ -785,15 +761,6 @@ fn halt_after_early_panic() -> ! {
             asm!("cli; hlt", options(nomem, nostack));
         }
     }
-}
-
-#[cfg(test)]
-fn write_bounded_test_evidence_record<P: BytePortIo, const BYTES: usize>(
-    serial: &mut Com1<P>,
-    record: &[u8; BYTES],
-) -> Result<(), SerialError> {
-    serial.write_raw_bytes(record)?;
-    serial.wait_until_transmitter_drained()
 }
 
 #[cfg(test)]

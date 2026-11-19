@@ -1,4 +1,5 @@
-//! Bounded selector-local summaries of primordial terminal state.
+//! Bounded summaries of primordial terminal state, in the form the former
+//! selector builds reported them.
 
 use deepwyrm_abi::{
     DW_EXCEPTION_GENERAL_PROTECTION, DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT,
@@ -10,20 +11,20 @@ const fn primordial_application_summary(application_code: u32) -> u32 {
         0
     } else if application_code == 0xaf01_0002 {
         // Wyrmroot system-init's fatal-reboot-required status is the primary
-        // pre-bootstrap failure discriminator for these selectors.
+        // pre-bootstrap failure discriminator for the former selectors.
         0x02
     } else if application_code & 0xffff_0000 == 0xaf01_0000 {
         0x10 | (application_code & 0x0f)
     } else if application_code & 0xffff_0000 == 0xaf11_0000 {
         0x20 | (application_code & 0x1f)
     } else if application_code & 0xffff_0000 == 0xaf1c_0000 {
-        // Selector 29 preserves the bounded system-init pre-READY failure
+        // Selector 29 preserved the bounded system-init pre-READY failure
         // category without exposing a production application-status ABI.
         0x20 | (application_code & 0x1f)
     } else if application_code & 0xff00_0000 == 0xb400_0000 {
         // B4 terminal records dedicate four bits each to the saturated
         // termination reason and exception type. Those two fields exactly
-        // fill the selector's remaining summary byte; retaining fault class,
+        // fill the summary's remaining byte; retaining fault class,
         // detail, or category too would make the diagnostic ambiguous.
         let reason = (application_code >> 18) & 0x0f;
         let exception_type = (application_code >> 14) & 0x0f;

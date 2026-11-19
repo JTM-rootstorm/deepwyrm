@@ -285,8 +285,6 @@ fn build_kernel(
         .current_dir(workspace)
         .env_remove("CARGO_HOME")
         .env_remove("CARGO_TARGET_DIR")
-        .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
-        .env_remove("DEEPWYRM_GUEST_TEST_ID")
         .env_remove("DEEPWYRM_EMIT_STACK_SIZES")
         .env("DEEPWYRM_PINNED_TARGET_DIR", target_dir)
         .stdin(Stdio::null())

@@ -24,7 +24,6 @@ fn rejected_with_env(arguments: &[&str], environment: &[(&str, &str)]) -> Output
         .args(arguments)
         .current_dir(workspace())
         .env_remove("CARGO_HOME")
-        .env_remove("DEEPWYRM_GUEST_TEST_ID")
         .env("DEEPWYRM_PINNED_TARGET_DIR", &target);
     for (name, value) in environment {
         command.env(name, value);

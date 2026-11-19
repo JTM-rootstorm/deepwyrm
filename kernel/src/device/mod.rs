@@ -33,7 +33,7 @@ pub(crate) use q35_interrupt::{
 
 #[allow(
     unused_imports,
-    reason = "typed finalization and selector-private collectors consume the exact binding identity"
+    reason = "typed finalization consumes the exact binding identity"
 )]
 pub(crate) use interrupt::InterruptBinding;
 

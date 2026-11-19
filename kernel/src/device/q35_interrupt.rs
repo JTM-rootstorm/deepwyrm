@@ -479,7 +479,7 @@ impl Q35InterruptPlatform {
         if source.terminal_freeze.is_some() {
             // A terminal-masked vector has no live generation snapshot. It
             // still receives the ordinary bounded EOI-only disposition, but
-            // it is deliberately outside selector-31's immutable accounting
+            // it is deliberately outside the terminal freeze's immutable accounting
             // snapshot: adding it to physical/orphan totals after Masking
             // would violate E0's required physical == exact relation.
             return Q35DeliverySnapshot::Orphan;
@@ -585,7 +585,7 @@ impl Q35InterruptPlatform {
         }
     }
 
-    /// Selector-31's terminal-only U2 freeze. This is not U2 retirement or
+    /// The terminal-only U2 freeze of the former selector 31. This is not U2 retirement or
     /// release: it masks the exact current route and serializes every live
     /// accounting source before replaying the saved U1 delivery.
     #[cfg(test)]
@@ -2066,7 +2066,7 @@ mod tests {
             INTERLEAVED_FREEZE.freeze_entered.wait();
             // This vector arrives after the terminal freeze has reached
             // Masking but before the pre-freeze handler finishes. It must be
-            // EOI-only, not an extra selector accounting entry.
+            // EOI-only, not an extra accounting entry.
             assert_eq!(platform.snapshot_delivery(), Q35DeliverySnapshot::Orphan);
             platform.record_pending_delivery(generation2);
             platform.complete_handler(generation2);

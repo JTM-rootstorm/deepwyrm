@@ -140,7 +140,7 @@ const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2 + VTD_UNIT_MMIO_LEAF_COUNT;
 // of eight rejected the ninth actor load after seven blocked receives retained
 // pins and ChannelCreate atomically requested two more for valid output ranges.
 // Keep bounded production headroom for overlapping blocked outputs and atomic
-// words rather than making the real kernel depend on selector-local capacity.
+// words rather than a capacity measured for one workload.
 const E5_USER_PIN_CAPACITY: usize = 32;
 #[cfg(test)]
 const DW1C_RETAINED_RECEIVE_PINS: usize = 10;
@@ -149,9 +149,6 @@ const DW1C_CHANNEL_CREATE_OUTPUT_PINS: usize = 2;
 #[cfg(test)]
 const DW1C_LIVE_USER_PIN_FLOOR: usize =
     DW1C_RETAINED_RECEIVE_PINS + DW1C_CHANNEL_CREATE_OUTPUT_PINS;
-#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-#[cfg(not(deepwyrm_production_product))]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Root bindings and Process identities come from the same pool, so they
 // cannot drift apart.
 #[cfg(deepwyrm_production_product)]
@@ -2511,8 +2508,7 @@ mod live_sessions {
         /// binding, this CPU, CR3 and the residency epoch before the session
         /// exists. It is private to this module: a usercopy session reaches the
         /// primordial runtime only through [`GuardFreeValue`]'s constructor, and
-        /// every other constructor here wraps it in a session with no usercopy
-        /// (or is compiled only into evidence or guest builds).
+        /// every other constructor here wraps it in a session with no usercopy.
         fn build_live_session(
             &mut self,
             active_root: address_space::UserCopyRoot,

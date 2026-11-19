@@ -63,52 +63,22 @@ use deepwyrm_abi::{
 };
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
-// Production capacities come from `arch/x86_64/pools.toml` (C1); the other
-// arms are the host builds' geometry, which never boots a product.
-#[cfg(deepwyrm_production_product)]
+// Capacities come from `arch/x86_64/pools.toml` (C1).
 use super::production_pools as pools;
-#[cfg(not(deepwyrm_production_product))]
-const REGISTRY_OBJECTS: usize = 32;
-#[cfg(deepwyrm_production_product)]
 const REGISTRY_OBJECTS: usize = pools::REGISTRY_OBJECTS;
-#[cfg(not(deepwyrm_production_product))]
-const MEMORY_OBJECTS: usize = 10;
-#[cfg(deepwyrm_production_product)]
 const MEMORY_OBJECTS: usize = pools::MEMORY_OBJECTS;
-#[cfg(not(deepwyrm_production_product))]
-const MEMORY_LEASES: usize = 10;
-#[cfg(deepwyrm_production_product)]
 const MEMORY_LEASES: usize = pools::MAPPING_LEASES;
 // I0 keeps the complete bootstrap -> init0 -> hello chain live while each
-// parent performs bounded READY/exit supervision of its direct child. The
-// selector-24 controller adds exactly one temporary supervised child.
-#[cfg(not(deepwyrm_production_product))]
-const USERSPACE_CHAIN_PROCESSES: usize = 3;
-#[cfg(deepwyrm_production_product)]
+// parent performs bounded READY/exit supervision of its direct child.
 const USERSPACE_CHAIN_PROCESSES: usize = pools::IDENTITIES;
-#[cfg(not(deepwyrm_production_product))]
-const CHANNEL_PAIRS: usize = USERSPACE_CHAIN_PROCESSES;
-#[cfg(deepwyrm_production_product)]
 const CHANNEL_PAIRS: usize = pools::CHANNEL_PAIRS;
-#[cfg(not(deepwyrm_production_product))]
-const CHANNEL_DEPTH: usize = 2;
-#[cfg(deepwyrm_production_product)]
 const CHANNEL_DEPTH: usize = pools::CHANNEL_DEPTH;
-#[cfg(not(deepwyrm_production_product))]
-const WAITERS: usize = 4;
-#[cfg(deepwyrm_production_product)]
 const WAITERS: usize = pools::WAIT_REGISTRATIONS;
-#[cfg(not(deepwyrm_production_product))]
-const TASK_GROUPS: usize = 1;
-#[cfg(deepwyrm_production_product)]
 const TASK_GROUPS: usize = pools::IDENTITIES;
 const PROCESSES: usize = USERSPACE_CHAIN_PROCESSES;
 const THREADS: usize = USERSPACE_CHAIN_PROCESSES;
 // The bootstrap handle deltas and peak live in `handle_capacity.rs`.
 use super::handle_capacity::{BOOTSTRAP_HANDLE_PEAK, INIT_MOVED_HANDLES};
-#[cfg(not(deepwyrm_production_product))]
-const HANDLES: usize = BOOTSTRAP_HANDLE_PEAK;
-#[cfg(deepwyrm_production_product)]
 const HANDLES: usize = pools::HANDLES_PER_PROCESS;
 const SPACES: usize = USERSPACE_CHAIN_PROCESSES;
 const REGIONS: usize = USERSPACE_CHAIN_PROCESSES;
@@ -118,18 +88,9 @@ const REGION_OBJECTS: usize = USERSPACE_CHAIN_PROCESSES;
 /// final-release batches by the transaction, so `xtask kernel-check` bounds
 /// every kernel stack with a quarter spare at this count (plan §10.2 item 2;
 /// before those changes the stepped map needed about 487 KB here).
-#[cfg(not(deepwyrm_production_product))]
-const REGION_SLOTS: usize = 64;
-#[cfg(deepwyrm_production_product)]
 const REGION_SLOTS: usize = pools::REGION_SLOTS;
 const EXECUTION_THREADS: usize = USERSPACE_CHAIN_PROCESSES;
-#[cfg(not(deepwyrm_production_product))]
-const EVENTS: usize = 1;
-#[cfg(deepwyrm_production_product)]
 const EVENTS: usize = pools::EVENTS;
-#[cfg(not(deepwyrm_production_product))]
-const TIMERS: usize = 1;
-#[cfg(deepwyrm_production_product)]
 const TIMERS: usize = pools::TIMERS;
 
 /// What `kernel_get_limits` reports: the pools this kernel was built with.
@@ -155,10 +116,10 @@ const KERNEL_LIMITS: deepwyrm_abi::DwKernelLimitsV1 = deepwyrm_abi::DwKernelLimi
 // A bounded mapping can cross one boundary at each non-root level. Keep two
 // candidates for PDPT, PD, and PT creation so the live publisher can construct
 // both paths without depending on where the requested range lands. The I2
-// bootfs needs a bounded 32-page window. The selector-24 WRCAP bootfs contains
-// the controller plus its deterministic config and asset and is exactly 39
+// bootfs needs a bounded 32-page window. The selector-24 WRCAP bootfs contained
+// the controller plus its deterministic config and asset and was exactly 39
 // pages after init0 termination-race reconciliation. The ordinary Wave 4
-// bootfs is exactly 17 pages with its selector-specific init0 artifact.
+// bootfs was exactly 17 pages with its own init0 artifact.
 //
 // D7: one journal batch spans up to 16 MiB (`PRIMORDIAL_MAX_USER_MAPPING_PAGES`),
 // which crosses up to nine PT, two PD and two PDPT boundaries. The pool holds
@@ -211,17 +172,11 @@ pub(super) const PRIMORDIAL_INVALIDATIONS: usize = PRIMORDIAL_MAX_MAPPING_PAGES;
 // same bounded carrier set; a capacity drift is a compile-time error.
 const _: [(); crate::arch::x86_64::H1_RUNTIME_CPU_SLOT_COUNT] = [(); crate::cpu::CPU_CAPACITY];
 const _: [(); PROCESSES] = [(); THREADS];
-#[cfg(not(deepwyrm_production_product))]
-const _: [(); PROCESSES] = [(); CHANNEL_PAIRS];
 const _: [(); PROCESSES] = [(); SPACES];
 const _: [(); PROCESSES] = [(); REGIONS];
 const _: [(); PROCESSES] = [(); REGION_OBJECTS];
 const _: [(); PROCESSES] = [(); EXECUTION_THREADS];
-#[cfg(not(deepwyrm_production_product))]
-const _: [(); 10] = [(); HANDLES];
-#[cfg(deepwyrm_production_product)]
 const _: [(); 96] = [(); HANDLES];
-#[cfg(deepwyrm_production_product)]
 const _: [(); 2] = [(); TIMERS];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
@@ -594,7 +549,7 @@ struct RuntimeCarrierFacade<
 /// so nothing in interrupt context takes that lock. Publication is one
 /// `CooperativeScheduler` operation under the scheduler's own
 /// `IrqSpinMutex`. It writes only the publishing CPU's `quantum` and
-/// `need_resched` slots, the event accounting, and the selector-28 fixture,
+/// `need_resched` slots, the event accounting, and the DW1-C fixture state,
 /// and it accepts only the ticket armed on that CPU for its exact running
 /// claim. No runtime-guard holder depends on excluding it:
 /// - on this CPU, a guard holder runs with IF clear and every synchronous
@@ -603,7 +558,7 @@ struct RuntimeCarrierFacade<
 ///   CPU's slots (`stop_running_claim_on`,
 ///   `retire_unentered_running_claim_on`, the DW1-B counter snapshot) each
 ///   run under the scheduler lock. They take an armed quantum or a published
-///   expiry, whichever they find. The selector-28 gate reports `Ready` only
+///   expiry, whichever they find. The DW1-C gate reports `Ready` only
 ///   after the last of publication's three steps.
 struct QuantumExpiryPublisher {
     shared: &'static PrimordialRuntimeShared,
@@ -7785,7 +7740,7 @@ fn primordial_completion_case(
 ) -> u32 {
     use crate::boot::primordial::construction::PrimordialCompletionError;
 
-    // The canonical detail has only sixteen selector-local bits, so it cannot
+    // The canonical detail has only sixteen bits, so it cannot
     // retain both arbitrary u32 values losslessly. Receive failures use ETVV:
     // T is the exact bounded Channel/wake tag and VV is the most actionable
     // terminal category (including exact AF01_0002 versus bootstrap-family).
@@ -10152,8 +10107,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         )
     }
 
-    /// The guarded half of `ProcessCreate` (D1 commit 7c): the selector
-    /// evidence checks, then the F10 transaction over the prepared input.
+    /// The guarded half of `ProcessCreate` (D1 commit 7c): the F10
+    /// transaction over the prepared input.
     /// The child root is reserved through P beneath this guard, and the
     /// output's commit or discard is returned for the facade to carry out.
     #[allow(

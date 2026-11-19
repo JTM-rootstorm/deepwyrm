@@ -118,10 +118,10 @@ const BOOTSTRAP_FRAME_RANGE_CAPACITY: usize = memory::physical::free_range_bound
     BOOTSTRAP_FRAME_ROLE_CAPACITY,
 );
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-// Selector 28 keeps the bootstrap/controller pair and ten actor address spaces
-// resident together.  The former 544-slot registry exhausted while reserving
+// Selector 28 kept the bootstrap/controller pair and ten actor address spaces
+// resident together, and the former 544-slot registry exhausted while reserving
 // the fourth live child root, before the workload could be armed.  Keep useful
-// headroom for the complete twelve-process image and its mapping transactions;
+// headroom for a twelve-process image and its mapping transactions;
 // this is role-metadata capacity, not a physical-memory or ABI limit.
 const BOOTSTRAP_FRAME_ROLE_CAPACITY: usize = 4096;
 

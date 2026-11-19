@@ -65,11 +65,9 @@ const TASK_HOST_INTEGRATION_TESTS: &[&str] = &[
     "object_registry_ui",
     "memory_authority_ui",
     "task_authority_ui",
-    "x86_64_activation_contract",
     "x86_64_entry_contract",
     "x86_64_syscall_contract",
     "x86_64_exception_contract",
-    "x86_64_memory_guest_contract",
 ];
 const IPC_HOST_TEST_FILTERS: &[&str] = &[
     "handle::table::tests::",
@@ -372,7 +370,6 @@ fn run_production_kernel_warning_gate() -> io::Result<u8> {
     let status = Command::new(workspace.join("tools/pinned-cargo"))
         .current_dir(&workspace)
         .env_remove("CARGO_HOME")
-        .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
         .args([
             "target",
             "rustc",

@@ -79,7 +79,7 @@ pub(crate) use f_services::{
 
 #[allow(
     unused_imports,
-    reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"
+    reason = "F7 native wait runtime ownership: not every name is used in every build"
 )]
 pub(crate) use adapters::{
     CleanupQueue, HeldReleases, NativeWaitControl, StagedStopCleanup, TerminalWaitCleanup,
@@ -127,7 +127,7 @@ pub(crate) use adapters::{
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,
-    reason = "the integrated F12 target probe consumes the synchronous compatibility adapter only when test support is selected"
+    reason = "MemoryObjectBackingAccess, process_create_with_root, process_terminate and thread_start_with_access have no caller in the kernel-target build; the primordial runtime uses the rest"
 )]
 pub(crate) use adapters::{
     DeferredMemoryObjectAccess, MemoryObjectBackingAccess, ProcessRootReservation,
@@ -135,13 +135,6 @@ pub(crate) use adapters::{
     process_create_with_root, process_terminate, thread_create, thread_start_with_access,
     thread_terminate,
 };
-#[cfg(all(
-    deepwyrm_integrated,
-    target_os = "none",
-    target_arch = "x86_64",
-    not(deepwyrm_production_product)
-))]
-pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};
 
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,
