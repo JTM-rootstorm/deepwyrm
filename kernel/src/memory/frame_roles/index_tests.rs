@@ -179,6 +179,111 @@ fn a_commit_takes_the_nodes_its_path_lacks_and_costs_what_it_said() {
     );
 }
 
+/// The pages of a three-level index whose commits need one, two and three
+/// frames after page 600 is committed: a neighbour in its leaf, a page under
+/// a fresh leaf node, and a page under a fresh node above that.
+const ONE_TWO_THREE: [(u64, u64); 3] = [(601, 1), (0, 2), (THREE_LEVELS - 1, 3)];
+
+/// DW2 §13.18 part f1: a commit within a limit at or above its cost commits
+/// exactly what the unlimited commit does, in a second manager made the
+/// same way.
+#[test]
+fn a_commit_within_its_cost_commits_what_the_full_commit_does() {
+    for slack in [0, 1, 1000, u64::MAX - 3] {
+        let (mut within, _) = manager(32);
+        let (mut full, _) = manager(32);
+        let grant = within.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+        let other = full.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+        assert_eq!(grant.physical_start(), other.physical_start());
+        within.commit_on_demand_page(grant.identity(), 600).unwrap();
+        full.commit_on_demand_page(other.identity(), 600).unwrap();
+        for (index, cost) in ONE_TWO_THREE {
+            assert_eq!(
+                within.on_demand_commit_cost(grant.identity(), index),
+                Ok(cost)
+            );
+            let commit = within
+                .commit_on_demand_page_within(grant.identity(), index, cost + slack)
+                .unwrap()
+                .unwrap();
+            let expected = full.commit_on_demand_page(other.identity(), index).unwrap();
+            assert_eq!(commit, expected, "page {index}, slack {slack}");
+            assert_eq!(commit.frames, cost);
+            assert_eq!(page(&within, &grant, index), Ok(commit.physical_start));
+            assert_eq!(within.available_frames(), full.available_frames());
+        }
+        within.check_invariants().unwrap();
+    }
+}
+
+/// One below the cost takes nothing and changes nothing: the free frames,
+/// the cost and a following full commit are as if it had not been asked.
+#[test]
+fn a_commit_one_below_its_cost_takes_nothing() {
+    let (mut roles, _) = manager(32);
+    let (mut untouched, _) = manager(32);
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    let other = untouched.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    roles.commit_on_demand_page(grant.identity(), 600).unwrap();
+    untouched
+        .commit_on_demand_page(other.identity(), 600)
+        .unwrap();
+    for (index, cost) in ONE_TWO_THREE {
+        let free = roles.available_frames();
+        assert_eq!(
+            roles.commit_on_demand_page_within(grant.identity(), index, cost - 1),
+            Ok(None),
+            "page {index}"
+        );
+        assert_eq!(roles.available_frames(), free);
+        assert_eq!(page(&roles, &grant, index), Err(FrameRoleError::Absent));
+        assert_eq!(
+            roles.on_demand_commit_cost(grant.identity(), index),
+            Ok(cost)
+        );
+        roles.check_invariants().unwrap();
+        assert_eq!(
+            roles.commit_on_demand_page(grant.identity(), index),
+            untouched.commit_on_demand_page(other.identity(), index)
+        );
+        assert_eq!(roles.available_frames(), untouched.available_frames());
+    }
+}
+
+/// A committed page is its frame and no frames, even for a limit of zero.
+#[test]
+fn a_committed_page_is_its_frame_within_any_limit() {
+    let (mut roles, _) = manager(32);
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    let backing = grant.identity();
+    let commit = roles.commit_on_demand_page(backing, 600).unwrap();
+    let free = roles.available_frames();
+    for limit in [0, 1, u64::MAX] {
+        assert_eq!(
+            roles.commit_on_demand_page_within(backing, 600, limit),
+            Ok(Some(OnDemandCommit {
+                physical_start: commit.physical_start,
+                frames: 0
+            }))
+        );
+    }
+    assert_eq!(roles.available_frames(), free);
+    // A page past the object is refused as the full commit refuses it,
+    // whatever the limit.
+    for limit in [0, u64::MAX] {
+        assert_eq!(
+            roles.commit_on_demand_page_within(backing, THREE_LEVELS, limit),
+            Err(FrameRoleError::WrongRole)
+        );
+    }
+    assert_eq!(
+        roles.commit_on_demand_page(backing, THREE_LEVELS),
+        Err(FrameRoleError::WrongRole)
+    );
+    assert_eq!(roles.available_frames(), free);
+    roles.check_invariants().unwrap();
+}
+
 #[test]
 fn a_commit_that_runs_out_of_frames_changes_nothing() {
     let (mut roles, _) = manager(3);
@@ -493,6 +598,10 @@ fn the_index_readers_keep_their_errors() {
         );
         assert_eq!(
             roles.commit_on_demand_page(identity, 0),
+            Err(FrameRoleError::WrongRole)
+        );
+        assert_eq!(
+            roles.commit_on_demand_page_within(identity, 0, 0),
             Err(FrameRoleError::WrongRole)
         );
         assert!(!roles.is_on_demand(identity));

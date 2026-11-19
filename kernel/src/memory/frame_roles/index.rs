@@ -611,19 +611,40 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         backing: BackingIdentity,
         page: u64,
     ) -> Result<OnDemandCommit, FrameRoleError> {
+        self.commit_on_demand_page_within(backing, page, u64::MAX)?
+            .ok_or(FrameRoleError::InvariantViolation)
+    }
+
+    /// As [`Self::commit_on_demand_page`], but takes nothing and returns
+    /// `None` when the commit would take more than `limit` frames. One walk
+    /// answers the cost and makes the commit (DW2 §13.18 part f1): a page
+    /// already committed is its frame and zero frames whatever the limit;
+    /// otherwise the frames needed are those [`Self::on_demand_commit_cost`]
+    /// counts.
+    pub(crate) fn commit_on_demand_page_within(
+        &mut self,
+        backing: BackingIdentity,
+        page: u64,
+        limit: u64,
+    ) -> Result<Option<OnDemandCommit>, FrameRoleError> {
         let head = backing.0;
         let (steps, found) = self.index_walk(head, page, RootUse::OnDemand)?;
         if let Some((_, range, _)) = found {
-            return Ok(OnDemandCommit {
+            return Ok(Some(OnDemandCommit {
                 physical_start: range.start,
                 frames: 0,
-            });
+            }));
         }
         let deepest = *steps
             .iter()
             .flatten()
             .last()
             .ok_or(FrameRoleError::InvariantViolation)?;
+        // As `on_demand_commit_cost` counts: a node for each level below
+        // the deepest existing one, and the page.
+        if u64::from(deepest.level) + 1 > limit {
+            return Ok(None);
+        }
         let memory = self.memory()?;
         // Take the frames top-down: a node for each level below the deepest
         // existing one, then the page. On failure, give back what was taken.
@@ -682,10 +703,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 level -= 1;
             }
         }
-        Ok(OnDemandCommit {
+        Ok(Some(OnDemandCommit {
             physical_start,
             frames,
-        })
+        }))
     }
 
     /// Takes one zeroed page and publishes `role` on it.
