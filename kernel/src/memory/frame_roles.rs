@@ -38,7 +38,15 @@ mod storage;
 #[path = "frame_roles/tables.rs"]
 mod tables;
 use chain::ChainState;
-pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory, OnDemandCommit};
+#[cfg_attr(
+    not(any(test, all(target_os = "none", target_arch = "x86_64"))),
+    allow(
+        unused_imports,
+        reason = "the live user-access session and the tests name it; the host library does not"
+    )
+)]
+pub(crate) use index::OnDemandCommit;
+pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory};
 use index::{INDEX_RUN_THRESHOLD, IndexEntryLink, IndexRootLink, IndexRootState, RootUse};
 pub(crate) use storage::MAX_GROWTH_PARTS;
 #[cfg(test)]

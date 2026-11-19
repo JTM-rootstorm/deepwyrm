@@ -9,11 +9,13 @@
 //! session, the leaf, the commit) or of the scheduler and this CPU's own
 //! state.
 //!
-//! A decline before step 6 changes nothing. From step 6 the frames a commit
-//! took are spent from the window's credit whatever follows, so the
-//! object's weight stays the frames committed plus the credit; a decline at
-//! step 7 or 8 is still correct, because the serve under T finds the page
-//! committed (cost zero) and does what it does today.
+//! A decline before step 6 changes nothing; steps 5 and 6 are one commit
+//! within the credit (DW2 §13.18 part f1), which declines with nothing
+//! taken. From step 6 the frames a commit took are spent from the window's
+//! credit whatever follows, so the object's weight stays the frames
+//! committed plus the credit; a decline at step 7 or 8 is still correct,
+//! because the serve under T finds the page committed (cost zero) and does
+//! what it does today.
 
 use crate::memory::address_region::{FaultWindow, Mapping};
 use crate::task::{ProcessKey, ThreadKey};
@@ -37,9 +39,10 @@ pub(crate) enum FastDecline {
     Mapping,
     /// Step 4: a page table on the path is missing, or the walk failed.
     Tables,
-    /// Step 5: the commit would take more than the credit.
+    /// Step 5: the commit would take more than the credit, or its cost
+    /// could not be asked.
     Credit,
-    /// Step 6: the commit was refused.
+    /// Step 6: the commit was refused (a frame could not be taken).
     Memory,
     /// Step 7: the leaf could not be written.
     Leaf,
@@ -61,10 +64,25 @@ pub(crate) enum FastServed {
 pub(crate) enum FastStamp {
     /// Steps 1 to 3 done, before the leaf's walk: the end of `check`.
     Checked,
-    /// Step 6 done (or skipped for a zero cost): the end of `commit`.
+    /// Steps 5 and 6 done (a committed page takes nothing): the end of
+    /// `commit`.
     Committed,
     /// Step 7 done: the end of `tables`.
     Written,
+}
+
+/// What a commit within the credit did (steps 5 and 6, DW2 §13.18 part
+/// f1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FastCommit {
+    /// The commit would take more than the limit; nothing was taken.
+    Over,
+    /// The cost could not be asked (not an on-demand page of this backing).
+    Unaskable,
+    /// A frame could not be taken.
+    Refused,
+    /// The page is committed; the frames this commit took (zero if it was).
+    Done(u64),
 }
 
 /// The publisher's side of steps 4 to 7, all under one borrow of the
@@ -76,12 +94,9 @@ pub(crate) trait FastLeaf {
     /// Step 4: the leaf's place, or `None` when a table is missing or the
     /// walk failed.
     fn find(&mut self, mapping: &Mapping, address: u64) -> Option<Self::Place>;
-    /// Step 5: the frames committing the page at `address` would take, or
-    /// `None` if it cannot be asked.
-    fn cost(&mut self, mapping: &Mapping, address: u64) -> Option<u64>;
-    /// Step 6: commits the page at `address`, returning the frames taken,
-    /// or `None` when the commit is refused (and took nothing).
-    fn commit(&mut self, mapping: &Mapping, address: u64) -> Option<u64>;
+    /// Steps 5 and 6: commits the place's page if it takes at most `limit`
+    /// frames (DW2 §13.18 part f1).
+    fn commit_within(&mut self, place: &mut Self::Place, limit: u64) -> FastCommit;
     /// Step 7: writes the leaf at `place`; `Some(true)` when it wrote,
     /// `Some(false)` when it was already this page's leaf, `None` when it
     /// could not.
@@ -154,26 +169,23 @@ pub(crate) fn serve_fast<R: Copy, P: FastServePaging<R>>(
         return Err(FastDecline::Mapping);
     }
     paging.stamp(FastStamp::Checked);
-    let (cost, frames, written) = {
+    let (frames, written) = {
         let mut leaf = paging.leaf(&mapping).ok_or(FastDecline::Identity)?;
         // 4. The leaf's place.
-        let place = leaf.find(&mapping, address).ok_or(FastDecline::Tables)?;
-        // 5. The commit's cost is within the credit.
-        let cost = leaf.cost(&mapping, address).ok_or(FastDecline::Credit)?;
-        if cost > window.credit() {
-            return Err(FastDecline::Credit);
-        }
-        // 6. The commit. A cost of zero commits nothing.
-        let frames = if cost == 0 {
-            0
-        } else {
-            leaf.commit(&mapping, address).ok_or(FastDecline::Memory)?
+        let mut place = leaf.find(&mapping, address).ok_or(FastDecline::Tables)?;
+        // 5 and 6. The commit, within the credit, in one walk of the
+        //    backing's index (DW2 §13.18 part f1). A committed page takes
+        //    nothing.
+        let frames = match leaf.commit_within(&mut place, window.credit()) {
+            FastCommit::Done(frames) => frames,
+            FastCommit::Over | FastCommit::Unaskable => return Err(FastDecline::Credit),
+            FastCommit::Refused => return Err(FastDecline::Memory),
         };
         leaf.stamp(FastStamp::Committed);
         // 7. The leaf.
         let written = leaf.write(place);
         leaf.stamp(FastStamp::Written);
-        (cost, frames, written)
+        (frames, written)
     };
     // Whatever follows, the credit falls by the frames taken.
     if frames != 0 {
@@ -185,7 +197,7 @@ pub(crate) fn serve_fast<R: Copy, P: FastServePaging<R>>(
         return Err(FastDecline::Return);
     }
     // 9.
-    Ok(if published || cost != 0 {
+    Ok(if published || frames != 0 {
         FastServed::Served
     } else {
         FastServed::AlreadyPresent

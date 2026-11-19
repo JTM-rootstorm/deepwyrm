@@ -129,6 +129,11 @@ pub(crate) struct TouchedLeafPlace<'a> {
     /// The first table on the path that is not this root's own, at its level
     /// and under its parent: the error the role manager gave.
     unauthenticated: Option<FrameRoleError>,
+    /// The page's frame, set only by
+    /// [`X86AddressSpacePublisher::commit_touched_page`] from the commit's
+    /// one walk of the backing's index (DW2 §13.18 part f1); `None` from
+    /// `find_touched_leaf`, and the write then resolves the page itself.
+    frame: Option<u64>,
     _publisher: core::marker::PhantomData<fn(&'a ()) -> &'a ()>,
 }
 
@@ -468,30 +473,25 @@ where
             path,
             revisits,
             unauthenticated,
+            frame: None,
             _publisher: core::marker::PhantomData,
         }))
     }
 
-    /// Frames committing object page `page` of the on-demand `backing`
-    /// would take (DW2 M6 §8.4), asked of this publisher's role manager:
-    /// the fast serve's cost, under the borrow that found the leaf (DW2
-    /// §13.16 part e3).
-    #[cfg_attr(
-        not(all(target_os = "none", target_arch = "x86_64")),
-        allow(dead_code, reason = "the live fast serve is its only caller")
-    )]
-    pub(crate) fn on_demand_commit_cost(
-        &self,
-        backing: BackingIdentity,
-        page: u64,
-    ) -> Result<u64, FrameRoleError> {
-        self.roles.on_demand_commit_cost(backing, page)
-    }
-
-    /// Commits object page `page` of the on-demand `backing` (DW2 M6 §8.4)
-    /// through this publisher's role manager, so a serve that found its
-    /// leaf's place commits the frame and writes the leaf under one borrow
-    /// (DW2 §13.16 part e1).
+    /// Commits the object page `place` was found for, if that takes at most
+    /// `limit` frames, and records its frame in `place` for the write (DW2
+    /// §13.18 part f1). `Ok(None)`: over the limit, nothing taken, `place`
+    /// unchanged. `Ok(Some(frames))`: the page is committed (`frames` is
+    /// zero when it already was) and `place` holds its frame.
+    ///
+    /// The backing and the object page come from the place's mapping and
+    /// page, with `page_descriptor`'s checked arithmetic; an address outside
+    /// the mapping, an overflow or an object offset that is not a page's
+    /// is `InvalidMapping`, with nothing taken. The commit's one walk of the
+    /// backing's index (`RootUse::OnDemand`) makes the checks the write's
+    /// resolve made: the root is this manager's, live and on demand, the
+    /// page is inside it, and every entry on the path is this root's node
+    /// or page at its place.
     #[cfg_attr(
         not(all(target_os = "none", target_arch = "x86_64")),
         allow(
@@ -499,6 +499,40 @@ where
             reason = "the live fault gate is its only caller outside tests"
         )
     )]
+    pub(crate) fn commit_touched_page(
+        &mut self,
+        place: &mut TouchedLeafPlace<'a>,
+        limit: u64,
+    ) -> Result<Option<u64>, X86AddressSpacePublishError<T::Error>> {
+        let mapping = &place.mapping;
+        let backing = mapping.backing();
+        let address = place.page.address();
+        let object_offset = address
+            .checked_sub(mapping.virtual_start())
+            .filter(|offset| *offset < mapping.byte_len())
+            .and_then(|offset| offset.checked_add(backing.object_offset()))
+            .filter(|offset| offset.is_multiple_of(BASE_PAGE_SIZE))
+            .ok_or(X86AddressSpacePublishError::InvalidMapping)?;
+        let committed = self
+            .roles
+            .commit_on_demand_page_within(
+                backing.backing_identity(),
+                object_offset / BASE_PAGE_SIZE,
+                limit,
+            )
+            .map_err(X86AddressSpacePublishError::FrameRole)?;
+        Ok(committed.map(|commit| {
+            place.frame = Some(commit.physical_start);
+            commit.frames
+        }))
+    }
+
+    /// Commits object page `page` of the on-demand `backing` (DW2 M6 §8.4)
+    /// through this publisher's role manager, between a find and its write,
+    /// as the serve did before DW2 §13.18 part f1. The live serves now
+    /// commit through the place ([`Self::commit_touched_page`]); the tests
+    /// keep this as the resolve path that one is compared with.
+    #[cfg(test)]
     pub(crate) fn commit_on_demand_page(
         &mut self,
         backing: BackingIdentity,
@@ -522,7 +556,10 @@ where
     /// invalidates; a refusal is returned as the journal returns it, and
     /// the span is ended on every path after it was begun. An
     /// already-present leaf reserves nothing, as in the journal path. One
-    /// new leaf under existing tables changes no frame role.
+    /// new leaf under existing tables changes no frame role. When the page
+    /// was committed through `place` ([`Self::commit_touched_page`]), its
+    /// frame is the commit's and is not resolved again (DW2 §13.18 part
+    /// f1); every other check is made as above, in its order.
     #[cfg_attr(
         not(all(target_os = "none", target_arch = "x86_64")),
         allow(
@@ -540,6 +577,7 @@ where
             path,
             revisits,
             unauthenticated,
+            frame: committed,
             _publisher,
         } = place;
         // A place found under another root is no place of this one.
@@ -566,16 +604,26 @@ where
         // The frame is the backing's page at this offset, resolved with
         // the writability the leaf will carry: `authorize_leaf` and the
         // journal's plan check resolve the same page again and compare.
-        let descriptor = page_descriptor(self.roles, &mapping, address, &mut None)?;
-        if !descriptor.on_demand {
-            return Err(X86AddressSpacePublishError::InvalidMapping);
-        }
-        let physical_start =
-            descriptor
-                .physical_start
-                .ok_or(X86AddressSpacePublishError::FrameRole(
-                    FrameRoleError::Absent,
-                ))?;
+        // A commit through this place already resolved it in its one walk
+        // of the on-demand backing's index, under this publisher's borrow of
+        // the role manager, which nothing else changes before this write
+        // (DW2 §13.18 part f1).
+        let (physical_start, permissions) = match committed {
+            Some(physical_start) => (physical_start, mapping_permissions(&mapping)),
+            None => {
+                let descriptor = page_descriptor(self.roles, &mapping, address, &mut None)?;
+                if !descriptor.on_demand {
+                    return Err(X86AddressSpacePublishError::InvalidMapping);
+                }
+                let physical_start =
+                    descriptor
+                        .physical_start
+                        .ok_or(X86AddressSpacePublishError::FrameRole(
+                            FrameRoleError::Absent,
+                        ))?;
+                (physical_start, descriptor.permissions)
+            }
+        };
         let limit = self.root.physical_limit();
         let frame = super::super::FrameAddress::new(physical_start, limit)
             .map_err(|_| X86AddressSpacePublishError::Map(MapError::FrameMismatch))?;
@@ -589,7 +637,7 @@ where
                 error,
             )))
         })?;
-        let entry = super::super::leaf_entry(frame, descriptor.permissions);
+        let entry = super::super::leaf_entry(frame, permissions);
         if leaf != 0 {
             super::super::decode_leaf::<OwnedPageTableJournalError<T::Error>>(
                 leaf,
@@ -612,7 +660,7 @@ where
         // As `map_page`: the policy, and a frame that is no table of the
         // path. (`decode_intermediate` above already required each table
         // entry present, not huge and with the user bit a user leaf needs.)
-        super::super::validate_mapping(page, descriptor.permissions)
+        super::super::validate_mapping(page, permissions)
             .map_err(|error| X86AddressSpacePublishError::Map(super::super::policy_error(error)))?;
         if path.contains(&frame) {
             return Err(X86AddressSpacePublishError::Map(MapError::InvalidPath));
@@ -1335,12 +1383,18 @@ fn page_descriptor<E, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
         object_offset,
         physical_start,
         on_demand: roles.is_on_demand(backing.backing_identity()),
-        permissions: MappingPermissions {
-            user: true,
-            readable: true,
-            writable: mapping.protection().writable(),
-            executable: mapping.protection().executable(),
-            uncached: backing.uncached(),
-        },
+        permissions: mapping_permissions(mapping),
     })
+}
+
+/// The permissions a leaf of `mapping` carries: user, readable, writable
+/// and executable from its protection, uncached from its backing.
+fn mapping_permissions(mapping: &Mapping) -> MappingPermissions {
+    MappingPermissions {
+        user: true,
+        readable: true,
+        writable: mapping.protection().writable(),
+        executable: mapping.protection().executable(),
+        uncached: mapping.backing().uncached(),
+    }
 }

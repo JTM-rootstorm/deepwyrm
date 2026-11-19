@@ -743,6 +743,13 @@ fn every_on_demand_entry_point_refuses_an_eager_root() {
             roles.commit_on_demand_page(backing, 0),
             Err(FrameRoleError::WrongRole)
         );
+        // DW2 §13.18 part f1: the commit within a limit, whatever the limit.
+        for limit in [0, 1, u64::MAX] {
+            assert_eq!(
+                roles.commit_on_demand_page_within(backing, 0, limit),
+                Err(FrameRoleError::WrongRole)
+            );
+        }
         assert_eq!(
             roles.on_demand_commit_cost(backing, 0),
             Err(FrameRoleError::WrongRole)

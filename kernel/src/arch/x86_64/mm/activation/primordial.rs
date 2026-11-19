@@ -10952,7 +10952,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             else {
                 return Outcome::Unserved;
             };
-            let place = match publisher.find_touched_leaf(&mapping, address) {
+            let mut place = match publisher.find_touched_leaf(&mapping, address) {
                 Ok(crate::arch::x86_64::mm::TouchedLeaf::Found(place)) => place,
                 Ok(crate::arch::x86_64::mm::TouchedLeaf::MissingTables(tables)) => {
                     break 'found tables as u64;
@@ -10994,19 +10994,27 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(outcome) => return outcome,
             }
             if cost != 0 {
-                let committed = publisher.commit_on_demand_page(backing, page);
+                // Through the place, so the write takes the frame from this
+                // commit's one walk of the backing's index (DW2 §13.18 part
+                // f1). The cost was asked in this hold of P and nothing
+                // since changed the index, so it is within the cost.
+                let committed = publisher.commit_touched_page(&mut place, cost);
                 step_report::fault_stamped(cpu, FaultStamp::CommitEnded);
                 match committed {
-                    Ok(commit) => crate::syscall::record_charged_pages(
+                    Ok(Some(frames)) => crate::syscall::record_charged_pages(
                         &mut self.core.registry,
                         object,
-                        commit.frames,
+                        frames,
                     ),
-                    Err(
+                    Ok(None) => {
+                        debug_assert!(false, "a commit took more than the cost asked in its hold");
+                        return Outcome::Unserved;
+                    }
+                    Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::FrameRole(
                         FrameRoleError::Physical(_)
                         | FrameRoleError::Capacity
                         | FrameRoleError::InitializationFailed,
-                    ) => return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY),
+                    )) => return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_MEMORY),
                     Err(_) => return Outcome::Unserved,
                 }
             } else {
@@ -12693,17 +12701,6 @@ struct LiveFastLeaf<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: us
     >,
 }
 
-/// The backing and object page a touch at `address` of `mapping` names.
-fn fast_page(
-    mapping: &crate::memory::address_region::Mapping,
-    address: u64,
-) -> (crate::memory::frame_roles::BackingIdentity, u64) {
-    (
-        mapping.backing().backing_identity(),
-        (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE,
-    )
-}
-
 impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fault_window::FastLeaf
     for LiveFastLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
 {
@@ -12720,25 +12717,22 @@ impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fau
         }
     }
 
-    fn cost(
+    fn commit_within(
         &mut self,
-        mapping: &crate::memory::address_region::Mapping,
-        address: u64,
-    ) -> Option<u64> {
-        let (backing, page) = fast_page(mapping, address);
-        self.publisher.on_demand_commit_cost(backing, page).ok()
-    }
-
-    fn commit(
-        &mut self,
-        mapping: &crate::memory::address_region::Mapping,
-        address: u64,
-    ) -> Option<u64> {
-        let (backing, page) = fast_page(mapping, address);
-        self.publisher
-            .commit_on_demand_page(backing, page)
-            .ok()
-            .map(|commit| commit.frames)
+        place: &mut Self::Place,
+        limit: u64,
+    ) -> super::fault_window::FastCommit {
+        use super::fault_window::FastCommit;
+        match self.publisher.commit_touched_page(place, limit) {
+            Ok(Some(frames)) => FastCommit::Done(frames),
+            Ok(None) => FastCommit::Over,
+            Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::FrameRole(
+                FrameRoleError::Physical(_)
+                | FrameRoleError::Capacity
+                | FrameRoleError::InitializationFailed,
+            )) => FastCommit::Refused,
+            Err(_) => FastCommit::Unaskable,
+        }
     }
 
     fn write(&mut self, place: Self::Place) -> Option<bool> {

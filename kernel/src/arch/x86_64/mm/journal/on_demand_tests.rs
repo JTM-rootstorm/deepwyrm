@@ -436,6 +436,51 @@ impl Fixture {
         })
     }
 
+    /// The same touch with the commit made through the place (DW2 §13.18
+    /// part f1): find, `commit_touched_page`, write, the write taking the
+    /// frame from the place. Where the serve commits (`commit` is the
+    /// touched page), the limit is unbounded; where it does not, the limit
+    /// is zero, so a committed page still gives the place its frame and an
+    /// uncommitted one is left to the write's resolve. With no place, the
+    /// commit is made as the other paths make it.
+    fn touch_through_place(&mut self, address: u64, commit: Option<u64>, pins: &Pins) -> Touch {
+        let mapping = self.mapping_at(address);
+        let backing = self.backing;
+        self.with_pins(pins, |fixture, target| {
+            let mut publisher = Self::publisher(
+                &mut fixture.roles,
+                fixture.root,
+                &fixture.page_tables,
+                &mut fixture.candidates,
+                &fixture.region,
+                target,
+            );
+            match publisher.find_touched_leaf(&mapping, address) {
+                Ok(TouchedLeaf::Found(mut place)) => {
+                    let limit = match commit {
+                        Some(page) => {
+                            assert_eq!(page, (address - mapping.virtual_start()) / BASE_PAGE_SIZE);
+                            u64::MAX
+                        }
+                        None => 0,
+                    };
+                    publisher.commit_touched_page(&mut place, limit).unwrap();
+                    (Ok(0), Some(publisher.write_touched_leaf(place)))
+                }
+                found => {
+                    if let Some(page) = commit {
+                        publisher.commit_on_demand_page(backing, page).unwrap();
+                    }
+                    match found {
+                        Ok(TouchedLeaf::MissingTables(tables)) => (Ok(tables), None),
+                        Err(error) => (Err(error), None),
+                        Ok(TouchedLeaf::Found(_)) => unreachable!(),
+                    }
+                }
+            }
+        })
+    }
+
     /// Publishes the leaf a touch at `address` needs.
     fn touch(&mut self, address: u64) -> Result<bool, X86AddressSpacePublishError<()>> {
         let mapping = self.mapping_at(address);
@@ -839,7 +884,9 @@ fn with_tables(mut fixture: Fixture) -> Fixture {
 /// write, committing object page `commit` between the walk and the publish,
 /// and checks that both give the same results and leave every page-table
 /// entry the same, bit for bit. The walk and write make at most one store
-/// and no invalidation. Returns the result and the second fixture.
+/// and no invalidation. A third fixture is touched with the commit made
+/// through the place and the frame taken from it (DW2 §13.18 part f1), and
+/// is held to the same. Returns the result and the second fixture.
 fn touch_both_ways(
     make: impl Fn() -> Fixture,
     address: u64,
@@ -868,9 +915,12 @@ fn touch_both_ways_holding(
 ) -> (Touch, Fixture) {
     let mut journal = make();
     let mut direct = make();
+    let mut placed = make();
     assert_eq!(direct.target.entries, journal.target.entries);
+    assert_eq!(placed.target.entries, journal.target.entries);
     let journal_pins = Pins::new();
     let direct_pins = Pins::new();
+    let placed_pins = Pins::new();
     let through_journal = {
         let _held = hold(&journal, &journal_pins);
         journal.touch_through_journal(address, commit, &journal_pins)
@@ -893,6 +943,34 @@ fn touch_both_ways_holding(
     assert_eq!(
         direct.roles.check_invariants(),
         journal.roles.check_invariants()
+    );
+    // DW2 §13.18 part f1: the third way, the frame from the commit through
+    // the place, gives the same results and the same entries, bit for bit.
+    let applied = placed.target.applied.len();
+    let invalidated = placed.target.invalidated.len();
+    let through_place = {
+        let _held = hold(&placed, &placed_pins);
+        placed.touch_through_place(address, commit, &placed_pins)
+    };
+    assert_eq!(through_place, through_journal);
+    assert_eq!(placed.target.entries, journal.target.entries);
+    assert_eq!(
+        placed.target.applied.len() - applied,
+        usize::from(through_place.1 == Some(Ok(true))),
+        "one store exactly when a leaf is published"
+    );
+    assert_eq!(placed.target.invalidated.len(), invalidated);
+    assert_eq!(
+        placed.roles.check_invariants(),
+        journal.roles.check_invariants()
+    );
+    assert_eq!(
+        placed.roles.available_frames(),
+        direct.roles.available_frames()
+    );
+    assert_eq!(
+        placed.roles.on_demand_frames(placed.backing),
+        direct.roles.on_demand_frames(direct.backing)
     );
     (through_find, direct)
 }
@@ -1247,6 +1325,160 @@ fn one_store_releases_its_page_after_writing() {
     drop(pins.begin_mutation(space, START, BASE_PAGE_SIZE).unwrap());
     let pin = pins.pin_owned(space, word(START + 8)).unwrap();
     pins.release_owned(space, pin).unwrap();
+}
+
+/// DW2 §13.18 part f1: a commit through the place over its limit takes
+/// nothing and leaves the place as `find_touched_leaf` made it, so the
+/// write resolves the page as before and refuses it uncommitted.
+#[test]
+fn a_commit_through_the_place_over_its_limit_leaves_the_write_to_resolve() {
+    let mut fixture = with_tables(Fixture::new());
+    let mapping = fixture.mapping_at(START);
+    let free = fixture.roles.available_frames();
+    let pins = Pins::new();
+    let result = fixture.with_pins(&pins, |fixture, target| {
+        let mut publisher = Fixture::publisher(
+            &mut fixture.roles,
+            fixture.root,
+            &fixture.page_tables,
+            &mut fixture.candidates,
+            &fixture.region,
+            target,
+        );
+        let Ok(TouchedLeaf::Found(mut place)) = publisher.find_touched_leaf(&mapping, START) else {
+            panic!("every table exists");
+        };
+        // Page 0 takes one frame (the backing's root is its leaf node).
+        assert_eq!(publisher.commit_touched_page(&mut place, 0), Ok(None));
+        publisher.write_touched_leaf(place)
+    });
+    assert_eq!(
+        result,
+        Err(X86AddressSpacePublishError::FrameRole(
+            FrameRoleError::Absent
+        ))
+    );
+    assert_eq!(fixture.roles.available_frames(), free);
+    assert_eq!(fixture.leaf(START), None);
+    // The same place within one frame commits it and writes its leaf.
+    assert_eq!(
+        fixture.touch_through_place(START, Some(0), &pins),
+        (Ok(0), Some(Ok(true)))
+    );
+    assert_eq!(fixture.roles.available_frames(), free - 1);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// A commit through a place whose mapping names no page of itself at the
+/// place's address is `InvalidMapping` with nothing taken: an object offset
+/// that overflows, one that is not a page's, and an address past the
+/// mapping's end.
+#[test]
+fn a_commit_through_the_place_refuses_a_page_its_mapping_cannot_name() {
+    let mut fixture = with_tables(Fixture::new());
+    let mapping = fixture.mapping_at(START);
+    let overflow = mapping.with_object_offset_for_test(!(BASE_PAGE_SIZE - 1));
+    let unaligned = mapping.with_object_offset_for_test(1);
+    let free = fixture.roles.available_frames();
+    let frames = fixture.roles.on_demand_frames(fixture.backing);
+    let pins = Pins::new();
+    for (mapping, address) in [
+        (overflow, START + BASE_PAGE_SIZE),
+        (unaligned, START),
+        (mapping, ALIAS),
+    ] {
+        let committed = fixture.with_pins(&pins, |fixture, target| {
+            let mut publisher = Fixture::publisher(
+                &mut fixture.roles,
+                fixture.root,
+                &fixture.page_tables,
+                &mut fixture.candidates,
+                &fixture.region,
+                target,
+            );
+            let Ok(TouchedLeaf::Found(mut place)) = publisher.find_touched_leaf(&mapping, address)
+            else {
+                panic!("every table exists");
+            };
+            let committed = publisher.commit_touched_page(&mut place, u64::MAX);
+            // Nor does the write publish anything for it.
+            assert!(publisher.write_touched_leaf(place).is_err());
+            committed
+        });
+        assert_eq!(
+            committed,
+            Err(X86AddressSpacePublishError::InvalidMapping),
+            "{address:#x}"
+        );
+        assert_eq!(fixture.roles.available_frames(), free);
+        assert_eq!(fixture.roles.on_demand_frames(fixture.backing), frames);
+    }
+    assert_eq!(fixture.leaf(START), None);
+    assert_eq!(fixture.leaf(ALIAS), None);
+    assert_eq!(fixture.roles.check_invariants(), Ok(()));
+}
+
+/// Part e1's path through another root's table, with the page committed in
+/// the serve's hold through the place: the commit is made and the write is
+/// refused, as the journal path refuses it after its commit.
+#[test]
+fn a_frame_from_the_place_is_still_refused_through_another_roots_table() {
+    let at = START + 2 * BASE_PAGE_SIZE;
+    let (result, mut fixture) = touch_both_ways(through_another_roots_table, at, Some(2));
+    assert_eq!(
+        result,
+        (
+            Ok(0),
+            Some(Err(X86AddressSpacePublishError::Map(
+                MapError::TableClaimRejected
+            )))
+        )
+    );
+    // The commit was made: page 2 costs nothing now.
+    assert_eq!(
+        fixture.roles.on_demand_commit_cost(fixture.backing, 2),
+        Ok(0)
+    );
+    fixture.swap_process();
+    assert_eq!(fixture.leaf(at), None);
+}
+
+/// A path that names one table twice: the PD's entry for `START` names the
+/// PD itself. Each way refuses the touch alike, and the frame from the
+/// place changes nothing of it.
+#[test]
+fn a_path_that_revisits_a_table_is_refused_each_way() {
+    let revisiting = || {
+        let mut fixture = with_tables(Fixture::new());
+        let key = entry_key(&fixture, START, 1);
+        let entry = fixture.target.entries[&key];
+        fixture
+            .target
+            .entries
+            .insert(key, (entry & !ADDRESS_MASK) | key.0);
+        fixture
+    };
+    for commit in [Some(0), None] {
+        let (result, _) = touch_both_ways(
+            || {
+                let mut fixture = revisiting();
+                if commit.is_none() {
+                    fixture.commit(0);
+                }
+                fixture
+            },
+            START,
+            commit,
+        );
+        assert_eq!(
+            result,
+            (
+                Ok(0),
+                Some(Err(X86AddressSpacePublishError::Map(MapError::InvalidPath)))
+            ),
+            "{commit:?}"
+        );
+    }
 }
 
 #[path = "release_tests.rs"]
