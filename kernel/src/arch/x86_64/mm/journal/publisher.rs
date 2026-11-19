@@ -341,6 +341,11 @@ where
     /// needs, writing nothing (DW2 §13.16 part e1): this publisher's
     /// [`TouchedLeafWriter::find_touched_leaf`], whose place carries this
     /// publisher's brand.
+    ///
+    /// Out of line, with the writer's body inlined into it, as this
+    /// method's own body was at `438d9f3`: the fast serve's leaf then stays
+    /// small enough to inline into the serve, which receives the place in
+    /// its own frame.
     #[cfg_attr(
         not(all(target_os = "none", target_arch = "x86_64")),
         allow(
@@ -348,6 +353,7 @@ where
             reason = "the live fault gate is its only caller outside tests"
         )
     )]
+    #[inline(never)]
     pub(crate) fn find_touched_leaf(
         &mut self,
         mapping: &Mapping,
@@ -432,6 +438,7 @@ where
             reason = "the live fault gate is its only caller outside tests"
         )
     )]
+    #[inline(never)]
     pub(crate) fn write_touched_leaf(
         &mut self,
         place: TouchedLeafPlace<'a>,
@@ -451,6 +458,7 @@ where
             reason = "the live fault gate is its only caller outside tests"
         )
     )]
+    #[inline(always)]
     fn touched_leaf_writer(
         &mut self,
     ) -> TouchedLeafWriter<'_, 'a, T, RANGE_CAPACITY, ROLE_CAPACITY> {

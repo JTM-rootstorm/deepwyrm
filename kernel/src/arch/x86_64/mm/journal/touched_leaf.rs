@@ -64,6 +64,11 @@ pub(crate) struct TouchedLeafPlace<'a> {
 /// The walk and the store of one touched leaf, over `&FrameRoleManager`
 /// (DW2 §15.2). `'w` is the borrow of the root, role manager and target;
 /// `'p` brands the places it finds and accepts.
+///
+/// Its walk and its store are inlined into each caller (the publisher's
+/// two methods and the shared serve's leaf), so a publisher's find and
+/// write compile as they did when they were the publisher's own bodies:
+/// no writer is built in memory and no place is copied between them.
 pub(crate) struct TouchedLeafWriter<
     'w,
     'p,
@@ -164,6 +169,7 @@ where
     /// A writer from parts whose root has passed [`check_root`] and whose
     /// binding is attested: a publisher's own borrows (its constructor made
     /// both), with the publisher's brand for places.
+    #[inline(always)]
     pub(super) fn from_parts(
         address_space: AddressSpaceKey,
         region: RegionKey,
@@ -199,6 +205,7 @@ where
             reason = "the live fault gate is its only caller outside tests"
         )
     )]
+    #[inline(always)]
     pub(crate) fn find_touched_leaf(
         &mut self,
         mapping: &Mapping,
@@ -326,6 +333,7 @@ where
             reason = "the live fault gate is its only caller outside tests"
         )
     )]
+    #[inline(always)]
     pub(crate) fn write_touched_leaf(
         &mut self,
         place: TouchedLeafPlace<'p>,
