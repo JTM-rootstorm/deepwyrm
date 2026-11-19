@@ -12,7 +12,7 @@ pub mod arch;
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod atomic_wait;
@@ -21,14 +21,14 @@ pub(crate) mod cpu;
 pub mod debug;
 #[allow(
     dead_code,
-    reason = "the interrupt-platform model and q35 terminal-freeze machinery are consumed only by host tests and selector platforms, interleaved with production types; unpicked"
+    reason = "the interrupt-platform model and q35 terminal-freeze machinery are consumed only by host tests, interleaved with production types; unpicked"
 )]
 pub(crate) mod device;
 #[cfg_attr(
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod handle;
@@ -37,7 +37,7 @@ pub mod interrupt;
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod ipc;
@@ -46,7 +46,7 @@ pub mod memory;
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod object;
@@ -62,7 +62,7 @@ pub(crate) mod one_shot;
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod service;
@@ -70,25 +70,25 @@ pub(crate) mod service;
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod sync;
 #[allow(
     dead_code,
-    reason = "about 80 adapters and wait/termination entry points are reached only from host tests or single selectors through re-exports; unpicked"
+    reason = "about 80 adapters and wait/termination entry points are reached only from host tests through re-exports; unpicked"
 )]
 pub(crate) mod syscall;
 #[allow(
     dead_code,
-    reason = "about 50 scheduler and execution model entry points are reached only from host tests or single selectors; unpicked"
+    reason = "about 50 scheduler and execution model entry points are reached only from host tests; unpicked"
 )]
 pub(crate) mod task;
 #[cfg_attr(
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod time;
@@ -96,13 +96,10 @@ pub(crate) mod time;
     not(deepwyrm_production_product),
     allow(
         dead_code,
-        reason = "only the production product links the whole kernel; selector, host-library and host-test builds each use a subset"
+        reason = "only the production product links the whole kernel; host-library and host-test builds each use a subset"
     )
 )]
 pub(crate) mod wait;
-
-#[cfg(feature = "test-support")]
-pub mod test_support;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use boot::BootInfoByteReader;
@@ -121,10 +118,10 @@ const BOOTSTRAP_FRAME_RANGE_CAPACITY: usize = memory::physical::free_range_bound
     BOOTSTRAP_FRAME_ROLE_CAPACITY,
 );
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-// Selector 28 keeps the bootstrap/controller pair and ten actor address spaces
-// resident together.  The former 544-slot registry exhausted while reserving
+// Selector 28 kept the bootstrap/controller pair and ten actor address spaces
+// resident together, and the former 544-slot registry exhausted while reserving
 // the fourth live child root, before the workload could be armed.  Keep useful
-// headroom for the complete twelve-process image and its mapping transactions;
+// headroom for a twelve-process image and its mapping transactions;
 // this is role-metadata capacity, not a physical-memory or ABI limit.
 const BOOTSTRAP_FRAME_ROLE_CAPACITY: usize = 4096;
 
@@ -279,12 +276,10 @@ extern "sysv64" fn dw_x86_64_ap_higher_half_entry(cpu_index: u32, local_apic_id:
     {
         fail_h1_application_processor(cpu_index, 0x105);
     }
-    #[cfg(not(feature = "test-support"))]
     let _ = debug::emit_early_cpu_state_record(cpu_index, local_apic_id, "online");
     if registry.park(cpu_index).is_err() {
         park_h1_application_processor();
     }
-    #[cfg(not(feature = "test-support"))]
     let _ = debug::emit_early_cpu_state_record(cpu_index, local_apic_id, "parked");
     // SAFETY: this is the root Rust frame of this AP's execution, entered once from the trampoline
     // assembly; no frame of this CPU exists below it, and everything it called has returned. A
@@ -313,7 +308,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         panic!("failed to install early x86_64 descriptors: {error:?}");
     }
     // SAFETY: the BSP runs on the boot stack; no painted stack is in use yet.
-    #[cfg(not(feature = "test-support"))]
     unsafe {
         arch::x86_64::stack_watermark::paint_all();
     }
@@ -327,25 +321,9 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
     );
     let boot_resource_grants = boot_info.boot_resource_grants();
 
-    #[cfg(not(feature = "test-support"))]
     let primordial_modules = boot_info
         .primordial_modules()
         .unwrap_or_else(|error| panic!("invalid primordial modules: {error:?}"));
-
-    #[cfg(feature = "test-support")]
-    match test_support::BUILD_GUEST_TEST {
-        test_support::BuildGuestTest::BootHandoffPass => test_support::complete_pass(0),
-        test_support::BuildGuestTest::ExceptionFailPath => {
-            test_support::trigger_expected_invalid_opcode()
-        }
-        test_support::BuildGuestTest::PanicPath => panic!("DW0-B panic-path guest test"),
-        test if test.is_memory_foundation() || test.is_task_userspace() => {}
-        #[cfg(deepwyrm_f9_guest)]
-        test if test.is_f9_userspace() => {}
-        #[cfg(deepwyrm_f12_guest)]
-        test if test.is_f12_userspace() => {}
-        _ => unreachable!("all build-selected guest tests have explicit dispatch"),
-    }
 
     {
         let physical_width =
@@ -460,7 +438,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             {
                 Ok(command) => arch::x86_64::acpi::sleep::publish_authorized_soft_off(command),
                 Err(_error) => {
-                    #[cfg(not(feature = "test-support"))]
                     let _ = debug::emit_early_record(
                         debug::DiagnosticLevel::Warn,
                         "power",
@@ -575,7 +552,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                         device::pci::KERNEL_MMIO.record(unit.register_base());
                     }
                 }
-                #[cfg(not(feature = "test-support"))]
                 if !sound {
                     let _ = debug::emit_early_record(
                         debug::DiagnosticLevel::Warn,
@@ -585,7 +561,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 }
                 sound
             });
-            #[cfg(not(feature = "test-support"))]
             if dmar.is_some_and(|dmar| dmar.reserved_memory_regions() != 0) {
                 let _ = debug::emit_early_record(
                     debug::DiagnosticLevel::Warn,
@@ -612,7 +587,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             {
                 device::pci::record_dma_confined(dmar.translated_bus0_functions());
             }
-            #[cfg(not(feature = "test-support"))]
             let _ = debug::emit_early_record(
                 debug::DiagnosticLevel::Info,
                 "iommu",
@@ -637,8 +611,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                     } => "VT-d translation on; no 4-level domains, so device DMA stays blocked",
                 },
             );
-            #[cfg(feature = "test-support")]
-            let _ = state;
         }
         // STORAGE_PLAN K1: check every PCI_FUNCTION boot record against the
         // hardware and size its BARs before any process can claim it.
@@ -660,7 +632,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                             || device::pci::KERNEL_MMIO.overlaps(start, end)
                     },
                 );
-                #[cfg(not(feature = "test-support"))]
                 let _ = debug::emit_early_record(
                     match result {
                         Ok(_) => debug::DiagnosticLevel::Info,
@@ -735,7 +706,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
             .unwrap_or_else(|error| panic!("failed to publish the H1 BSP online: {error:?}"));
         arch::x86_64::idle::enable_live_cpu(cpu::CpuIndex::BOOTSTRAP)
             .unwrap_or_else(|error| panic!("failed to enable H4 BSP idle wake: {error:?}"));
-        #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_cpu_state_record(0, bsp_local_apic_id, "online");
 
         let runtime_stacks = arch::x86_64::linked_runtime_cpu_stack_layout()
@@ -784,19 +754,16 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
         active_paging
             .retire_ap_trampoline_mapping()
             .unwrap_or_else(|error| panic!("failed to retire the H1 AP trampoline: {error:?}"));
-        #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,
             "boot",
             "activated Deep-owned page tables",
         );
-        #[cfg(not(feature = "test-support"))]
         let _ = debug::emit_early_record(
             debug::DiagnosticLevel::Info,
             "cpu",
             arch::x86_64::syscall::supervisor_protections_record(),
         );
-        #[cfg(not(feature = "test-support"))]
         {
             /// Emits one `[memory]` record of labels each followed by a
             /// decimal value.
@@ -840,27 +807,6 @@ pub(crate) fn kernel_main(boot_info_physical: u64) -> ! {
                 (b" largest-pages=", role_growth.largest_free_pages),
             ]);
         }
-        #[cfg(feature = "test-support")]
-        let _ = role_growth;
-        #[cfg(feature = "test-support")]
-        match test_support::BUILD_GUEST_TEST {
-            #[cfg(deepwyrm_memory_guest)]
-            test if test.is_memory_foundation() => {
-                test_support::run_memory_guest_test(active_paging)
-            }
-            #[cfg(deepwyrm_e7_guest)]
-            test if test.is_task_userspace() => test_support::run_task_guest_test(active_paging),
-            #[cfg(deepwyrm_f9_guest)]
-            test if test.is_f9_userspace() => {
-                active_paging.run_atomic_wait_userspace_test(test_support::BUILD_GUEST_TEST)
-            }
-            #[cfg(deepwyrm_f12_guest)]
-            test if test.is_f12_userspace() => {
-                active_paging.run_ipc_blocking_userspace_test(test_support::BUILD_GUEST_TEST)
-            }
-            _ => unreachable!("post-activation selector lacks an explicit runtime"),
-        }
-        #[cfg(not(feature = "test-support"))]
         active_paging.run_primordial(primordial_modules, boot_resource_grants)
     }
 }

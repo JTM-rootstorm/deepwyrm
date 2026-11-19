@@ -21,7 +21,7 @@ pub(crate) use table::{
     ResolvedHandle, TypedHandlePairReservation,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn resolve_test_internal_owner<const OBJECTS: usize>(
     registry: &mut crate::object::ObjectRegistry<OBJECTS>,
     owner: &crate::object::InternalRef,

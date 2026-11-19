@@ -70,11 +70,9 @@ const TASK_HOST_INTEGRATION_TESTS: &[&str] = &[
     "object_registry_ui",
     "memory_authority_ui",
     "task_authority_ui",
-    "x86_64_activation_contract",
     "x86_64_entry_contract",
     "x86_64_syscall_contract",
     "x86_64_exception_contract",
-    "x86_64_memory_guest_contract",
 ];
 const IPC_HOST_TEST_FILTERS: &[&str] = &[
     "handle::table::tests::",
@@ -135,9 +133,8 @@ Commands:
                                      stack bound (DW2 plan §10.2)
   abi generate                       Generate ABI-owned artifacts
   abi check                          Verify generated ABI artifacts have no drift
-  test host [abi|memory|handles|tasks|ipc|selectors]
+  test host [abi|memory|handles|tasks|ipc]
                                      Run host tests: unfiltered is the workspace
-                                     then the kernel under every selector build
   run --plan --request <path>        Emit the canonical QEMU run plan only
   gdb --plan --request <path>        Emit paused QEMU/GDB command plans only
   test guest <selector> --plan --request <path>
@@ -186,7 +183,6 @@ enum HostTestFilter {
     Handles,
     Tasks,
     Ipc,
-    Selectors,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,17 +402,16 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
             command.args(["fmt", "--all", "--", "--check"]);
         }
         Invocation::Check => {
-            let selectors = run_selector_library_checks()?;
-            if selectors != 0 {
-                return Ok(selectors);
+            let production = run_production_library_check()?;
+            if production != 0 {
+                return Ok(production);
             }
             command.args(["check", "--locked", "--workspace", "--all-targets"]);
         }
         Invocation::Clippy => {
             // The production kernel is gated in the shape it ships in --
-            // freestanding target, no selector, no test-support -- before the
-            // host workspace, for the same reason `check` orders its rows that
-            // way. DW1-F/WYR1-F F2A found two dead surfaces that only this row
+            // freestanding target -- before the host workspace, for the same
+            // reason `check` orders its rows that way. DW1-F/WYR1-F F2A found two dead surfaces that only this row
             // can see: the IOAPIC redirection decode instruments and a pair of
             // pre-WYR1-C syscall adapter re-exports.
             let production = run_production_kernel_warning_gate()?;
@@ -475,19 +470,8 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
                 Some(HostTestFilter::Ipc) => {
                     return run_ipc_host_tests();
                 }
-                Some(HostTestFilter::Selectors) => {
-                    return run_selector_host_tests();
-                }
                 None => {
-                    // The workspace first, then the kernel under every selector
-                    // build: the per-selector rows cost about four minutes, well
-                    // inside what the default run can carry (S1.1).
                     command.args(["--workspace", "--all-targets"]);
-                    let status = command.status()?;
-                    if !status.success() {
-                        return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
-                    }
-                    return run_selector_host_tests();
                 }
             }
         }
@@ -500,105 +484,25 @@ fn run_invocation(invocation: Invocation) -> io::Result<u8> {
     Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8)
 }
 
-/// One selector build configuration: every implemented selector.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SelectorBuild<'a> {
-    label: &'a str,
-    selector: &'a str,
-}
-
-/// The single list of selector build configurations every selector gate reads.
-fn selector_builds(selectors: &[String]) -> Vec<SelectorBuild<'_>> {
-    selectors
-        .iter()
-        .map(|selector| SelectorBuild {
-            label: selector,
-            selector,
-        })
-        .collect()
-}
-
-/// Reads the implemented selectors from the harness manifest, refusing an empty
-/// parse: a gate over zero selectors would pass without checking anything.
-fn read_implemented_guest_selectors() -> io::Result<Option<Vec<String>>> {
-    let manifest = fs::read_to_string(workspace_root().join(HARNESS_CONFIG))?;
-    let selectors = implemented_guest_selectors(&manifest);
-    if selectors.is_empty() {
-        let mut stderr = io::stderr().lock();
-        writeln!(
-            stderr,
-            "error: the guest harness manifest lists no implemented selectors"
-        )?;
-        return Ok(None);
-    }
-    Ok(Some(selectors))
-}
-
-/// Reads the implemented guest selectors from the harness manifest.
+/// Compiles the production kernel's library on the target lane.
 ///
-/// Derived rather than listed, so a selector added to the manifest joins this
-/// gate without anyone remembering to add it here -- the drift this gate exists
-/// to catch is exactly the drift a second hand-maintained list would
-/// reintroduce. `reserved` entries are skipped: they have no implementation to
-/// compile, and `build.rs` refuses them by name.
-fn implemented_guest_selectors(manifest: &str) -> Vec<String> {
-    let mut selectors = Vec::new();
-    let mut current = None;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("[guest_test.") {
-            current = rest.strip_suffix(']').map(str::to_owned);
-        } else if line == "state = \"implemented\"" {
-            if let Some(selector) = current.take() {
-                selectors.push(selector);
-            }
-        } else if line.starts_with('[') {
-            current = None;
-        }
-    }
-    selectors
-}
-
-/// Compiles every implemented selector's kernel library.
-///
-/// Selector-gated code is `target_os = "none"`, so `check`'s host workspace
-/// pass has never compiled any of it -- only the product paths that mint VM
-/// images do. That is how R5D's rename survived with two stale call sites in
-/// `ipc-blocking-smoke`, and it is the same shape as the two Wyrmroot selectors
-/// that broke the same week. Running here means no selector's compilability
-/// depends on anyone remembering its name.
+/// Until DW1-F/WYR1-F F1A.2 nothing ever compiled the production kernel on
+/// the target lane, and that gap is how the q35 IOAPIC bring-up stayed
+/// reachable only in instrumented builds without anything noticing -- an
+/// uninstrumented kernel compiled fine, it just had no interrupt-driven
+/// console. The host workspace check that follows never compiles the
+/// `target_os = "none"` code.
 ///
 /// This re-enters `tools/pinned-cargo` on the target lane rather than calling
 /// Cargo directly, because only that lane verifies the accepted toolchain and
 /// exports the freestanding linker a target build needs. `CARGO_HOME` is
 /// cleared because the lane owns it and refuses to be handed one.
-fn run_selector_library_checks() -> io::Result<u8> {
+fn run_production_library_check() -> io::Result<u8> {
     let workspace = workspace_root();
-    let lane = workspace.join("tools/pinned-cargo");
-    let Some(selectors) = read_implemented_guest_selectors()? else {
-        return Ok(EXIT_NOT_IMPLEMENTED);
-    };
-    let builds = selector_builds(&selectors);
-    // The production kernel is the shape no selector selects, and until
-    // DW1-F/WYR1-F F1A.2 nothing ever compiled it on the target lane: every row
-    // above sets `DEEPWYRM_GUEST_TEST_SELECTOR`. That gap is how the q35 IOAPIC
-    // bring-up stayed reachable only under three selector strings without
-    // anything noticing -- an uninstrumented kernel compiled fine, it just had
-    // no interrupt-driven console. Check it first, because a production break
-    // matters more than a selector break.
-    let rows = core::iter::once(None).chain(
-        builds
-            .iter()
-            .map(|build| Some((build.label, build.selector))),
-    );
-    for selector in rows {
-        let mut command = Command::new(&lane);
-        command.current_dir(&workspace).env_remove("CARGO_HOME");
-        command.env_remove("DEEPWYRM_GUEST_TEST_SELECTOR");
-        if let Some((_, selector)) = selector {
-            command.env("DEEPWYRM_GUEST_TEST_SELECTOR", selector);
-        }
-        let mut arguments = vec![
+    let status = Command::new(workspace.join("tools/pinned-cargo"))
+        .current_dir(&workspace)
+        .env_remove("CARGO_HOME")
+        .args([
             "target",
             "check",
             "--locked",
@@ -607,29 +511,18 @@ fn run_selector_library_checks() -> io::Result<u8> {
             "--lib",
             "--target",
             "x86_64-unknown-none",
-        ];
-        // `test-support` is what a selector build needs; the production row is
-        // checked without it, so this also proves the production kernel does
-        // not depend on the test-support surface to compile.
-        if selector.is_some() {
-            arguments.extend(["--features", "test-support"]);
-        }
-        let status = command.args(arguments).status()?;
-        if !status.success() {
-            let mut stderr = io::stderr().lock();
-            match selector {
-                Some((label, _)) => writeln!(stderr, "error: selector {label} does not compile")?,
-                None => writeln!(stderr, "error: the production kernel does not compile")?,
-            }
-            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
-        }
+        ])
+        .status()?;
+    if !status.success() {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "error: the production kernel does not compile")?;
+        return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
     }
     Ok(0)
 }
 
-/// Warnings-denied rustc over the production kernel: the no-selector row
-/// `run_selector_library_checks` checks first, on the target lane, with no
-/// selector and no `test-support`.
+/// Warnings-denied rustc over the production kernel: the build
+/// `run_production_library_check` checks, on the target lane.
 ///
 /// Not Clippy. The accepted Wyrmroot toolchain ships `cargo` and `rustc` only
 /// (`tooling/rust-toolchain.toml`), so there is no `clippy-driver` that can see
@@ -645,7 +538,6 @@ fn run_production_kernel_warning_gate() -> io::Result<u8> {
     let status = Command::new(workspace.join("tools/pinned-cargo"))
         .current_dir(&workspace)
         .env_remove("CARGO_HOME")
-        .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
         .args([
             "target",
             "rustc",
@@ -667,55 +559,6 @@ fn run_production_kernel_warning_gate() -> io::Result<u8> {
             "error: the production kernel does not compile warning-free"
         )?;
         return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
-    }
-    Ok(0)
-}
-
-/// Runs the kernel's host unit tests once per selector build, with
-/// `test-support` and that row's environment.
-///
-/// The workspace run has no selector, so it compiles neither the
-/// `feature = "test-support"` code nor anything under the evidence cfgs
-/// `build.rs` derives from `DEEPWYRM_GUEST_TEST_SELECTOR`. Until S1.1 no gate
-/// ran those host tests, and the first run found two selectors whose host test
-/// builds did not compile and four tests that failed under another selector's
-/// cfg. Only `--lib`: the lane admits `test-support` for nothing else.
-fn run_selector_host_tests() -> io::Result<u8> {
-    let Some(selectors) = read_implemented_guest_selectors()? else {
-        return Ok(EXIT_NOT_IMPLEMENTED);
-    };
-    for build in selector_builds(&selectors) {
-        {
-            let mut stderr = io::stderr().lock();
-            writeln!(
-                stderr,
-                "xtask: kernel host tests for selector {}",
-                build.label
-            )?;
-        }
-        let mut command = Command::new("cargo");
-        command.current_dir(workspace_root());
-        command.env("DEEPWYRM_GUEST_TEST_SELECTOR", build.selector);
-        let status = command
-            .args([
-                "test",
-                "--locked",
-                "--package",
-                "deepwyrm-kernel",
-                "--lib",
-                "--features",
-                "test-support",
-            ])
-            .status()?;
-        if !status.success() {
-            let mut stderr = io::stderr().lock();
-            writeln!(
-                stderr,
-                "error: kernel host tests fail for selector {}",
-                build.label
-            )?;
-            return Ok(status.code().unwrap_or(EXIT_NOT_IMPLEMENTED as i32) as u8);
-        }
     }
     Ok(0)
 }

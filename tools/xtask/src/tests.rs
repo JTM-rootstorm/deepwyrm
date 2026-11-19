@@ -79,10 +79,6 @@ fn available_commands_have_explicit_actions() {
             Action::Command(Invocation::HostTests(Some(HostTestFilter::Ipc))),
         ),
         (
-            &["test", "host", "selectors"][..],
-            Action::Command(Invocation::HostTests(Some(HostTestFilter::Selectors))),
-        ),
-        (
             &["run", "--plan", "--request", "request.toml"][..],
             Action::Command(Invocation::HarnessPlan(
                 HarnessKind::Run,
@@ -159,13 +155,19 @@ fn task_host_gate_covers_scheduler_resources_and_target_guard_contracts() {
             "object_registry_ui",
             "memory_authority_ui",
             "task_authority_ui",
-            "x86_64_activation_contract",
             "x86_64_entry_contract",
             "x86_64_syscall_contract",
             "x86_64_exception_contract",
-            "x86_64_memory_guest_contract",
         ]
     );
+}
+
+#[test]
+fn every_task_host_integration_test_names_an_existing_test_file() {
+    for name in TASK_HOST_INTEGRATION_TESTS {
+        let path = workspace_root().join(format!("kernel/tests/{name}.rs"));
+        assert!(path.is_file(), "{} does not exist", path.display());
+    }
 }
 
 #[test]
@@ -834,55 +836,6 @@ fn terminal(status: &str, test_id: u32, detail: u32) -> Vec<u8> {
     let mut record = format!("DWTEST1|{status}|{test_id:08X}|{detail:08X}|").into_bytes();
     record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
     record
-}
-
-#[test]
-fn the_selector_gate_reads_implemented_selectors_and_skips_reserved_ones() {
-    // A parser that silently returns nothing would turn the selector gate into
-    // a no-op that still reports success, which is the failure mode the gate
-    // exists to prevent. Pin both halves against the real manifest.
-    let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
-    let selectors = implemented_guest_selectors(&manifest);
-    assert!(
-        selectors.len() > 10,
-        "the manifest lists {} implemented selectors, which is too few to be a real parse",
-        selectors.len()
-    );
-    for implemented in ["ipc-blocking-smoke", "atomic-wait-wake", "memory-mapping"] {
-        assert!(
-            selectors.iter().any(|selector| selector == implemented),
-            "{implemented} is implemented and must be gated"
-        );
-    }
-    for reserved in ["task-syscall-sanitize", "task-user-exception"] {
-        assert!(
-            !selectors.iter().any(|selector| selector == reserved),
-            "{reserved} is reserved and has no implementation to compile"
-        );
-    }
-}
-
-#[test]
-fn selector_builds_are_every_selector_once() {
-    let manifest = fs::read_to_string(workspace_root().join("tooling/guest-harness.toml")).unwrap();
-    let selectors = implemented_guest_selectors(&manifest);
-    let builds = selector_builds(&selectors);
-    assert_eq!(builds.len(), selectors.len());
-    for (build, selector) in builds.iter().zip(&selectors) {
-        assert_eq!(
-            (build.label, build.selector),
-            (selector.as_str(), selector.as_str())
-        );
-    }
-    let labels = builds
-        .iter()
-        .map(|build| build.label)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        labels.len(),
-        builds.len(),
-        "selector build labels must be unique"
-    );
 }
 
 fn clippy_message(package_id: &str, lint: &str, file: &str, line: u32, column: u32) -> String {

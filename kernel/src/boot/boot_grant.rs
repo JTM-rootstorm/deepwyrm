@@ -50,7 +50,7 @@ impl BootResourceGrant {
     #[cfg(test)]
     #[allow(
         dead_code,
-        reason = "selector-30 consumes this only in the target runtime"
+        reason = "only host tests use this; the former selector-30 runtime was its other consumer"
     )]
     pub(crate) const fn descriptor(self) -> BootResourceDescriptor {
         self.descriptor
@@ -132,7 +132,7 @@ impl BootResourceGrants {
     #[cfg(test)]
     #[allow(
         dead_code,
-        reason = "selector-30 consumes this only in the target runtime"
+        reason = "only host tests use this; the former selector-30 runtime was its other consumer"
     )]
     pub(crate) const fn len(self) -> usize {
         self.count
@@ -157,7 +157,7 @@ impl BootResourceGrants {
     #[cfg(test)]
     #[allow(
         dead_code,
-        reason = "selector-30 consumes this only in the target runtime"
+        reason = "only host tests use this; the former selector-30 runtime was its other consumer"
     )]
     pub(crate) fn grant(self, index: usize) -> Option<BootResourceGrant> {
         if index >= self.count {
@@ -408,7 +408,7 @@ impl BootResourceGrantAuthority {
     #[cfg(test)]
     #[allow(
         dead_code,
-        reason = "selector-30 consumes this only in the target runtime"
+        reason = "only host tests use this; the former selector-30 runtime was its other consumer"
     )]
     pub(crate) fn state_for(&self, resource_id: u64) -> Option<(u64, BootResourceGrantState)> {
         let state = self.state.lock();

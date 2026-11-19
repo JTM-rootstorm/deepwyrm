@@ -752,7 +752,7 @@ impl<const INTERRUPTS: usize> InterruptAuthority<INTERRUPTS> {
         self.interrupts.lock().iter().flatten().count()
     }
 
-    /// Selector-31 terminal admission is a positive exact-state check: a
+    /// The former selector 31's terminal admission is a positive exact-state check: a
     /// missing, Creating, Finalizing, Pending, or AckPrepared record is never
     /// quiescent. Only the current live binding in `Armed` may cross the
     /// terminal materialization boundary.

@@ -88,11 +88,8 @@ pub(super) fn parse_test(args: &[String]) -> Action {
                     Action::Command(Invocation::HostTests(Some(HostTestFilter::Tasks)))
                 }
                 "ipc" => Action::Command(Invocation::HostTests(Some(HostTestFilter::Ipc))),
-                "selectors" => {
-                    Action::Command(Invocation::HostTests(Some(HostTestFilter::Selectors)))
-                }
                 _ => Action::UsageError(
-                    "unknown host-test filter; expected `abi`, `memory`, `handles`, `tasks`, `ipc`, or `selectors`"
+                    "unknown host-test filter; expected `abi`, `memory`, `handles`, `tasks`, or `ipc`"
                         .into(),
                 ),
             },
@@ -159,7 +156,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("test") => write!(
             writer,
-            "Usage: cargo xtask test <host|guest|integration> ...\n\nUnfiltered `test host` runs the workspace tests, then the kernel's host unit tests once per selector build (every implemented selector plus its variants) with `test-support`. Host filters are `abi`, `memory`, `handles`, `tasks`, `ipc`, and `selectors`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite. `test host selectors` runs only the per-selector kernel host tests. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
+            "Usage: cargo xtask test <host|guest|integration> ...\n\nUnfiltered `test host` runs the workspace tests. Host filters are `abi`, `memory`, `handles`, `tasks`, and `ipc`. `test host ipc` runs the bounded IPC, wait, time, handle-transfer, timer, finalizer, and process-creation host suite. `test guest` emits a plan only; guest execution remains coordinator-owned.\n"
         ),
         Some(command @ ("run" | "gdb")) => write!(
             writer,
@@ -183,7 +180,7 @@ pub(super) fn print_help(mut writer: impl Write, command: Option<&str>) -> io::R
         ),
         Some("kernel-check") => write!(
             writer,
-            "Usage: cargo xtask kernel-check\n\nBuilds the production kernel and a stack analysis copy on the target lane. Checks that production is a static freestanding image with no test-only symbols or selector markers, that the analysis copy's code is byte-identical to production, and that the deepest direct-call chain from each kernel entry leaves a quarter of its stack spare. Calls through registers are not bounded here; dev-boot's stack high-water marks cover them.\n"
+            "Usage: cargo xtask kernel-check\n\nBuilds the production kernel and a stack analysis copy on the target lane. Checks that production is a static freestanding image, that the analysis copy's code is byte-identical to production, and that the deepest direct-call chain from each kernel entry leaves a quarter of its stack spare. Calls through registers are not bounded here; dev-boot's stack high-water marks cover them.\n"
         ),
         Some("doc") => write!(
             writer,

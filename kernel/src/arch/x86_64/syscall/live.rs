@@ -90,8 +90,8 @@ use crate::arch::x86_64::user_state::{
 // `RuntimeAuthorityHandle` is a CPU's only way to lock (the quantum-expiry publisher takes no
 // runtime lock since D1 commit 2), and only it mints a token. The remaining mints are
 // `GuardFree::assume` in root
-// frames that hold no guard by construction (the AP entry in `lib.rs`, the dw1c detached idle
-// entry here, and the F9/F12 guest runtimes).
+// frames that hold no guard by construction (the AP entry in `lib.rs` and the dw1c detached idle
+// entry here).
 //
 // [FRAME] `dw_x86_64_syscall_dispatch` and `dw_x86_64_timer_pre_iret_gate` receive frame pointers
 // from assembly (`syscall_entry.S`, `exceptions.S`). Rust checks them for null and alignment. That
@@ -313,10 +313,6 @@ struct NativeSyscallRuntimeEntry<
         + crate::syscall::native::NativeRendezvousRuntime,
 > {
     runtime: core::ptr::NonNull<R>,
-    /// The quantum-expiry publisher to bind when this entry publishes the
-    /// runtime itself (the guest runtimes); `None` when its caller already
-    /// published both (the primordial runtime).
-    quantum_expiry: Option<core::ptr::NonNull<R::QuantumExpiry>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2872,50 +2868,6 @@ unsafe fn iret_validated_user(state: &ValidatedUserReturn) -> ! {
     unsafe { dw_x86_64_iret_to_user(state.raw()) }
 }
 
-/// Publishes one stationary CPU-local execution carrier and enters CPL3 through
-/// the validated IRETQ helper without returning its exclusive borrow to safe
-/// Rust. A carrier address may be published for exactly one CPU slot.
-///
-/// # Safety
-///
-/// `stack` is the exact live E3 kernel-stack carrier of the selected Thread.
-// Only the E7, F9 and F12 guest runtimes pin a stack carrier and enter with it;
-// the primordial runtime enters through `enter_published_native_syscall_runtime`.
-#[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
-#[allow(
-    unsafe_code,
-    reason = "the divergent entry frame retains one CPU's pinned carrier borrow after unique per-CPU publication and transfers through audited IRETQ assembly"
-)]
-pub(crate) unsafe fn enter_native_syscall_runtime<
-    'runtime,
-    R: crate::syscall::native::NativeSyscallFrameRuntime
-        + crate::syscall::native::NativeRendezvousRuntime,
->(
-    runtime: core::pin::Pin<&'runtime mut R>,
-    state: &ValidatedUserReturn,
-    stack: KernelStackBounds,
-    exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
-) -> ! {
-    // SAFETY: the pointer is taken once from the pin, which is consumed here and never used again,
-    // so every later access goes through it; nothing moves `R`.
-    let runtime = core::ptr::NonNull::from(unsafe { core::pin::Pin::get_unchecked_mut(runtime) });
-    // The guest runtimes arm no quantum: their publisher is zero-sized, so a dangling, aligned
-    // pointer is a valid one, and no storage is needed.
-    const {
-        assert!(
-            size_of::<R::QuantumExpiry>() == 0,
-            "a guest runtime's quantum-expiry publisher must be zero-sized"
-        );
-    }
-    let entry = NativeSyscallRuntimeEntry {
-        runtime,
-        quantum_expiry: Some(core::ptr::NonNull::dangling()),
-    };
-    // SAFETY: forwarded from this function's `# Safety`; `enter` performs the remaining binding
-    // checks itself.
-    unsafe { entry.enter(state, stack, exception_binding) }
-}
-
 /// Enters CPL3 on a carrier its caller already published with
 /// `bind_running_native_runtime_carrier_for_slot`, through the same pointer,
 /// so no reference is retagged over the published address (F1).
@@ -2938,10 +2890,7 @@ pub(crate) unsafe fn enter_published_native_syscall_runtime<
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
 ) -> ! {
-    let entry = NativeSyscallRuntimeEntry {
-        runtime,
-        quantum_expiry: None,
-    };
+    let entry = NativeSyscallRuntimeEntry { runtime };
     // SAFETY: forwarded from this function's `# Safety`; `enter` checks the pointer against the
     // published binding and halts on a mismatch.
     unsafe { entry.enter(state, stack, exception_binding) }
@@ -2969,63 +2918,27 @@ impl<
         // SAFETY: [ENTRY-REF] no record reference is live here; `stack` is the selected Thread's
         // live stack per this function's caller contract.
         unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
-        // The entry's pointer is the one published (or compared with the published binding): no
-        // reference is created over the carrier here.
+        // The entry's pointer is compared with the published binding: no reference is created
+        // over the carrier here.
         let context = self.runtime.as_ptr();
         let cpu_index = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
-        if RUNTIME_STATE
+        let binding = RUNTIME
             .get(cpu_index)
-            .is_some_and(|slot| slot.load(Ordering::Acquire) == RUNTIME_UNBOUND)
+            .filter(|_| {
+                RUNTIME_STATE[cpu_index].load(Ordering::Acquire) == RUNTIME_BOUND
+                    && RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index)
+                        == Some(RuntimeCarrierLifecycle::Executing)
+            })
+            // SAFETY: [PER-CPU-SLOT] the filter observed BOUND with Acquire, so the one-shot
+            // binding is initialized and immutable; it is `Copy`.
+            .map(|storage| unsafe { (*storage.0.get()).assume_init() })
+            .unwrap_or_else(|| halt_forever());
+        if binding.context != context.cast::<()>()
+            || binding.handler as usize != native_runtime_trampoline::<R> as *const () as usize
+            || binding.idle_scheduler_handler as usize
+                != native_runtime_idle_scheduler::<R> as *const () as usize
         {
-            // SAFETY: [CARRIER] the entry's caller keeps the carrier stationary for the kernel's life
-            // (a pin consumed by a never-returning frame, or a pointer published under
-            // `bind_native_runtime_carrier_for_slot`'s contract), and every later use goes through
-            // this pointer; it is owned by this CPU's slot.
-            unsafe {
-                publish_syscall_runtime(
-                    cpu_index,
-                    context.cast::<()>(),
-                    native_runtime_trampoline::<R>,
-                    native_runtime_fresh_thread::<R>,
-                    native_runtime_idle_scheduler::<R>,
-                    native_runtime_user_exception::<R>,
-                    native_runtime_rendezvous_gate::<R>,
-                    native_runtime_rendezvous_reaper::<R>,
-                    self.quantum_expiry
-                        .unwrap_or_else(|| halt_forever())
-                        .as_ptr()
-                        .cast::<()>(),
-                    native_runtime_quantum_expiry::<R::QuantumExpiry>,
-                    native_runtime_prepare_quantum::<R>,
-                    native_runtime_timer_pre_iret::<R>,
-                    native_runtime_user_page_fault::<R>,
-                )
-            }
-            .unwrap_or_else(|_| halt_forever());
-            RUNTIME_CARRIER_LIFECYCLES
-                .bind_parked(cpu_index)
-                .unwrap_or_else(|_| halt_forever());
-            let cpu = crate::cpu::CpuIndex::new(cpu_index).unwrap_or_else(|| halt_forever());
-            release_native_runtime_carrier_for_slot(cpu).unwrap_or_else(|_| halt_forever());
-        } else {
-            let binding = RUNTIME
-                .get(cpu_index)
-                .filter(|_| {
-                    RUNTIME_STATE[cpu_index].load(Ordering::Acquire) == RUNTIME_BOUND
-                        && RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index)
-                            == Some(RuntimeCarrierLifecycle::Executing)
-                })
-                // SAFETY: [PER-CPU-SLOT] the filter observed BOUND with Acquire, so the one-shot
-                // binding is initialized and immutable; it is `Copy`.
-                .map(|storage| unsafe { (*storage.0.get()).assume_init() })
-                .unwrap_or_else(|| halt_forever());
-            if binding.context != context.cast::<()>()
-                || binding.handler as usize != native_runtime_trampoline::<R> as *const () as usize
-                || binding.idle_scheduler_handler as usize
-                    != native_runtime_idle_scheduler::<R> as *const () as usize
-            {
-                halt_forever();
-            }
+            halt_forever();
         }
         // SAFETY: the boundary was validated, `stack` was bound above per the caller's contract,
         // and `state` is a `ValidatedUserReturn`; the primordial caller keeps it on the boot stack,
@@ -3081,8 +2994,6 @@ fn halt_forever() -> ! {
     reason = "invalid E4 entry state is terminal with interrupts disabled"
 )]
 fn halt_at_line(line: u32) -> ! {
-    // Guest-test builds keep their serial records exact.
-    #[cfg(not(feature = "test-support"))]
     {
         let message = crate::debug::HaltLineMessage::new(line);
         let _ = crate::debug::emit_early_record(
@@ -3091,8 +3002,6 @@ fn halt_at_line(line: u32) -> ! {
             message.as_str(),
         );
     }
-    #[cfg(feature = "test-support")]
-    let _ = line;
     loop {
         // SAFETY: [ASM] CLI then HLT, with nothing after it; neither touches memory or the stack.
         unsafe {

@@ -28,9 +28,6 @@ pub(crate) fn drop_one_record_for_test() {
 
 struct FakePort {
     ready: bool,
-    final_write_count_for_drain: Option<usize>,
-    drain_polls_before_empty: usize,
-    drain_poll_count: usize,
     writes: [(u16, u8); 2048],
     write_count: usize,
 }
@@ -39,9 +36,6 @@ impl FakePort {
     const fn ready() -> Self {
         Self {
             ready: true,
-            final_write_count_for_drain: None,
-            drain_polls_before_empty: 0,
-            drain_poll_count: 0,
             writes: [(0, 0); 2048],
             write_count: 0,
         }
@@ -50,23 +44,6 @@ impl FakePort {
     const fn stalled() -> Self {
         Self {
             ready: false,
-            final_write_count_for_drain: None,
-            drain_polls_before_empty: 0,
-            drain_poll_count: 0,
-            writes: [(0, 0); 2048],
-            write_count: 0,
-        }
-    }
-
-    const fn ready_with_delayed_drain(
-        final_write_count_for_drain: usize,
-        drain_polls_before_empty: usize,
-    ) -> Self {
-        Self {
-            ready: true,
-            final_write_count_for_drain: Some(final_write_count_for_drain),
-            drain_polls_before_empty,
-            drain_poll_count: 0,
             writes: [(0, 0); 2048],
             write_count: 0,
         }
@@ -90,18 +67,7 @@ impl crate::arch::x86_64::io_port::BytePortIo for FakePort {
             return 0;
         }
 
-        let mut status = LINE_STATUS_THR_EMPTY;
-        match self.final_write_count_for_drain {
-            Some(final_write_count) if self.write_count >= final_write_count => {
-                self.drain_poll_count += 1;
-                if self.drain_poll_count > self.drain_polls_before_empty {
-                    status |= LINE_STATUS_TRANSMITTER_EMPTY;
-                }
-            }
-            Some(_) => {}
-            None => status |= LINE_STATUS_TRANSMITTER_EMPTY,
-        }
-        status
+        LINE_STATUS_THR_EMPTY | LINE_STATUS_TRANSMITTER_EMPTY
     }
 
     fn write_u8(&mut self, port: u16, value: u8) {
@@ -140,83 +106,6 @@ fn translates_newlines_and_times_out_without_unbounded_polling() {
     let mut stalled = Com1::with_poll_limit(FakePort::stalled(), 3);
     assert_eq!(stalled.write_bytes(b"x"), Err(SerialError::TransmitTimeout));
     assert_eq!(stalled.io.write_count, 0);
-}
-
-#[test]
-fn raw_completion_record_preserves_its_single_lf_byte() {
-    const RECORD: &[u8] = b"DWTEST1|03|0123ABCD|DEADBEEF|C001D00D\n";
-    assert_eq!(RECORD.len(), 38);
-
-    let mut serial = Com1::new(FakePort::ready_with_delayed_drain(RECORD.len(), 2));
-    write_bounded_raw_record(&mut serial, RECORD).unwrap();
-    let port = serial.io;
-    assert_eq!(port.write_count, RECORD.len());
-    assert_eq!(&port.bytes()[..RECORD.len()], RECORD);
-    assert_eq!(port.bytes()[RECORD.len() - 1], b'\n');
-    assert_eq!(port.drain_poll_count, 3);
-}
-
-#[test]
-fn raw_machine_records_are_bounded() {
-    let record = [b'x'; MAX_RAW_RECORD_BYTES + 1];
-    let mut serial = Com1::new(FakePort::ready());
-    assert_eq!(
-        write_bounded_raw_record(&mut serial, &record),
-        Err(SerialError::RecordTooLong)
-    );
-    assert_eq!(serial.io.write_count, 0);
-}
-
-#[test]
-fn test_evidence_writer_transmits_the_exact_85_byte_record() {
-    const RECORD_BYTES: usize = 85;
-    let record = [b'E'; RECORD_BYTES];
-    let mut serial = Com1::new(FakePort::ready());
-    write_bounded_test_evidence_record(&mut serial, &record).unwrap();
-    let port = serial.io;
-    assert_eq!(port.write_count, RECORD_BYTES);
-    assert_eq!(&port.bytes()[..RECORD_BYTES], &record);
-}
-
-#[test]
-fn one_com1_transaction_orders_fifteen_wrcap_records_before_dwtest1() {
-    const WRCAP_BYTES: usize = 117;
-    const WRCAP_COUNT: usize = 15;
-    const TERMINAL: &[u8] = b"DWTEST1|01|00000018|00000000|00000000\n";
-    let mut record = [b'0'; WRCAP_BYTES];
-    record[..6].copy_from_slice(b"WRCAP1");
-    record[WRCAP_BYTES - 1] = b'\n';
-
-    let mut serial = Com1::new(FakePort::ready());
-    for sequence in 0..WRCAP_COUNT {
-        record[34] = b'0' + u8::try_from(sequence).unwrap();
-        write_bounded_test_evidence_record(&mut serial, &record).unwrap();
-    }
-    write_bounded_raw_record(&mut serial, TERMINAL).unwrap();
-
-    let port = serial.io;
-    let bytes = port.bytes();
-    assert_eq!(port.write_count, WRCAP_BYTES * WRCAP_COUNT + TERMINAL.len());
-    for sequence in 0..WRCAP_COUNT {
-        let start = sequence * WRCAP_BYTES;
-        assert_eq!(&bytes[start..start + 6], b"WRCAP1");
-        assert_eq!(bytes[start + WRCAP_BYTES - 1], b'\n');
-    }
-    assert_eq!(
-        &bytes[WRCAP_BYTES * WRCAP_COUNT..port.write_count],
-        TERMINAL
-    );
-}
-
-#[test]
-fn raw_machine_record_reports_a_distinct_drain_timeout() {
-    let mut serial = Com1::with_poll_limit(FakePort::ready_with_delayed_drain(1, usize::MAX), 3);
-    assert_eq!(
-        write_bounded_raw_record(&mut serial, b"\n"),
-        Err(SerialError::TransmitDrainTimeout)
-    );
-    assert_eq!(serial.io.write_count, 1);
-    assert_eq!(serial.io.drain_poll_count, 3);
 }
 
 #[test]

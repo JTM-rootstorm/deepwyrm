@@ -579,9 +579,6 @@ impl EarlyExceptionReporter for SerialEarlyExceptionReporter {
             fault_address: exception.fault_address,
             backtrace_frames: &[],
         });
-        #[cfg(feature = "test-support")]
-        crate::test_support::complete_exception(exception);
-        #[cfg(not(feature = "test-support"))]
         halt_forever()
     }
 }
@@ -761,9 +758,6 @@ pub(crate) unsafe extern "sysv64" fn dw_x86_64_terminal_interrupt_dispatch(
         fault_address: None,
         backtrace_frames: &[],
     });
-    #[cfg(feature = "test-support")]
-    crate::test_support::complete_panic(raw_context.vector as u32);
-    #[cfg(not(feature = "test-support"))]
     halt_forever()
 }
 

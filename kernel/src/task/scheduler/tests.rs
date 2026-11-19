@@ -620,7 +620,7 @@ fn dw1c_fixture_keeps_reporter_on_arm_cpu_through_token8_ack() {
     let seed = installed_dw1c_fixture(cpu(0));
 
     // A real preemption releases the reporter continuation onto its ARM CPU.
-    // The selector fixture must not let an idle carrier steal it onto token 8's
+    // The DW1-C fixture must not let an idle carrier steal it onto token 8's
     // lane, because the controller's token-3/5/7 wakes must remain remote from
     // the authenticated ARM CPU.
     assert_eq!(

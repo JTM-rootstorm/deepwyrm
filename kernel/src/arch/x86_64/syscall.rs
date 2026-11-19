@@ -45,12 +45,6 @@ pub(crate) use msr::{E4_FMASK, SyscallMsrPlan};
 pub(crate) use super::exceptions::{
     UserExceptionBindError, UserExceptionBinding, UserExceptionHandler, bind_user_exception_handler,
 };
-#[cfg(all(
-    target_os = "none",
-    target_arch = "x86_64",
-    any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest)
-))]
-pub(crate) use live::enter_native_syscall_runtime;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,

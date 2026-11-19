@@ -1022,7 +1022,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         (pages, objects)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn creation_into_handle(
         &mut self,
         reference: CreationRef,
@@ -1041,7 +1041,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn creation_into_internal(
         &self,
         reference: CreationRef,
@@ -1285,7 +1285,7 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn complete_finalization(
         &mut self,
         final_release: FinalRelease,

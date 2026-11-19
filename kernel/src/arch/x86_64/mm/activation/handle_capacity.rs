@@ -20,11 +20,11 @@ pub(super) const BOOTSTRAP_HANDLE_PEAK: usize = INITIAL_BOOTSTRAP_HANDLES
     + PROCESS_ROOT_HANDLES
     + THREAD_HANDLES
     + INIT_DUPLICATE_HANDLES;
-// Selector 30 receives the ordinary four bootstrap capabilities plus the
-// boot-resource domain.  After the first owner exits, bootstrap retains the
+// Selector 30 received the ordinary four bootstrap capabilities plus the
+// boot-resource domain.  After the first owner exited, bootstrap retained the
 // trigger's Process and launch Channel while the replacement owner loader
-// holds its net Channel, Process+root, Thread, and resource-domain staging
-// duplicate.  That exact replacement-launch peak is twelve handles.
+// held its net Channel, Process+root, Thread, and resource-domain staging
+// duplicate.  That exact replacement-launch peak was twelve handles.
 #[cfg(test)]
 pub(super) const D6_INITIAL_HANDLES: usize = INITIAL_BOOTSTRAP_HANDLES + 1;
 #[cfg(test)]

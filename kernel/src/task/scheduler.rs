@@ -118,8 +118,8 @@ pub(crate) enum SchedulerPreemptionDecision {
     },
 }
 
-/// Exact internal snapshot consumed by selector-26 evidence integration after
-/// its cross-repository wire is frozen. This is kernel-private and not ABI.
+/// Exact internal scheduler snapshot (designed for the former selector-26
+/// evidence). This is kernel-private and not ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerPreemptionSnapshot {
     pub(crate) running: Option<SchedulerExecutionClaim>,
@@ -292,8 +292,8 @@ impl SchedulerWakePublication {
 }
 
 /// Exact successful continuation-release commit returned after scheduler
-/// authority has been dropped. Selector-private evidence consumes the
-/// generation only outside the scheduler lock.
+/// authority has been dropped. The generation is consumed only outside the
+/// scheduler lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerCompletedSwitch {
     runnable_publication: Option<RunnablePublication>,
@@ -379,12 +379,12 @@ impl SchedulerIdleDispatch {
     }
 }
 
-/// Selector-private migration exclusions use the same fixed reason ordering
+/// Fixture migration exclusions use the same fixed reason ordering
 /// as the DW1-A contract. They are absent from ordinary production kernels.
 #[cfg(test)]
 #[allow(
     dead_code,
-    reason = "the fixed rejection code set is validated across phased selector fixtures"
+    reason = "the fixed rejection code set is validated across the scheduler fixtures"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -417,7 +417,7 @@ pub(crate) struct SchedulerMigrationRejection {
     pub(crate) reason: SchedulerMigrationRejectionReason,
 }
 
-/// Selector-private identity used to install DW1-C's deterministic scheduler
+/// Fixture identity used to install DW1-C's deterministic scheduler
 /// fixture from the already validated ARM table. This is not affinity ABI.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,7 +426,7 @@ pub(crate) struct Dw1cSchedulerActorIdentity {
     pub(crate) execution_generation: u64,
 }
 
-/// Selector-private request for one CPU to leave a blocked actor's suspended
+/// DW1-C fixture request for one CPU to leave a blocked actor's suspended
 /// continuation on its ordinary detached idle carrier.  The exact execution
 /// generation prevents a late ARM retry from detaching a later run of the
 /// same Thread.
@@ -691,7 +691,7 @@ pub(crate) struct SchedulerCounters {
     pub(crate) overflow_fault: bool,
 }
 
-/// One selector-private, whole-scheduler accounting observation. Both
+/// One DW1-C fixture, whole-scheduler accounting observation. Both
 /// identities are minted while the scheduler lock is held, after every
 /// retained ownership and accounting invariant has been validated. They are
 /// scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens
@@ -1275,7 +1275,7 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
                 .any(|suspended| suspended.thread == entry.thread)
     }
 
-    /// Selector-private final revalidation shared by idle stealing and the
+    /// Final revalidation shared by idle stealing and the
     /// explicit migration-attempt fixture.  It runs under the scheduler lock;
     /// a rejection exposes no partial move.
     #[cfg(test)]
@@ -1875,7 +1875,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
     }
 
-    /// Installs selector 28's deterministic placement fixture after ARM has
+    /// Installs the DW1-C deterministic placement fixture after ARM has
     /// authenticated the exact reporter and actor table. No evidence observer
     /// is invoked while scheduler authority is held.
     #[cfg(test)]
@@ -1983,7 +1983,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Ok(())
     }
 
-    /// Selects the exact carrier that must rescan before selector 28 can retry
+    /// Selects the exact carrier that must rescan before the DW1-C fixture can retry
     /// ARM.  A blocked actor may still own its physically suspended syscall
     /// continuation after the remaining CPUs become quiescent.  Returning
     /// `WOULD_BLOCK` alone cannot wake that carrier, so the caller stages one
@@ -2022,7 +2022,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Some(request.cpu)
     }
 
-    /// Returns the exact selector-private detach request only while the named
+    /// Returns the exact DW1-C detach request only while the named
     /// generation still owns this CPU's physically suspended continuation.
     #[cfg(test)]
     pub(crate) fn dw1c_continuation_detach_request_on(
@@ -2076,7 +2076,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
     }
 
-    /// Opens selector 28's token-8 terminal gate only after the collector has
+    /// Opens the DW1-C token-8 terminal gate only after the collector has
     /// accepted the exact scheduler-published expiry. Publication and evidence
     /// observation intentionally occur on opposite sides of scheduler
     /// ownership, so holding the ticket alone is not yet a terminal permit.
@@ -3218,7 +3218,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    /// Performs selector 28's token-6 wake and deliberate migration rejection
+    /// Performs the DW1-C token-6 wake and deliberate migration rejection
     /// under one scheduler acquisition. The woken generation cannot dispatch
     /// between Runnable publication and the exact exclusion probe.
     #[cfg(test)]
@@ -3993,7 +3993,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         })
     }
 
-    /// Selector-private exact identity resolver used while ARM inspects a
+    /// Exact identity resolver used while ARM inspects a
     /// started actor. The scheduler lock joins Running, queued Runnable, and
     /// Blocked/suspended ownership without exposing this identity as ABI.
     #[cfg(test)]
@@ -4039,7 +4039,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         }
     }
 
-    /// Captures selector 28's terminal accounting relation under one scheduler
+    /// Captures the DW1-C terminal accounting relation under one scheduler
     /// lock. No payload is returned, and no snapshot identity is consumed,
     /// unless the complete live state and every sticky diagnostic remain
     /// sound.
@@ -4215,7 +4215,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     }
 
     #[cfg(test)]
-    /// Performs one selector-private migration attempt through the same locked
+    /// Performs one fixture migration attempt through the same locked
     /// candidate revalidation used by idle stealing.  A rejected attempt never
     /// changes queue placement, accounting, or migration generations.
     pub(crate) fn attempt_migration_revalidation_on(

@@ -20,11 +20,7 @@ use output_gate::{BoundedWait, ContendedWait, OutputGate, OutputHold, WriterId};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::panic::PanicInfo;
 
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use core::arch::asm;
 
 use crate::arch::x86_64::io_port::BytePortIo;
@@ -43,33 +39,17 @@ const LINE_STATUS: u16 = 5;
 const DIVISOR_LOW: u16 = 0;
 const DIVISOR_HIGH: u16 = 1;
 const LINE_STATUS_THR_EMPTY: u8 = 1 << 5;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 const LINE_STATUS_TRANSMITTER_EMPTY: u8 = 1 << 6;
 const LINE_CONTROL_DLAB: u8 = 1 << 7;
 const LINE_CONTROL_8N1: u8 = 0x03;
 const FIFO_ENABLE_CLEAR_14: u8 = 0xc7;
 const MODEM_DTR_RTS_OUT2: u8 = 0x0b;
 const DEFAULT_POLL_LIMIT: u32 = 4_096;
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production diagnostics are omitted from test images"
-    )
-)]
 const MAX_SUBSYSTEM_BYTES: usize = 32;
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production diagnostics are omitted from test images"
-    )
-)]
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 192;
 const MAX_PANIC_REASON_BYTES: usize = 256;
 const MAX_BACKTRACE_FRAMES: usize = 16;
-#[cfg(any(test, feature = "test-support"))]
-const MAX_RAW_RECORD_BYTES: usize = 64;
 /// A bounded early COM1 writer.
 struct Com1<P: BytePortIo> {
     io: P,
@@ -115,10 +95,6 @@ impl Write for PanicReasonBuffer {
 pub(crate) enum SerialError {
     Busy,
     TransmitTimeout,
-    #[cfg(any(test, feature = "test-support"))]
-    TransmitDrainTimeout,
-    #[cfg(any(test, feature = "test-support"))]
-    RecordTooLong,
 }
 
 impl<P: BytePortIo> Com1<P> {
@@ -154,18 +130,6 @@ impl<P: BytePortIo> Com1<P> {
         Ok(())
     }
 
-    /// Writes protocol bytes exactly as supplied, including any line endings.
-    ///
-    /// This is for fixed machine records such as test completion markers;
-    /// human diagnostics should use [`Self::write_bytes`] for CRLF output.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn write_raw_bytes(&mut self, bytes: &[u8]) -> Result<(), SerialError> {
-        for &byte in bytes {
-            self.write_hardware_byte(byte)?;
-        }
-        Ok(())
-    }
-
     fn write_hardware_byte(&mut self, byte: u8) -> Result<(), SerialError> {
         for _ in 0..self.poll_limit {
             if self.io.read_u8(COM1_BASE + LINE_STATUS) & LINE_STATUS_THR_EMPTY != 0 {
@@ -174,16 +138,6 @@ impl<P: BytePortIo> Com1<P> {
             }
         }
         Err(SerialError::TransmitTimeout)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn wait_until_transmitter_drained(&mut self) -> Result<(), SerialError> {
-        for _ in 0..self.poll_limit {
-            if self.io.read_u8(COM1_BASE + LINE_STATUS) & LINE_STATUS_TRANSMITTER_EMPTY != 0 {
-                return Ok(());
-            }
-        }
-        Err(SerialError::TransmitDrainTimeout)
     }
 }
 
@@ -207,13 +161,6 @@ pub(crate) enum DiagnosticLevel {
 }
 
 impl DiagnosticLevel {
-    #[cfg_attr(
-        all(feature = "test-support", target_os = "none"),
-        allow(
-            dead_code,
-            reason = "production diagnostics are omitted from test images"
-        )
-    )]
     const fn label(self) -> &'static str {
         match self {
             Self::Info => "INFO",
@@ -341,13 +288,6 @@ pub(crate) fn records_dropped() -> u64 {
 /// its own whole; a record inside a record on the same CPU is refused at once.
 /// A refusal is counted in [`records_dropped`]. Serial timeouts stop the
 /// record rather than blocking panic handling indefinitely.
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production diagnostics are omitted from test images"
-    )
-)]
 fn emit_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     level: DiagnosticLevel,
@@ -366,13 +306,6 @@ fn emit_record<P: BytePortIo>(
 }
 
 /// [`emit_record`] through a given gate, writer and wait.
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production diagnostics are omitted from test images"
-    )
-)]
 fn emit_record_through<P: BytePortIo>(
     gate: &OutputGate,
     writer: WriterId,
@@ -395,13 +328,6 @@ fn emit_record_through<P: BytePortIo>(
 }
 
 /// Emits the bounded H1 CPU identity/lifecycle record used by live SMP gates.
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production CPU lifecycle diagnostics are omitted from test images"
-    )
-)]
 fn emit_bootstrap_completion_record<P: BytePortIo>(
     serial: &mut Com1<P>,
     level: DiagnosticLevel,
@@ -563,34 +489,13 @@ fn emit_panic_record_through<P: BytePortIo>(
 
 /// `halt line=<line>`, built without allocation, for a fail-stop site that
 /// names the line that called it.
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production halt records are omitted from test images"
-    )
-)]
 pub(crate) struct HaltLineMessage {
     bytes: [u8; HALT_LINE_PREFIX.len() + 10],
     len: usize,
 }
 
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production halt records are omitted from test images"
-    )
-)]
 const HALT_LINE_PREFIX: &[u8] = b"halt line=";
 
-#[cfg_attr(
-    all(feature = "test-support", target_os = "none"),
-    allow(
-        dead_code,
-        reason = "production halt records are omitted from test images"
-    )
-)]
 impl HaltLineMessage {
     pub(crate) fn new(line: u32) -> Self {
         let mut bytes = [0; HALT_LINE_PREFIX.len() + 10];
@@ -726,11 +631,7 @@ pub(crate) fn initialize_early_com1() {
 }
 
 /// Emits a structured record through the kernel's initialized COM1 path.
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_record(
     level: DiagnosticLevel,
     subsystem: &str,
@@ -741,11 +642,7 @@ pub(crate) fn emit_early_record(
 }
 
 /// Target-only wrapper for `emit_process_retirement_record`.
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_process_retirement_record(
     application: u32,
     reason: u32,
@@ -756,22 +653,14 @@ pub(crate) fn emit_early_process_retirement_record(
 }
 
 /// Emits the record that precedes powering off with no Process left.
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_system_empty_record() -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
     emit_system_empty_record(&mut serial)
 }
 
 /// Emits one allocation-free CPU identity/lifecycle record through COM1.
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_cpu_state_record(
     cpu_index: usize,
     local_apic_id: u8,
@@ -781,11 +670,7 @@ pub(crate) fn emit_early_cpu_state_record(
     emit_cpu_state_record(&mut serial, cpu_index, local_apic_id, state)
 }
 
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 /// Emits the primordial bootstrap's completion record with its cause.
 ///
 /// F3A.6q. The production arm of `primordial`'s completion handler matched
@@ -812,11 +697,6 @@ pub(crate) fn emit_early_bootstrap_completion_record(
 
 /// Target-only wrapper for `emit_capacity_record`, for the syscall boundaries
 /// that collapse a typed capacity error into `DW_STATUS_NO_RESOURCES`.
-///
-/// Unlike its neighbours this is *not* gated on `not(feature = "test-support")`:
-/// the syscall adapter that calls it is compiled into instrumented images too,
-/// and an instrumented build that silently lost this record would reproduce
-/// exactly the production-versus-instrumented asymmetry F3A.6s was about.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn emit_early_capacity_record(resource: &str, site: u8) -> Result<(), SerialError> {
     let mut serial = Com1::new(X86PortIo);
@@ -863,40 +743,12 @@ pub(crate) fn handle_early_panic(info: &PanicInfo<'_>) -> ! {
 
     let _ = emit_early_panic_record(&record);
 
-    // The test-support completion transport is deliberately only provided for
-    // the canonical x86_64 guest target. Production builds retain the halt
-    // path below.
-    #[cfg(all(feature = "test-support", target_arch = "x86_64"))]
-    {
-        crate::test_support::complete_panic(test_panic_location_detail(info));
-    }
-
-    #[cfg(not(all(feature = "test-support", target_arch = "x86_64")))]
     halt_after_early_panic()
-}
-
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
-fn test_panic_location_detail(info: &PanicInfo<'_>) -> u32 {
-    let Some(location) = info.location() else {
-        return 0x5041_4e49;
-    };
-    let file_hash = location
-        .file()
-        .as_bytes()
-        .iter()
-        .fold(0x811c_u16, |hash, byte| {
-            hash.wrapping_mul(0x0193) ^ u16::from(*byte)
-        });
-    u32::from(file_hash) << 16 | (location.line() & 0xffff)
 }
 
 /// Terminal x86 panic path when no higher-level scheduler or recovery policy
 /// exists yet.
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
     reason = "x86 terminal cli/hlt boundary for freestanding kernel panic handling"
@@ -909,42 +761,6 @@ fn halt_after_early_panic() -> ! {
             asm!("cli; hlt", options(nomem, nostack));
         }
     }
-}
-
-/// Writes one bounded, byte-exact machine record through COM1.
-///
-/// This deliberately bypasses the CRLF formatting used for human diagnostics.
-/// It is crate-private so only the kernel's explicit test-support seam can use
-/// it; it does not expose a general hardware-port operation to callers.
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn emit_early_raw_record(record: &[u8]) -> Result<(), SerialError> {
-    let _hold = acquire_output().ok_or(SerialError::Busy)?;
-    let mut serial = Com1::new(X86PortIo);
-    write_bounded_raw_record(&mut serial, record)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn write_bounded_raw_record<P: BytePortIo>(
-    serial: &mut Com1<P>,
-    record: &[u8],
-) -> Result<(), SerialError> {
-    if record.len() > MAX_RAW_RECORD_BYTES {
-        return Err(SerialError::RecordTooLong);
-    }
-    serial.write_raw_bytes(record)?;
-    if !record.is_empty() {
-        serial.wait_until_transmitter_drained()?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn write_bounded_test_evidence_record<P: BytePortIo, const BYTES: usize>(
-    serial: &mut Com1<P>,
-    record: &[u8; BYTES],
-) -> Result<(), SerialError> {
-    serial.write_raw_bytes(record)?;
-    serial.wait_until_transmitter_drained()
 }
 
 #[cfg(test)]

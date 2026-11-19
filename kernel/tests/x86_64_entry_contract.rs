@@ -191,116 +191,6 @@ fn task_layout_manifest_is_kernel_private_exact_and_fails_closed_on_drift() {
 }
 
 #[test]
-fn guest_test_identity_is_resolved_only_from_the_canonical_selector() {
-    let harness = fs::read_to_string(guest_harness_path()).expect("read guest harness manifest");
-    for (selector, id) in [
-        ("boot-handoff-pass", 1),
-        ("exception-fail-path", 2),
-        ("panic-path", 3),
-        ("memory-mapping", 4),
-        ("memory-unmapping", 5),
-        ("memory-permissions", 6),
-        ("memory-invalid-pointer", 7),
-        ("memory-user-kernel-isolation", 8),
-        ("memory-shared-memory-object", 9),
-        ("task-syscall-smoke", 10),
-        ("ipc-blocking-smoke", 13),
-        ("atomic-wait-wake", 16),
-    ] {
-        assert_eq!(
-            kernel_build::select_guest_test(true, Some(selector), false, &harness),
-            Ok(Some(id)),
-            "selector {selector} must retain its immutable harness ID"
-        );
-    }
-    for selector in [
-        "task-syscall-sanitize",
-        "task-user-exception",
-        "ipc-transfer-rollback",
-        "wait-deadline-timer",
-        "process-create-bootstrap",
-        "primordial-bootstrap",
-        "primordial-blocking-cleanup",
-        "primordial-user-exception",
-        "primordial-invalid-return",
-        "smp-runtime-stress",
-        "smp-runtime-acceptance",
-        "native-userspace-capability",
-        "permanent-supervisor-rrc",
-        "bootstrap-registry-launch",
-        "normal-preemption-smp",
-        "device-coordinator-restart",
-        "device-resource-interrupt-synthetic",
-        "q35-com2-interrupt",
-        "native-console-streams",
-        "interactive-wyrmsh",
-        "dw1-wyr1-interactive-closure",
-    ] {
-        assert!(
-            kernel_build::select_guest_test(true, Some(selector), false, &harness).is_err(),
-            "reserved selector {selector} must not produce a runnable build identity"
-        );
-    }
-    assert!(kernel_build::select_guest_test(true, Some("unknown-test"), false, &harness).is_err());
-    assert!(kernel_build::select_guest_test(true, None, false, &harness).is_err());
-    assert!(kernel_build::select_guest_test(false, Some("panic-path"), false, "").is_err());
-    assert!(kernel_build::select_guest_test(true, Some("panic-path"), true, &harness).is_err());
-    assert_eq!(
-        kernel_build::select_guest_test(false, None, false, ""),
-        Ok(None)
-    );
-}
-
-#[test]
-fn guest_test_manifest_rejects_ambiguous_or_reserved_ids() {
-    for malformed in [
-        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"implemented\"\n[guest_test.a]\nid = 2\nstate = \"implemented\"\n",
-        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"implemented\"\n[guest_test.b]\nid = 1\nstate = \"implemented\"\n",
-        "schema_version = 2\n[guest_test.a]\nid = 0\nstate = \"implemented\"\n",
-        "schema_version = 2\n[guest_test.a]\nid = 4294967296\nstate = \"implemented\"\n",
-        "schema_version = 2\n[guest_test.a]\nid = 1\nid = 2\nstate = \"implemented\"\n",
-        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"invalid\"\n",
-        "schema_version = 2\n[guest_test.a]\nid = 1\nstate = \"implemented\"\nstate = \"reserved\"\n",
-        "schema_version = 2\n[guest_test.a]\n",
-        "schema_version = 2\n[guest_test.a]\nname = \"a\"\n",
-        "schema_version = 2\n[unknown.a]\nid = 1\nstate = \"implemented\"\n",
-        "schema_version = 3\n[guest_test.a]\nid = 1\nstate = \"implemented\"\n",
-        "schema_version = 2\n[guest_test.INVALID]\nid = 1\nstate = \"implemented\"\n",
-    ] {
-        assert!(
-            kernel_build::select_guest_test(true, Some("a"), false, malformed).is_err(),
-            "accepted malformed guest harness:\n{malformed}"
-        );
-    }
-}
-
-#[test]
-fn e7_user_constants_match_the_generated_abi() {
-    assert_eq!(kernel_build::E7_USER_ENTRY, 0x4000_0000);
-    assert_eq!(kernel_build::E7_USER_DATA, 0x4000_1000);
-    assert_eq!(kernel_build::E7_USER_STACK_BOTTOM, 0x5000_0000);
-    assert_eq!(kernel_build::E7_USER_STACK_TOP, 0x5000_1000);
-    assert_eq!(
-        kernel_build::E7_SYSCALL_ABI_GET_INFO,
-        deepwyrm_abi::DW_SYSCALL_ABI_GET_INFO.0
-    );
-    assert_eq!(
-        kernel_build::E7_SYSCALL_PROCESS_EXIT,
-        deepwyrm_abi::DW_SYSCALL_PROCESS_EXIT.0
-    );
-    assert_eq!(
-        kernel_build::E7_STATUS_NOT_SUPPORTED,
-        deepwyrm_abi::DW_STATUS_NOT_SUPPORTED.0
-    );
-    assert_eq!(
-        kernel_build::E7_ABI_INFO_SIZE,
-        deepwyrm_abi::DW_ABI_INFO_V1_SIZE
-    );
-    assert_eq!(kernel_build::E7_ABI_VERSION, deepwyrm_abi::DW_ABI_VERSION);
-    assert_eq!(kernel_build::E7_PAGE_SIZE, deepwyrm_abi::DW_BASE_PAGE_SIZE);
-}
-
-#[test]
 fn linked_entry_and_rust_boundary_match_the_canonical_elf_policy() {
     let clang = host_tools::clang();
     let rustc = host_tools::rustc();
@@ -676,10 +566,6 @@ fn task_layout_path() -> PathBuf {
 
 fn linker_path() -> PathBuf {
     kernel_root().join("arch/x86_64/linker.ld")
-}
-
-fn guest_harness_path() -> PathBuf {
-    kernel_root().join("../tooling/guest-harness.toml")
 }
 
 fn entry_assembly_path() -> PathBuf {

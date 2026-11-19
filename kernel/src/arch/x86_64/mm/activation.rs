@@ -113,8 +113,6 @@ pub(crate) use address_space::{
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use user_access::LiveProcessAddressSpace;
-#[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use user_access::OwnedLiveAtomicU32;
 #[path = "activation/build.rs"]
 mod build;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -142,7 +140,7 @@ const PER_CPU_SCRATCH_MMIO_LEAF_COUNT: u64 = 2 + VTD_UNIT_MMIO_LEAF_COUNT;
 // of eight rejected the ninth actor load after seven blocked receives retained
 // pins and ChannelCreate atomically requested two more for valid output ranges.
 // Keep bounded production headroom for overlapping blocked outputs and atomic
-// words rather than making the real kernel depend on selector-local capacity.
+// words rather than a capacity measured for one workload.
 const E5_USER_PIN_CAPACITY: usize = 32;
 #[cfg(test)]
 const DW1C_RETAINED_RECEIVE_PINS: usize = 10;
@@ -151,9 +149,6 @@ const DW1C_CHANNEL_CREATE_OUTPUT_PINS: usize = 2;
 #[cfg(test)]
 const DW1C_LIVE_USER_PIN_FLOOR: usize =
     DW1C_RETAINED_RECEIVE_PINS + DW1C_CHANNEL_CREATE_OUTPUT_PINS;
-#[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
-#[cfg(not(deepwyrm_production_product))]
-const LIVE_ADDRESS_SPACE_CAPACITY: usize = 3;
 // Root bindings and Process identities come from the same pool, so they
 // cannot drift apart.
 #[cfg(deepwyrm_production_product)]
@@ -2461,8 +2456,7 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 /// guard-free P guard mints. "No usercopy under T" (H0 §12.8) is therefore a
 /// type fact for the primordial runtime. The page-table mutation,
 /// return-validation and pin-settlement sessions wrap the same builder and
-/// expose no copy. The guest runtimes' constructor (no T there) and the
-/// evidence supervisors' are compiled only into their own builds.
+/// expose no copy.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live_sessions {
     use super::*;
@@ -2470,18 +2464,6 @@ mod live_sessions {
     impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
     {
-        /// A usercopy session for a guest test runtime, which has no runtime
-        /// authority T (D1 commit 9). The primordial runtime never builds one:
-        /// its usercopy goes through the guard-free session.
-        #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
-        pub(crate) fn current_process_address_space(
-            &mut self,
-            active_root: &ActiveRootSelection,
-            process: crate::task::ProcessKey,
-        ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-            self.build_live_session(active_root.usercopy_root(), process)
-        }
-
         /// The page-table mutation session for `process`'s current root (D1
         /// option B3): root selection, table candidates and the coherent
         /// publisher, with no usercopy.
@@ -2526,8 +2508,7 @@ mod live_sessions {
         /// binding, this CPU, CR3 and the residency epoch before the session
         /// exists. It is private to this module: a usercopy session reaches the
         /// primordial runtime only through [`GuardFreeValue`]'s constructor, and
-        /// every other constructor here wraps it in a session with no usercopy
-        /// (or is compiled only into evidence or guest builds).
+        /// every other constructor here wraps it in a session with no usercopy.
         fn build_live_session(
             &mut self,
             active_root: address_space::UserCopyRoot,
@@ -2878,10 +2859,6 @@ impl<A> ActiveDeepPaging<A> {
         self.identity
     }
 }
-
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
-#[path = "activation/test_support.rs"]
-mod test_support;
 
 impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
     /// Publishes the prepared root. There is deliberately no recoverable error

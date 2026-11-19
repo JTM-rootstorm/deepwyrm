@@ -766,7 +766,7 @@ fn complete_primordial_launch_with_ready<B: PrimordialCompletionBackend>(
     Ok(())
 }
 
-/// Selector-local split of the primordial completion contract. This validates
+/// The former selector builds' split of the primordial completion contract. This validates
 /// the committed READY and structured zero exit without consuming the runtime
 /// authority that a live permanent-supervisor descendant still requires.
 #[cfg(test)]
@@ -776,7 +776,7 @@ pub(crate) fn validate_primordial_retirement_facts<B: PrimordialCompletionBacken
     validate_primordial_retirement_facts_with_ready(backend, &READY_BYTES)
 }
 
-/// Selector-local retirement validation for the four-capability resource
+/// The former selector builds' retirement validation for the four-capability resource
 /// primordial profile. This preserves the READY/exit split while requiring
 /// the same profile-aware READY accepted by the initial construction path.
 #[cfg(test)]
@@ -793,7 +793,7 @@ fn validate_primordial_retirement_facts_with_ready<B: PrimordialCompletionBacken
     let mut bytes = [0_u8; 40];
     // Snapshot both facts before applying the established READY-first error
     // precedence. A failed receive must not erase the concurrent structured
-    // Process disposition needed by selector-local failure diagnostics.
+    // Process disposition needed by failure diagnostics.
     let ready = backend.receive_ready(&mut bytes);
     let exit = backend.observe_exit();
     // F3A.6t makes the comment above true. It claimed a failed receive must

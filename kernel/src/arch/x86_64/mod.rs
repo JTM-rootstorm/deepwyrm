@@ -36,11 +36,7 @@ pub(crate) mod ipi;
 pub mod mm;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) mod pci_config;
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) mod power;
 #[allow(
     dead_code,
@@ -49,14 +45,7 @@ pub(crate) mod power;
 pub(crate) mod rendezvous;
 pub(crate) mod smp;
 // Host builds use only its tests; the live kernel paints and reports.
-#[cfg(any(
-    test,
-    all(
-        not(feature = "test-support"),
-        target_os = "none",
-        target_arch = "x86_64"
-    )
-))]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) mod stack_watermark;
 #[cfg_attr(
     not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),

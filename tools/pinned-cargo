@@ -56,20 +56,6 @@ require_file() {
     [ -f "$1" ] || fail "$2 is not a regular file: $1"
 }
 
-contains_feature() {
-    feature_list=$1
-    wanted=$2
-    printf '%s\n' "$feature_list" | awk -v wanted="$wanted" '
-        BEGIN { FS = "[[:space:],]+" }
-        {
-            for (field = 1; field <= NF; field++) {
-                if ($field == wanted) found = 1
-            }
-        }
-        END { exit found ? 0 : 1 }
-    '
-}
-
 [ "$#" -ge 1 ] || {
     usage >&2
     exit 2
@@ -92,40 +78,15 @@ esac
 [ "$#" -ge 1 ] || fail "missing Cargo arguments"
 
 [ -z "${CARGO_HOME:-}" ] || fail "CARGO_HOME is lane-owned; do not supply it"
-[ -z "${DEEPWYRM_GUEST_TEST_ID:-}" ] || \
-    fail "DEEPWYRM_GUEST_TEST_ID is build-owned; select a named guest test instead"
 
-test_support=false
-safe_host_test_support=false
 safe_host_targets=false
-expect_features=false
 for argument in "$@"; do
-    if [ "$expect_features" = true ]; then
-        contains_feature "$argument" test-support && test_support=true
-        expect_features=false
-        continue
-    fi
     case "$argument" in
-        --features)
-            expect_features=true
-            ;;
-        --features=*)
-            features=${argument#--features=}
-            contains_feature "$features" test-support && test_support=true
-            ;;
-        --all-features)
-            test_support=true
-            ;;
-        --lib)
-            safe_host_test_support=true
-            safe_host_targets=true
-            ;;
-        --tests|--test|--test=*|--doc)
+        --lib|--tests|--test|--test=*|--doc)
             safe_host_targets=true
             ;;
     esac
 done
-[ "$expect_features" = false ] || fail "--features requires an explicit feature list"
 
 if [ "$lane" = host ]; then
     for argument in "$@"; do
@@ -145,27 +106,14 @@ if [ "$lane" = host ]; then
                 ;;
         esac
     done
-    if [ "$test_support" = false ]; then
-        case "$1" in
-            build|check|clippy|rustdoc)
-                [ "$safe_host_targets" = true ] || \
-                    fail "host lane rejects implicit $1 targets; select --lib, --tests, --test, or --doc"
-                ;;
-        esac
-    fi
+    case "$1" in
+        build|check|clippy|rustdoc)
+            [ "$safe_host_targets" = true ] || \
+                fail "host lane rejects implicit $1 targets; select --lib, --tests, --test, or --doc"
+            ;;
+    esac
 fi
 
-selector=${DEEPWYRM_GUEST_TEST_SELECTOR:-}
-if [ "$test_support" = true ] && [ -z "$selector" ]; then
-    fail "test-support requires DEEPWYRM_GUEST_TEST_SELECTOR before Cargo admission"
-fi
-if [ "$test_support" = false ] && [ -n "$selector" ]; then
-    fail "DEEPWYRM_GUEST_TEST_SELECTOR requires explicit test-support admission"
-fi
-if [ "$lane" = host ] && [ "$test_support" = true ]; then
-    [ "$1" = test ] && [ "$safe_host_test_support" = true ] || \
-        fail "host test-support is restricted to an explicit Cargo test --lib gate"
-fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 workspace=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 project_root=$(CDPATH='' cd -- "$workspace/.." && pwd -P)

@@ -77,11 +77,9 @@ pub(crate) use f_services::{
     FServiceState, FServiceTerminalCleanup, UnreachableUserAccess,
 };
 
-#[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use adapters::atomic_wake_with;
 #[allow(
     unused_imports,
-    reason = "F7 native wait runtime ownership is consumed by the later freestanding F guest runtime"
+    reason = "F7 native wait runtime ownership: not every name is used in every build"
 )]
 pub(crate) use adapters::{
     CleanupQueue, HeldReleases, NativeWaitControl, StagedStopCleanup, TerminalWaitCleanup,
@@ -97,12 +95,8 @@ pub(crate) use adapters::RegistryWindowCharges;
     all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
 ))]
 pub(crate) use adapters::WindowCredit;
-#[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_e7_guest))]
-pub(crate) use adapters::clock_get;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::interrupt_ack;
-#[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
-pub(crate) use adapters::process_terminate;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use adapters::{
     ChannelReceiveCopyOut, ChannelReceiveHold, ChannelReceiveOutputs, ChannelSendInputs,
@@ -133,7 +127,7 @@ pub(crate) use adapters::{
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 #[allow(
     unused_imports,
-    reason = "the integrated F12 target probe consumes the synchronous compatibility adapter only when test support is selected"
+    reason = "MemoryObjectBackingAccess, process_create_with_root, process_terminate and thread_start_with_access have no caller in the kernel-target build; the primordial runtime uses the rest"
 )]
 pub(crate) use adapters::{
     DeferredMemoryObjectAccess, MemoryObjectBackingAccess, ProcessRootReservation,
@@ -141,22 +135,6 @@ pub(crate) use adapters::{
     process_create_with_root, process_terminate, thread_create, thread_start_with_access,
     thread_terminate,
 };
-#[cfg(deepwyrm_e7_guest)]
-pub(crate) use adapters::{NoTerminalWaitCleanup, abi_get_info};
-#[cfg(all(
-    not(deepwyrm_integrated),
-    any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest)
-))]
-pub(crate) use adapters::{complete_deferred_current_reclaim_on, process_exit_on};
-#[cfg(all(deepwyrm_f12_guest, not(deepwyrm_integrated)))]
-pub(crate) use adapters::{handle_close, handle_duplicate, object_get_info_v1};
-#[cfg(all(
-    deepwyrm_integrated,
-    target_os = "none",
-    target_arch = "x86_64",
-    not(deepwyrm_production_product)
-))]
-pub(crate) use adapters::{object_get_info_v1, object_get_info_v1_with_devices};
 
 use deepwyrm_abi::{
     DW_STATUS_NOT_SUPPORTED, DwKnownSyscall, DwStatus, DwSyscallId, DwSyscallImplementationPhase,

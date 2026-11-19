@@ -36,13 +36,12 @@
 
 // The read side has no guest caller by design: host GDB reads `LIVENESS`
 // straight out of memory over the gdbstub, which is the whole point of a
-// diagnostic that must work when the runtime authority is stalled. A selector's
-// timeout path calls `emit_snapshot` once reset card R1's product exists.
+// diagnostic that must work when the runtime authority is stalled.
 #![cfg_attr(
     target_os = "none",
     allow(
         dead_code,
-        reason = "host GDB consumes the read side without a guest call; R1's product wires emit_snapshot"
+        reason = "host GDB consumes the read side without a guest call"
     )
 )]
 
@@ -591,20 +590,6 @@ fn format_snapshot_on(snapshot: &LivenessSnapshot, buffer: &mut [u8]) -> Option<
         return None;
     }
     Some(cursor.written)
-}
-
-/// Emits one formatted snapshot through the test-support COM1 seam.
-///
-/// This is the guest half of the R1B timeout trigger. It is deliberately
-/// lock-free with respect to the runtime authority so it still reports when
-/// that authority is the thing that has stalled.
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn emit_snapshot() -> Result<(), super::SerialError> {
-    let mut buffer = [0_u8; SNAPSHOT_MAX_BYTES];
-    let Some(length) = format_snapshot(&mut buffer) else {
-        return Err(super::SerialError::Busy);
-    };
-    super::emit_early_raw_record(&buffer[..length])
 }
 
 #[cfg(test)]
