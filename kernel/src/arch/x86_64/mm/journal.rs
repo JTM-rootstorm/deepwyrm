@@ -66,6 +66,13 @@ pub(super) mod target_seal {
 ///
 /// `zero_table_frame` must, on success, leave all 512 entries of `frame`
 /// zero: the publisher then hands the frame to the role manager as zeroed.
+///
+/// `apply_if_empty` must read the one entry it names and, only when that
+/// read is 0, store the write, with nothing of this target between the
+/// read and the store. When the entry read is nonzero it stores nothing
+/// and has no TLB effect. On an error every owned-root entry is unchanged,
+/// as for `apply`. It invalidates nothing, so it is only for a store into
+/// an entry that must be empty (empty to present needs no invalidation).
 #[allow(
     unsafe_code,
     reason = "atomic page-table writes and TLB invalidation are architecture facts"
@@ -95,6 +102,24 @@ pub(crate) unsafe trait AtomicPageTableTarget: target_seal::Sealed {
 
     /// Ends the span `begin_mutation_span` opened.
     fn end_mutation_span(&mut self) {}
+
+    /// Stores `write`, with no invalidation, only if its entry reads 0, and
+    /// returns `None`; otherwise returns `Some` of the entry it read and
+    /// stores nothing (DW2 §15.2: a touched leaf is stored only while it is
+    /// still empty). See the trait's safety contract.
+    ///
+    /// This default reads with `read_entry` and stores with `apply`, so it
+    /// meets the contract for any target whose `read_entry` and `apply`
+    /// meet theirs, given that the caller holds the target, and so nothing
+    /// of it runs between the two. A target whose `apply` already reads the
+    /// location before it stores may override it to make that one read.
+    fn apply_if_empty(&mut self, write: JournalWrite) -> Result<Option<u64>, Self::Error> {
+        let found = self.read_entry(write.table(), write.index())?;
+        if found != 0 {
+            return Ok(Some(found));
+        }
+        self.apply(&[write], &[]).map(|()| None)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

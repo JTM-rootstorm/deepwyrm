@@ -118,4 +118,14 @@ unsafe impl<T: AtomicPageTableTarget, const PINS: usize> AtomicPageTableTarget
     fn end_mutation_span(&mut self) {
         self.span = None;
     }
+
+    /// As `apply` with no invalidation: it takes no permit and checks
+    /// nothing of a held span (`apply` checks the span only for
+    /// invalidations), and the inner target makes the one read and the
+    /// store.
+    fn apply_if_empty(&mut self, write: JournalWrite) -> Result<Option<u64>, Self::Error> {
+        self.scratch
+            .apply_if_empty(write)
+            .map_err(PinTrackedError::Target)
+    }
 }

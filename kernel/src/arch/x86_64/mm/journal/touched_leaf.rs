@@ -326,6 +326,13 @@ where
     /// ([`X86AddressSpacePublisher::commit_touched_page`]), its frame is
     /// the commit's and is not resolved again (DW2 §13.18 part f1); every
     /// other check is made as above, in its order.
+    ///
+    /// Inside the span the leaf is read again by the store itself
+    /// (`AtomicPageTableTarget::apply_if_empty`), and stored only if it is
+    /// still empty (DW2 §15.2); a leaf found present there is answered as
+    /// the first read answers it. A failed read inside the span is the
+    /// store's error, `Journal(Target(..))`, not the first read's
+    /// `Map(Access(Target(..)))`.
     #[cfg_attr(
         not(all(target_os = "none", target_arch = "x86_64")),
         allow(
@@ -435,25 +442,25 @@ where
                 X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
             })?;
         // The leaf is read again inside the span, and stored only while it
-        // is still empty (DW2 §15.2). Under a shared hold of P another
-        // CPU's serve of this page may have stored it since the read above;
-        // two spans over one page are never held at once, so this read sees
-        // that store, and storing again would clear the accessed and dirty
-        // bits the other CPU's TLB already holds. A leaf found present is
-        // answered as the read above would have answered it. Under an
-        // exclusive hold nothing else stores a leaf, so this read is 0.
-        let stored = match self.target.read_entry(path[3], index) {
-            Err(error) => Err(X86AddressSpacePublishError::Map(MapError::Access(
+        // is still empty (DW2 §15.2), by the store itself
+        // (`apply_if_empty`: the target's one read before its store). Under
+        // a shared hold of P another CPU's serve of this page may have
+        // stored it since the read above; two spans over one page are never
+        // held at once, so this read sees that store, and storing again
+        // would clear the accessed and dirty bits the other CPU's TLB
+        // already holds. A leaf found present is answered as the read above
+        // would have answered it. Under an exclusive hold nothing else
+        // stores a leaf, so this read is 0. A failed read here is the
+        // store's error, `Journal(Target(..))`.
+        let stored = match self
+            .target
+            .apply_if_empty(JournalWrite::new(path[3], index, entry))
+        {
+            Ok(None) => Ok(true),
+            Ok(Some(leaf)) => present_leaf(leaf, entry, page, limit, unauthenticated),
+            Err(error) => Err(X86AddressSpacePublishError::Journal(
                 OwnedPageTableJournalError::Target(error),
-            ))),
-            Ok(0) => self
-                .target
-                .apply(&[JournalWrite::new(path[3], index, entry)], &[])
-                .map(|()| true)
-                .map_err(|error| {
-                    X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
-                }),
-            Ok(leaf) => present_leaf(leaf, entry, page, limit, unauthenticated),
+            )),
         };
         self.target.end_mutation_span();
         stored

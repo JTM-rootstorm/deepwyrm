@@ -1227,6 +1227,22 @@ impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
         self.access_frame_entry(table, index, Some(value))
             .map(|_| ())
     }
+
+    /// The check `apply` and `apply_if_empty` make of each write before any
+    /// store: its location is valid, and is read now; the entry read.
+    fn preflight_write(&mut self, write: &JournalWrite) -> Result<u64, LiveActiveTargetError> {
+        self.validate_location(write.table(), write.index())?;
+        self.read_location(write.table(), write.index())
+    }
+
+    /// The check `apply` and `apply_if_empty` make after the preflight reads
+    /// and before any store: this CPU's scratch leaf is not installed.
+    fn require_scratch_leaf_free(&mut self) -> Result<(), LiveActiveTargetError> {
+        if self.io.load(self.scratch_leaf_address()) != 0 {
+            return Err(LiveActiveTargetError::Busy);
+        }
+        Ok(())
+    }
 }
 
 // SAFETY: this target is linear, root/role bound, and uses the authenticated
@@ -1254,12 +1270,9 @@ unsafe impl<I: ActiveScratchIo> AtomicPageTableTarget for ActiveScratchTarget<I>
     ) -> Result<(), Self::Error> {
         self.require_owning_cpu()?;
         for write in writes {
-            self.validate_location(write.table(), write.index())?;
-            let _ = self.read_location(write.table(), write.index())?;
+            let _ = self.preflight_write(write)?;
         }
-        if self.io.load(self.scratch_leaf_address()) != 0 {
-            return Err(LiveActiveTargetError::Busy);
-        }
+        self.require_scratch_leaf_free()?;
 
         let mut wrote = false;
         for write in writes {
@@ -1275,6 +1288,22 @@ unsafe impl<I: ActiveScratchIo> AtomicPageTableTarget for ActiveScratchTarget<I>
             self.io.invalidate(page.address());
         }
         Ok(())
+    }
+
+    /// `apply`'s checks for one write and no invalidation, in its order:
+    /// this CPU, the write's location (valid, and read now), and this CPU's
+    /// scratch leaf free; then, only when the location read 0, its one
+    /// store. The preflight read is the read the contract asks for, so the
+    /// entry is read once (DW2 §15.2).
+    fn apply_if_empty(&mut self, write: JournalWrite) -> Result<Option<u64>, Self::Error> {
+        self.require_owning_cpu()?;
+        let found = self.preflight_write(&write)?;
+        if found != 0 {
+            return Ok(Some(found));
+        }
+        self.require_scratch_leaf_free()?;
+        self.write_location(write.table(), write.index(), write.value())?;
+        Ok(None)
     }
 }
 
