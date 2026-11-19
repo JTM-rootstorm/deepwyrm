@@ -2550,7 +2550,10 @@ mod live_sessions {
         /// §15.2), in their order: this CPU's binding, CR3, the copied root
         /// identity against the live binding, this CPU and the residency
         /// epoch, then this CPU's scratch target. It reads only, so both the
-        /// exclusive builder and the shared one make it.
+        /// exclusive builder and the shared one make it. Inlined into each,
+        /// so neither returns the checks' results through memory, as the
+        /// exclusive builder did not before it was shared.
+        #[inline(always)]
         #[allow(
             unsafe_code,
             reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
