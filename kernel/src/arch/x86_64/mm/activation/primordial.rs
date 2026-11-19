@@ -8507,9 +8507,14 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // The serve under T may open, replace or close this CPU's window:
         // the next fault runs the exclusive fast serve first (DW2 §15.2).
         self.shared_serve.serve_under_t_ran();
-        self.with_synchronized_runtime_at_safe_point(|runtime| {
+        // Unless it committed ahead of a stream (DW2 §15.6): then the next
+        // touches find their pages committed, and the next fault tries the
+        // shared serve first.
+        let mut committed_ahead = false;
+        let pass = self.with_synchronized_runtime_at_safe_point(|runtime| {
             let mut refused = None;
-            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused, true);
+            let mut outcome =
+                runtime.serve_user_page_fault(cr2, error, &mut refused, Some(&mut committed_ahead));
             // A touch refused when owed work could admit it frees owed
             // memory first (§10.10 item 7, §10.12 item 6, DW2 §13.12 part
             // b): a quota refusal the refusing groups' finalizing pages
@@ -8544,8 +8549,11 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     reschedule,
                 }
             })
-        })
-        .unwrap_or(crate::syscall::native::FaultPass::retry())
+        });
+        if committed_ahead {
+            self.shared_serve.serve_under_t_committed_ahead();
+        }
+        pass.unwrap_or(crate::syscall::native::FaultPass::retry())
     }
 
     /// The fast serve (DW2 §13.16 part e3): with P alone, taken through a
@@ -10651,15 +10659,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ///
     /// A quota refusal first closes every fault window and admits once
     /// more, so credit is never the reason a touch is refused; and with
-    /// `open_window` (the fault gate's serve, not a fill-in's) a touch that
+    /// `ahead` (the fault gate's serve, not a fill-in's) a touch that
     /// leaves its page present opens or tops up this CPU's fault window
-    /// for the rest of the mapping (DW2 §13.16 part e3).
+    /// for the rest of the mapping (DW2 §13.16 part e3). When the window
+    /// says the touch starts or continues a stream, the pages after it are
+    /// committed ahead from the window's credit in this hold, and `ahead`
+    /// is set when that took a frame or covered a page (DW2 §15.6).
     fn serve_user_page_fault(
         &mut self,
         cr2: u64,
         error: u64,
         refused: &mut Option<FaultCharges>,
-        open_window: bool,
+        mut ahead: Option<&mut bool>,
     ) -> crate::syscall::native::UserPageFaultOutcome {
         use crate::memory::frame_roles::FrameRoleError;
         use crate::syscall::native::UserPageFaultOutcome as Outcome;
@@ -10699,6 +10710,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE;
         // The window this touch opens, its identity copied here under T
         // (DW2 §13.16 part e3).
+        let open_window = ahead.is_some();
         let opening = open_window.then(|| crate::memory::address_region::WindowOpening {
             thread,
             process,
@@ -10822,8 +10834,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Err(error) => panic!("an on-demand fault could not publish its leaf: {error:?}"),
             };
             drop(publisher);
-            if let Some(opening) = opening {
-                session.open_fault_window(
+            if let (Some(opening), Some(ahead)) = (opening, ahead.as_deref_mut()) {
+                let opened = session.open_fault_window(
                     cpu,
                     opening,
                     &mut crate::syscall::RegistryWindowCharges {
@@ -10831,6 +10843,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                         tasks: &self.core.tasks,
                     },
                 );
+                if opened.ahead {
+                    *ahead =
+                        commit_ahead_of_stream(&mut session, cpu, backing, page, address, &mapping);
+                }
             }
             return outcome;
         };
@@ -10945,8 +10961,8 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         } else {
             Outcome::AlreadyPresent
         };
-        if let Some(opening) = opening {
-            session.open_fault_window(
+        if let (Some(opening), Some(ahead)) = (opening, ahead) {
+            let opened = session.open_fault_window(
                 cpu,
                 opening,
                 &mut crate::syscall::RegistryWindowCharges {
@@ -10954,6 +10970,10 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     tasks: &self.core.tasks,
                 },
             );
+            if opened.ahead {
+                *ahead =
+                    commit_ahead_of_stream(&mut session, cpu, backing, page, address, &mapping);
+            }
         }
         outcome
     }
@@ -12779,17 +12799,19 @@ impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fau
 
     /// Takes no frame: the page is resolved once, as the write's resolve
     /// does, and its frame carried in the place for the write. A page with
-    /// a frame is `Done(0)`; an absent one `NotCommitted`; any other error
-    /// `Unaskable`.
+    /// a frame is `Done(0)`; an absent one `NotCommitted` while the
+    /// window's credit (`limit`) is not spent, and `Over` (the `Credit`
+    /// decline, straight to the serve under T) once it is, past a commit
+    /// ahead's range (DW2 §15.6); any other error `Unaskable`.
     fn commit_within(
         &mut self,
         place: &mut Self::Place,
-        _limit: u64,
+        limit: u64,
     ) -> super::fault_window::FastCommit {
         use super::fault_window::FastCommit;
         match self.writer.resolve_touched_page(place) {
             Ok(true) => FastCommit::Done(0),
-            Ok(false) => FastCommit::NotCommitted,
+            Ok(false) => super::fault_window::shared_uncommitted(limit),
             Err(_) => FastCommit::Unaskable,
         }
     }
@@ -12861,6 +12883,32 @@ impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
+/// The commit ahead of a stream (DW2 §15.6), after a serve under T whose
+/// window said the touch at `address` (object page `page` of `backing`, in
+/// `mapping`) starts or continues one: in this hold of T and P, with its
+/// session, at most the window's credit (64 frames). Counted in the step
+/// report's `fault-ahead` line, its time stamped around it. Whether it
+/// committed ahead: took a frame or covered a page already committed.
+fn commit_ahead_of_stream<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>(
+    session: &mut user_access::PageTableMutationSession<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>,
+    cpu: usize,
+    backing: crate::memory::frame_roles::BackingIdentity,
+    page: u64,
+    address: u64,
+    mapping: &crate::memory::address_region::Mapping,
+) -> bool {
+    let began = step_report::fault_ahead_began(cpu);
+    let Some(commit) = session.commit_fault_window_ahead(cpu, backing, page, address, mapping)
+    else {
+        return false;
+    };
+    let committed = commit.frames != 0 || commit.pages != 0;
+    if committed {
+        step_report::fault_ahead(began, commit.frames);
+    }
+    committed
+}
+
 fn admit_fault_charges(
     cpu: usize,
     registry: &Registry,
@@ -12922,7 +12970,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::fi
         let error = USER | if write { WRITE } else { 0 };
         step_report::fill_in_served();
         let mut refused = None;
-        let outcome = self.serve_user_page_fault(address, error, &mut refused, false);
+        let outcome = self.serve_user_page_fault(address, error, &mut refused, None);
         let owed = matches!(
             outcome,
             crate::syscall::native::UserPageFaultOutcome::Exhausted(status)

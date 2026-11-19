@@ -2711,6 +2711,9 @@ mod live_sessions {
                 .fault_windows
                 .close_address_space(address_space, charges);
             crate::arch::x86_64::step_report::windows_changed(0, closed.closed() as u64);
+            crate::arch::x86_64::step_report::streams_changed(
+                self.fault_windows.take_stream_changes(),
+            );
             closed
         }
 
@@ -2722,6 +2725,9 @@ mod live_sessions {
         ) -> usize {
             let closed = self.fault_windows.close_all(charges);
             crate::arch::x86_64::step_report::windows_changed(0, closed as u64);
+            crate::arch::x86_64::step_report::streams_changed(
+                self.fault_windows.take_stream_changes(),
+            );
             closed
         }
 
