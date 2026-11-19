@@ -718,57 +718,6 @@ impl<const CAPACITY: usize> ExecutionDomain<CAPACITY> {
         self.scheduler.runnable_start_generation(thread)
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_dw1c_scheduler_fixture(
-        &self,
-        reporter: super::SchedulerExecutionClaim,
-        actors: [super::Dw1cSchedulerActorIdentity; 8],
-    ) -> Result<(), SchedulerError> {
-        self.scheduler.install_dw1c_fixture(reporter, actors)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stage_dw1c_arm_retry_wake(&self, actors: [super::Dw1cSchedulerActorIdentity; 8]) {
-        if let Some(target) = self.scheduler.stage_dw1c_arm_retry_detach(actors) {
-            super::notify_runnable_work(Some(target));
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dw1c_continuation_detach_request_on(
-        &self,
-        cpu: SchedulerCpuId,
-        suspended: ThreadKey,
-    ) -> Option<super::Dw1cContinuationDetachRequest> {
-        self.scheduler
-            .dw1c_continuation_detach_request_on(cpu, suspended)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn complete_dw1c_continuation_detach(
-        &self,
-        request: super::Dw1cContinuationDetachRequest,
-    ) -> Result<(), SchedulerError> {
-        self.scheduler.complete_dw1c_continuation_detach(request)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> super::Dw1cTerminalGate {
-        self.scheduler.dw1c_terminal_gate(thread)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dw1c_token2_relay_ready(&self) -> bool {
-        self.scheduler.dw1c_token2_relay_ready()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dw1c_final_scheduler_snapshot(
-        &self,
-    ) -> Result<super::Dw1cFinalSchedulerSnapshot, SchedulerError> {
-        self.scheduler.dw1c_final_snapshot()
-    }
-
     pub(crate) fn prepare_bootstrap_carrier(
         &self,
         resources: super::CarrierResourceTuple,

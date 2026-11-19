@@ -68,16 +68,6 @@ pub(crate) use terminal_handoff::{
 
 #[cfg(test)]
 #[allow(unused_imports)]
-pub(crate) use scheduler::Dw1cFinalSchedulerSnapshot;
-
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use scheduler::{
-    Dw1cContinuationDetachRequest, Dw1cSchedulerActorIdentity, Dw1cTerminalGate,
-};
-
-#[cfg(test)]
-#[allow(unused_imports)]
 pub(crate) use scheduler::SchedulerMigrationRejectionReason;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
