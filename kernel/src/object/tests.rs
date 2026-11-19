@@ -606,6 +606,69 @@ mod usage {
         close_and_release(&mut registry, owner);
     }
 
+    /// DW2 §13.19 item 1: whether a slot is free, and how many owed
+    /// backings hold one, across a reservation, its passing to an owed
+    /// backing, and the ends of both.
+    #[test]
+    fn reservation_slots_free_and_held_by_owed_backings_are_counted() {
+        let mut registry = ObjectRegistry::<{ RESERVATION_THREADS + 1 }>::new();
+        let owner = group(&mut registry, ChargeTag::EMPTY);
+        let charge = tag(&[owner.id()]);
+        let threads: Vec<_> = (0..RESERVATION_THREADS)
+            .map(|_| charged(&mut registry, DW_OBJECT_TYPE_THREAD, ChargeTag::EMPTY, 0))
+            .collect();
+        assert!(registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 0);
+
+        // Every slot held by Threads' creates: none free, none owed.
+        for thread in &threads {
+            assert!(registry.reserve_pages(thread.id(), charge, 1));
+        }
+        check(&registry);
+        assert!(!registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 0);
+
+        // Two passed to owed backings, in place: still none free.
+        assert!(registry.rekey_reservation_to_owed_backing(threads[0].id(), 70, 1));
+        assert!(registry.rekey_reservation_to_owed_backing(threads[1].id(), 71, 0));
+        check(&registry);
+        assert!(!registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 2);
+
+        // A Thread's create re-reserving keeps its one slot.
+        assert!(registry.reserve_pages(threads[2].id(), charge, 3));
+        assert!(!registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 2);
+
+        // One owed backing's reservation ends: a slot is free.
+        registry.end_owed_backing_reservation(70);
+        check(&registry);
+        assert!(registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 1);
+        // A rolled-back create's backing takes it.
+        assert!(registry.reserve_owed_backing_pages(72, charge, 1));
+        assert!(!registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 2);
+
+        // A Thread's reservation ends: free again, owed unchanged.
+        registry.release_reserved_pages(threads[3].id());
+        assert!(registry.reservation_slot_free());
+        assert_eq!(registry.owed_backing_reservations(), 2);
+
+        registry.end_owed_backing_reservation(71);
+        registry.end_owed_backing_reservation(72);
+        for thread in &threads {
+            registry.release_reserved_pages(thread.id());
+        }
+        check(&registry);
+        assert_eq!(registry.owed_backing_reservations(), 0);
+        assert_eq!(registry.charged_pages(owner.id()), 0);
+        for thread in threads {
+            close_and_release(&mut registry, thread);
+        }
+        close_and_release(&mut registry, owner);
+    }
+
     #[test]
     fn an_owed_backing_s_reservation_is_finalizing_and_a_create_s_is_not() {
         let mut registry = ObjectRegistry::<4>::new();

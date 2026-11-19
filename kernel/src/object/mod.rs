@@ -251,7 +251,9 @@ const EMPTY_SLOT: ObjectSlot = ObjectSlot {
 /// thread-stack capacity, which bounds live threads (asserted in `lib.rs`).
 /// Keyed by thread, not CPU, since a create can yield between reserving and
 /// creating and resume elsewhere (DW2 M5 §10.8 D1). Owed backings hold
-/// slots too, so a create can find every slot held: it is then refused.
+/// slots too, so a create can find every slot held: if an owed backing
+/// holds one, the create waits for the owed steps that free it (DW2
+/// §13.19 item 1); if Threads' creates hold them all, it is refused.
 pub(crate) const RESERVATION_THREADS: usize = 64;
 
 /// What holds a page reservation (DW2 §12.11 part 2 item 8).
@@ -407,7 +409,9 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
 
     /// Charges `pages` to `tag` for `thread`'s create in flight, replacing
     /// any reservation that thread held. `false` when every slot is held by
-    /// another thread or by an owed backing: the create is then refused.
+    /// another thread or by an owed backing: the create then waits for the
+    /// owed steps if an owed backing holds one, and is refused otherwise
+    /// (DW2 §13.19 item 1).
     #[must_use]
     pub(crate) fn reserve_pages(
         &mut self,
@@ -517,6 +521,21 @@ impl<const CAPACITY: usize> ObjectRegistry<CAPACITY> {
     /// freed.
     pub(crate) fn end_owed_backing_reservation(&mut self, backing: u64) {
         self.end_reservation(ReservationHolder::OwedBacking(backing));
+    }
+
+    /// Whether any reservation slot is free (DW2 §13.19 item 1).
+    pub(crate) fn reservation_slot_free(&self) -> bool {
+        self.reserved.iter().any(Option::is_none)
+    }
+
+    /// How many reservation slots owed backings hold (DW2 §13.19 item 1):
+    /// each is freed by the owed finalize steps.
+    pub(crate) fn owed_backing_reservations(&self) -> usize {
+        self.reserved
+            .iter()
+            .flatten()
+            .filter(|(holder, _, _)| matches!(holder, ReservationHolder::OwedBacking(_)))
+            .count()
     }
 
     fn reserve_for(
