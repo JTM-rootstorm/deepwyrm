@@ -736,3 +736,125 @@ fn a_run_past_its_nodes_end_panics() {
         model.write_run(node, 500, 13, 1)
     };
 }
+
+/// DW2 §15.6: a commit ahead over a range with some pages committed takes
+/// only the missing frames, in address order, and the same frames as
+/// committing each page in turn would in a manager made the same way.
+#[test]
+fn a_range_commit_takes_only_the_missing_frames_in_order() {
+    let (mut roles, _) = manager(32);
+    let (mut one_by_one, _) = manager(32);
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    let other = one_by_one.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    for index in [3, 5] {
+        roles
+            .commit_on_demand_page(grant.identity(), index)
+            .unwrap();
+        one_by_one
+            .commit_on_demand_page(other.identity(), index)
+            .unwrap();
+    }
+    let cost = roles
+        .on_demand_commit_range_cost(grant.identity(), 2, 6)
+        .unwrap();
+    assert_eq!(cost, 4, "pages 2, 4, 6 and 7 under the existing leaf");
+    let before = roles.available_frames();
+    let commit = roles.commit_on_demand_range_within(grant.identity(), 2, 6, 64);
+    assert_eq!(
+        commit,
+        OnDemandRangeCommit {
+            frames: cost,
+            pages: 6,
+            refused: None
+        }
+    );
+    assert_eq!(roles.available_frames(), before - cost);
+    for index in 2..8 {
+        let expected = one_by_one
+            .commit_on_demand_page(other.identity(), index)
+            .unwrap();
+        assert_eq!(
+            page(&roles, &grant, index),
+            Ok(expected.physical_start),
+            "page {index}"
+        );
+    }
+    assert_eq!(page(&roles, &grant, 8), Err(FrameRoleError::Absent));
+    roles.check_invariants().unwrap();
+}
+
+/// A limit below the range's cost stops at the first page it cannot pay
+/// for; pages already committed are covered whatever is left.
+#[test]
+fn a_range_commit_stops_at_its_limit() {
+    let (mut roles, _) = manager(32);
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    let backing = grant.identity();
+    // Page 0 takes two nodes and itself; each page after it one.
+    let commit = roles.commit_on_demand_range_within(backing, 0, 10, 4);
+    assert_eq!(
+        commit,
+        OnDemandRangeCommit {
+            frames: 4,
+            pages: 2,
+            refused: None
+        }
+    );
+    assert_eq!(page(&roles, &grant, 2), Err(FrameRoleError::Absent));
+    let free = roles.available_frames();
+    assert_eq!(
+        roles.commit_on_demand_range_within(backing, 0, 10, 0),
+        OnDemandRangeCommit {
+            frames: 0,
+            pages: 2,
+            refused: None
+        }
+    );
+    assert_eq!(
+        roles.commit_on_demand_range_within(backing, 0, 0, 64),
+        OnDemandRangeCommit {
+            frames: 0,
+            pages: 0,
+            refused: None
+        }
+    );
+    assert_eq!(roles.available_frames(), free);
+    roles.check_invariants().unwrap();
+}
+
+/// A refusal part way reports what was taken before it, which stays
+/// committed; the refused page changes nothing.
+#[test]
+fn a_range_commit_refused_part_way_reports_what_it_took() {
+    // Five frames after the root: page 0 takes three, pages 1 and 2 one
+    // each, and page 3 finds none.
+    let (mut roles, _) = manager(6);
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    let commit = roles.commit_on_demand_range_within(grant.identity(), 0, 10, 64);
+    assert_eq!((commit.frames, commit.pages), (5, 3));
+    assert!(matches!(commit.refused, Some(FrameRoleError::Physical(_))));
+    assert_eq!(roles.available_frames(), 0);
+    for index in 0..3 {
+        assert!(page(&roles, &grant, index).is_ok(), "page {index}");
+    }
+    assert_eq!(page(&roles, &grant, 3), Err(FrameRoleError::Absent));
+    assert_eq!(roles.on_demand_frames(grant.identity()), Ok(1 + 5));
+    roles.check_invariants().unwrap();
+
+    // A frame that fails to zero on the second page.
+    let (mut roles, model) = manager(16);
+    let grant = roles.allocate_on_demand_backing(THREE_LEVELS).unwrap();
+    // The root is the first page; page 0 takes the next three.
+    *model.fail_zero.lock().unwrap() = Some(grant.physical_start() + 4 * PAGE);
+    let commit = roles.commit_on_demand_range_within(grant.identity(), 0, 10, 64);
+    assert_eq!(
+        commit,
+        OnDemandRangeCommit {
+            frames: 3,
+            pages: 1,
+            refused: Some(FrameRoleError::InitializationFailed)
+        }
+    );
+    assert_eq!(page(&roles, &grant, 1), Err(FrameRoleError::Absent));
+    roles.check_invariants().unwrap();
+}

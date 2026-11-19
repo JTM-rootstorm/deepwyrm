@@ -209,6 +209,19 @@ pub(crate) struct OnDemandCommit {
     pub(crate) frames: u64,
 }
 
+/// What a commit over a page range within a frame limit made (DW2 §15.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OnDemandRangeCommit {
+    /// Frames taken, pages and nodes.
+    pub(crate) frames: u64,
+    /// Pages covered from the range's first, in order: each committed by
+    /// this call or already.
+    pub(crate) pages: u64,
+    /// What refused the page after the last covered, when it was not the
+    /// limit. The pages before it stay committed.
+    pub(crate) refused: Option<FrameRoleError>,
+}
+
 /// One frame taken for a commit or a run's nodes, not yet linked.
 #[derive(Clone, Copy)]
 pub(super) struct Taken {
@@ -707,6 +720,49 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             physical_start,
             frames,
         }))
+    }
+
+    /// Commits the pages of `[first, first + count)` of an on-demand
+    /// backing in address order, taking at most `limit` frames in all (DW2
+    /// §15.6, a commit ahead of a stream). Each page is
+    /// [`Self::commit_on_demand_page_within`] with what is left of the
+    /// limit, one walk of the index a page: a page already committed takes
+    /// nothing and is covered, whatever is left. It stops at the first page
+    /// that would take more than is left, or that is refused; what it took
+    /// before stays committed and is reported, so the caller can account
+    /// for it.
+    pub(crate) fn commit_on_demand_range_within(
+        &mut self,
+        backing: BackingIdentity,
+        first: u64,
+        count: u64,
+        limit: u64,
+    ) -> OnDemandRangeCommit {
+        let mut done = OnDemandRangeCommit {
+            frames: 0,
+            pages: 0,
+            refused: None,
+        };
+        while done.pages < count {
+            let Some(page) = first.checked_add(done.pages) else {
+                done.refused = Some(FrameRoleError::InvariantViolation);
+                break;
+            };
+            // Each commit is within what was left, so this never wraps.
+            let left = limit - done.frames;
+            match self.commit_on_demand_page_within(backing, page, left) {
+                Ok(Some(commit)) => {
+                    done.frames += commit.frames;
+                    done.pages += 1;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    done.refused = Some(error);
+                    break;
+                }
+            }
+        }
+        done
     }
 
     /// Takes one zeroed page and publishes `role` on it.
