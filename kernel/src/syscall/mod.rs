@@ -7,6 +7,15 @@
 
 pub(crate) mod native;
 
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        reason = "only the live facade fills in a syscall's buffers and commits in steps"
+    )
+)]
+pub(crate) mod fill_in;
+
 mod abi_bytes;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use abi_bytes::EncodedObjectInfo;
