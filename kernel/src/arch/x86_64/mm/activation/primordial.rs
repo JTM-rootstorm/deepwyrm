@@ -1293,8 +1293,12 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// until the final hold, so a concurrent create cannot allocate past
     /// the limit (§7.3 R7); the adapter's admission under the final hold
     /// decides. A quota refusal owed work could admit takes the hold's owed
-    /// step and reserves nothing (DW2 §13.12 part b); any other refusal
-    /// goes on, unreserved, to fail in the adapter as before. `yielding`:
+    /// step and reserves nothing (DW2 §13.12 part b), and so does a create
+    /// its quota admits that finds no reservation slot free while an owed
+    /// backing holds one, whose slot the owed steps free (DW2 §13.19 item
+    /// 1); any other refusal, including every slot held by Threads' creates
+    /// in flight, goes on, unreserved, to fail in the adapter as before.
+    /// `yielding`:
     /// the quantum ended at this safe point, so nothing is done.
     #[inline(always)]
     fn deferred_first_hold(
@@ -1333,7 +1337,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 if reserve(runtime) || (runtime.close_all_fault_windows() != 0 && reserve(runtime))
                 {
                     true
-                } else if runtime.create_refusal_owed(process, pages) {
+                } else if runtime.create_refusal_owed(process, pages)
+                    || runtime.create_slot_owed(process, pages)
+                {
                     runtime.take_owed_step(step_report::AdmissionWait::Create);
                     return FirstHold::Owed;
                 } else {
@@ -11294,6 +11300,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 pages,
             )
         })
+    }
+
+    /// Whether a create of `pages` charged pages for `process` that found
+    /// no reservation slot free is owed (DW2 §13.19 item 1): its quota
+    /// admits it and an owed backing holds a slot, which the owed steps
+    /// free.
+    fn create_slot_owed(&self, process: ProcessKey, pages: u64) -> bool {
+        crate::syscall::memory_object_slot_owed(
+            &self.core.registry,
+            &self.core.tasks,
+            process,
+            pages,
+        )
     }
 
     /// Whether a fault's or fill-in's `Exhausted(status)` is owed: the

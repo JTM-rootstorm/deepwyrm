@@ -235,3 +235,144 @@ fn a_commit_or_fault_refused_by_an_owed_backing_is_owed() {
     fixture.close(handle);
     fixture.finalize();
 }
+
+/// `count` Thread identities, distinct from each other and from every
+/// identity of the fixture's registry: a reservation keys on identity
+/// alone.
+fn threads(count: usize) -> std::vec::Vec<crate::task::ThreadKey> {
+    let mut scratch = ObjectRegistry::<{ crate::object::RESERVATION_THREADS + 1 }>::new();
+    (0..count)
+        .map(|_| {
+            let creation = scratch.create(deepwyrm_abi::DW_OBJECT_TYPE_THREAD).unwrap();
+            crate::task::ThreadKey::from_object_id(
+                scratch.creation_into_handle(creation).unwrap().id(),
+            )
+        })
+        .collect()
+}
+
+impl Fixture {
+    fn slot_owed(&self, pages: u64) -> bool {
+        memory_object_slot_owed(&self.registry, &self.tasks, self.process, pages)
+    }
+
+    fn reserve(&mut self, pages: u64, thread: crate::task::ThreadKey) -> bool {
+        reserve_memory_object_pages(&mut self.registry, &self.tasks, self.process, pages, thread)
+    }
+
+    /// Fills `owed` reservation slots with owed backings keyed from 100,
+    /// charged nothing, and the rest with `others`' creates in flight.
+    fn fill_slots(&mut self, owed: usize, others: &[crate::task::ThreadKey]) {
+        assert_eq!(owed + others.len(), crate::object::RESERVATION_THREADS);
+        let empty = crate::task::quota::ChargeTag::EMPTY;
+        for key in 0..owed {
+            assert!(
+                self.registry
+                    .reserve_owed_backing_pages(100 + key as u64, empty, 0)
+            );
+        }
+        for &thread in others {
+            assert!(self.registry.reserve_pages(thread.object_id(), empty, 0));
+        }
+    }
+}
+
+/// DW2 §13.19 item 1: a create its quota admits that finds every slot held,
+/// with an owed backing among the holders, is owed; with every slot held by
+/// Threads' creates it is not.
+#[test]
+fn a_create_finding_every_slot_held_is_owed_only_for_an_owed_backing() {
+    let slots = crate::object::RESERVATION_THREADS;
+    let ids = threads(slots + 1);
+    let creating = ids[slots];
+
+    // Every slot held by owed backings: owed, and the reserve fails.
+    let mut job = fixture(8, 64);
+    job.fill_slots(slots, &[]);
+    assert!(job.create_allowed(1));
+    assert!(job.slot_owed(1));
+    assert!(!job.reserve(1, creating));
+    // Every slot is still an owed backing's: the creating Thread holds none.
+    assert!(!job.registry.reservation_slot_free());
+    assert_eq!(job.registry.owed_backing_reservations(), slots);
+
+    // 63 by owed backings and one by another Thread's create: owed.
+    let mut job = fixture(8, 64);
+    job.fill_slots(slots - 1, &ids[..1]);
+    assert!(job.slot_owed(1));
+    assert!(!job.reserve(1, creating));
+
+    // All 64 by Threads' creates in flight: not owed.
+    let mut job = fixture(8, 64);
+    job.fill_slots(0, &ids[..slots]);
+    assert!(job.create_allowed(1));
+    assert!(!job.slot_owed(1));
+    assert!(!job.reserve(1, creating));
+}
+
+/// A free slot is not owed, and the create reserves it.
+#[test]
+fn a_create_finding_a_slot_free_is_not_slot_owed() {
+    let slots = crate::object::RESERVATION_THREADS;
+    let ids = threads(1);
+    let mut fixture = fixture(8, 64);
+    let empty = crate::task::quota::ChargeTag::EMPTY;
+    for key in 0..slots - 1 {
+        assert!(
+            fixture
+                .registry
+                .reserve_owed_backing_pages(100 + key as u64, empty, 0)
+        );
+    }
+    assert!(fixture.registry.reservation_slot_free());
+    assert!(!fixture.slot_owed(1));
+    assert!(fixture.reserve(1, ids[0]));
+    assert!(!fixture.registry.reservation_slot_free());
+}
+
+/// A create its quota refuses, with every slot held by owed backings, is
+/// not slot-owed: the quota's rule decides it. Here the backings are
+/// charged to the job, so that rule finds it owed.
+#[test]
+fn a_create_the_quota_refuses_is_decided_by_the_quota_rule() {
+    let slots = crate::object::RESERVATION_THREADS;
+    let ids = threads(1);
+    let mut fixture = fixture(8, 64);
+    let tag = fixture.tasks.charge_tag(fixture.process).unwrap();
+    for key in 0..slots {
+        assert!(
+            fixture
+                .registry
+                .reserve_owed_backing_pages(100 + key as u64, tag, 1)
+        );
+    }
+    // 64 of 64 pages charged to the owed backings: one more refuses.
+    assert!(!fixture.create_allowed(1));
+    assert!(!fixture.slot_owed(1));
+    assert!(fixture.create_owed(1));
+    assert!(!fixture.reserve(1, ids[0]));
+    for key in 0..slots {
+        fixture
+            .registry
+            .end_owed_backing_reservation(100 + key as u64);
+    }
+}
+
+/// Once one owed backing's reservation ends, a slot is free, the create is
+/// no longer slot-owed, and the same create reserves.
+#[test]
+fn a_slot_freed_by_an_owed_backing_admits_the_waiting_create() {
+    let slots = crate::object::RESERVATION_THREADS;
+    let ids = threads(1);
+    let mut fixture = fixture(8, 64);
+    fixture.fill_slots(slots, &[]);
+    assert!(fixture.slot_owed(1));
+    assert!(!fixture.reserve(1, ids[0]));
+    fixture.registry.end_owed_backing_reservation(100);
+    assert!(fixture.registry.reservation_slot_free());
+    assert_eq!(fixture.registry.owed_backing_reservations(), slots - 1);
+    assert!(!fixture.slot_owed(1));
+    assert!(fixture.reserve(1, ids[0]));
+    assert!(!fixture.create_allowed(64));
+    fixture.registry.release_reserved_pages(ids[0].object_id());
+}

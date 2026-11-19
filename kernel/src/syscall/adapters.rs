@@ -2730,6 +2730,33 @@ pub(crate) fn memory_object_refusal_owed<
     refusal_owed(&[objects, pages])
 }
 
+/// Whether a create of `pages` charged pages for `process` that found
+/// no reservation slot is owed (DW2 §13.19 item 1): its quota admits it,
+/// no slot is free, and an owed backing holds one, so the owed finalize
+/// steps will free a slot. `false` when the quota refuses (that rule is
+/// [`memory_object_refusal_owed`]), when a slot is free, or when every
+/// slot is held by a Thread's create in flight.
+#[cfg_attr(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(dead_code, reason = "only the live runtime waits out an owed refusal")
+)]
+pub(crate) fn memory_object_slot_owed<
+    const OBJECTS: usize,
+    const GROUPS: usize,
+    const PROCESSES: usize,
+    const THREADS: usize,
+    const HANDLES: usize,
+>(
+    registry: &ObjectRegistry<OBJECTS>,
+    tasks: &TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
+    process: ProcessKey,
+    pages: u64,
+) -> bool {
+    memory_object_quota_allows(registry, tasks, process, pages)
+        && !registry.reservation_slot_free()
+        && registry.owed_backing_reservations() != 0
+}
+
 /// Whether [`admit_charged_pages`] refusing `frames` for `object` now is
 /// owed (DW2 §13.12 part b): it refuses for quota, and every group that
 /// refuses would admit with its finalizing pages gone.
@@ -9282,6 +9309,10 @@ pub(crate) fn memory_object_quota_allows<
 /// reserves them for `thread` until the hold that creates the object releases
 /// them (DW2 §7.3 R7): its frames are allocated outside the global lock,
 /// and without the reservation a concurrent create would not see them.
+/// `false`, with `thread` holding no reservation, when the quota refuses or
+/// no slot is free; the caller asks [`memory_object_refusal_owed`] and
+/// [`memory_object_slot_owed`] whether owed work would cure it (DW2 §13.12
+/// part b, §13.19 item 1).
 pub(crate) fn reserve_memory_object_pages<
     const OBJECTS: usize,
     const GROUPS: usize,
