@@ -7,6 +7,15 @@
 
 pub(crate) mod native;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the live fill-in and commit step move onto these decisions in the next commit"
+    )
+)]
+pub(crate) mod fill_in;
+
 mod abi_bytes;
 #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
 pub(crate) use abi_bytes::EncodedObjectInfo;

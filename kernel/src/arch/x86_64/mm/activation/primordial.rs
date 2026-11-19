@@ -47,6 +47,7 @@ use crate::object::{HandleRef, InternalRef, ObjectRegistry};
 use crate::sync::IrqSpinMutex;
 #[cfg(feature = "test-support")]
 use crate::syscall::FServiceOperationOwner;
+use crate::syscall::fill_in::CommitStep;
 use crate::syscall::native::{
     DivergentCarrier, NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest,
     NativeSyscallResult, SyscallControl,
@@ -12794,18 +12795,6 @@ enum FirstHold {
     Owed,
     /// The quantum ended at the safe point: the call parks.
     Yield,
-}
-
-/// How one commit step's hold ended (DW2 M6 §8.2, §13.12 part b).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommitStep {
-    /// The whole range is committed.
-    Done,
-    /// The step committed its pages; more remain.
-    More,
-    /// The step met a refusal owed work could admit and took the hold's
-    /// owed step instead; it is taken again at the next safe point.
-    Owed,
 }
 
 /// The two charges a fault's serve admits together, each an object and its
