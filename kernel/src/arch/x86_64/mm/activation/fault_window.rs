@@ -92,6 +92,21 @@ pub(crate) enum FastCommit {
     NotCommitted,
 }
 
+/// A shared serve's answer for a page with no frame, by the window's
+/// credit (`limit`, DW2 §15.6): with none left the touch is past what a
+/// commit ahead covered, and `Over` sends it straight to the serve under T
+/// as the `Credit` decline, which commits the next range; with credit,
+/// `NotCommitted`, and the exclusive serve commits it from that credit in
+/// the same fault.
+#[inline(always)]
+pub(crate) const fn shared_uncommitted(limit: u64) -> FastCommit {
+    if limit == 0 {
+        FastCommit::Over
+    } else {
+        FastCommit::NotCommitted
+    }
+}
+
 /// The publisher's side of steps 4 to 7, all under one borrow of the
 /// session, so the leaf's place found in step 4 is written in step 7 by
 /// the same publisher.
@@ -248,6 +263,13 @@ impl SharedServeFlag {
     /// this CPU's window, so the next fault runs the exclusive serve first.
     pub(crate) fn serve_under_t_ran(&mut self) {
         self.took_no_frame = false;
+    }
+
+    /// This CPU's serve under T committed ahead of a stream (DW2 §15.6): the
+    /// next touches find their pages committed, so the next fault tries the
+    /// shared serve first.
+    pub(crate) fn serve_under_t_committed_ahead(&mut self) {
+        self.took_no_frame = true;
     }
 }
 

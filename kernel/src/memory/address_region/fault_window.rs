@@ -13,7 +13,22 @@
 //! ([`FaultWindows::close`], [`FaultWindows::close_address_space`],
 //! [`FaultWindows::close_all`]) only with T and P both held, the weight
 //! changed through [`WindowCharges`] in the same hold. Under P alone it only
-//! falls, by exactly the frames a commit took ([`FaultWindows::spend`]).
+//! falls, by exactly the frames a commit took ([`FaultWindows::spend`],
+//! and under T and P [`FaultWindows::spend_ahead`]).
+//!
+//! A stream (DW2 §15.6): a window records the page of its last serve under
+//! T (`base`), the credit it had right after that open or top-up
+//! (`granted`), and the end of what was last committed ahead for it
+//! (`ahead_end`). The next serve under T for the same window starts a
+//! stream when the window has committed nothing ahead and the page is
+//! exactly `base + (granted - credit + 1)` pages: every frame spent since
+//! was a touch and this touch is the next page. A window that has
+//! committed ahead continues its stream at exactly `ahead_end`; a serve
+//! inside `(base, ahead_end)` changes nothing about it; any other ends it,
+//! and the window is a credit window again. A new or replaced window is
+//! never a stream. Committing ahead converts credit into committed frames
+//! one for one, so it changes no weight and the invariant above holds as
+//! for a fast serve's commit.
 //!
 //! No mapping record of an address space changes while a window copied from
 //! it exists: every function of the AddressRegion adapter that hands out a
@@ -57,6 +72,53 @@ pub(crate) struct FaultWindow<R> {
     mapping: Mapping,
     object: ObjectId,
     credit: u64,
+    /// The page of the last serve under T that opened or kept this window.
+    base: u64,
+    /// The credit right after that open or top-up, or after the last
+    /// commit ahead.
+    granted: u64,
+    /// The end of what was last committed ahead for this window: the
+    /// address of the first page it did not cover. `None` when the window
+    /// is not a stream.
+    ahead_end: Option<u64>,
+}
+
+/// What a serve under T at a page is to the window it keeps (DW2 §15.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamStep {
+    /// The window committed nothing ahead, and this is the page after every
+    /// frame spent since its last serve under T.
+    Starts,
+    /// The page is exactly where the last commit ahead ended.
+    Continues,
+    /// The page is inside the last commit ahead's range (a page table was
+    /// missing there): nothing about the stream changes.
+    Inside,
+    /// Anywhere else: no stream, and any stream ends.
+    Elsewhere,
+}
+
+/// The stream rule (DW2 §15.6) for a serve under T at page `page` that
+/// keeps `window`, decided before its top-up. An overflow is no stream.
+fn stream_step<R>(window: &FaultWindow<R>, page: u64) -> StreamStep {
+    match window.ahead_end {
+        Some(end) if page == end => StreamStep::Continues,
+        Some(end) if window.base < page && page < end => StreamStep::Inside,
+        Some(_) => StreamStep::Elsewhere,
+        None => {
+            let next = window
+                .granted
+                .checked_sub(window.credit)
+                .and_then(|spent| spent.checked_add(1))
+                .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+                .and_then(|bytes| window.base.checked_add(bytes));
+            if next == Some(page) {
+                StreamStep::Starts
+            } else {
+                StreamStep::Elsewhere
+            }
+        }
+    }
 }
 
 impl<R: Copy> FaultWindow<R> {
@@ -94,6 +156,23 @@ impl<R: Copy> FaultWindow<R> {
     pub(crate) const fn credit(&self) -> u64 {
         self.credit
     }
+
+    /// The page of the last serve under T that opened or kept it.
+    pub(crate) const fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Its credit right after that open or top-up, or after the last
+    /// commit ahead.
+    pub(crate) const fn granted(&self) -> u64 {
+        self.granted
+    }
+
+    /// The end of what was last committed ahead for it, while it is a
+    /// stream (DW2 §15.6).
+    pub(crate) const fn ahead_end(&self) -> Option<u64> {
+        self.ahead_end
+    }
 }
 
 /// What a serve under T and P found, for opening a window after it.
@@ -116,6 +195,20 @@ pub(crate) struct WindowOpened {
     pub(crate) opened: bool,
     /// The CPU's old window was closed.
     pub(crate) closed: bool,
+    /// This serve starts or continues a stream (DW2 §15.6): the pages
+    /// after it are to be committed ahead from the window's credit.
+    pub(crate) ahead: bool,
+}
+
+/// Streams started and ended since the last [`FaultWindows::take_stream_changes`]
+/// (DW2 §15.6, the `streams` line).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StreamChanges {
+    /// Windows whose first commit ahead was recorded.
+    pub(crate) started: u64,
+    /// Streams ended by a serve under T elsewhere, or by their window
+    /// closing or being replaced.
+    pub(crate) ended: u64,
 }
 
 /// Proof that no fault window copied from `address_space`'s mapping records
@@ -161,6 +254,8 @@ fn pages_after(mapping: &Mapping, address: u64) -> u64 {
 /// One fault window slot per CPU, in P's value.
 pub(crate) struct FaultWindows<R, const CPUS: usize> {
     slots: [Option<FaultWindow<R>>; CPUS],
+    /// Stream changes not yet taken for the step report.
+    streams: StreamChanges,
 }
 
 impl<R: Copy, const CPUS: usize> Default for FaultWindows<R, CPUS> {
@@ -173,6 +268,10 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
     pub(crate) const fn new() -> Self {
         Self {
             slots: [const { None }; CPUS],
+            streams: StreamChanges {
+                started: 0,
+                ended: 0,
+            },
         }
     }
 
@@ -201,16 +300,45 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
             .unwrap_or_else(|| panic!("a fault window's commit took more than its credit"));
     }
 
+    /// Under T and P (DW2 §15.6): a commit ahead for CPU `cpu`'s window
+    /// took `frames`, which its credit had admitted, and covered the pages
+    /// up to `ahead_end`, the address of the first page it did not cover.
+    /// The credit falls by exactly `frames`, as [`Self::spend`] (with its
+    /// panics); the window records `ahead_end`, and its granted credit is
+    /// what is left, so a later serve inside the range is not a start.
+    pub(crate) fn spend_ahead(&mut self, cpu: usize, frames: u64, ahead_end: u64) {
+        self.spend(cpu, frames);
+        let window = self
+            .slots
+            .get_mut(cpu)
+            .and_then(Option::as_mut)
+            .unwrap_or_else(|| panic!("a fault window's commit had no window"));
+        if window.ahead_end.is_none() {
+            self.streams.started += 1;
+        }
+        window.ahead_end = Some(ahead_end);
+        window.granted = window.credit;
+    }
+
+    /// The streams started and ended since the last call, and resets them.
+    pub(crate) fn take_stream_changes(&mut self) -> StreamChanges {
+        core::mem::take(&mut self.streams)
+    }
+
     /// Under T and P, at the end of a serve that left `opening.address`
     /// present: the window for the rest of the mapping (DW2 §13.16).
     /// - A window of the same Thread, Process, object and mapping is kept,
     ///   its root identity refreshed, and topped up to `min(64, pages
     ///   after this one)` by the difference, if that difference is
-    ///   admitted.
+    ///   admitted. Before the top-up the stream rule (DW2 §15.6) is asked:
+    ///   [`WindowOpened::ahead`] when this serve starts or continues a
+    ///   stream; a serve elsewhere ends one. Unless the page is inside the
+    ///   last commit ahead's range, the window then records this page and
+    ///   its credit after the top-up.
     /// - Any other window of this CPU is closed. Then, when the mapping has
     ///   pages after this one, `min(64, those pages)` frames are admitted
     ///   against the object and a window is stored only if that admission
-    ///   succeeds.
+    ///   succeeds. A new window is never a stream.
     pub(crate) fn open(
         &mut self,
         cpu: usize,
@@ -222,12 +350,18 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
             return opened;
         };
         let target = FAULT_WINDOW_FRAMES.min(pages_after(&opening.mapping, opening.address));
+        let page = opening.address & !(PAGE_SIZE - 1);
         if let Some(window) = slot.as_mut()
             && window.thread == opening.thread
             && window.process == opening.process
             && window.object == opening.object
             && window.mapping == opening.mapping
         {
+            let step = stream_step(window, page);
+            if step == StreamStep::Elsewhere && window.ahead_end.take().is_some() {
+                self.streams.ended += 1;
+            }
+            opened.ahead = matches!(step, StreamStep::Starts | StreamStep::Continues);
             window.root = opening.root;
             window.root_epoch = opening.root_epoch;
             if target > window.credit {
@@ -238,11 +372,18 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
                     opened.opened = true;
                 }
             }
+            if step != StreamStep::Inside {
+                window.base = page;
+                window.granted = window.credit;
+            }
             return opened;
         }
         if let Some(old) = slot.take() {
             if old.credit != 0 {
                 charges.subtract(old.object, old.credit);
+            }
+            if old.ahead_end.is_some() {
+                self.streams.ended += 1;
             }
             opened.closed = true;
         }
@@ -256,18 +397,28 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
                 mapping: opening.mapping,
                 object: opening.object,
                 credit: target,
+                base: page,
+                granted: target,
+                ahead_end: None,
             });
             opened.opened = true;
         }
         opened
     }
 
-    fn close_slot(slot: &mut Option<FaultWindow<R>>, charges: &mut impl WindowCharges) -> bool {
+    fn close_slot(
+        slot: &mut Option<FaultWindow<R>>,
+        charges: &mut impl WindowCharges,
+        streams: &mut StreamChanges,
+    ) -> bool {
         let Some(window) = slot.take() else {
             return false;
         };
         if window.credit != 0 {
             charges.subtract(window.object, window.credit);
+        }
+        if window.ahead_end.is_some() {
+            streams.ended += 1;
         }
         true
     }
@@ -277,7 +428,7 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
     pub(crate) fn close(&mut self, cpu: usize, charges: &mut impl WindowCharges) -> bool {
         self.slots
             .get_mut(cpu)
-            .is_some_and(|slot| Self::close_slot(slot, charges))
+            .is_some_and(|slot| Self::close_slot(slot, charges, &mut self.streams))
     }
 
     /// Under T and P: closes every CPU's window whose mapping is in
@@ -292,7 +443,7 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
             if slot
                 .as_ref()
                 .is_some_and(|window| window.mapping.address_space() == address_space)
-                && Self::close_slot(slot, charges)
+                && Self::close_slot(slot, charges, &mut self.streams)
             {
                 closed += 1;
             }
@@ -310,7 +461,7 @@ impl<R: Copy, const CPUS: usize> FaultWindows<R, CPUS> {
         self.slots
             .iter_mut()
             .filter(|slot| slot.is_some())
-            .map(|slot| Self::close_slot(slot, charges))
+            .map(|slot| Self::close_slot(slot, charges, &mut self.streams))
             .filter(|closed| *closed)
             .count()
     }

@@ -46,6 +46,9 @@ use chain::ChainState;
     )
 )]
 pub(crate) use index::OnDemandCommit;
+/// The live serve under T names it for a commit ahead (DW2 §15.6).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use index::OnDemandRangeCommit;
 pub(crate) use index::{INDEX_FANOUT, INDEX_MAX_PAGES, IndexMemory};
 use index::{INDEX_RUN_THRESHOLD, IndexEntryLink, IndexRootLink, IndexRootState, RootUse};
 pub(crate) use storage::MAX_GROWTH_PARTS;

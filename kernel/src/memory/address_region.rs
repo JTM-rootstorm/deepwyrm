@@ -37,8 +37,8 @@ mod fault_window;
     reason = "the live runtime opens, spends and closes windows; host builds use the table through the adapter and tests"
 )]
 pub(crate) use fault_window::{
-    FAULT_WINDOW_FRAMES, FaultWindow, FaultWindows, WindowCharges, WindowOpened, WindowOpening,
-    WindowsClosed, usage_without_credit,
+    FAULT_WINDOW_FRAMES, FaultWindow, FaultWindows, StreamChanges, WindowCharges, WindowOpened,
+    WindowOpening, WindowsClosed, usage_without_credit,
 };
 #[cfg(all(deepwyrm_integrated, test))]
 pub(crate) use fault_window::{test_mapping, test_windows_closed};

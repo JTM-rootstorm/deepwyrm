@@ -167,7 +167,7 @@ impl FastLeaf for ModelLeaf<'_> {
             return FastCommit::Done(0);
         }
         if self.model.shared {
-            return FastCommit::NotCommitted;
+            return shared_uncommitted(limit);
         }
         if 1 + nodes > limit {
             return FastCommit::Over;
@@ -1063,4 +1063,80 @@ fn the_gate_over_the_models_commits_through_the_exclusive_serve() {
     );
     assert_eq!(credit(model), Some(63));
     model.assert_charge_invariant();
+}
+
+/// DW2 §15.6: past a commit ahead's range the window has no credit left,
+/// and a shared serve of a page with no frame is the `Credit` decline,
+/// straight to the serve under T, with nothing written; with credit it is
+/// `NotCommitted`, for the exclusive serve.
+#[test]
+fn a_shared_serve_of_an_uncommitted_page_declines_by_the_credit() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    model.shared = true;
+    assert_declined_unchanged(model, START + PAGE, WRITE_FAULT, FastDecline::NotCommitted);
+    // The window's whole credit spent, as by a commit ahead.
+    model.shared = false;
+    model.windows.spend(0, 64);
+    model.objects[0].frames = 64;
+    model.shared = true;
+    assert_eq!(credit(model), Some(0));
+    let calls = assert_declined_unchanged_frames(model, START + PAGE, FastDecline::Credit);
+    assert_eq!(
+        calls,
+        ["session", "scheduler", "leaf", "find", "commit_within"]
+    );
+    assert_eq!(model.stamps, [FastStamp::Checked, FastStamp::Checked]);
+}
+
+/// As [`assert_declined_unchanged`], for a model whose object already has
+/// frames committed: the decline writes nothing and spends nothing.
+fn assert_declined_unchanged_frames(
+    model: &mut Model,
+    cr2: u64,
+    decline: FastDecline,
+) -> Vec<&'static str> {
+    let window = model.windows.window(model.cpu).copied();
+    let weight = model.weights.weight(model.objects[0].id);
+    let frames = model.objects[0].frames;
+    model.calls.clear();
+    assert_eq!(serve_fast(model, cr2, WRITE_FAULT), Err(decline));
+    assert_eq!(model.windows.window(model.cpu).copied(), window);
+    assert_eq!(model.weights.weight(model.objects[0].id), weight);
+    assert_eq!(model.objects[0].frames, frames);
+    assert!(model.leaves.is_empty());
+    assert!(!model.calls.contains(&"commit"));
+    assert!(!model.calls.contains(&"write"));
+    assert!(!model.calls.contains(&"spend"));
+    core::mem::take(&mut model.calls)
+}
+
+/// DW2 §15.6: a serve under T that committed ahead sets the flag, so the
+/// next fault tries the shared serve first; one that did not clears it.
+#[test]
+fn a_serve_under_t_that_committed_ahead_sets_the_flag() {
+    let mut flag = SharedServeFlag::new();
+    let mut run = GateRun::default();
+    // The facade's order: cleared when the serve under T runs, then set
+    // when it committed ahead.
+    flag.serve_under_t_ran();
+    flag.serve_under_t_committed_ahead();
+    assert!(flag.tries_shared());
+    let answered = serve_gated(
+        &mut flag,
+        &mut run,
+        |run| {
+            run.ran.push("shared");
+            Ok(FastServed::Served)
+        },
+        |run| {
+            run.ran.push("exclusive");
+            Ok((FastServed::Served, false))
+        },
+    );
+    assert_eq!(answered, (Ok(FastServed::Served), FastKind::Shared));
+    assert_eq!(run.ran, ["shared"]);
+    // A serve under T that did not commit ahead clears it.
+    flag.serve_under_t_ran();
+    assert!(!flag.tries_shared());
 }

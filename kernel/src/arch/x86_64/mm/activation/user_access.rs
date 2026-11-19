@@ -87,6 +87,9 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> usize {
         let closed = self.session.windows.close_all(charges);
         crate::arch::x86_64::step_report::windows_changed(0, closed as u64);
+        crate::arch::x86_64::step_report::streams_changed(
+            self.session.windows.take_stream_changes(),
+        );
         closed
     }
 
@@ -103,7 +106,64 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             u64::from(opened.opened),
             u64::from(opened.closed),
         );
+        crate::arch::x86_64::step_report::streams_changed(
+            self.session.windows.take_stream_changes(),
+        );
         opened
+    }
+
+    /// Under T and P, right after this CPU's serve under T at `address`,
+    /// object page `page` of the on-demand `backing` in `mapping`, opened
+    /// or kept CPU slot `cpu`'s window and the window said the serve starts
+    /// or continues a stream (DW2 §15.6): commits the backing's pages after
+    /// the touched one, in address order, at most the window's credit of
+    /// them and of frames, clipped to the mapping, and spends what that
+    /// took from the window's credit, recording where the commit ahead
+    /// ended. Pages already committed take nothing and are covered. A
+    /// refusal part way keeps what was taken, spends it, and ends the range
+    /// at the first page not covered. The frames are the window's credit,
+    /// already charged to the object's weight when it was admitted, so
+    /// nothing is admitted or recorded here, as for a fast serve's commit.
+    /// `None` when there was nothing to commit ahead (no window, no credit,
+    /// or no page after this one in the mapping).
+    pub(crate) fn commit_fault_window_ahead(
+        &mut self,
+        cpu: usize,
+        backing: crate::memory::frame_roles::BackingIdentity,
+        page: u64,
+        address: u64,
+        mapping: &crate::memory::address_region::Mapping,
+    ) -> Option<crate::memory::frame_roles::OnDemandRangeCommit> {
+        let credit = self.session.windows.window(cpu)?.credit();
+        let mapping_end = mapping.virtual_start().saturating_add(mapping.byte_len());
+        let pages_after = mapping_end.saturating_sub(address.saturating_add(PAGE_SIZE)) / PAGE_SIZE;
+        let count = credit.min(pages_after);
+        if count == 0 {
+            return None;
+        }
+        let first = page.checked_add(1)?;
+        let commit = self
+            .session
+            .roles
+            .commit_on_demand_range_within(backing, first, count, credit);
+        // The first page not covered is inside the mapping or its end, so
+        // this does not overflow; if it did, the frames are still spent.
+        match commit
+            .pages
+            .checked_add(1)
+            .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+            .and_then(|bytes| address.checked_add(bytes))
+        {
+            Some(ahead_end) => self
+                .session
+                .windows
+                .spend_ahead(cpu, commit.frames, ahead_end),
+            None => self.session.windows.spend(cpu, commit.frames),
+        }
+        crate::arch::x86_64::step_report::streams_changed(
+            self.session.windows.take_stream_changes(),
+        );
+        Some(commit)
     }
 
     /// Whether any user pin or mutation holds part of `address_space`.
@@ -899,6 +959,7 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> crate::memory::address_region::WindowsClosed {
         let closed = self.windows.close_address_space(address_space, charges);
         crate::arch::x86_64::step_report::windows_changed(0, closed.closed() as u64);
+        crate::arch::x86_64::step_report::streams_changed(self.windows.take_stream_changes());
         closed
     }
 

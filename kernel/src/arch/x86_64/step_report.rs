@@ -373,6 +373,14 @@ pub(crate) struct StepTally<const CPUS: usize> {
     windows_opened: AtomicU64,
     windows_closed: AtomicU64,
     window_declines: [AtomicU64; WINDOW_DECLINES],
+    /// Serves under T that committed ahead of a stream, the frames they
+    /// took, and the commit ahead's time in ticks (DW2 §15.6).
+    ahead_commits: AtomicU64,
+    ahead_frames: AtomicU64,
+    ahead_ticks: AtomicU64,
+    /// Streams started and ended (DW2 §15.6).
+    streams_started: AtomicU64,
+    streams_ended: AtomicU64,
     /// Per CPU and source, [`P_LOCK_FIGURES`], times in ticks.
     p_lock: [[[AtomicU64; P_LOCK_FIGURES]; P_LOCK_SOURCES]; CPUS],
 }
@@ -457,6 +465,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
             windows_opened: AtomicU64::new(0),
             windows_closed: AtomicU64::new(0),
             window_declines: [const { AtomicU64::new(0) }; WINDOW_DECLINES],
+            ahead_commits: AtomicU64::new(0),
+            ahead_frames: AtomicU64::new(0),
+            ahead_ticks: AtomicU64::new(0),
+            streams_started: AtomicU64::new(0),
+            streams_ended: AtomicU64::new(0),
             p_lock: [const { [const { [const { AtomicU64::new(0) }; P_LOCK_FIGURES] }; P_LOCK_SOURCES] };
                 CPUS],
         }
@@ -654,6 +667,20 @@ impl<const CPUS: usize> StepTally<CPUS> {
         self.windows_closed.fetch_add(closed, Ordering::Relaxed);
     }
 
+    /// A serve under T committed ahead of a stream (DW2 §15.6), taking
+    /// `frames`, in `ticks` (zero when the fault was not timed).
+    pub(crate) fn fault_ahead(&self, frames: u64, ticks: u64) {
+        self.ahead_commits.fetch_add(1, Ordering::Relaxed);
+        self.ahead_frames.fetch_add(frames, Ordering::Relaxed);
+        self.ahead_ticks.fetch_add(ticks, Ordering::Relaxed);
+    }
+
+    /// `started` streams started and `ended` ended (DW2 §15.6).
+    pub(crate) fn streams_changed(&self, started: u64, ended: u64) {
+        self.streams_started.fetch_add(started, Ordering::Relaxed);
+        self.streams_ended.fetch_add(ended, Ordering::Relaxed);
+    }
+
     /// The fast serve declined for `decline`.
     pub(crate) fn window_declined(&self, decline: WindowDecline) {
         self.window_declines[decline as usize].fetch_add(1, Ordering::Relaxed);
@@ -816,6 +843,17 @@ impl<const CPUS: usize> StepTally<CPUS> {
             "fault-windows opened={} closed={}",
             self.windows_opened.load(Ordering::Relaxed),
             self.windows_closed.load(Ordering::Relaxed),
+        ));
+        line(format_args!(
+            "fault-ahead commits={} frames={} us={}",
+            self.ahead_commits.load(Ordering::Relaxed),
+            self.ahead_frames.load(Ordering::Relaxed),
+            us(&self.ahead_ticks),
+        ));
+        line(format_args!(
+            "streams started={} ended={}",
+            self.streams_started.load(Ordering::Relaxed),
+            self.streams_ended.load(Ordering::Relaxed),
         ));
         line(format_args!(
             "fault-declines identity={identity} mapping={mapping} tables={tables} credit={credit} memory={memory} leaf={leaf} return={declined_return}"
@@ -1547,6 +1585,26 @@ mod live {
         TALLY.windows_changed(opened, closed);
     }
 
+    /// The start of a commit ahead on `cpu` (DW2 §15.6): one TSC read, only
+    /// while the CPU's fault gate is timing a fault.
+    pub(crate) fn fault_ahead_began(cpu: usize) -> Option<u64> {
+        TALLY.fault_timing(cpu).then(ticks)
+    }
+
+    /// A commit ahead begun at `began` took `frames` (see
+    /// [`StepTally::fault_ahead`]): one TSC read when it was timed.
+    pub(crate) fn fault_ahead(began: Option<u64>, frames: u64) {
+        let elapsed = began.map_or(0, |began| ticks().saturating_sub(began));
+        TALLY.fault_ahead(frames, elapsed);
+    }
+
+    /// Streams started and ended (see [`StepTally::streams_changed`]).
+    pub(crate) fn streams_changed(changes: crate::memory::address_region::StreamChanges) {
+        if changes.started != 0 || changes.ended != 0 {
+            TALLY.streams_changed(changes.started, changes.ended);
+        }
+    }
+
     /// The fast serve declined (see [`StepTally::window_declined`]).
     pub(crate) fn window_declined(decline: super::WindowDecline) {
         TALLY.window_declined(decline);
@@ -1626,12 +1684,13 @@ mod live {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
     admission_waited, after_safe_point, allow_teardown_step, at_safe_point, backing_allocated,
-    backing_made, call_ended, commit_step, fast_served_shared, fast_stamped, fault_entered,
-    fault_pass, fault_pass_began, fault_pass_fast, fault_returned, fault_stamped, fault_untimed,
-    fill_in_served, finalize_hold_ended, finalize_queued, finalize_stepped, finalize_waited, now,
-    owed, owed_wake, p_lock_released, parked_call_ended, report, set_drain_source, step_began,
-    t_lock_released, t_lock_served, take_teardown_step, ticks, timed, timed_nested, usage_checked,
-    window_declined, windows_changed,
+    backing_made, call_ended, commit_step, fast_served_shared, fast_stamped, fault_ahead,
+    fault_ahead_began, fault_entered, fault_pass, fault_pass_began, fault_pass_fast,
+    fault_returned, fault_stamped, fault_untimed, fill_in_served, finalize_hold_ended,
+    finalize_queued, finalize_stepped, finalize_waited, now, owed, owed_wake, p_lock_released,
+    parked_call_ended, report, set_drain_source, step_began, streams_changed, t_lock_released,
+    t_lock_served, take_teardown_step, ticks, timed, timed_nested, usage_checked, window_declined,
+    windows_changed,
 };
 
 #[cfg(test)]
@@ -2259,6 +2318,8 @@ mod tests {
                 "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
                 "fault-windows opened=0 closed=0",
+                "fault-ahead commits=0 frames=0 us=0",
+                "streams started=0 ended=0",
                 "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
                 "fault-declines-shared not-committed=0",
                 "commit-steps count=0 admit-us=0 take-us=0 rest-us=0",
@@ -2427,14 +2488,14 @@ mod tests {
         tally.t_lock_released(4, DrainSource::Gate, us(2));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[7..10],
+            lines[9..12],
             [
                 "t-lock cpu=0 source=syscall count=3 waited=2 wait-us=10 wait-longest-us=7 held-us=19 held-longest-us=10",
                 "t-lock cpu=0 source=idle count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "t-lock cpu=1 source=fault count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
             ]
         );
-        assert!(lines[10].starts_with("commit-steps "));
+        assert!(lines[12].starts_with("commit-steps "));
     }
 
     #[test]
@@ -2459,6 +2520,8 @@ mod tests {
                 "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
                 "fault-windows opened=0 closed=0",
+                "fault-ahead commits=0 frames=0 us=0",
+                "streams started=0 ended=0",
                 "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
                 "fault-declines-shared not-committed=0",
                 // 2,999 ticks is under one microsecond: whole µs, rounded down.
@@ -2475,6 +2538,8 @@ mod tests {
                 "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
                 "fault-windows opened=0 closed=0",
+                "fault-ahead commits=0 frames=0 us=0",
+                "streams started=0 ended=0",
                 "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
                 "fault-declines-shared not-committed=0",
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=0 held-longest-us=0",
@@ -2505,7 +2570,7 @@ mod tests {
         tally.commit_step(0, us(10), us(30), us(530), us(540));
         tally.commit_step(us(1_000), us(1_001), us(1_002), us(1_102), us(1_105));
         assert_eq!(
-            measure_lines(&tally)[7],
+            measure_lines(&tally)[9],
             "commit-steps count=2 admit-us=21 take-us=600 rest-us=24"
         );
     }
@@ -2539,7 +2604,7 @@ mod tests {
             slot.store(big, Ordering::Relaxed);
         }
         let lines = measure_lines(&tally);
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 11);
         for line in &lines {
             assert!(line.len() < 190, "{} bytes: {line}", line.len());
         }
@@ -2577,8 +2642,8 @@ mod tests {
         tally.t_lock_released(1, DrainSource::Gate, 3_000);
         let (out, before_closing) = report(&tally);
         // Every line before the closing lines is written by then.
-        assert_eq!(before_closing, 9 + 6 + 9 + 1);
-        assert_eq!(out.len(), 9 + 6 + 9 + 1 + 2);
+        assert_eq!(before_closing, 9 + 6 + 11 + 1);
+        assert_eq!(out.len(), 9 + 6 + 11 + 1 + 2);
         assert_eq!(out[8], "backing-alloc-longest-us=0 runs=0 pages=0");
         assert_eq!(out[14], "owed-wakes=0 unsent=0 queue=0 retirement=0");
         assert!(out[15].starts_with("faults served="));
@@ -2586,16 +2651,18 @@ mod tests {
         assert!(out[17].starts_with("faults-shared served="));
         assert!(out[18].starts_with("fault-passes "));
         assert!(out[19].starts_with("fault-windows "));
-        assert!(out[20].starts_with("fault-declines "));
-        assert!(out[21].starts_with("fault-declines-shared "));
+        assert!(out[20].starts_with("fault-ahead "));
+        assert!(out[21].starts_with("streams "));
+        assert!(out[22].starts_with("fault-declines "));
+        assert!(out[23].starts_with("fault-declines-shared "));
         assert_eq!(
-            out[22],
+            out[24],
             "t-lock cpu=1 source=gate count=1 waited=1 wait-us=1 wait-longest-us=1 held-us=2 held-longest-us=2"
         );
-        assert!(out[23].starts_with("commit-steps "));
-        assert_eq!(out[24], "admission-waits create=0 commit=0 fault=0");
+        assert!(out[25].starts_with("commit-steps "));
+        assert_eq!(out[26], "admission-waits create=0 commit=0 fault=0");
         assert_eq!(
-            out[25..],
+            out[27..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
         assert!(!out.iter().any(|line| line.starts_with("usage-check")));
@@ -2615,11 +2682,11 @@ mod tests {
         }
         tally.usage_checked(1, 0);
         let (out, _) = report(&tally);
-        assert!(out[22].starts_with("commit-steps "));
-        assert_eq!(out[23], "admission-waits create=1 commit=3 fault=2");
-        assert_eq!(out[24], "usage-check groups=1 mismatches=0");
+        assert!(out[24].starts_with("commit-steps "));
+        assert_eq!(out[25], "admission-waits create=1 commit=3 fault=2");
+        assert_eq!(out[26], "usage-check groups=1 mismatches=0");
         assert_eq!(
-            out[25..],
+            out[27..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
     }
@@ -2632,23 +2699,23 @@ mod tests {
         let tally = StepTally::<2>::new();
         tally.usage_checked(0, 0);
         let (out, before_closing) = report(&tally);
-        assert_eq!(before_closing, 9 + 6 + 8 + 1 + 1);
+        assert_eq!(before_closing, 9 + 6 + 10 + 1 + 1);
         assert_eq!(
-            out[22],
+            out[24],
             "commit-steps count=0 admit-us=0 take-us=0 rest-us=0"
         );
-        assert_eq!(out[23], "admission-waits create=0 commit=0 fault=0");
-        assert_eq!(out[24], "usage-check groups=0 mismatches=0");
+        assert_eq!(out[25], "admission-waits create=0 commit=0 fault=0");
+        assert_eq!(out[26], "usage-check groups=0 mismatches=0");
         assert_eq!(
-            out[25..],
+            out[27..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
 
         tally.usage_checked(12, 3);
-        assert_eq!(report(&tally).0[24], "usage-check groups=12 mismatches=3");
+        assert_eq!(report(&tally).0[26], "usage-check groups=12 mismatches=3");
         tally.usage_checked(usize::MAX, usize::MAX);
         assert_eq!(
-            report(&tally).0[24],
+            report(&tally).0[26],
             "usage-check groups=2147483647 mismatches=2147483647"
         );
     }
@@ -2763,10 +2830,27 @@ mod tests {
         let lines = measure_lines(&tally);
         assert_eq!(lines[4], "fault-windows opened=3 closed=3");
         assert_eq!(
-            lines[5],
+            lines[7],
             "fault-declines identity=7 mapping=1 tables=2 credit=3 memory=4 leaf=5 return=6"
         );
-        assert_eq!(lines[6], "fault-declines-shared not-committed=8");
+        assert_eq!(lines[8], "fault-declines-shared not-committed=8");
+    }
+
+    /// DW2 §15.6: commits ahead (their frames and time) and streams
+    /// started and ended, each in its own line after `fault-windows`.
+    #[test]
+    fn commits_ahead_and_streams_are_counted_after_the_fault_windows() {
+        let tally = StepTally::<2>::new();
+        tally.fault_ahead(64, us(11));
+        tally.fault_ahead(20, us(4));
+        tally.fault_ahead(0, 0);
+        tally.streams_changed(2, 0);
+        tally.streams_changed(0, 1);
+        let lines = measure_lines(&tally);
+        assert!(lines[4].starts_with("fault-windows "));
+        assert_eq!(lines[5], "fault-ahead commits=3 frames=84 us=15");
+        assert_eq!(lines[6], "streams started=2 ended=1");
+        assert!(lines[7].starts_with("fault-declines "));
     }
 
     /// DW2 §13.16 part e3: P is reported per CPU and source as T is, a line
@@ -2789,7 +2873,7 @@ mod tests {
         tally.t_lock_released(0, DrainSource::Fault, us(1));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[7..12],
+            lines[9..14],
             [
                 "t-lock cpu=0 source=fault count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "p-lock cpu=0 source=runtime count=1 waited=0 wait-us=0 held-us=5",
@@ -2798,7 +2882,7 @@ mod tests {
                 "p-lock cpu=1 source=usercopy count=1 waited=1 wait-us=0 held-us=4",
             ]
         );
-        assert!(lines[12].starts_with("commit-steps "));
+        assert!(lines[14].starts_with("commit-steps "));
     }
 
     /// The fault-window lines and the shared serve's two lines (DW2
@@ -2817,6 +2901,11 @@ mod tests {
             &tally.faults_shared,
             &tally.fault_shared_total,
             &tally.fault_shared_longest,
+            &tally.ahead_commits,
+            &tally.ahead_frames,
+            &tally.ahead_ticks,
+            &tally.streams_started,
+            &tally.streams_ended,
         ]
         .into_iter()
         .chain(&tally.window_declines)
@@ -2837,6 +2926,16 @@ mod tests {
         let declines = find("fault-declines ");
         let shared = find("faults-shared ");
         let shared_declines = find("fault-declines-shared ");
+        let ahead = find("fault-ahead ");
+        let streams = find("streams ");
+        assert_eq!(
+            ahead,
+            std::format!("fault-ahead commits={LARGEST} frames={LARGEST} us={LARGEST}")
+        );
+        assert_eq!(
+            streams,
+            std::format!("streams started={LARGEST} ended={LARGEST}")
+        );
         assert!(windows.ends_with(&std::format!("closed={LARGEST}")));
         assert!(declines.ends_with(&std::format!("return={LARGEST}")));
         assert_eq!(
@@ -2849,7 +2948,7 @@ mod tests {
             shared_declines,
             std::format!("fault-declines-shared not-committed={LARGEST}")
         );
-        for line in [windows, declines, shared, shared_declines] {
+        for line in [windows, declines, shared, shared_declines, ahead, streams] {
             assert!(line.len() <= 192, "{} bytes: {line}", line.len());
         }
     }
