@@ -28,15 +28,7 @@ kernel/src/arch/x86_64/syscall/live.rs unsafe-block-without-safety-comment 0
 kernel/src/arch/x86_64/apic_live.rs test-attribute-in-target-only-file 0
 kernel/src/arch/x86_64/entry.rs test-attribute-in-target-only-file 0
 kernel/src/arch/x86_64/mm/activation/primordial.rs test-attribute-in-target-only-file 0
-kernel/src/arch/x86_64/mm/activation/test_support.rs test-attribute-in-target-only-file 0
-kernel/src/arch/x86_64/mm/activation/test_support/e7.rs test-attribute-in-target-only-file 0
-kernel/src/arch/x86_64/mm/activation/test_support/f12.rs test-attribute-in-target-only-file 0
-kernel/src/arch/x86_64/mm/activation/test_support/f9.rs test-attribute-in-target-only-file 0
 kernel/src/arch/x86_64/mm/activation/user_access.rs test-attribute-in-target-only-file 0
 kernel/src/arch/x86_64/power.rs test-attribute-in-target-only-file 0
 kernel/src/arch/x86_64/syscall/live.rs test-attribute-in-target-only-file 0
 kernel/src/time/live.rs test-attribute-in-target-only-file 0
-kernel/src/time/live/probes.rs test-attribute-in-target-only-file 0
-kernel/src/test_support/memory.rs test-attribute-in-target-only-file 0
-kernel/src/test_support/task.rs test-attribute-in-target-only-file 0
-kernel/src/test_support/x86_64.rs test-attribute-in-target-only-file 0

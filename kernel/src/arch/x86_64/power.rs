@@ -1,11 +1,8 @@
 //! Production platform power-off.
 //!
 //! The terminal path of a production boot used to emit its completion record
-//! and then halt forever, while every instrumented build ended its run through
-//! the `test-support` `isa-debug-exit` transport. That asymmetry meant a
-//! production image could describe why it had finished but could not act on it:
-//! the machine stayed up with nothing left to run, and anything watching the
-//! domain rather than the guest never observed an end.
+//! and then halt forever: the machine stayed up with nothing left to run, and
+//! anything watching the domain rather than the guest never observed an end.
 //!
 //! This module closes that gap with the architectural mechanism rather than a
 //! test device. The values come from firmware via [`crate::arch::x86_64::acpi`]

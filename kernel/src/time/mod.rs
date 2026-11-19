@@ -68,15 +68,6 @@ pub(crate) use live::{
     service_current_scheduler_quantum_deadline, settle_bsp_owed_events, timer_arm_counts,
     timer_service_is_healthy,
 };
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
-#[allow(
-    unused_imports,
-    reason = "F3 target probe result is consumed only by the selected guest evidence path"
-)]
-pub(crate) use live::{
-    F3TargetProbe, F8TargetTimerProbe, calibrated_apic_timer_hz, run_target_deadline_probe,
-    run_target_timer_probe,
-};
 #[cfg(all(target_os = "none", target_arch = "x86_64", deepwyrm_dw1e_platform))]
 #[allow(
     unused_imports,

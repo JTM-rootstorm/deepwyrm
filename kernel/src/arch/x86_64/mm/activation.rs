@@ -113,8 +113,6 @@ pub(crate) use address_space::{
 use graph::*;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use user_access::LiveProcessAddressSpace;
-#[cfg(all(deepwyrm_f9_guest, target_os = "none", target_arch = "x86_64"))]
-pub(crate) use user_access::OwnedLiveAtomicU32;
 #[path = "activation/build.rs"]
 mod build;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -2461,8 +2459,7 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 /// guard-free P guard mints. "No usercopy under T" (H0 §12.8) is therefore a
 /// type fact for the primordial runtime. The page-table mutation,
 /// return-validation and pin-settlement sessions wrap the same builder and
-/// expose no copy. The guest runtimes' constructor (no T there) and the
-/// evidence supervisors' are compiled only into their own builds.
+/// expose no copy.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live_sessions {
     use super::*;
@@ -2470,18 +2467,6 @@ mod live_sessions {
     impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
     {
-        /// A usercopy session for a guest test runtime, which has no runtime
-        /// authority T (D1 commit 9). The primordial runtime never builds one:
-        /// its usercopy goes through the guard-free session.
-        #[cfg(any(deepwyrm_e7_guest, deepwyrm_f9_guest, deepwyrm_f12_guest))]
-        pub(crate) fn current_process_address_space(
-            &mut self,
-            active_root: &ActiveRootSelection,
-            process: crate::task::ProcessKey,
-        ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
-            self.build_live_session(active_root.usercopy_root(), process)
-        }
-
         /// The page-table mutation session for `process`'s current root (D1
         /// option B3): root selection, table candidates and the coherent
         /// publisher, with no usercopy.
@@ -2878,10 +2863,6 @@ impl<A> ActiveDeepPaging<A> {
         self.identity
     }
 }
-
-#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
-#[path = "activation/test_support.rs"]
-mod test_support;
 
 impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
     /// Publishes the prepared root. There is deliberately no recoverable error

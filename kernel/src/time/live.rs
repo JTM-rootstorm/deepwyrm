@@ -31,14 +31,6 @@ use super::{
     TimerExpiryToken, apic_one_shot_for_delta,
 };
 
-#[cfg(feature = "test-support")]
-mod probes;
-#[cfg(feature = "test-support")]
-pub(crate) use probes::{
-    F3TargetProbe, F8TargetTimerProbe, calibrated_apic_timer_hz, run_target_deadline_probe,
-    run_target_timer_probe,
-};
-
 const UNINITIALIZED: u8 = 0;
 const INITIALIZING: u8 = 1;
 const INITIALIZED: u8 = 2;
@@ -1499,8 +1491,6 @@ fn report_clock_choice(verdict: super::tsc::TscVerdict) {
         verdict.hz.unwrap_or(0),
         verdict.disagreement_ppm.map_or(-1, |ppm| ppm as i64),
     );
-    // Guest-test builds keep their serial records exact.
-    #[cfg(not(feature = "test-support"))]
     if let Ok(message) = core::str::from_utf8(&line.bytes[..line.len]) {
         let _ =
             crate::debug::emit_early_record(crate::debug::DiagnosticLevel::Info, "time", message);
@@ -2035,8 +2025,6 @@ fn read_pm_timer(descriptor: PmTimerDescriptor) -> u32 {
     reason = "an impossible F3 interrupt/runtime invariant is fail-stop with interrupts disabled"
 )]
 fn halt_forever(reason: &'static str) -> ! {
-    // Guest-test builds keep their serial records exact.
-    #[cfg(not(feature = "test-support"))]
     {
         const PREFIX: &[u8] = b"halt reason=";
         let mut bytes = [0_u8; 64];
@@ -2049,8 +2037,6 @@ fn halt_forever(reason: &'static str) -> ! {
         let _ =
             crate::debug::emit_early_record(crate::debug::DiagnosticLevel::Error, "time", message);
     }
-    #[cfg(feature = "test-support")]
-    let _ = reason;
     loop {
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
     }

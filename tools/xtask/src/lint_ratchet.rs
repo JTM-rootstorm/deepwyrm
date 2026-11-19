@@ -42,22 +42,14 @@ pub(super) const TEST_TEXT_COUNTER: &str = "test-attribute-in-target-only-file";
 /// their child modules; the list starts from S1's list of code host Clippy
 /// never sees. A new target-only file must be added here: the list cannot
 /// discover one by itself.
-pub(super) const TARGET_ONLY_FILES: [&str; 15] = [
+pub(super) const TARGET_ONLY_FILES: [&str; 7] = [
     "kernel/src/arch/x86_64/apic_live.rs",
     "kernel/src/arch/x86_64/entry.rs",
     "kernel/src/arch/x86_64/mm/activation/primordial.rs",
-    "kernel/src/arch/x86_64/mm/activation/test_support.rs",
-    "kernel/src/arch/x86_64/mm/activation/test_support/e7.rs",
-    "kernel/src/arch/x86_64/mm/activation/test_support/f12.rs",
-    "kernel/src/arch/x86_64/mm/activation/test_support/f9.rs",
     "kernel/src/arch/x86_64/mm/activation/user_access.rs",
     "kernel/src/arch/x86_64/power.rs",
     "kernel/src/arch/x86_64/syscall/live.rs",
     "kernel/src/time/live.rs",
-    "kernel/src/time/live/probes.rs",
-    "kernel/src/test_support/memory.rs",
-    "kernel/src/test_support/task.rs",
-    "kernel/src/test_support/x86_64.rs",
 ];
 
 /// `(scope, counter)`: a package and lint, or a file and the text counter.

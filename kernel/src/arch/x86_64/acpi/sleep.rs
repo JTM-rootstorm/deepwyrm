@@ -6,8 +6,7 @@
 //! yields a proposal; the locked q35 profile separately authorizes the exact
 //! PM1 control port before any write is permitted.
 //!
-//! Unlike the `test-support` debug-exit transport, nothing here depends on a
-//! QEMU test device. The values come from firmware and the write is the
+//! Nothing here depends on a QEMU test device. The values come from firmware and the write is the
 //! architectural one, so this path is also correct on physical hardware that
 //! implements ACPI 2.0 fixed hardware.
 

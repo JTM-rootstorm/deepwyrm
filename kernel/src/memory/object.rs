@@ -914,7 +914,7 @@ impl<const OBJECTS: usize, const LEASES: usize> MemoryObjectAuthority<OBJECTS, L
 
     /// Test-support compatibility path. Production payload-bearing construction
     /// must use `bind_backing`, which consumes CreationRef.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn grant_backing(
         &mut self,
         reference: &CreationRef,

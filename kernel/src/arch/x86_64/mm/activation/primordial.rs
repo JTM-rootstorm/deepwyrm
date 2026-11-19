@@ -45,8 +45,6 @@ use crate::memory::object::{MemoryObjectAuthority, MemoryProtection};
 use crate::memory::user_range::{EmptyAddressRule, UserAccess, UserAddressSpace, UserRange};
 use crate::object::{HandleRef, InternalRef, ObjectRegistry};
 use crate::sync::IrqSpinMutex;
-#[cfg(feature = "test-support")]
-use crate::syscall::FServiceOperationOwner;
 use crate::syscall::fill_in::{CommitStep, FillInEnd};
 use crate::syscall::native::{
     DivergentCarrier, NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest,
@@ -66,7 +64,7 @@ use deepwyrm_abi::{
 
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
 // Production capacities come from `arch/x86_64/pools.toml` (C1); the other
-// arms are the guest-test geometry, which never boots a product.
+// arms are the host builds' geometry, which never boots a product.
 #[cfg(deepwyrm_production_product)]
 use super::production_pools as pools;
 #[cfg(not(deepwyrm_production_product))]
@@ -175,12 +173,6 @@ pub(super) const PRIMORDIAL_TABLE_CANDIDATES: usize = 16;
 // surfaced as an opaque `NO_RESOURCES` from the bootstrap's bootfs mapping and
 // cost the F3A campaign eleven revisions to name (F3A.6x).
 //
-// Selector 34's arm below already said why, and fixed it for itself: "a
-// guessed constant is what made an oversized archive surface as an opaque
-// NO_RESOURCES ... instead of a build error." Four selector arms derive the
-// ceiling from the producer's measured archive. Production, which is the
-// absence of every selector, was never given the fix.
-//
 // `DEEPWYRM_BOOTFS_MAX_PAGES` is emitted by `build.rs` for every
 // configuration: the producer's measurement when a producer built this kernel,
 // and the historical Wave 4 value when nothing measured it, so a standalone
@@ -195,7 +187,7 @@ const _: () = assert!(crate::boot::primordial::construction::STACK_BYTES % 4096 
 /// journal lives in static storage beneath P (`LiveJournalStorage`), not on
 /// a kernel stack.
 const PRIMORDIAL_MAX_USER_MAPPING_PAGES: usize = 4096;
-// Mapping machinery must fit the selector-local bootfs ceiling, the
+// Mapping machinery must fit the bootfs ceiling, the
 // independently owned primordial stack and the largest user mapping, without
 // widening bootfs admission.
 const PRIMORDIAL_MAX_MAPPING_PAGES: usize = {
@@ -233,10 +225,8 @@ const _: [(); 96] = [(); HANDLES];
 const _: [(); 2] = [(); TIMERS];
 const _: [(); 7] = [(); BOOTSTRAP_HANDLE_PEAK - INIT_MOVED_HANDLES];
 
-// Mirrors the production arm of `PRIMORDIAL_BOOTFS_MAX_PAGES` exactly. Without
-// it this is dead code in every selector build, and a selector that reaches the
-// const's arm without reaching this one is a compile error rather than a silent
-// mismatch.
+// Parses the build script's `DEEPWYRM_BOOTFS_MAX_PAGES` at compile time, so a
+// malformed value is a compile error.
 const fn parse_production_bootfs_pages() -> usize {
     let bytes = env!("DEEPWYRM_BOOTFS_MAX_PAGES").as_bytes();
     let mut value = 0_usize;
@@ -3116,7 +3106,6 @@ enum PreparedTerminalHandoff {
     /// Production only: nothing remains to run. The facade powers off after it
     /// drops the runtime guard, because the fallback halt loop enables
     /// interrupts (DW0-H §12.8; design §11.2.6).
-    #[cfg(not(feature = "test-support"))]
     PowerOff,
 }
 
@@ -3141,7 +3130,6 @@ enum TerminalKernelContinuation {
     /// F3A.7k. Production's primordial retiring while other Processes live,
     /// with nothing runnable on its own CPU. The userspace half is already
     /// unmapped; the root is retired from the kernel root and the CPU idles.
-    #[cfg(not(feature = "test-support"))]
     RetirePrimordialToIdle {
         retirement: TerminalRetirementState,
         proof: crate::task::ProcessQuiescenceProof,
@@ -4741,11 +4729,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     unsafe fn prepare_suspend_stationary(
         &mut self,
     ) -> crate::syscall::native::NativeSuspendPlan<'static> {
-        #[cfg(feature = "test-support")]
-        let owner = self
-            .core
-            .services
-            .operation_owner(self.own.scheduled().thread);
         let cancelled_quantum = self.own.wait_control.pending_quantum_cancellation();
         self.stage_local_scheduler_quantum_cancellation(cancelled_quantum);
         let control = &mut self.own.wait_control;
@@ -4930,11 +4913,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     unsafe fn poll_idle_suspend_stationary(
         &mut self,
     ) -> crate::syscall::native::NativeIdleSuspendPoll<'static> {
-        #[cfg(feature = "test-support")]
-        let owner = self
-            .core
-            .services
-            .operation_owner(self.own.scheduled().thread);
         let control = &mut self.own.wait_control;
         // SAFETY: [P-PLAN] forwarded from this function's `# Safety`; `self.cpu()` is the physically
         // current CPU and the entry is the fixed `first_run_thread_entry_rip`.
@@ -5163,7 +5141,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Emitted before the root switch, while this process's own
             // termination information is still readable, and ignored on
             // failure -- a busy COM1 must not change a retirement.
-            #[cfg(not(feature = "test-support"))]
             if let Ok(info) = self.core.tasks.process_info(retirement.retired_process) {
                 let primordial_live = matches!(
                     self.core.tasks.root_region(self.core.primordial_process),
@@ -5185,7 +5162,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Asked only here, with nothing runnable on this CPU, and only of
             // Processes: one that still exists, in any state short of exited,
             // keeps the idle this path always took.
-            #[cfg(not(feature = "test-support"))]
             if !self
                 .core
                 .tasks
@@ -5225,7 +5201,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         // reporter, and idle this CPU. The address space stays: it is the idle
         // carrier's publisher root, which `finish_quiesced_process_root_
         // retirement` never tears down for the primordial.
-        #[cfg(not(feature = "test-support"))]
         if self
             .core
             .tasks
@@ -5315,7 +5290,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 drop(retirement);
                 PreparedTerminalStep::Final(PreparedTerminalHandoff::IdleScheduler)
             }
-            #[cfg(not(feature = "test-support"))]
             TerminalKernelContinuation::RetirePrimordialToIdle {
                 retirement,
                 proof,
@@ -5348,27 +5322,17 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     fn finish_primordial_terminal_handoff(&mut self) -> PreparedTerminalHandoff {
         let completion = complete_primordial_launch(self);
-        // Selector builds never run the primordial product.
-        #[cfg(feature = "test-support")]
-        unreachable!("selector builds do not run the primordial product: {completion:?}");
-        #[cfg(not(feature = "test-support"))]
-        {
-            let record = crate::boot::primordial::construction::completion_record(&completion);
-            let _ = crate::debug::emit_early_bootstrap_completion_record(
-                record.level,
-                record.cause,
-                record.detail,
-                record.exit.map(|exit| (exit.name(), exit.code())),
-            );
-            // Nothing remains runnable. Production used to halt here forever
-            // while every instrumented build ended its domain through the
-            // test-only debug-exit transport, so only an instrumented image
-            // could finish a run. Power the platform off instead, once the
-            // facade has dropped the guard; the fallback inside is the halt
-            // loop this replaced.
-            self.check_usage_for_report();
-            PreparedTerminalHandoff::PowerOff
-        }
+        let record = crate::boot::primordial::construction::completion_record(&completion);
+        let _ = crate::debug::emit_early_bootstrap_completion_record(
+            record.level,
+            record.cause,
+            record.detail,
+            record.exit.map(|exit| (exit.name(), exit.code())),
+        );
+        // Nothing remains runnable. Power the platform off, once the facade
+        // has dropped the guard; the fallback inside is a halt loop.
+        self.check_usage_for_report();
+        PreparedTerminalHandoff::PowerOff
     }
 
     /// In the hold that decides to power off, the last hold before the step
@@ -5376,7 +5340,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// of the registry, recorded for the report's `usage-check` line (DW2
     /// §13.12 part a). Both `PowerOff` handoffs call it, and the report is
     /// written only on the power-off path.
-    #[cfg(not(feature = "test-support"))]
     fn check_usage_for_report(&self) {
         let (groups, mismatches) = self.core.registry.usage_mismatches();
         crate::arch::x86_64::step_report::usage_checked(groups, mismatches);
@@ -7766,11 +7729,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         self.synchronize_scheduler_current();
         let publication = self.complete_physical_switch_handoff();
         crate::task::notify_completed_switch_runnable(publication);
-        #[cfg(feature = "test-support")]
-        let owner = self
-            .core
-            .services
-            .operation_owner(self.own.scheduled().thread);
         let mut settlement = crate::syscall::DeferredWaitSettlement::new();
         let resumed = {
             let mut deadlines = crate::wait::engine::LiveWaitDeadlineAuthority;
@@ -8816,7 +8774,6 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     PreparedTerminalHandoff::IdleScheduler => {
                         crate::arch::x86_64::syscall::enter_bound_idle_scheduler(carrier.release())
                     }
-                    #[cfg(not(feature = "test-support"))]
                     PreparedTerminalHandoff::PowerOff => {
                         crate::arch::x86_64::power::soft_off_then_halt(this.runtime.guard_free())
                     }
@@ -9293,80 +9250,6 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_)
         ) {
             return crate::syscall::native::NativeResumeOutcome::ServiceRendezvous;
-        }
-        #[cfg(feature = "test-support")]
-        let suspended_claim = runtime.core.shared.execution.suspended_claim_on(self.cpu);
-        #[cfg(feature = "test-support")]
-        if runtime
-            .core
-            .shared
-            .execution
-            .current_thread_on(self.cpu)
-            .is_none()
-        {
-            let suspended = suspended_claim.is_some();
-            match (notification, suspended) {
-                (crate::arch::x86_64::rendezvous::MailboxNotification::None, false) => {
-                    panic!("resume lost current without a mailbox notification or suspension")
-                }
-                (crate::arch::x86_64::rendezvous::MailboxNotification::None, true) => {
-                    if runtime.own.wait_control.is_clear() {
-                        match suspended_claim.and_then(|claim| {
-                            runtime
-                                .core
-                                .shared
-                                .execution
-                                .scheduler_state(claim.thread())
-                                .map(|state| (claim, state))
-                        }) {
-                            None if runtime.own.stopping_claim.is_some() => {
-                                panic!("resume crossed an in-progress remote-stop carrier")
-                            }
-                            None if runtime.own.deferred_current.is_some() => {
-                                panic!("resume crossed another local terminal carrier on this CPU")
-                            }
-                            None if suspended_claim.is_some_and(|claim| {
-                                runtime
-                                    .owned
-                                    .physically_executing
-                                    .physically_executes(claim.thread())
-                            }) =>
-                            {
-                                panic!("resume physically executes its terminally retired carrier")
-                            }
-                            None => panic!("resume reached another terminally retired carrier"),
-                            Some((_, crate::task::SchedulerThreadState::Blocked)) => {
-                                panic!("resume reached a still-blocked switched carrier")
-                            }
-                            Some((_, crate::task::SchedulerThreadState::Runnable)) => {
-                                panic!("resume reached an unclaimed runnable switched carrier")
-                            }
-                            Some((_, crate::task::SchedulerThreadState::Running)) => {
-                                panic!("resume reached a suspension whose Thread runs elsewhere")
-                            }
-                            Some((_, crate::task::SchedulerThreadState::Reserved)) => {
-                                panic!("resume reached a reserved switched carrier")
-                            }
-                        }
-                    }
-                    panic!("resume lost current while an idle suspension remained owned")
-                }
-                (crate::arch::x86_64::rendezvous::MailboxNotification::Wake, false) => {
-                    panic!("resume lost current after consuming a wake")
-                }
-                (crate::arch::x86_64::rendezvous::MailboxNotification::Wake, true) => {
-                    panic!("resume lost current after wake with a suspension still owned")
-                }
-                (crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_), false) => {
-                    panic!("resume lost current behind a completed remote stop")
-                }
-                (crate::arch::x86_64::rendezvous::MailboxNotification::HoldSafe(_), true) => {
-                    panic!("resume lost current behind remote stop with a suspension still owned")
-                }
-                (crate::arch::x86_64::rendezvous::MailboxNotification::Stop(_), _) => {
-                    unreachable!()
-                }
-            }
         }
         let settlement = runtime.resume_suspended(frame);
         // The resumed wait's releases are drained before the Thread returns
@@ -10581,17 +10464,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     handle,
                     &mut self.core.cleanup,
                 );
-                #[cfg(feature = "test-support")]
-                if status == DW_STATUS_BAD_STATE {
-                    panic!(
-                        "running HandleClose caller has bad lifecycle: process={:?} thread={:?} lifecycle={:?}",
-                        self.own.scheduled().process,
-                        self.own.scheduled().thread,
-                        self.core
-                            .tasks
-                            .process_lifecycle(self.own.scheduled().process),
-                    );
-                }
                 NativeSyscallResult::returning(status)
             }
             NativeSyscallRequest::TaskGroupTerminate { .. } => {

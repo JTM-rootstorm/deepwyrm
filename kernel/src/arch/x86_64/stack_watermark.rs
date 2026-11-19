@@ -51,11 +51,7 @@ impl ClassMark {
     }
 }
 
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod live {
     use super::{ClassMark, high_water_bytes, paint};
     use crate::memory::kernel_stack::KernelStackBounds;
@@ -171,11 +167,7 @@ mod live {
     }
 }
 
-#[cfg(all(
-    not(feature = "test-support"),
-    target_os = "none",
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{paint_all, report};
 
 #[cfg(test)]
