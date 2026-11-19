@@ -2346,7 +2346,7 @@ Whichever is built keeps §8.4's rule (what is admitted is what is charged) and 
 | Consecutive deferrals of the BSP's timer arm | Decided at M8's exit from the `deferred` counter of its four-CPU boots |
 | One boot whose finalization stayed owed for 2.9 s | Not seen since; closed at M8's exit unless a four-CPU KVM boot shows it |
 | `dev-boot --check --smp` without `--kvm` and without `--icount` fails on a loaded host, before and after part e3 (§13.17) | Its own item before M8's exit: decode the failing steps from the kept evidence, reproduce it on a loaded host, and either fix what stalls or run that mode of the check on virtual time. Wyrmroot's `wait` answering `foreign` for a spawned job that has ended is looked at with it |
-| Three jobs at once wait for P (§13.17) | Step 3's next part: designed from the `p-lock` and `faults-fast` lines and §13.7's candidates, and brought to Mike before it is built |
+| Three jobs at once wait for P (§13.17) | §13.18: what the hold is and three ways on, for Mike's decision |
 
 ### 13.9 Decisions this asks of Mike
 
@@ -2791,3 +2791,59 @@ One job's first touch is now about 1.2 µs on one CPU and on four, against 2.4 a
 **Lanes.** `m8-touch-leaf`, `m8-fault-window`, `m8-fault-window-check` and `m8-fill-in-tests` are merged and retired.
 
 **Next.** Three jobs at once wait for P, as §13.16 said they might. The candidates are §13.7's (frames ready per CPU, zeroing outside P), to be designed from the `p-lock` and `faults-fast` lines and brought to Mike as a design. Then the carried items of §13.8 and M8's exit.
+
+### 13.18 Step 3 after part e: what a first touch holds P for, and three ways on (2026-11-18; for Mike's decision)
+
+Read at Deepwyrm `50473f1`, which with Wyrmroot `8aaf00e` was pushed on 2026-11-18. The numbers are run 7's (§13.17) unless said.
+
+**The hold is the whole serve.** One job's first touch is 1,161 to 1,316 ns as the program sees it. The fast serve is 934 to 1,011 ns of that in the kernel, and P is held for 1,009 to 1,018 ns a fault (`p-lock source=fault`, held time over count, the four three-job boots). What is outside P is the exception's entry and exit, the gate and the program: about 200 ns.
+
+So three jobs cannot together touch more than one page for each hold of about 1.0 µs, whatever else is done. They touch one every 1.3 to 1.5 µs.
+
+**Who holds P in a three-job boot** (the totals over four CPUs of the second boot, which runs the three jobs; four boots):
+
+| Source | Acquisitions | Held, total | Held, each | Waited, total |
+|---|---|---|---|---|
+| A fault (the fast serve) | 1.29 to 1.43 million | 1.32 to 1.44 s | 1,009 to 1,018 ns | 2.88 to 3.14 s |
+| The runtime (a call under T) | 244,000 to 260,000 | 0.84 to 0.91 s | 3.3 to 3.6 µs | 0.23 to 0.24 s |
+| A usercopy | 16,300 to 16,700 | 0.02 s | 1.2 µs | 0.02 s |
+
+Faults hold P for about three fifths of its held time and calls under T for two fifths; which calls those are is not broken down. A fault waits 2.1 to 2.3 µs for P on average (2.5 to 2.6 when it waits at all): about two other holds.
+
+**What the hold does**, by reading `serve_fast` and what it calls. The times are one job's.
+
+| Part | ns | What runs under P |
+|---|---|---|
+| check | 178 to 184 | P is taken. The window. A session for the window's root (`try_usercopy_process_address_space`). The scheduler's lock (`runs_undisturbed_on`), the Stop mailbox, and on the BSP the expiries' lock |
+| commit | 336 to 398 | A publisher. `find_touched_leaf`: three table entries read, each table authenticated in the role table. The backing's index walked for the cost, and walked again for the commit. One frame from the allocator, zeroed, its role record written, its index entry linked |
+| tables | 141 to 146 | The mapping validated, the root's identity again, the index walked a third time for the frame (`page_descriptor`, `resolve_at`), the leaf read, a mutation span over the page, one store |
+| return | 277 to 282 | The credit spent. RIP and RSP each walked through the tables (`validate_and_sanitize`) |
+
+No part is most of it. The hold is many small checks, each of which the reviews of e1 and e3 rest on.
+
+**Zeroing is not it.** §13.7's two candidates for P were zeroing outside the lock and frames kept ready for each CPU. Measured on the development host with the kernel's own instruction (`rep stosq` of 512 words; a host program, not the guest): 29 ns a page over 4 MiB, 36 ns over 64 MiB, 157 ns over 448 MiB, which no longer fits the cache. `touch-loop 64` reuses 64 MiB of frames, so zeroing is about 36 of the hold's 1,000 ns. Neither candidate is proposed: they could take about 36 ns out of the hold for this probe, and about 157 ns for a job whose frames do not fit the cache.
+
+**Three ways on.**
+
+*A. Stop step 3 here.* §2's goal for M8 is met: a first touch no longer serialises every CPU on T, and it fell from 15.2 µs to 1.2 for one job and from 32 to 36 µs to 3.9 to 4.5 for each of three. What remains is that three jobs together are no faster than one, bound by P. M8 goes on to its carried items (§13.8) and its exit, and P's scope becomes a stage of its own, named and ordered by Mike.
+
+*B. Part f1: two index walks fewer in the hold.* A finished small part, kept only if faster by measured time.
+- `commit_on_demand_page_within(backing, page, limit)` on the role manager and the publisher: one walk; a page already committed returns its frame and zero frames; a page whose frames would exceed `limit` returns "over" and takes nothing; else the commit as today. `serve_fast`'s steps 5 and 6 become one call with the window's credit as the limit; "over" is `declined-credit` and a refusal `declined-memory`, as now.
+- `write_touched_leaf` takes the commit's result (the frame, tied to the publisher's borrow as `TouchedLeafPlace` is) and does not resolve the page again. Before changing it the worker lists every check `page_descriptor` and `resolve_at` make for an on-demand backing and says where each is still made; that list is what the security review reads.
+- The serve under T keeps its own order (cost, admission, commit, leaf) and only loses the third walk.
+- What it is worth is not measured: at most the cost of two walks in a hold of about 1,000 ns. It changes part e1's reviewed writer, so it is reviewed again before it merges.
+
+*C. Part f2: fast serves share P.* The structural answer, outlined, not specified.
+- P becomes a reader-writer lock. A fast serve takes it shared, with a lock of its own address space; every other holder takes it exclusively, as today.
+- Under a shared hold a fast serve may write only what no other fast serve can reach: its CPU's window; frames taken for its CPU ahead, with their role records, when the window is opened under T and P (so it calls neither the allocator nor the role table's slot allocation); its backing's index; its address space's tables. Two fast serves then meet only in one address space (its lock) or one backing mapped twice (a lock for the backing, or a decline).
+- What it costs: the role manager's `&mut self` no longer proves exclusion on this path, so the records a shared holder writes need interior mutability with a written ownership argument (new `unsafe`); a rule so exclusive holders are not starved; ready frames given back before any `NO_MEMORY` refusal, as windows are closed before a quota refusal; and the reviews of e1 and e3 made again on the new shape.
+- What it cannot do: the calls under T hold P exclusively for two fifths of its held time in these boots, and a fault still waits for them.
+- A full design needs the role manager, the journal's target and the usercopy sessions read for every place that assumes exclusion. It is days of design and review, not a part.
+
+*Not proposed.* Serving the pages after a touch in the same hold (it commits pages no one touched, which changes what on-demand means and what a group is charged). Leaving out the return's validation for a fault's unchanged frame (every return to a program is validated today; that is a kernel rule, and 280 ns).
+
+**Recommendation.** A, with B if Mike wants the small gain measured. C is real work with a real prize, but it is a redesign of what P guards and belongs in a stage of its own, after M8's carried items and exit, where it can be read and reviewed as one thing.
+
+**Decisions this asks of Mike.**
+1. A, B then A, or C now.
+2. If C is not built now: the stage it goes in (a new stage after M8, before or after M9).
