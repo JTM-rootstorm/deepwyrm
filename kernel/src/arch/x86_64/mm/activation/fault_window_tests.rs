@@ -94,6 +94,9 @@ struct Model {
     commit_refused: bool,
     write_fails: bool,
     return_refused: bool,
+    /// The paging is a shared hold's (DW2 §15.2): a commit takes no frame,
+    /// an uncommitted page is `NotCommitted`, and nothing may be spent.
+    shared: bool,
     /// What the serve asked, in order.
     calls: Vec<&'static str>,
     stamps: Vec<FastStamp>,
@@ -163,6 +166,9 @@ impl FastLeaf for ModelLeaf<'_> {
         if self.model.object_of(&mapping).committed.contains(&page) {
             return FastCommit::Done(0);
         }
+        if self.model.shared {
+            return FastCommit::NotCommitted;
+        }
         if 1 + nodes > limit {
             return FastCommit::Over;
         }
@@ -224,6 +230,7 @@ impl FastServePaging<u32> for Model {
     }
 
     fn spend(&mut self, frames: u64) {
+        assert!(!self.shared, "a shared serve takes no frame to spend");
         self.calls.push("spend");
         self.windows.spend(self.cpu, frames);
     }
@@ -283,6 +290,7 @@ fn fixture() -> Fixture {
         commit_refused: false,
         write_fails: false,
         return_refused: false,
+        shared: false,
         calls: Vec::new(),
         stamps: Vec::new(),
     };
@@ -697,6 +705,7 @@ fn a_randomised_run_keeps_the_invariant_of_the_charge_after_every_operation() {
         commit_refused: false,
         write_fails: false,
         return_refused: false,
+        shared: false,
         calls: Vec::new(),
         stamps: Vec::new(),
     };
@@ -783,4 +792,275 @@ fn a_randomised_run_keeps_the_invariant_of_the_charge_after_every_operation() {
         served > 500 && declined > 500 && opened > 100,
         "{served} {declined} {opened}"
     );
+}
+
+/// DW2 §15.2: a shared serve of a page with no frame is `NotCommitted`,
+/// returned at the commit, before anything is written: the model, its
+/// window, its credit and its weights are as they were.
+#[test]
+fn not_committed_is_returned_before_any_write_and_changes_nothing() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    model.shared = true;
+    let calls =
+        assert_declined_unchanged(model, START + PAGE, WRITE_FAULT, FastDecline::NotCommitted);
+    assert_eq!(
+        calls,
+        ["session", "scheduler", "leaf", "find", "commit_within"]
+    );
+    assert!(model.objects[0].committed.is_empty());
+    assert_eq!(model.stamps, [FastStamp::Checked]);
+}
+
+/// A shared model serve of a committed page: `Served` when its leaf was
+/// empty, `AlreadyPresent` when it was this page's; neither commits nor
+/// spends, so the credit and the weights stay.
+#[test]
+fn a_shared_serve_of_a_committed_page_writes_only_its_leaf() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    model.shared = true;
+    model.objects[0].committed.push(1);
+    model.objects[0].frames = 1;
+    model.weights.add(model.objects[0].id, 1);
+    model.assert_charge_invariant();
+    let before = credit(model);
+    assert_eq!(
+        serve_fast(model, START + PAGE, WRITE_FAULT),
+        Ok(FastServed::Served)
+    );
+    assert_eq!(
+        model.calls,
+        [
+            "session",
+            "scheduler",
+            "leaf",
+            "find",
+            "commit_within",
+            "write",
+            "return"
+        ]
+    );
+    assert_eq!(model.leaves, [START + PAGE]);
+    model.calls.clear();
+    assert_eq!(
+        serve_fast(model, START + PAGE + 5, READ_FAULT),
+        Ok(FastServed::AlreadyPresent)
+    );
+    assert!(!model.calls.contains(&"commit") && !model.calls.contains(&"spend"));
+    assert_eq!(model.leaves, [START + PAGE]);
+    assert_eq!(credit(model), before);
+    assert_eq!(model.objects[0].frames, 1);
+    model.assert_charge_invariant();
+}
+
+/// Every decline of a shared serve writes nothing that P guards: no
+/// commit, no spend, the window and the weights as they were; only the
+/// leaf's own declines (7 and 8) come after a leaf write is attempted.
+#[test]
+fn every_decline_of_a_shared_serve_writes_nothing() {
+    type Knob = fn(&mut Model);
+    let knobs: [(Knob, FastDecline); 8] = [
+        (|model| model.cpu = 1, FastDecline::Identity),
+        (|model| model.session_refused = true, FastDecline::Identity),
+        (
+            |model| model.scheduler_refuses = true,
+            FastDecline::Identity,
+        ),
+        (
+            |model| model.publisher_refused = true,
+            FastDecline::Identity,
+        ),
+        (|model| model.tables_missing = true, FastDecline::Tables),
+        (|model| model.cost_unaskable = true, FastDecline::Credit),
+        (|model| model.write_fails = true, FastDecline::Leaf),
+        (|model| model.return_refused = true, FastDecline::Return),
+    ];
+    for (knob, decline) in knobs {
+        let mut fixture = fixture();
+        let model = &mut fixture.model;
+        model.shared = true;
+        model.objects[0].committed.push(1);
+        model.objects[0].frames = 1;
+        model.weights.add(model.objects[0].id, 1);
+        knob(model);
+        let window = model.windows.window(0).copied();
+        let weight = model.weights.weight(model.objects[0].id);
+        model.calls.clear();
+        assert_eq!(
+            serve_fast(model, START + PAGE, WRITE_FAULT),
+            Err(decline),
+            "{decline:?}"
+        );
+        assert!(!model.calls.contains(&"commit") && !model.calls.contains(&"spend"));
+        assert_eq!(model.windows.window(0).copied(), window);
+        assert_eq!(model.weights.weight(model.objects[0].id), weight);
+        assert_eq!(model.objects[0].committed, [1]);
+        if decline != FastDecline::Return {
+            assert!(model.leaves.is_empty(), "{decline:?}");
+        }
+        model.cpu = 0;
+        model.assert_charge_invariant();
+    }
+}
+
+/// What each serve did in a gate test, in order.
+#[derive(Default)]
+struct GateRun {
+    ran: Vec<&'static str>,
+}
+
+/// DW2 §15.2: the gate's flag. Clear: only the exclusive serve runs, and
+/// the flag is set when it took no frame. Set: the shared serve runs
+/// first and answers the fault, except `NotCommitted`, which clears the
+/// flag and runs the exclusive serve in the same fault. Another shared
+/// decline is the fault's. The serve under T clears it.
+#[test]
+fn the_gate_tries_the_shared_serve_only_after_a_serve_that_took_no_frame() {
+    let mut flag = SharedServeFlag::new();
+    let mut run = GateRun::default();
+    // Clear, the exclusive serve takes a frame: the flag stays clear.
+    let answered = serve_gated(
+        &mut flag,
+        &mut run,
+        |run| {
+            run.ran.push("shared");
+            Ok(FastServed::Served)
+        },
+        |run| {
+            run.ran.push("exclusive");
+            Ok((FastServed::Served, false))
+        },
+    );
+    assert_eq!(answered, (Ok(FastServed::Served), FastKind::Exclusive));
+    assert!(!flag.tries_shared());
+    // A decline of the exclusive serve leaves it clear.
+    let answered = serve_gated(
+        &mut flag,
+        &mut run,
+        |_| Ok(FastServed::Served),
+        |run| {
+            run.ran.push("exclusive");
+            Err::<(FastServed, bool), _>(FastDecline::Credit)
+        },
+    );
+    assert_eq!(answered, (Err(FastDecline::Credit), FastKind::Exclusive));
+    assert!(!flag.tries_shared());
+    // Clear, the exclusive serve takes no frame: set.
+    let _ = serve_gated(
+        &mut flag,
+        &mut run,
+        |_| Ok(FastServed::Served),
+        |run| {
+            run.ran.push("exclusive");
+            Ok((FastServed::AlreadyPresent, true))
+        },
+    );
+    assert!(flag.tries_shared());
+    assert_eq!(run.ran, ["exclusive", "exclusive", "exclusive"]);
+    run.ran.clear();
+    // Set: the shared serve answers and the exclusive one does not run.
+    let answered = serve_gated(
+        &mut flag,
+        &mut run,
+        |run| {
+            run.ran.push("shared");
+            Ok(FastServed::Served)
+        },
+        |run| {
+            run.ran.push("exclusive");
+            Ok((FastServed::Served, false))
+        },
+    );
+    assert_eq!(answered, (Ok(FastServed::Served), FastKind::Shared));
+    assert!(flag.tries_shared());
+    // Set, another shared decline: the fault's, for the serve under T; the
+    // flag stays.
+    let answered = serve_gated(
+        &mut flag,
+        &mut run,
+        |run| {
+            run.ran.push("shared");
+            Err(FastDecline::Leaf)
+        },
+        |run| {
+            run.ran.push("exclusive");
+            Ok((FastServed::Served, false))
+        },
+    );
+    assert_eq!(answered, (Err(FastDecline::Leaf), FastKind::Shared));
+    assert!(flag.tries_shared());
+    assert_eq!(run.ran, ["shared", "shared"]);
+    run.ran.clear();
+    // Set, `NotCommitted`: cleared, and the exclusive serve runs in the
+    // same fault; it took a frame, so the flag stays clear.
+    let answered = serve_gated(
+        &mut flag,
+        &mut run,
+        |run| {
+            run.ran.push("shared");
+            Err(FastDecline::NotCommitted)
+        },
+        |run| {
+            run.ran.push("exclusive");
+            Ok((FastServed::Served, false))
+        },
+    );
+    assert_eq!(answered, (Ok(FastServed::Served), FastKind::Exclusive));
+    assert_eq!(run.ran, ["shared", "exclusive"]);
+    assert!(!flag.tries_shared());
+    // The serve under T clears a set flag.
+    let mut flag = SharedServeFlag::new();
+    let _ = serve_gated(&mut flag, &mut run, |_| Ok(()), |_| Ok(((), true)));
+    assert!(flag.tries_shared());
+    flag.serve_under_t_ran();
+    assert!(!flag.tries_shared());
+}
+
+/// The gate over the shared and exclusive models: a committed page after
+/// a serve that took no frame is served shared; an uncommitted one is
+/// `NotCommitted` and committed by the exclusive serve in the same fault.
+#[test]
+fn the_gate_over_the_models_commits_through_the_exclusive_serve() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    model.objects[0].committed.push(1);
+    model.objects[0].frames = 1;
+    model.weights.add(model.objects[0].id, 1);
+    let mut flag = SharedServeFlag::new();
+    let shared = |model: &mut Model, address| {
+        model.shared = true;
+        let served = serve_fast(model, address, WRITE_FAULT);
+        model.shared = false;
+        served
+    };
+    let exclusive = |model: &mut Model, address| {
+        let spent = credit(model);
+        serve_fast(model, address, WRITE_FAULT).map(|served| (served, credit(model) == spent))
+    };
+    // Page 1 is committed: the exclusive serve takes no frame and sets it.
+    let answered = serve_gated(
+        &mut flag,
+        model,
+        |model| shared(model, START + PAGE),
+        |model| exclusive(model, START + PAGE),
+    );
+    assert_eq!(answered, (Ok(FastServed::Served), FastKind::Exclusive));
+    assert!(flag.tries_shared());
+    // Page 2 is not: shared is `NotCommitted`, the exclusive serve commits.
+    model.calls.clear();
+    let answered = serve_gated(
+        &mut flag,
+        model,
+        |model| shared(model, START + 2 * PAGE),
+        |model| exclusive(model, START + 2 * PAGE),
+    );
+    assert_eq!(answered, (Ok(FastServed::Served), FastKind::Exclusive));
+    assert!(!flag.tries_shared());
+    assert_eq!(
+        model.calls.iter().filter(|call| **call == "commit").count(),
+        1
+    );
+    assert_eq!(credit(model), Some(63));
+    model.assert_charge_invariant();
 }

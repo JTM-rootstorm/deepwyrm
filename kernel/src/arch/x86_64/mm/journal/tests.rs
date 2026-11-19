@@ -89,6 +89,34 @@ fn mutation(table: u64, index: usize, expected: u64, replacement: u64) -> EntryM
     }
 }
 
+/// DW2 §15.2: the default `apply_if_empty` reads the entry once and
+/// stores only into an empty one: an empty entry is stored (`None`); a
+/// present one is returned (`Some`) and nothing is stored; a refused store
+/// leaves the entry as it was.
+#[test]
+fn the_default_apply_if_empty_stores_only_into_an_empty_entry() {
+    let mut target = FakeTarget::default();
+    let write = JournalWrite::new(FrameAddress(0x1000), 3, 0x5007);
+    assert_eq!(target.apply_if_empty(write), Ok(None));
+    assert_eq!(target.entries.get(&(0x1000, 3)), Some(&0x5007));
+    assert_eq!(target.applied, [(0x1000, 3)]);
+    assert_eq!(target.read_count, 1);
+    assert!(target.invalidated.is_empty());
+    // Present: returned, not stored again.
+    let again = JournalWrite::new(FrameAddress(0x1000), 3, 0x6007);
+    assert_eq!(target.apply_if_empty(again), Ok(Some(0x5007)));
+    assert_eq!(target.entries.get(&(0x1000, 3)), Some(&0x5007));
+    assert_eq!(target.applied, [(0x1000, 3)]);
+    assert_eq!(target.apply_count, 1);
+    assert_eq!(target.read_count, 2);
+    // A refused store changes nothing.
+    target.fail_apply = true;
+    let refused = JournalWrite::new(FrameAddress(0x2000), 0, 0x7007);
+    assert_eq!(target.apply_if_empty(refused), Err(()));
+    assert_eq!(target.entries.get(&(0x2000, 0)), None);
+    assert!(target.invalidated.is_empty());
+}
+
 #[test]
 fn journal_is_invisible_until_atomic_child_first_publication() {
     let mut target = FakeTarget::default();

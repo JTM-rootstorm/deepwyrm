@@ -3370,6 +3370,109 @@ mod direct_map_access {
         assert!(!touched_the_window(&target));
     }
 
+    /// DW2 §15.2: `apply_if_empty` makes `apply`'s checks for one write,
+    /// with `apply`'s results, and reads the entry once: an empty entry is
+    /// stored as `apply` stores it; a present one is returned with no store
+    /// and no window touched.
+    #[test]
+    fn apply_if_empty_stores_as_apply_and_only_into_an_empty_entry() {
+        let fixture = graph_fixture();
+        let limit = fixture.capabilities.physical_limit();
+        let table = FrameAddress::new(0x15_0000, limit).unwrap();
+        let cell = DIRECT_MAP_BASE + 0x15_0000 + 9 * 8;
+        let write = JournalWrite::test_new(table, 9, 0x9abc);
+        // Empty: stored in place, as `apply` stores it, with one load.
+        let mut by_apply = target_with_map(fixture.scratch_pt);
+        assert_eq!(by_apply.apply(&[write], &[]), Ok(()));
+        let mut target = target_with_map(fixture.scratch_pt);
+        assert_eq!(target.apply_if_empty(write), Ok(None));
+        assert_eq!(target.io.memory, by_apply.io.memory);
+        assert_eq!(target.io.events, by_apply.io.events);
+        assert_eq!(target.io.memory.get(&cell), Some(&0x9abc));
+        assert!(!touched_the_window(&target));
+        // Present: returned, nothing stored.
+        target.io.events.clear();
+        let again = JournalWrite::test_new(table, 9, 0x1111);
+        assert_eq!(target.apply_if_empty(again), Ok(Some(0x9abc)));
+        assert_eq!(target.io.memory.get(&cell), Some(&0x9abc));
+        assert!(
+            target
+                .io
+                .events
+                .iter()
+                .all(|event| !matches!(event, ScratchIoEvent::Store(_, _)))
+        );
+        // Through the window, outside the map: as `apply`, leaf restored.
+        let outside =
+            JournalWrite::test_new(FrameAddress::new(0x30_0000, limit).unwrap(), 4, 0x2222);
+        let mut by_apply = target_with_map(fixture.scratch_pt);
+        assert_eq!(by_apply.apply(&[outside], &[]), Ok(()));
+        let mut target = target_with_map(fixture.scratch_pt);
+        assert_eq!(target.apply_if_empty(outside), Ok(None));
+        assert_eq!(target.io.memory, by_apply.io.memory);
+        assert_eq!(target.io.events, by_apply.io.events);
+        assert_eq!(
+            target
+                .io
+                .memory
+                .get(&target.scratch_leaf_address())
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// `apply_if_empty` refuses where `apply` refuses, with its error and
+    /// no store: another CPU, the shared scratch PT, and this CPU's scratch
+    /// leaf found installed.
+    #[test]
+    fn apply_if_empty_refuses_where_apply_refuses() {
+        let fixture = graph_fixture();
+        let limit = fixture.capabilities.physical_limit();
+        let table = FrameAddress::new(0x15_0000, limit).unwrap();
+        let write = JournalWrite::test_new(table, 9, 0x9abc);
+        let pt = FrameAddress::new(fixture.scratch_pt.physical_start(), limit).unwrap();
+        let reserved = JournalWrite::test_new(pt, 0, 0x1234);
+        type Setup = fn(&mut ActiveScratchTarget<FakeActiveScratchIo>);
+        let cases: [(Setup, JournalWrite, LiveActiveTargetError); 3] = [
+            (
+                |target| target.io.current_cpu = CpuIndex::new(1).unwrap(),
+                write,
+                LiveActiveTargetError::WrongCpu,
+            ),
+            (
+                |_| {},
+                reserved,
+                LiveActiveTargetError::ReservedScratchEntry,
+            ),
+            (
+                |target| {
+                    let leaf = target.scratch_leaf_address();
+                    target.io.memory.insert(leaf, 0x7003);
+                },
+                write,
+                LiveActiveTargetError::Busy,
+            ),
+        ];
+        for (setup, write, error) in cases {
+            let mut by_apply = target_with_map(fixture.scratch_pt);
+            setup(&mut by_apply);
+            assert_eq!(by_apply.apply(&[write], &[]), Err(error));
+            let mut target = target_with_map(fixture.scratch_pt);
+            setup(&mut target);
+            assert_eq!(target.apply_if_empty(write), Err(error));
+            assert_eq!(target.io.events, by_apply.io.events, "{error:?}");
+            assert!(
+                target
+                    .io
+                    .events
+                    .iter()
+                    .all(|event| !matches!(event, ScratchIoEvent::Store(_, _))),
+                "{error:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_frame_outside_the_map_still_goes_through_the_window() {
         let fixture = graph_fixture();

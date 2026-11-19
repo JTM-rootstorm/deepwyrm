@@ -48,6 +48,10 @@ pub(crate) enum FastDecline {
     Leaf,
     /// Step 8: the return is not authorised by present leaves alone.
     Return,
+    /// Steps 5 and 6 of a shared serve (DW2 §15.2): the page has no frame,
+    /// and a shared hold takes none. Nothing was written; the gate runs
+    /// the exclusive fast serve in the same fault.
+    NotCommitted,
 }
 
 /// What the fast serve did when it served (step 9).
@@ -83,6 +87,9 @@ pub(crate) enum FastCommit {
     Refused,
     /// The page is committed; the frames this commit took (zero if it was).
     Done(u64),
+    /// The page has no frame and none may be taken here: a shared serve's
+    /// answer for a page not yet committed (DW2 §15.2).
+    NotCommitted,
 }
 
 /// The publisher's side of steps 4 to 7, all under one borrow of the
@@ -180,6 +187,7 @@ pub(crate) fn serve_fast<R: Copy, P: FastServePaging<R>>(
             FastCommit::Done(frames) => frames,
             FastCommit::Over | FastCommit::Unaskable => return Err(FastDecline::Credit),
             FastCommit::Refused => return Err(FastDecline::Memory),
+            FastCommit::NotCommitted => return Err(FastDecline::NotCommitted),
         };
         leaf.stamp(FastStamp::Committed);
         // 7. The leaf.
@@ -202,6 +210,71 @@ pub(crate) fn serve_fast<R: Copy, P: FastServePaging<R>>(
     } else {
         FastServed::AlreadyPresent
     })
+}
+
+/// Which fast serve answered a fault (DW2 §15.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FastKind {
+    /// The serve with P shared, of a page already committed.
+    Shared,
+    /// The serve with P exclusive, which may commit.
+    Exclusive,
+}
+
+/// One CPU's owner-local memory of its last fast serve (DW2 §15.2): set
+/// when that serve took no frame, so the next fault tries the shared serve
+/// first. A wrong value costs one attempt: a shared serve of an uncommitted
+/// page answers `NotCommitted` and the exclusive one runs in the same
+/// fault.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SharedServeFlag {
+    took_no_frame: bool,
+}
+
+impl SharedServeFlag {
+    /// Clear: the next fault runs the exclusive fast serve.
+    pub(crate) const fn new() -> Self {
+        Self {
+            took_no_frame: false,
+        }
+    }
+
+    /// Whether the next fault tries the shared serve first.
+    pub(crate) const fn tries_shared(self) -> bool {
+        self.took_no_frame
+    }
+
+    /// This CPU's serve under T ran: it may have opened, replaced or closed
+    /// this CPU's window, so the next fault runs the exclusive serve first.
+    pub(crate) fn serve_under_t_ran(&mut self) {
+        self.took_no_frame = false;
+    }
+}
+
+/// The gate's choice of fast serve for one fault (DW2 §15.2), over
+/// `context`. With the flag set, `shared` runs first: its success is the
+/// fault's; on `NotCommitted` the flag is cleared and `exclusive` runs in
+/// the same fault; any other decline is the fault's, for the serve under
+/// T. With the flag clear, `exclusive` runs, and its success sets the flag
+/// when it took no frame (its `bool`). Returns the outcome and which serve
+/// gave it.
+pub(crate) fn serve_gated<C, T>(
+    flag: &mut SharedServeFlag,
+    context: &mut C,
+    shared: impl FnOnce(&mut C) -> Result<T, FastDecline>,
+    exclusive: impl FnOnce(&mut C) -> Result<(T, bool), FastDecline>,
+) -> (Result<T, FastDecline>, FastKind) {
+    if flag.took_no_frame {
+        match shared(context) {
+            Err(FastDecline::NotCommitted) => flag.took_no_frame = false,
+            answered => return (answered, FastKind::Shared),
+        }
+    }
+    let answered = exclusive(context).map(|(served, took_no_frame)| {
+        flag.took_no_frame = took_no_frame;
+        served
+    });
+    (answered, FastKind::Exclusive)
 }
 
 #[cfg(test)]

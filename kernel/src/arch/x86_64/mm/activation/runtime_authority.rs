@@ -315,8 +315,25 @@ impl<T: HoldEndCheck> Drop for RuntimeAuthorityGuard<'_, T> {
 ///
 /// It lives outside T's value, so a later D1 step can give usercopy its own
 /// way in without reaching into T's cell.
+///
+/// P is a reader-writer lock (DW2 §15.2, M8b step 1). Every access above
+/// takes it exclusively, as before. A third way in,
+/// [`PagingLock::guard_free_shared_fault_access`], takes it shared, for the
+/// fast serve of a page already committed: its guard gives `&P` only, and
+/// nothing reachable from it writes what P guards.
+///
+/// `state` is one word: bit 0 ([`WRITER`]) is set while an exclusive guard
+/// exists; bit 1 ([`WRITER_WAITING`]) is set by every exclusive acquirer
+/// while it waits and cleared by the one that takes; bits 2 and up
+/// ([`READER`] each) count the shared guards. A shared acquirer waits while
+/// either low bit is set, so a waiting writer stops new readers; an
+/// exclusive acquirer takes only when no writer holds and no reader is
+/// counted. Several writers may wait at once: each re-sets the waiting bit
+/// on every spin in which it finds it clear, and the one that takes clears
+/// it, so a clear bit can let a reader in only until the next waiter's next
+/// spin, never for more than that one reader's hold.
 pub(super) struct PagingLock<P> {
-    locked: AtomicBool,
+    state: AtomicU64,
     /// Called on every iteration of the spin, as for the runtime authority.
     spin_service: SpinService,
     /// P's timing (DW2 §13.16 part e3), taken as T's is.
@@ -324,14 +341,25 @@ pub(super) struct PagingLock<P> {
     value: UnsafeCell<P>,
 }
 
+/// [`PagingLock`]'s writer bit: an exclusive guard exists.
+const WRITER: u64 = 1;
+/// [`PagingLock`]'s writer-waiting bit: an exclusive acquirer is waiting.
+const WRITER_WAITING: u64 = 1 << 1;
+/// One shared guard in [`PagingLock`]'s reader count (bits 2 and up).
+const READER: u64 = 1 << 2;
+/// The reader count's bits.
+const READERS: u64 = !(WRITER | WRITER_WAITING);
+
 /// Who took P, for its timing (DW2 §13.16 part e3, the `p-lock` line):
 /// every P beneath a T guard is `Runtime`; with no T guard, a fast serve is
-/// `Fault` and every other holder `Usercopy`.
+/// `Fault` and every other holder `Usercopy`; a fast serve that takes P
+/// shared is `FaultShared` (DW2 §15.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PagingSource {
     Fault = 0,
     Usercopy = 1,
     Runtime = 2,
+    FaultShared = 3,
 }
 
 /// P's timing hooks. `now` reads the counter (`None`: no timing); a
@@ -358,9 +386,13 @@ fn untimed_now() -> Option<u64> {
 fn untimed_release(_: PagingSource, _: Option<u64>, _: u64) {}
 
 // SAFETY: `value` is written once before any AP carrier is released, never moved afterward, and
-// every access goes through a `PagingGuard`, which holds `locked` (acquired with Acquire, released
-// with Release). This is the same explicit DW0-H bridge as `RuntimeAuthorityLock`'s, for a paging
-// authority whose type deliberately does not claim `Send`/`Sync` on its own.
+// every access goes through a guard: a `PagingGuard`, which holds the writer bit alone (taken with
+// Acquire when no reader is counted, released with Release), or a `SharedPagingGuard`, which holds
+// one count of the readers (taken with Acquire while no writer holds, released with Release) and
+// gives `&P` only. This is the same explicit DW0-H bridge as `RuntimeAuthorityLock`'s, for a
+// paging authority whose type deliberately does not claim `Send`/`Sync` on its own; what shared
+// guards on several CPUs may do through their `&P` at once is bounded where the shared guard's
+// reference is formed (`SharedPagingGuard::deref`).
 unsafe impl<P> Sync for PagingLock<P> {}
 
 impl<P> PagingLock<P> {
@@ -375,7 +407,7 @@ impl<P> PagingLock<P> {
         timing: PagingTiming,
     ) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            state: AtomicU64::new(0),
             spin_service,
             timing,
             value: UnsafeCell::new(value),
@@ -390,14 +422,27 @@ impl<P> PagingLock<P> {
         self.acquire_in(PagingSource::Runtime)
     }
 
+    /// Takes P exclusively: sets the writer-waiting bit, waits until no
+    /// writer holds and no reader is counted, then takes the writer bit and
+    /// clears the waiting bit in one exchange.
     fn acquire_in<M>(&self, source: PagingSource) -> PagingGuard<'_, P, M> {
         // Stamped only once the first try fails, as for T.
         let mut ticketed = None;
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        loop {
+            let state = self.state.load(Ordering::Relaxed);
+            if state & (WRITER | READERS) == 0
+                && self
+                    .state
+                    .compare_exchange_weak(state, WRITER, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+            // Re-set on every spin that finds it clear: another writer's
+            // taking clears it, and this one still waits.
+            if state & WRITER_WAITING == 0 {
+                self.state.fetch_or(WRITER_WAITING, Ordering::Relaxed);
+            }
             if ticketed.is_none() {
                 ticketed = (self.timing.now)();
             }
@@ -409,12 +454,57 @@ impl<P> PagingLock<P> {
             lock: self,
             source,
             served,
-            waited: ticketed
-                .zip(served)
-                .map(|(ticketed, served)| served.saturating_sub(ticketed)),
+            waited: waited(ticketed, served),
             _mode: PhantomData,
         }
     }
+
+    /// Takes P shared: waits while a writer holds or waits, then counts one
+    /// reader in one exchange.
+    fn acquire_shared(&self) -> SharedPagingGuard<'_, P> {
+        let mut ticketed = None;
+        loop {
+            let state = self.state.load(Ordering::Relaxed);
+            if state & (WRITER | WRITER_WAITING) == 0 {
+                let Some(next) = state.checked_add(READER) else {
+                    panic!("the paging lock's reader count overflowed");
+                };
+                if self
+                    .state
+                    .compare_exchange_weak(state, next, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            if ticketed.is_none() {
+                ticketed = (self.timing.now)();
+            }
+            (self.spin_service)();
+            core::hint::spin_loop();
+        }
+        let served = (self.timing.now)();
+        SharedPagingGuard {
+            lock: self,
+            served,
+            waited: waited(ticketed, served),
+        }
+    }
+
+    /// Reads P's timing just before a release, as T's is, and reports it.
+    fn time_release(&self, source: PagingSource, served: Option<u64>, waited: Option<u64>) {
+        if let (Some(served), Some(released)) = (served, (self.timing.now)()) {
+            (self.timing.released)(source, waited, released.saturating_sub(served));
+        }
+    }
+}
+
+/// The wait of an acquisition that began to spin at `ticketed` and was
+/// served at `served`; `None` when it was served at its first try.
+fn waited(ticketed: Option<u64>, served: Option<u64>) -> Option<u64> {
+    ticketed
+        .zip(served)
+        .map(|(ticketed, served)| served.saturating_sub(ticketed))
 }
 
 impl<P> PagingLock<P> {
@@ -450,6 +540,25 @@ impl<P> PagingLock<P> {
             source: PagingSource::Fault,
             _beneath_runtime_guard: PhantomData,
             _mode: PhantomData,
+        }
+    }
+
+    /// Shared access to P with no T guard beneath it, for the fast serve of
+    /// a page already committed (DW2 §15.2): the only way P is taken
+    /// shared. As [`Self::guard_free_access`], the `GuardFree` token and the
+    /// access mutably borrow the CPU's handle for `'a`, so P is never held
+    /// before T; timed as `FaultShared`.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live shared fast serve takes it")
+    )]
+    pub(super) fn guard_free_shared_fault_access<'a>(
+        &'a self,
+        _guard_free: GuardFree<'a>,
+    ) -> SharedPagingAccess<'a, P> {
+        SharedPagingAccess {
+            lock: self,
+            _beneath_runtime_guard: PhantomData,
         }
     }
 }
@@ -543,17 +652,18 @@ impl<P, M> Deref for PagingGuard<'_, P, M> {
     type Target = P;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: `acquire` is the only constructor of a guard and returns only after it owns
-        // `locked`; `drop` releases it with a Release store that the next `acquire` reads with
-        // Acquire.
+        // SAFETY: `acquire_in` is the only constructor of a guard and returns only after its
+        // exchange set the writer bit from a word with no reader counted; while the bit is set no
+        // other writer takes and no reader is counted. `drop` clears it with a Release that the
+        // next acquisition's Acquire exchange reads.
         unsafe { &*self.lock.value.get() }
     }
 }
 
 impl<P, M> DerefMut for PagingGuard<'_, P, M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: as in `deref`, the guard owns `locked`, and `&mut self` on the guard makes this
-        // the only reference to the value for its lifetime.
+        // SAFETY: as in `deref`, the guard holds the writer bit alone, and `&mut self` on the
+        // guard makes this the only reference to the value for its lifetime.
         unsafe { &mut *self.lock.value.get() }
     }
 }
@@ -561,10 +671,72 @@ impl<P, M> DerefMut for PagingGuard<'_, P, M> {
 impl<P, M> Drop for PagingGuard<'_, P, M> {
     fn drop(&mut self) {
         // Read just before the release store, as T's is.
-        if let (Some(served), Some(released)) = (self.served, (self.lock.timing.now)()) {
-            (self.lock.timing.released)(self.source, self.waited, released.saturating_sub(served));
-        }
-        self.lock.locked.store(false, Ordering::Release);
+        self.lock
+            .time_release(self.source, self.served, self.waited);
+        // Only the writer bit: a waiting writer's bit stays set, so the next
+        // writer takes before any new reader.
+        self.lock.state.fetch_and(!WRITER, Ordering::Release);
+    }
+}
+
+/// The right to take P shared during one guard-free fast serve (DW2
+/// §15.2). Neither `Clone` nor `Copy`, and constructible only by
+/// [`PagingLock::guard_free_shared_fault_access`].
+pub(super) struct SharedPagingAccess<'a, P> {
+    lock: &'a PagingLock<P>,
+    _beneath_runtime_guard: PhantomData<&'a mut ()>,
+}
+
+impl<P> SharedPagingAccess<'_, P> {
+    /// Takes P shared. The guard mutably borrows this access until it
+    /// drops, so P is never taken twice on one CPU.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live shared fast serve takes it")
+    )]
+    pub(super) fn lock_shared(&mut self) -> SharedPagingGuard<'_, P> {
+        self.lock.acquire_shared()
+    }
+}
+
+/// A shared hold of P (DW2 §15.2): it gives `&P` and nothing else. It has
+/// no `DerefMut` and mints no [`GuardFreeValue`], and neither it nor
+/// anything built from it is [`PagingHeld`], so S is never taken beneath
+/// it.
+pub(super) struct SharedPagingGuard<'a, P> {
+    lock: &'a PagingLock<P>,
+    /// When P was taken, and how long it spun, in the timing's ticks.
+    served: Option<u64>,
+    waited: Option<u64>,
+}
+
+impl<P> Deref for SharedPagingGuard<'_, P> {
+    type Target = P;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `acquire_shared` is the only constructor of this guard and returns only after
+        // its exchange counted one reader while the writer bit was clear (Acquire); the count
+        // stays nonzero until `drop` (Release). An exclusive guard is formed only by the exchange
+        // that sets the writer bit from a word with no reader counted, so no `PagingGuard`, and
+        // so no `&mut P`, exists while this reference does. Other shared guards on other CPUs may
+        // hold `&P` at the same time; each reaches P's value only through `&P`, and what may be
+        // done through it is bounded by the shared fault session (DW2 §15.2,
+        // `SharedFaultSession`): every path from it reads, or writes through a structure's own
+        // lock (its CPU's slot of the pin tracker; the residency state, the scheduler and the
+        // timer expiries are only read under theirs) or an atomic (this CPU's scratch leaf, the
+        // step report), or stores one page-table leaf by one atomic store, only while that leaf
+        // is empty, inside a mutation span over its page that the pin tracker holds for its CPU
+        // alone and after reading the leaf again inside that span, so two shared serves never
+        // store one leaf; none writes a field of P's value through a shared reference.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<P> Drop for SharedPagingGuard<'_, P> {
+    fn drop(&mut self) {
+        self.lock
+            .time_release(PagingSource::FaultShared, self.served, self.waited);
+        self.lock.state.fetch_sub(READER, Ordering::Release);
     }
 }
 
@@ -897,13 +1069,13 @@ mod tests {
         let (value, mut access) = guard.with_paging(&paging);
         *value += 1;
         *access.lock() += 5;
-        assert!(!paging.locked.load(Ordering::Relaxed));
+        assert!(!writer_held(&paging));
         {
             let held = access.lock();
             assert_eq!(*held, 15);
-            assert!(paging.locked.load(Ordering::Relaxed));
+            assert!(writer_held(&paging));
         }
-        assert!(!paging.locked.load(Ordering::Relaxed));
+        assert!(!writer_held(&paging));
         drop(guard);
         assert_eq!(*handle.lock(), 2);
     }
@@ -987,6 +1159,299 @@ mod tests {
         assert_eq!(*paging.acquire(), 14);
     }
 
+    /// Whether an exclusive guard of `paging` exists.
+    fn writer_held<P>(paging: &PagingLock<P>) -> bool {
+        paging.state.load(Ordering::Relaxed) & WRITER != 0
+    }
+
+    /// Whether an exclusive acquirer of `paging` is waiting.
+    fn writer_waiting<P>(paging: &PagingLock<P>) -> bool {
+        paging.state.load(Ordering::Relaxed) & WRITER_WAITING != 0
+    }
+
+    /// The shared guards of `paging` now.
+    fn readers<P>(paging: &PagingLock<P>) -> u64 {
+        (paging.state.load(Ordering::Relaxed) & READERS) / READER
+    }
+
+    /// Yields until `done` holds, at most a bounded number of times;
+    /// whether it held.
+    fn eventually(done: impl Fn() -> bool) -> bool {
+        for _ in 0..200_000 {
+            if done() {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        done()
+    }
+
+    /// Yields a while and answers whether `done` held at any point: for
+    /// what must not happen while something else is held.
+    fn ever_within_a_while(done: impl Fn() -> bool) -> bool {
+        for _ in 0..20_000 {
+            if done() {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        done()
+    }
+
+    /// DW2 §15.2: two shared holders of P overlap, each on its own thread,
+    /// and each reads the value; P is free once both have left.
+    #[test]
+    fn two_shared_holders_overlap() {
+        let paging = PagingLock::new(7_u32, no_service);
+        let inside = AtomicU64::new(0);
+        let leave = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let holders = [(); 2].map(|()| {
+                scope.spawn(|| {
+                    let held = paging.acquire_shared();
+                    inside.fetch_add(1, Ordering::AcqRel);
+                    // Each stays until both are inside at once.
+                    assert!(eventually(|| leave.load(Ordering::Acquire)));
+                    *held
+                })
+            });
+            assert!(
+                eventually(|| inside.load(Ordering::Acquire) == 2),
+                "a second shared holder did not get in beside the first"
+            );
+            assert_eq!(readers(&paging), 2);
+            assert!(!writer_held(&paging));
+            leave.store(true, Ordering::Release);
+            for holder in holders {
+                assert_eq!(holder.join().expect("shared holder"), 7);
+            }
+        });
+        assert_eq!(paging.state.load(Ordering::Relaxed), 0);
+    }
+
+    /// An exclusive holder of P excludes a shared and an exclusive acquirer
+    /// until it releases; each then gets P.
+    #[test]
+    fn an_exclusive_holder_excludes_shared_and_exclusive_acquirers() {
+        let paging = PagingLock::new(0_u32, no_service);
+        let shared_in = AtomicBool::new(false);
+        let exclusive_in = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let mut held = paging.acquire();
+            let shared = scope.spawn(|| {
+                let value = *paging.acquire_shared();
+                shared_in.store(true, Ordering::Release);
+                value
+            });
+            let exclusive = scope.spawn(|| {
+                let mut guard = paging.acquire();
+                exclusive_in.store(true, Ordering::Release);
+                *guard += 10;
+            });
+            assert!(eventually(|| writer_waiting(&paging)));
+            assert!(!ever_within_a_while(
+                || shared_in.load(Ordering::Acquire) || exclusive_in.load(Ordering::Acquire)
+            ));
+            assert_eq!(readers(&paging), 0);
+            *held = 1;
+            drop(held);
+            exclusive.join().expect("exclusive acquirer");
+            let seen = shared.join().expect("shared acquirer");
+            // The reader saw the value either before or after the other
+            // writer, never a torn one.
+            assert!(seen == 1 || seen == 11, "{seen}");
+        });
+        assert!(shared_in.load(Ordering::Relaxed) && exclusive_in.load(Ordering::Relaxed));
+        assert_eq!(*paging.acquire(), 11);
+        assert_eq!(paging.state.load(Ordering::Relaxed), 0);
+    }
+
+    /// DW2 §15.2: a writer waiting for the readers stops new readers, and
+    /// gets P as soon as the readers it waited for have left, before the
+    /// new reader.
+    #[test]
+    fn a_waiting_writer_stops_new_readers_and_takes_when_the_readers_leave() {
+        let paging = PagingLock::new(0_u32, no_service);
+        let order = std::sync::Mutex::new(std::vec::Vec::new());
+        let writer_in = AtomicBool::new(false);
+        let writer_leave = AtomicBool::new(false);
+        let reader_in = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let first = paging.acquire_shared();
+            let writer = scope.spawn(|| {
+                let mut guard = paging.acquire();
+                order.lock().unwrap().push("writer");
+                writer_in.store(true, Ordering::Release);
+                assert!(eventually(|| writer_leave.load(Ordering::Acquire)));
+                *guard += 1;
+            });
+            assert!(eventually(|| writer_waiting(&paging)));
+            let reader = scope.spawn(|| {
+                let value = *paging.acquire_shared();
+                order.lock().unwrap().push("reader");
+                reader_in.store(true, Ordering::Release);
+                value
+            });
+            // The new reader waits behind the waiting writer, though only a
+            // reader holds P.
+            assert!(!ever_within_a_while(|| reader_in.load(Ordering::Acquire)));
+            assert!(!writer_in.load(Ordering::Acquire));
+            assert_eq!(readers(&paging), 1);
+            drop(first);
+            // The writer takes once the first reader leaves.
+            assert!(eventually(|| writer_in.load(Ordering::Acquire)));
+            assert!(!ever_within_a_while(|| reader_in.load(Ordering::Acquire)));
+            writer_leave.store(true, Ordering::Release);
+            writer.join().expect("writer");
+            assert_eq!(reader.join().expect("reader"), 1);
+        });
+        assert_eq!(*order.lock().unwrap(), ["writer", "reader"]);
+        assert_eq!(paging.state.load(Ordering::Relaxed), 0);
+    }
+
+    /// Two writers wait behind a reader: whichever takes first clears the
+    /// waiting bit and the other sets it again, so a new reader still
+    /// waits for both.
+    #[test]
+    fn two_waiting_writers_both_take_before_a_new_reader() {
+        let paging = PagingLock::new(0_u32, no_service);
+        let writers_done = AtomicU64::new(0);
+        let reader_saw = AtomicU64::new(u64::MAX);
+        let release = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let first = paging.acquire_shared();
+            let writers = [(); 2].map(|()| {
+                scope.spawn(|| {
+                    let mut guard = paging.acquire();
+                    // Each holds until the test lets them go, so the other
+                    // waits behind it with the bit set.
+                    assert!(eventually(|| release.load(Ordering::Acquire)));
+                    *guard += 1;
+                    writers_done.fetch_add(1, Ordering::AcqRel);
+                })
+            });
+            assert!(eventually(|| writer_waiting(&paging)));
+            let reader = scope.spawn(|| {
+                let value = *paging.acquire_shared();
+                reader_saw.store(u64::from(value), Ordering::Release);
+            });
+            drop(first);
+            // One writer holds; the other waits with the bit set again.
+            assert!(eventually(
+                || writer_held(&paging) && writer_waiting(&paging)
+            ));
+            release.store(true, Ordering::Release);
+            for writer in writers {
+                writer.join().expect("writer");
+            }
+            reader.join().expect("reader");
+        });
+        assert_eq!(writers_done.load(Ordering::Relaxed), 2);
+        assert_eq!(reader_saw.load(Ordering::Relaxed), 2);
+        assert_eq!(paging.state.load(Ordering::Relaxed), 0);
+    }
+
+    static SHARED_WAITER_SPINS: AtomicU64 = AtomicU64::new(0);
+    static EXCLUSIVE_WAITER_SPINS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_shared_waiter_spin() {
+        SHARED_WAITER_SPINS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_exclusive_waiter_spin() {
+        EXCLUSIVE_WAITER_SPINS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Both kinds of acquirer call the spin service on every turn of their
+    /// wait: a shared one behind a writer, an exclusive one behind a reader.
+    #[test]
+    fn both_kinds_of_waiter_call_the_spin_service() {
+        let paging = PagingLock::new(0_u32, count_shared_waiter_spin);
+        std::thread::scope(|scope| {
+            let held = paging.acquire();
+            let waiter = scope.spawn(|| *paging.acquire_shared());
+            assert!(eventually(
+                || SHARED_WAITER_SPINS.load(Ordering::Relaxed) >= 3
+            ));
+            drop(held);
+            waiter.join().expect("shared waiter");
+        });
+        let paging = PagingLock::new(0_u32, count_exclusive_waiter_spin);
+        std::thread::scope(|scope| {
+            let held = paging.acquire_shared();
+            let waiter = scope.spawn(|| *paging.acquire() += 1);
+            assert!(eventually(|| EXCLUSIVE_WAITER_SPINS
+                .load(Ordering::Relaxed)
+                >= 3));
+            drop(held);
+            waiter.join().expect("exclusive waiter");
+        });
+        // Taken at the first try, neither calls it.
+        let spins = SHARED_WAITER_SPINS.load(Ordering::Relaxed);
+        drop(PagingLock::new(0_u32, count_shared_waiter_spin).acquire_shared());
+        assert_eq!(SHARED_WAITER_SPINS.load(Ordering::Relaxed), spins);
+    }
+
+    static SHARED_CLOCK: AtomicU64 = AtomicU64::new(100);
+    static SHARED_RELEASES: std::sync::Mutex<std::vec::Vec<(PagingSource, Option<u64>, u64)>> =
+        std::sync::Mutex::new(std::vec::Vec::new());
+
+    fn shared_clock() -> Option<u64> {
+        Some(SHARED_CLOCK.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn shared_released(source: PagingSource, waited: Option<u64>, held: u64) {
+        SHARED_RELEASES.lock().unwrap().push((source, waited, held));
+    }
+
+    /// DW2 §15.2: the shared fault access is the only shared way in; it
+    /// reads the value, is timed as `FaultShared` with its wait and hold as
+    /// the others are, and leaves P free.
+    #[test]
+    fn the_shared_fault_access_is_timed_as_fault_shared() {
+        let lock = RuntimeAuthorityLock::new(1_u32, no_service);
+        let paging = PagingLock::new_timed(
+            10_u32,
+            no_service,
+            PagingTiming {
+                now: shared_clock,
+                released: shared_released,
+            },
+        );
+        let [mut handle] = lock.handles::<1>();
+        {
+            let mut access = paging.guard_free_shared_fault_access(handle.guard_free());
+            let held = access.lock_shared();
+            assert_eq!(*held, 10);
+            assert_eq!(readers(&paging), 1);
+        }
+        assert_eq!(paging.state.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *SHARED_RELEASES.lock().unwrap(),
+            [(PagingSource::FaultShared, None, 1)]
+        );
+        // A shared taking that spins behind a writer has a wait.
+        let spinning = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let held = paging.acquire();
+            let spinner = scope.spawn(|| {
+                spinning.store(true, Ordering::Release);
+                *paging.acquire_shared()
+            });
+            assert!(eventually(|| spinning.load(Ordering::Acquire)));
+            // Two reads by the shared hold, one when `held` was served: the
+            // next is the spinner's, made only when its first try fails.
+            assert!(eventually(|| SHARED_CLOCK.load(Ordering::Relaxed) >= 104));
+            drop(held);
+            assert_eq!(spinner.join().expect("spinning thread"), 10);
+        });
+        let releases = SHARED_RELEASES.lock().unwrap();
+        assert_eq!(releases.len(), 3);
+        assert_eq!(releases[1].0, PagingSource::Runtime);
+        assert_eq!(releases[2].0, PagingSource::FaultShared);
+        assert!(releases[2].1.is_some_and(|waited| waited >= 1));
+    }
+
     #[test]
     fn handles_are_minted_once() {
         let lock = RuntimeAuthorityLock::new((), no_service);
@@ -1027,7 +1492,7 @@ mod tests {
             let held = access.lock();
             initiator_lock.acquire_beneath(&held)
         };
-        assert!(!paging.locked.load(Ordering::Relaxed));
+        assert!(!writer_held(&paging));
         assert!(initiator_lock.locked.load(Ordering::Relaxed));
         drop(handle.guard_free());
         let Settled = initiator.release(Settled);

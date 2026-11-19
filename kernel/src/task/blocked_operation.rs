@@ -662,13 +662,26 @@ mod tests {
             Err((error, _pin)) => panic!("blocked-operation publication failed: {error:?}"),
         };
         assert_eq!(
-            pins.begin_mutation(address_space, 0x2000, 0x1000).err(),
+            pins.begin_mutation(
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                address_space,
+                0x2000,
+                0x1000
+            )
+            .err(),
             Some(UserPinError::Conflict)
         );
         operation
             .complete_with(&registry, BlockedOperationWinner::Terminal, drop)
             .unwrap();
-        let permit = pins.begin_mutation(address_space, 0x2000, 0x1000).unwrap();
+        let permit = pins
+            .begin_mutation(
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                address_space,
+                0x2000,
+                0x1000,
+            )
+            .unwrap();
         drop(permit);
     }
 

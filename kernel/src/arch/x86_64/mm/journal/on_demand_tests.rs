@@ -369,6 +369,7 @@ impl Fixture {
             pins,
             address_space: self.region.address_space_key(),
             span: None,
+            cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         };
         let result = touch(self, &mut tracked);
         assert!(tracked.span.is_none(), "a touch left a mutation span held");
@@ -1227,6 +1228,184 @@ fn one_walk_writes_the_leaf_each_protection_needs() {
     }
 }
 
+/// The same touch through a writer built directly over `&FrameRoleManager`
+/// (DW2 §15.2), as the shared fault session builds one: find, then write,
+/// with no commit (the page is committed already). The target is
+/// pin-tracked over `pins`.
+#[allow(
+    unsafe_code,
+    reason = "the keys were issued for the root and region this binds"
+)]
+fn touch_through_writer(fixture: &mut Fixture, address: u64, pins: &Pins) -> Touch {
+    let mapping = fixture.mapping_at(address);
+    fixture.with_pins(pins, |fixture, target| {
+        // SAFETY: the keys were issued for this fixture's root and region, the
+        // target is its tables', and no other writer or publisher runs.
+        let mut writer = unsafe {
+            super::super::touched_leaf::TouchedLeafWriter::new(
+                fixture.region.address_space_key(),
+                fixture.region.region_key(),
+                &fixture.page_tables,
+                fixture.root,
+                &fixture.roles,
+                target,
+            )
+        }
+        .unwrap();
+        match writer.find_touched_leaf(&mapping, address) {
+            Ok(TouchedLeaf::Found(place)) => (Ok(0), Some(writer.write_touched_leaf(place))),
+            Ok(TouchedLeaf::MissingTables(tables)) => (Ok(tables), None),
+            Err(error) => (Err(error), None),
+        }
+    })
+}
+
+/// What a committed page's leaf holds before the touch.
+#[derive(Clone, Copy, Debug)]
+enum LeafBefore {
+    Empty,
+    ThisPage,
+    AnotherFrame,
+}
+
+/// Every table, page 0 committed (and page 1 committed and touched), the
+/// object mapped with `protection`, and page 0's leaf as `before` says.
+fn committed_page(ceiling: Protection, protection: Protection, before: LeafBefore) -> Fixture {
+    let mut fixture = with_tables(Fixture::with_protection(ceiling, protection));
+    fixture.commit(0);
+    match before {
+        LeafBefore::Empty => {}
+        LeafBefore::ThisPage => {
+            fixture.touch(START).unwrap();
+        }
+        LeafBefore::AnotherFrame => {
+            let page_one = fixture.target.entries[&entry_key(&fixture, START + BASE_PAGE_SIZE, 0)];
+            let key = entry_key(&fixture, START, 0);
+            fixture.target.entries.insert(key, page_one);
+        }
+    }
+    fixture
+}
+
+/// DW2 §15.2: for a committed page, the writer reached through the
+/// publisher and a writer built directly over `&FrameRoleManager` give the
+/// same result and leave every page-table entry the same, bit for bit, for
+/// read-only, writable and executable mappings, with the leaf empty, this
+/// page's, or another frame's; each makes one store exactly when it
+/// publishes.
+#[test]
+fn a_writer_over_the_shared_role_manager_writes_what_the_publisher_does() {
+    for (ceiling, protection) in [
+        (Protection::READ_WRITE, Protection::READ),
+        (Protection::READ_WRITE, Protection::READ_WRITE),
+        (Protection::READ_EXECUTE, Protection::READ_EXECUTE),
+    ] {
+        for (before, expected) in [
+            (LeafBefore::Empty, Some(Ok(true))),
+            (LeafBefore::ThisPage, Some(Ok(false))),
+            (
+                LeafBefore::AnotherFrame,
+                Some(Err(X86AddressSpacePublishError::Map(
+                    MapError::FrameMismatch,
+                ))),
+            ),
+        ] {
+            let mut published = committed_page(ceiling, protection, before);
+            let mut direct = committed_page(ceiling, protection, before);
+            assert_eq!(direct.target.entries, published.target.entries);
+            let through_publisher = published.touch_through_find(START, None, &Pins::new());
+            let applied = direct.target.applied.len();
+            let through_writer = touch_through_writer(&mut direct, START, &Pins::new());
+            assert_eq!(
+                through_writer, through_publisher,
+                "{protection:?} {before:?}"
+            );
+            assert_eq!(
+                through_writer,
+                (Ok(0), expected),
+                "{protection:?} {before:?}"
+            );
+            assert_eq!(
+                direct.target.entries, published.target.entries,
+                "{protection:?} {before:?}"
+            );
+            assert_eq!(
+                direct.target.applied.len() - applied,
+                usize::from(through_writer.1 == Some(Ok(true))),
+                "one store exactly when a leaf is published"
+            );
+            assert_eq!(direct.roles.check_invariants(), Ok(()));
+            if matches!(before, LeafBefore::Empty) {
+                let leaf = direct.target.entries[&entry_key(&direct, START, 0)];
+                assert_eq!(leaf & WRITABLE_BIT != 0, protection.writable());
+                assert_eq!(leaf & NO_EXECUTE_BIT == 0, protection.executable());
+            }
+        }
+    }
+}
+
+/// DW2 §15.2: between a serve's read of an empty leaf and its mutation span,
+/// another CPU's serve of the page stores the leaf (and that CPU's Thread
+/// writes, setting the dirty bit). The read inside the span sees it: the
+/// leaf is not stored again, the result is what the first read would have
+/// answered for that value, and the span is ended.
+#[test]
+fn a_leaf_stored_before_the_span_is_not_stored_again() {
+    const DIRTY_BIT: u64 = 1 << 6;
+    // This page's own entry, as a serve writes it.
+    let this_page = {
+        let mut fixture = with_tables(Fixture::new());
+        fixture.commit(0);
+        fixture.touch(START).unwrap();
+        fixture.target.entries[&entry_key(&fixture, START, 0)]
+    };
+    let page_one = {
+        let fixture = with_tables(Fixture::new());
+        fixture.target.entries[&entry_key(&fixture, START + BASE_PAGE_SIZE, 0)]
+    };
+    for (stored, expected) in [
+        // This page's entry, written to by the other CPU's Thread.
+        (this_page | DIRTY_BIT, Ok(false)),
+        // Another frame's entry.
+        (
+            page_one,
+            Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch)),
+        ),
+        // No valid user leaf: this page's entry without the user bit.
+        (
+            this_page & !USER_BIT,
+            Err(X86AddressSpacePublishError::Map(MapError::InvalidPath)),
+        ),
+    ] {
+        let mut fixture = with_tables(Fixture::new());
+        fixture.commit(0);
+        let key = entry_key(&fixture, START, 0);
+        // Three reads walk the tables, one reads the empty leaf; the fifth,
+        // inside the span, finds what the other serve stored.
+        fixture.target.mutate_on_read = Some((fixture.target.read_count + 5, key, stored));
+        let applied = fixture.target.applied.len();
+        let pins = Pins::new();
+        // `with_pins` asserts that the span was ended.
+        let result = fixture.touch_through_find(START, None, &pins);
+        assert_eq!(result, (Ok(0), Some(expected)), "{stored:#x}");
+        assert_eq!(
+            fixture.target.entries[&key], stored,
+            "the stored leaf stays"
+        );
+        assert_eq!(fixture.target.applied.len(), applied, "no store");
+        // The page's mutation slot is free again.
+        drop(
+            pins.begin_mutation(
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                fixture.region.address_space_key(),
+                START,
+                BASE_PAGE_SIZE,
+            )
+            .unwrap(),
+        );
+    }
+}
+
 /// A readable word at `address`, for a user pin.
 fn word(address: u64) -> UserRange {
     UserRange::new(
@@ -1252,6 +1431,7 @@ fn hold_pin<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
 fn hold_mutation<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
     Box::new(
         pins.begin_mutation(
+            crate::cpu::CpuIndex::BOOTSTRAP,
             fixture.region.address_space_key(),
             START + 3 * BASE_PAGE_SIZE,
             BASE_PAGE_SIZE,
@@ -1322,7 +1502,15 @@ fn one_store_releases_its_page_after_writing() {
         (Ok(0), Some(Ok(true)))
     );
     let space = fixture.region.address_space_key();
-    drop(pins.begin_mutation(space, START, BASE_PAGE_SIZE).unwrap());
+    drop(
+        pins.begin_mutation(
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            space,
+            START,
+            BASE_PAGE_SIZE,
+        )
+        .unwrap(),
+    );
     let pin = pins.pin_owned(space, word(START + 8)).unwrap();
     pins.release_owned(space, pin).unwrap();
 }

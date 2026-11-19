@@ -26,7 +26,7 @@
 //! authority T (queueing and stepping both run in its holds), so each has
 //! one writer at a time; they are read at power-off.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A call in steps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,13 +169,23 @@ pub(crate) enum WindowDecline {
     Memory = 4,
     Leaf = 5,
     Return = 6,
+    /// A shared serve's page had no frame (DW2 §15.2): written in its own
+    /// `fault-declines-shared` line.
+    NotCommitted = 7,
 }
 
-const WINDOW_DECLINES: usize = 7;
+const WINDOW_DECLINES: usize = 8;
+
+/// The parts of a shared-served fault's time, in the `faults-shared`
+/// line's order (DW2 §15.2): check (the gate's entry, taking P shared
+/// included, to before the leaf's walk), tables (the walk, the resolve
+/// and the leaf: a shared serve commits nothing), and return.
+const SHARED_PARTS: usize = 3;
 
 /// Who took P (DW2 §13.16 part e3), in the `p-lock` line's names.
-pub(crate) const P_LOCK_SOURCES: usize = 3;
-const P_LOCK_SOURCE_NAMES: [&str; P_LOCK_SOURCES] = ["fault", "usercopy", "runtime"];
+pub(crate) const P_LOCK_SOURCES: usize = 4;
+const P_LOCK_SOURCE_NAMES: [&str; P_LOCK_SOURCES] =
+    ["fault", "usercopy", "runtime", "fault-shared"];
 
 /// A P acquisition's figures, per CPU and source: count, how many spun,
 /// wait sum, held sum.
@@ -349,6 +359,15 @@ pub(crate) struct StepTally<const CPUS: usize> {
     fault_fast_parts: [AtomicU64; FAST_PARTS],
     /// The gate's passes the fast serve answered.
     fault_passes_fast: AtomicU64,
+    /// Per CPU, whether the fast serve that answered its current fault was
+    /// the shared one (DW2 §15.2): its sample goes to `faults-shared`.
+    fast_shared: [AtomicBool; CPUS],
+    /// Shared-served faults sampled, their total and longest, and the sums
+    /// of their [`SHARED_PARTS`], in ticks.
+    faults_shared: AtomicU64,
+    fault_shared_total: AtomicU64,
+    fault_shared_longest: AtomicU64,
+    fault_shared_parts: [AtomicU64; SHARED_PARTS],
     /// Fault windows opened (an admission that stored or topped one up),
     /// closed, and the fast serve's declines by [`WindowDecline`].
     windows_opened: AtomicU64,
@@ -430,6 +449,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
             fault_fast_longest: AtomicU64::new(0),
             fault_fast_parts: [const { AtomicU64::new(0) }; FAST_PARTS],
             fault_passes_fast: AtomicU64::new(0),
+            fast_shared: [const { AtomicBool::new(false) }; CPUS],
+            faults_shared: AtomicU64::new(0),
+            fault_shared_total: AtomicU64::new(0),
+            fault_shared_longest: AtomicU64::new(0),
+            fault_shared_parts: [const { AtomicU64::new(0) }; SHARED_PARTS],
             windows_opened: AtomicU64::new(0),
             windows_closed: AtomicU64::new(0),
             window_declines: [const { AtomicU64::new(0) }; WINDOW_DECLINES],
@@ -443,6 +467,9 @@ impl<const CPUS: usize> StepTally<CPUS> {
     pub(crate) fn fault_entered(&self, cpu: usize, now: u64) {
         if let Some(entry) = self.fault_entry.get(cpu) {
             entry.store(now.saturating_add(1), Ordering::Relaxed);
+        }
+        if let Some(shared) = self.fast_shared.get(cpu) {
+            shared.store(false, Ordering::Relaxed);
         }
     }
 
@@ -510,6 +537,9 @@ impl<const CPUS: usize> StepTally<CPUS> {
                 stamp.store(0, Ordering::Relaxed);
             }
         }
+        if let Some(shared) = self.fast_shared.get(cpu) {
+            shared.store(false, Ordering::Relaxed);
+        }
         let entry = entry.swap(0, Ordering::Relaxed);
         let stamps = stamps
             .each_ref()
@@ -557,6 +587,15 @@ impl<const CPUS: usize> StepTally<CPUS> {
         self.fault_passes_fast.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The fast serve that answered `cpu`'s current fault was the shared
+    /// one (DW2 §15.2): [`Self::fault_returned_fast`] samples it as
+    /// `faults-shared`. Cleared at the gate's entry and at every return.
+    pub(crate) fn fast_served_shared(&self, cpu: usize) {
+        if let Some(shared) = self.fast_shared.get(cpu) {
+            shared.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// As [`Self::fault_returned`], after a fault whose last pass the fast
     /// serve answered: a served one with the gate's entry and every fast
     /// stamp is one `faults-fast` sample. The CPU's record, the slow serve's
@@ -572,6 +611,10 @@ impl<const CPUS: usize> StepTally<CPUS> {
         for stamp in slow {
             stamp.store(0, Ordering::Relaxed);
         }
+        let shared = self
+            .fast_shared
+            .get(cpu)
+            .is_some_and(|shared| shared.swap(false, Ordering::Relaxed));
         let entry = entry.swap(0, Ordering::Relaxed);
         let stamps = stamps
             .each_ref()
@@ -583,6 +626,18 @@ impl<const CPUS: usize> StepTally<CPUS> {
             return;
         }
         let [checked, committed, written] = stamps.map(|stamp| stamp - 1);
+        if shared {
+            let points = [entry - 1, checked, written, now];
+            let total = now.saturating_sub(entry - 1);
+            self.faults_shared.fetch_add(1, Ordering::Relaxed);
+            self.fault_shared_total.fetch_add(total, Ordering::Relaxed);
+            self.fault_shared_longest
+                .fetch_max(total, Ordering::Relaxed);
+            for (part, pair) in self.fault_shared_parts.iter().zip(points.windows(2)) {
+                part.fetch_add(pair[1].saturating_sub(pair[0]), Ordering::Relaxed);
+            }
+            return;
+        }
         let points = [entry - 1, checked, committed, written, now];
         let total = now.saturating_sub(entry - 1);
         self.faults_fast.fetch_add(1, Ordering::Relaxed);
@@ -727,6 +782,13 @@ impl<const CPUS: usize> StepTally<CPUS> {
             us(&self.fault_fast_total),
             us(&self.fault_fast_longest),
         ));
+        let [check, tables, ret] = self.fault_shared_parts.each_ref().map(us);
+        line(format_args!(
+            "faults-shared served={} total-us={} longest-us={} check-us={check} tables-us={tables} return-us={ret}",
+            self.faults_shared.load(Ordering::Relaxed),
+            us(&self.fault_shared_total),
+            us(&self.fault_shared_longest),
+        ));
         let [served, present, released, retry, unserved, exhausted] = self
             .fault_passes
             .each_ref()
@@ -744,6 +806,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
             memory,
             leaf,
             declined_return,
+            not_committed,
         ] = self
             .window_declines
             .each_ref()
@@ -756,6 +819,9 @@ impl<const CPUS: usize> StepTally<CPUS> {
         ));
         line(format_args!(
             "fault-declines identity={identity} mapping={mapping} tables={tables} credit={credit} memory={memory} leaf={leaf} return={declined_return}"
+        ));
+        line(format_args!(
+            "fault-declines-shared not-committed={not_committed}"
         ));
         for (cpu, sources) in self.t_lock.iter().enumerate() {
             for (name, figures) in SOURCE_NAMES.iter().zip(sources) {
@@ -1470,6 +1536,12 @@ mod live {
         TALLY.fault_pass_fast();
     }
 
+    /// The fast serve that answered `cpu`'s fault was the shared one (see
+    /// [`StepTally::fast_served_shared`]).
+    pub(crate) fn fast_served_shared(cpu: usize) {
+        TALLY.fast_served_shared(cpu);
+    }
+
     /// Fault windows opened and closed (see [`StepTally::windows_changed`]).
     pub(crate) fn windows_changed(opened: u64, closed: u64) {
         TALLY.windows_changed(opened, closed);
@@ -1554,8 +1626,8 @@ mod live {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use live::{
     admission_waited, after_safe_point, allow_teardown_step, at_safe_point, backing_allocated,
-    backing_made, call_ended, commit_step, fast_stamped, fault_entered, fault_pass,
-    fault_pass_began, fault_pass_fast, fault_returned, fault_stamped, fault_untimed,
+    backing_made, call_ended, commit_step, fast_served_shared, fast_stamped, fault_entered,
+    fault_pass, fault_pass_began, fault_pass_fast, fault_returned, fault_stamped, fault_untimed,
     fill_in_served, finalize_hold_ended, finalize_queued, finalize_stepped, finalize_waited, now,
     owed, owed_wake, p_lock_released, parked_call_ended, report, set_drain_source, step_began,
     t_lock_released, t_lock_served, take_teardown_step, ticks, timed, timed_nested, usage_checked,
@@ -2184,9 +2256,11 @@ mod tests {
             [
                 "faults served=0 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
+                "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
                 "fault-windows opened=0 closed=0",
                 "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
+                "fault-declines-shared not-committed=0",
                 "commit-steps count=0 admit-us=0 take-us=0 rest-us=0",
             ]
         );
@@ -2206,7 +2280,7 @@ mod tests {
             "faults served=2 total-us=130 longest-us=100 sync-us=11 lookup-us=7 admit-us=23 commit-us=44 tables-us=20 return-us=25"
         );
         assert_eq!(
-            lines[2],
+            lines[3],
             "fault-passes served=2 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0"
         );
         // A shorter fault later keeps the longest.
@@ -2237,11 +2311,12 @@ mod tests {
         tally.fault_pass(FaultPass::Served);
         tally.fault_returned(0, true, Some(us(80)));
         assert_eq!(
-            measure_lines(&tally)[..3],
+            measure_lines(&tally)[..4],
             [
                 // The earlier passes are in the final pass's sync.
                 "faults served=1 total-us=80 longest-us=80 sync-us=50 lookup-us=2 admit-us=3 commit-us=5 tables-us=10 return-us=10",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
+                "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=1 already-present=0 released=0 retry=2 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
             ]
         );
@@ -2279,7 +2354,7 @@ mod tests {
             "faults served=0 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0"
         );
         assert_eq!(
-            lines[2],
+            lines[3],
             "fault-passes served=0 already-present=1 released=1 retry=0 unserved=1 exhausted=1 fill-in-serves=2 fast=0"
         );
     }
@@ -2352,14 +2427,14 @@ mod tests {
         tally.t_lock_released(4, DrainSource::Gate, us(2));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[5..8],
+            lines[7..10],
             [
                 "t-lock cpu=0 source=syscall count=3 waited=2 wait-us=10 wait-longest-us=7 held-us=19 held-longest-us=10",
                 "t-lock cpu=0 source=idle count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "t-lock cpu=1 source=fault count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
             ]
         );
-        assert!(lines[8].starts_with("commit-steps "));
+        assert!(lines[10].starts_with("commit-steps "));
     }
 
     #[test]
@@ -2381,9 +2456,11 @@ mod tests {
             [
                 "faults served=1 total-us=1000 longest-us=1000 sync-us=100 lookup-us=100 admit-us=100 commit-us=200 tables-us=300 return-us=200",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
+                "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
                 "fault-windows opened=0 closed=0",
                 "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
+                "fault-declines-shared not-committed=0",
                 // 2,999 ticks is under one microsecond: whole µs, rounded down.
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=2 held-longest-us=2",
                 "commit-steps count=1 admit-us=1 take-us=1 rest-us=2",
@@ -2395,9 +2472,11 @@ mod tests {
             [
                 "faults served=1 total-us=0 longest-us=0 sync-us=0 lookup-us=0 admit-us=0 commit-us=0 tables-us=0 return-us=0",
                 "faults-fast served=0 total-us=0 longest-us=0 check-us=0 commit-us=0 tables-us=0 return-us=0",
+                "faults-shared served=0 total-us=0 longest-us=0 check-us=0 tables-us=0 return-us=0",
                 "fault-passes served=0 already-present=0 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=0",
                 "fault-windows opened=0 closed=0",
                 "fault-declines identity=0 mapping=0 tables=0 credit=0 memory=0 leaf=0 return=0",
+                "fault-declines-shared not-committed=0",
                 "t-lock cpu=1 source=gate count=1 waited=1 wait-us=0 wait-longest-us=0 held-us=0 held-longest-us=0",
                 "commit-steps count=1 admit-us=0 take-us=0 rest-us=0",
             ]
@@ -2426,7 +2505,7 @@ mod tests {
         tally.commit_step(0, us(10), us(30), us(530), us(540));
         tally.commit_step(us(1_000), us(1_001), us(1_002), us(1_102), us(1_105));
         assert_eq!(
-            measure_lines(&tally)[5],
+            measure_lines(&tally)[7],
             "commit-steps count=2 admit-us=21 take-us=600 rest-us=24"
         );
     }
@@ -2460,7 +2539,7 @@ mod tests {
             slot.store(big, Ordering::Relaxed);
         }
         let lines = measure_lines(&tally);
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 9);
         for line in &lines {
             assert!(line.len() < 190, "{} bytes: {line}", line.len());
         }
@@ -2498,23 +2577,25 @@ mod tests {
         tally.t_lock_released(1, DrainSource::Gate, 3_000);
         let (out, before_closing) = report(&tally);
         // Every line before the closing lines is written by then.
-        assert_eq!(before_closing, 9 + 6 + 7 + 1);
-        assert_eq!(out.len(), 9 + 6 + 7 + 1 + 2);
+        assert_eq!(before_closing, 9 + 6 + 9 + 1);
+        assert_eq!(out.len(), 9 + 6 + 9 + 1 + 2);
         assert_eq!(out[8], "backing-alloc-longest-us=0 runs=0 pages=0");
         assert_eq!(out[14], "owed-wakes=0 unsent=0 queue=0 retirement=0");
         assert!(out[15].starts_with("faults served="));
         assert!(out[16].starts_with("faults-fast served="));
-        assert!(out[17].starts_with("fault-passes "));
-        assert!(out[18].starts_with("fault-windows "));
-        assert!(out[19].starts_with("fault-declines "));
+        assert!(out[17].starts_with("faults-shared served="));
+        assert!(out[18].starts_with("fault-passes "));
+        assert!(out[19].starts_with("fault-windows "));
+        assert!(out[20].starts_with("fault-declines "));
+        assert!(out[21].starts_with("fault-declines-shared "));
         assert_eq!(
-            out[20],
+            out[22],
             "t-lock cpu=1 source=gate count=1 waited=1 wait-us=1 wait-longest-us=1 held-us=2 held-longest-us=2"
         );
-        assert!(out[21].starts_with("commit-steps "));
-        assert_eq!(out[22], "admission-waits create=0 commit=0 fault=0");
+        assert!(out[23].starts_with("commit-steps "));
+        assert_eq!(out[24], "admission-waits create=0 commit=0 fault=0");
         assert_eq!(
-            out[23..],
+            out[25..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
         assert!(!out.iter().any(|line| line.starts_with("usage-check")));
@@ -2534,11 +2615,11 @@ mod tests {
         }
         tally.usage_checked(1, 0);
         let (out, _) = report(&tally);
-        assert!(out[20].starts_with("commit-steps "));
-        assert_eq!(out[21], "admission-waits create=1 commit=3 fault=2");
-        assert_eq!(out[22], "usage-check groups=1 mismatches=0");
+        assert!(out[22].starts_with("commit-steps "));
+        assert_eq!(out[23], "admission-waits create=1 commit=3 fault=2");
+        assert_eq!(out[24], "usage-check groups=1 mismatches=0");
         assert_eq!(
-            out[23..],
+            out[25..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
     }
@@ -2551,23 +2632,23 @@ mod tests {
         let tally = StepTally::<2>::new();
         tally.usage_checked(0, 0);
         let (out, before_closing) = report(&tally);
-        assert_eq!(before_closing, 9 + 6 + 6 + 1 + 1);
+        assert_eq!(before_closing, 9 + 6 + 8 + 1 + 1);
         assert_eq!(
-            out[20],
+            out[22],
             "commit-steps count=0 admit-us=0 take-us=0 rest-us=0"
         );
-        assert_eq!(out[21], "admission-waits create=0 commit=0 fault=0");
-        assert_eq!(out[22], "usage-check groups=0 mismatches=0");
+        assert_eq!(out[23], "admission-waits create=0 commit=0 fault=0");
+        assert_eq!(out[24], "usage-check groups=0 mismatches=0");
         assert_eq!(
-            out[23..],
+            out[25..],
             ["timer-arm retries=2 deferred=3", "records-dropped=0"]
         );
 
         tally.usage_checked(12, 3);
-        assert_eq!(report(&tally).0[22], "usage-check groups=12 mismatches=3");
+        assert_eq!(report(&tally).0[24], "usage-check groups=12 mismatches=3");
         tally.usage_checked(usize::MAX, usize::MAX);
         assert_eq!(
-            report(&tally).0[22],
+            report(&tally).0[24],
             "usage-check groups=2147483647 mismatches=2147483647"
         );
     }
@@ -2640,7 +2721,7 @@ mod tests {
             "faults-fast served=2 total-us=14 longest-us=10 check-us=5 commit-us=3 tables-us=4 return-us=2"
         );
         assert_eq!(
-            lines[2],
+            lines[3],
             "fault-passes served=2 already-present=1 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=3"
         );
         // A fast serve missing a stamp, or after the slow serve answered, is
@@ -2673,17 +2754,19 @@ mod tests {
             (WindowDecline::Memory, 4),
             (WindowDecline::Leaf, 5),
             (WindowDecline::Return, 6),
+            (WindowDecline::NotCommitted, 8),
         ] {
             for _ in 0..times {
                 tally.window_declined(decline);
             }
         }
         let lines = measure_lines(&tally);
-        assert_eq!(lines[3], "fault-windows opened=3 closed=3");
+        assert_eq!(lines[4], "fault-windows opened=3 closed=3");
         assert_eq!(
-            lines[4],
+            lines[5],
             "fault-declines identity=7 mapping=1 tables=2 credit=3 memory=4 leaf=5 return=6"
         );
+        assert_eq!(lines[6], "fault-declines-shared not-committed=8");
     }
 
     /// DW2 §13.16 part e3: P is reported per CPU and source as T is, a line
@@ -2697,52 +2780,137 @@ mod tests {
         // CPU 0's runtime hold, and a usercopy on CPU 1.
         tally.p_lock_released(0, 2, None, us(5));
         tally.p_lock_released(1, 1, Some(0), us(4));
+        // CPU 0's shared fast serve.
+        tally.p_lock_released(0, 3, Some(us(2)), us(1));
         // A CPU past the table, and a source past the names.
         tally.p_lock_released(4, 0, None, us(1));
-        tally.p_lock_released(0, 3, None, us(1));
+        tally.p_lock_released(0, 4, None, us(1));
         tally.t_lock_served(0, None, us(0));
         tally.t_lock_released(0, DrainSource::Fault, us(1));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[5..9],
+            lines[7..12],
             [
                 "t-lock cpu=0 source=fault count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "p-lock cpu=0 source=runtime count=1 waited=0 wait-us=0 held-us=5",
+                "p-lock cpu=0 source=fault-shared count=1 waited=1 wait-us=2 held-us=1",
                 "p-lock cpu=1 source=fault count=2 waited=1 wait-us=3 held-us=3",
                 "p-lock cpu=1 source=usercopy count=1 waited=1 wait-us=0 held-us=4",
             ]
         );
-        assert!(lines[9].starts_with("commit-steps "));
+        assert!(lines[12].starts_with("commit-steps "));
     }
 
-    /// The two fault-window lines, every counter at 17 digits, as the
-    /// report writes them, fit a diagnostic record's 192 bytes; that bound
-    /// is enough because a count cannot reach 10^17 in a boot (at one a
-    /// nanosecond that is about three years), and if a field is ever added
-    /// it is the format that must change, not this test.
+    /// The fault-window lines and the shared serve's two lines (DW2
+    /// §15.2), every value at 17 digits, as the report writes them, fit a
+    /// diagnostic record's 192 bytes; that bound is enough because a count
+    /// cannot reach 10^17 in a boot (at one a nanosecond that is about
+    /// three years), and if a field is ever added it is the format that
+    /// must change, not this test.
     #[test]
     fn the_fault_window_lines_fit_a_record_up_to_seventeen_digit_counts() {
         const LARGEST: u64 = 99_999_999_999_999_999;
         let tally = StepTally::<2>::new();
-        for slot in [&tally.windows_opened, &tally.windows_closed]
-            .into_iter()
-            .chain(&tally.window_declines)
+        for slot in [
+            &tally.windows_opened,
+            &tally.windows_closed,
+            &tally.faults_shared,
+            &tally.fault_shared_total,
+            &tally.fault_shared_longest,
+        ]
+        .into_iter()
+        .chain(&tally.window_declines)
+        .chain(&tally.fault_shared_parts)
         {
             slot.store(LARGEST, Ordering::Relaxed);
         }
-        let lines = measure_lines(&tally);
-        let windows = lines
-            .iter()
-            .find(|line| line.starts_with("fault-windows "))
-            .unwrap();
-        let declines = lines
-            .iter()
-            .find(|line| line.starts_with("fault-declines "))
-            .unwrap();
+        // At 1 MHz a tick is a microsecond, so the times print as stored.
+        let lines = measure_lines_at(&tally, 1_000_000);
+        let find = |prefix: &str| {
+            lines
+                .iter()
+                .find(|line| line.starts_with(prefix))
+                .unwrap()
+                .clone()
+        };
+        let windows = find("fault-windows ");
+        let declines = find("fault-declines ");
+        let shared = find("faults-shared ");
+        let shared_declines = find("fault-declines-shared ");
         assert!(windows.ends_with(&std::format!("closed={LARGEST}")));
         assert!(declines.ends_with(&std::format!("return={LARGEST}")));
-        for line in [windows, declines] {
+        assert_eq!(
+            shared,
+            std::format!(
+                "faults-shared served={LARGEST} total-us={LARGEST} longest-us={LARGEST} check-us={LARGEST} tables-us={LARGEST} return-us={LARGEST}"
+            )
+        );
+        assert_eq!(
+            shared_declines,
+            std::format!("fault-declines-shared not-committed={LARGEST}")
+        );
+        for line in [windows, declines, shared, shared_declines] {
             assert!(line.len() <= 192, "{} bytes: {line}", line.len());
         }
+    }
+
+    /// DW2 §15.2: a fault whose last pass the shared serve answered is a
+    /// `faults-shared` sample (check from the gate's entry; tables from the
+    /// end of the checks through the walk, the resolve and the leaf; and
+    /// return), not a `faults-fast` one; the pass is counted as `fast`. The
+    /// mark is the fault's own: the next fault on that CPU, answered by the
+    /// exclusive serve, is a `faults-fast` sample.
+    #[test]
+    fn a_shared_served_fault_is_a_faults_shared_sample() {
+        let tally = StepTally::<2>::new();
+        tally.fault_entered(1, us(0));
+        tally.fast_stamped(1, FastFaultStamp::Checked, us(3));
+        tally.fast_stamped(1, FastFaultStamp::Committed, us(4));
+        tally.fast_stamped(1, FastFaultStamp::Written, us(7));
+        tally.fast_served_shared(1);
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_pass_fast();
+        tally.fault_returned_fast(1, true, Some(us(9)));
+        // A shared serve's already-present pass is no sample.
+        tally.fault_entered(1, us(10));
+        tally.fast_stamped(1, FastFaultStamp::Checked, us(11));
+        tally.fast_stamped(1, FastFaultStamp::Committed, us(12));
+        tally.fast_stamped(1, FastFaultStamp::Written, us(13));
+        tally.fast_served_shared(1);
+        tally.fault_pass(FaultPass::AlreadyPresent);
+        tally.fault_pass_fast();
+        tally.fault_returned_fast(1, false, None);
+        // The next fault there is the exclusive serve's.
+        tally.fault_entered(1, us(100));
+        tally.fast_stamped(1, FastFaultStamp::Checked, us(101));
+        tally.fast_stamped(1, FastFaultStamp::Committed, us(103));
+        tally.fast_stamped(1, FastFaultStamp::Written, us(104));
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_pass_fast();
+        tally.fault_returned_fast(1, true, Some(us(105)));
+        // A mark left by a fault that did not return is cleared at the
+        // next entry.
+        tally.fast_served_shared(0);
+        tally.fault_untimed(0);
+        tally.fault_entered(0, us(200));
+        tally.fast_stamped(0, FastFaultStamp::Checked, us(201));
+        tally.fast_stamped(0, FastFaultStamp::Committed, us(202));
+        tally.fast_stamped(0, FastFaultStamp::Written, us(203));
+        tally.fault_pass(FaultPass::Served);
+        tally.fault_pass_fast();
+        tally.fault_returned_fast(0, true, Some(us(204)));
+        let lines = measure_lines(&tally);
+        assert_eq!(
+            lines[1],
+            "faults-fast served=2 total-us=9 longest-us=5 check-us=2 commit-us=3 tables-us=2 return-us=2"
+        );
+        assert_eq!(
+            lines[2],
+            "faults-shared served=1 total-us=9 longest-us=9 check-us=3 tables-us=4 return-us=2"
+        );
+        assert_eq!(
+            lines[3],
+            "fault-passes served=3 already-present=1 released=0 retry=0 unserved=0 exhausted=0 fill-in-serves=0 fast=4"
+        );
     }
 }

@@ -38,6 +38,7 @@ fn a_span_excludes_pins_until_it_ends_and_confines_its_batches() {
         pins: &pins,
         address_space: space(1),
         span: None,
+        cpu: crate::cpu::CpuIndex::BOOTSTRAP,
     };
     // A pin inside refuses the span; one outside does not.
     let inside = pins.pin_owned(space(1), word(PAGE * 20 + 8)).unwrap();
@@ -86,6 +87,7 @@ fn a_span_in_one_address_space_leaves_another_free() {
         pins: &pins,
         address_space: space(1),
         span: None,
+        cpu: crate::cpu::CpuIndex::BOOTSTRAP,
     };
     let other = pins.pin_owned(space(2), word(PAGE * 17)).unwrap();
     target.begin_mutation_span(PAGE * 16, PAGE * 8).unwrap();

@@ -77,6 +77,7 @@ mod pin_tracker {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::UserRange;
+    use crate::cpu::{CPU_CAPACITY, CpuIndex};
     use crate::memory::address_region::AddressSpaceKey;
 
     static NEXT_USER_PIN_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -138,8 +139,18 @@ mod pin_tracker {
 
     struct UserPinState<const CAPACITY: usize> {
         pins: [PinSlot; CAPACITY],
-        mutation: Option<PinnedRange>,
+        /// One mapping mutation for each CPU, by `CpuIndex` (DW2 §15.2):
+        /// fast serves taking P shared on several CPUs may each write a
+        /// leaf at once.
+        mutations: [Option<PinnedRange>; CPU_CAPACITY],
         teardown: Option<AddressSpaceKey>,
+    }
+
+    impl<const CAPACITY: usize> UserPinState<CAPACITY> {
+        /// Every mapping mutation in progress, on any CPU.
+        fn mutations(&self) -> impl Iterator<Item = PinnedRange> + '_ {
+            self.mutations.iter().flatten().copied()
+        }
     }
 
     /// Detached mapping-stability ownership suitable for blocked operations.
@@ -188,7 +199,7 @@ mod pin_tracker {
                 domain: mint_domain(),
                 state: crate::sync::SpinMutex::new(UserPinState {
                     pins: [EMPTY_PIN_SLOT; CAPACITY],
-                    mutation: None,
+                    mutations: [None; CPU_CAPACITY],
                     teardown: None,
                 }),
             }
@@ -205,10 +216,7 @@ mod pin_tracker {
             if state.teardown == Some(address_space) {
                 return Err(UserPinError::Conflict);
             }
-            if state
-                .mutation
-                .is_some_and(|mutation| mutation.overlaps(range))
-            {
+            if state.mutations().any(|mutation| mutation.overlaps(range)) {
                 return Err(UserPinError::Conflict);
             }
             for (index, slot) in state.pins.iter_mut().enumerate() {
@@ -290,13 +298,13 @@ mod pin_tracker {
             Ok(())
         }
 
-        /// Whether any user pin, or a mutation, holds part of
+        /// Whether any user pin, or a mutation on any CPU, holds part of
         /// `address_space`. An exited Process's teardown requires none.
         pub(crate) fn holds_any(&self, address_space: AddressSpaceKey) -> bool {
             let state = self.state.lock();
             state
-                .mutation
-                .is_some_and(|mutation| mutation.address_space == address_space)
+                .mutations()
+                .any(|mutation| mutation.address_space == address_space)
                 || state
                     .pins
                     .iter()
@@ -304,8 +312,20 @@ mod pin_tracker {
                     .any(|pin| pin.address_space == address_space)
         }
 
+        /// Reserves `[start, start + byte_len)` of `address_space` for one
+        /// mapping mutation on `cpu`, in that CPU's slot (DW2 §15.2). It is
+        /// refused while the address space is reserved for teardown, while a
+        /// pin overlaps the range, while `cpu` has a mutation in progress,
+        /// and while another CPU's mutation in the same address space
+        /// overlaps the range.
+        ///
+        /// Inlined into its two callers, the pin-tracked target's span and
+        /// its lone batch, as the one-slot tracker's was: it is on every
+        /// first touch's leaf store (DW2 §15.2).
+        #[inline(always)]
         pub(crate) fn begin_mutation(
             &self,
+            cpu: CpuIndex,
             address_space: AddressSpaceKey,
             start: u64,
             byte_len: u64,
@@ -321,9 +341,14 @@ mod pin_tracker {
                 start,
                 end_exclusive,
             };
+            let slot = cpu.index();
             let mut state = self.state.lock();
+            // One pass over the slots: this CPU's slot taken, or any
+            // mutation overlapping (only one in the same address space can).
             if state.teardown == Some(address_space)
-                || state.mutation.is_some()
+                || state.mutations.iter().enumerate().any(|(index, other)| {
+                    other.is_some_and(|other| index == slot || other.overlaps(mutation))
+                })
                 || state
                     .pins
                     .iter()
@@ -332,9 +357,10 @@ mod pin_tracker {
             {
                 return Err(UserPinError::Conflict);
             }
-            state.mutation = Some(mutation);
+            state.mutations[slot] = Some(mutation);
             Ok(UserMutationPermit {
                 tracker: self,
+                cpu: slot,
                 range: mutation,
             })
         }
@@ -353,8 +379,8 @@ mod pin_tracker {
             let mut state = self.state.lock();
             if state.teardown.is_some()
                 || state
-                    .mutation
-                    .is_some_and(|mutation| mutation.address_space == address_space)
+                    .mutations()
+                    .any(|mutation| mutation.address_space == address_space)
                 || state
                     .pins
                     .iter()
@@ -434,20 +460,17 @@ mod pin_tracker {
     #[must_use = "mapping mutation permits must span the complete page-table publication"]
     pub(crate) struct UserMutationPermit<'a, const CAPACITY: usize> {
         tracker: &'a UserPinTracker<CAPACITY>,
+        /// The CPU slot this mutation holds, and only that one is cleared.
+        cpu: usize,
         range: PinnedRange,
     }
 
     impl<const CAPACITY: usize> Drop for UserMutationPermit<'_, CAPACITY> {
         fn drop(&mut self) {
             let mut state = self.tracker.state.lock();
-            assert_eq!(
-                state
-                    .mutation
-                    .map(|range| (range.start, range.end_exclusive)),
-                Some((self.range.start, self.range.end_exclusive)),
-                "user mutation tracker drift"
-            );
-            state.mutation = None;
+            let slot = &mut state.mutations[self.cpu];
+            assert_eq!(*slot, Some(self.range), "user mutation tracker drift");
+            *slot = None;
         }
     }
 }
@@ -926,6 +949,7 @@ impl PinnedUserBatchPages for DeferredBatchPin<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::CpuIndex;
     use crate::memory::address_region::AddressSpaceKey;
     use crate::memory::user_range::{EmptyAddressRule, UserAddressSpace, UserRangeError};
 
@@ -1159,6 +1183,13 @@ mod tests {
         AddressSpaceKey::for_test(1, raw)
     }
 
+    /// The CPU the tests that predate one mutation slot per CPU run on.
+    const CPU: CpuIndex = CpuIndex::BOOTSTRAP;
+
+    fn cpu(index: usize) -> CpuIndex {
+        CpuIndex::new(index).unwrap()
+    }
+
     /// DW2 §7.1 R2: teardown's precondition sees a pin or a mutation in its
     /// own address space, and only there.
     #[test]
@@ -1173,7 +1204,7 @@ mod tests {
         tracker.release_owned(scope(1), pin).unwrap();
         assert!(!tracker.holds_any(scope(1)));
         let mutation = tracker
-            .begin_mutation(scope(2), PAGE_SIZE, PAGE_SIZE)
+            .begin_mutation(CPU, scope(2), PAGE_SIZE, PAGE_SIZE)
             .unwrap();
         assert!(tracker.holds_any(scope(2)));
         assert!(!tracker.holds_any(scope(1)));
@@ -1191,16 +1222,16 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            tracker.begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE),
+            tracker.begin_mutation(CPU, scope(1), PAGE_SIZE * 4, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
         let disjoint = tracker
-            .begin_mutation(scope(1), PAGE_SIZE * 8, PAGE_SIZE)
+            .begin_mutation(CPU, scope(1), PAGE_SIZE * 8, PAGE_SIZE)
             .unwrap();
         drop(disjoint);
         drop(pin);
         let overlap_after_drop = tracker
-            .begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+            .begin_mutation(CPU, scope(1), PAGE_SIZE * 4, PAGE_SIZE)
             .unwrap();
         drop(overlap_after_drop);
     }
@@ -1219,12 +1250,12 @@ mod tests {
         .unwrap();
         let pin = tracker.pin_owned(scope(1), word).unwrap();
         assert!(matches!(
-            tracker.begin_mutation(scope(1), PAGE_SIZE * 6, PAGE_SIZE),
+            tracker.begin_mutation(CPU, scope(1), PAGE_SIZE * 6, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
         tracker.release_owned(scope(1), pin).unwrap();
         let mutation = tracker
-            .begin_mutation(scope(1), PAGE_SIZE * 6, PAGE_SIZE)
+            .begin_mutation(CPU, scope(1), PAGE_SIZE * 6, PAGE_SIZE)
             .unwrap();
         drop(mutation);
     }
@@ -1233,7 +1264,7 @@ mod tests {
     fn active_mutation_rejects_new_overlapping_pin() {
         let tracker = UserPinTracker::<2>::new();
         let mutation = tracker
-            .begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE * 2)
+            .begin_mutation(CPU, scope(1), PAGE_SIZE * 4, PAGE_SIZE * 2)
             .unwrap();
         assert!(matches!(
             tracker.pin(scope(1), range_at(PAGE_SIZE * 5, 8, UserAccess::READ)),
@@ -1253,11 +1284,11 @@ mod tests {
         let range = range_at(PAGE_SIZE * 4, PAGE_SIZE, UserAccess::WRITE);
         let parent = tracker.pin_owned(scope(1), range).unwrap();
         let child_mutation = tracker
-            .begin_mutation(scope(2), PAGE_SIZE * 4, PAGE_SIZE)
+            .begin_mutation(CPU, scope(2), PAGE_SIZE * 4, PAGE_SIZE)
             .unwrap();
         drop(child_mutation);
         assert!(matches!(
-            tracker.begin_mutation(scope(1), PAGE_SIZE * 4, PAGE_SIZE),
+            tracker.begin_mutation(CPU, scope(1), PAGE_SIZE * 4, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
         tracker.release_owned(scope(1), parent).unwrap();
@@ -1313,7 +1344,7 @@ mod tests {
             Err(UserPinError::ForeignToken)
         );
         assert!(matches!(
-            first.begin_mutation(scope(1), PAGE_SIZE * 6, PAGE_SIZE),
+            first.begin_mutation(CPU, scope(1), PAGE_SIZE * 6, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
         first.release_owned(scope(1), token).unwrap();
@@ -1332,12 +1363,12 @@ mod tests {
         let borrowed = tracker.pin(scope(1), range).unwrap();
         let token = borrowed.into_owned();
         assert!(matches!(
-            tracker.begin_mutation(scope(1), PAGE_SIZE * 7, PAGE_SIZE),
+            tracker.begin_mutation(CPU, scope(1), PAGE_SIZE * 7, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
         tracker.release_owned(scope(1), token).unwrap();
         let permit = tracker
-            .begin_mutation(scope(1), PAGE_SIZE * 7, PAGE_SIZE)
+            .begin_mutation(CPU, scope(1), PAGE_SIZE * 7, PAGE_SIZE)
             .unwrap();
         drop(permit);
     }
@@ -1369,7 +1400,7 @@ mod tests {
             Err(UserPinError::Conflict)
         ));
         assert!(matches!(
-            tracker.begin_mutation(same, PAGE_SIZE * 12, PAGE_SIZE),
+            tracker.begin_mutation(CPU, same, PAGE_SIZE * 12, PAGE_SIZE),
             Err(UserPinError::Conflict)
         ));
         let other_pin = tracker
@@ -1377,12 +1408,12 @@ mod tests {
             .unwrap();
         drop(other_pin);
         let other_mutation = tracker
-            .begin_mutation(other, PAGE_SIZE * 12, PAGE_SIZE)
+            .begin_mutation(CPU, other, PAGE_SIZE * 12, PAGE_SIZE)
             .unwrap();
         drop(other_mutation);
         drop(reservation);
         let retry = tracker
-            .begin_mutation(same, PAGE_SIZE * 12, PAGE_SIZE)
+            .begin_mutation(CPU, same, PAGE_SIZE * 12, PAGE_SIZE)
             .unwrap();
         drop(retry);
     }
@@ -1406,6 +1437,200 @@ mod tests {
         drop(second_reservation);
         let first_reservation = tracker.reserve_teardown(first).unwrap();
         drop(first_reservation);
+    }
+
+    /// DW2 §15.2: mutations in two address spaces at once, each on its own
+    /// CPU; each permit clears only its own CPU's slot.
+    #[test]
+    fn mutations_in_two_address_spaces_run_at_once_on_two_cpus() {
+        let tracker = UserPinTracker::<2>::new();
+        let first = tracker
+            .begin_mutation(cpu(0), scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+            .unwrap();
+        // The same range of another address space, on another CPU.
+        let second = tracker
+            .begin_mutation(cpu(1), scope(2), PAGE_SIZE * 4, PAGE_SIZE)
+            .unwrap();
+        assert!(tracker.holds_any(scope(1)) && tracker.holds_any(scope(2)));
+        drop(first);
+        assert!(!tracker.holds_any(scope(1)));
+        assert!(tracker.holds_any(scope(2)));
+        // CPU 0's slot is free again; CPU 1's is still held.
+        drop(
+            tracker
+                .begin_mutation(cpu(0), scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+                .unwrap(),
+        );
+        assert!(matches!(
+            tracker.begin_mutation(cpu(1), scope(3), PAGE_SIZE, PAGE_SIZE),
+            Err(UserPinError::Conflict)
+        ));
+        drop(second);
+        assert!(!tracker.holds_any(scope(2)));
+    }
+
+    /// DW2 §15.2: two CPUs' mutations in one address space are refused
+    /// when they overlap and run at once when they do not.
+    #[test]
+    fn two_cpus_mutations_in_one_address_space_are_refused_only_if_they_overlap() {
+        let tracker = UserPinTracker::<2>::new();
+        let first = tracker
+            .begin_mutation(cpu(0), scope(1), PAGE_SIZE * 4, PAGE_SIZE * 2)
+            .unwrap();
+        for (start, byte_len) in [
+            (PAGE_SIZE * 4, PAGE_SIZE),
+            (PAGE_SIZE * 5, PAGE_SIZE),
+            (PAGE_SIZE * 3, PAGE_SIZE * 2),
+            (PAGE_SIZE, PAGE_SIZE * 8),
+        ] {
+            assert!(
+                matches!(
+                    tracker.begin_mutation(cpu(1), scope(1), start, byte_len),
+                    Err(UserPinError::Conflict)
+                ),
+                "{start:#x}+{byte_len:#x}"
+            );
+        }
+        // Touching ranges do not overlap.
+        let below = tracker
+            .begin_mutation(cpu(1), scope(1), PAGE_SIZE * 3, PAGE_SIZE)
+            .unwrap();
+        let above = tracker
+            .begin_mutation(cpu(2), scope(1), PAGE_SIZE * 6, PAGE_SIZE)
+            .unwrap();
+        drop((first, below, above));
+        assert!(!tracker.holds_any(scope(1)));
+    }
+
+    /// A CPU has one mutation slot: a second mutation on the same CPU is
+    /// refused, in any address space and at any range.
+    #[test]
+    fn a_second_mutation_on_the_same_cpu_is_refused() {
+        let tracker = UserPinTracker::<2>::new();
+        let first = tracker
+            .begin_mutation(cpu(2), scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+            .unwrap();
+        for (space, start) in [(1, PAGE_SIZE * 9), (2, PAGE_SIZE * 4), (2, PAGE_SIZE * 9)] {
+            assert!(matches!(
+                tracker.begin_mutation(cpu(2), scope(space), start, PAGE_SIZE),
+                Err(UserPinError::Conflict)
+            ));
+        }
+        drop(first);
+        drop(
+            tracker
+                .begin_mutation(cpu(2), scope(2), PAGE_SIZE * 9, PAGE_SIZE)
+                .unwrap(),
+        );
+    }
+
+    /// A pin is refused by an overlapping mutation on any CPU, and a
+    /// mutation by an overlapping pin whatever its CPU.
+    #[test]
+    fn a_pin_meets_a_mutation_on_another_cpu() {
+        let tracker = UserPinTracker::<2>::new();
+        let mutation = tracker
+            .begin_mutation(cpu(3), scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+            .unwrap();
+        assert!(matches!(
+            tracker.pin(scope(1), range_at(PAGE_SIZE * 4 + 8, 8, UserAccess::READ)),
+            Err(UserPinError::Conflict)
+        ));
+        assert!(matches!(
+            tracker.pin_owned(scope(1), range_at(PAGE_SIZE * 4 + 8, 8, UserAccess::READ)),
+            Err(UserPinError::Conflict)
+        ));
+        // Another page, or another address space, pins.
+        let beside = tracker
+            .pin_owned(scope(1), range_at(PAGE_SIZE * 5, 8, UserAccess::READ))
+            .unwrap();
+        let elsewhere = tracker
+            .pin_owned(scope(2), range_at(PAGE_SIZE * 4, 8, UserAccess::READ))
+            .unwrap();
+        // And a mutation over that pin is refused on every CPU.
+        for index in 0..crate::cpu::CPU_CAPACITY {
+            if index == 3 {
+                continue;
+            }
+            assert!(matches!(
+                tracker.begin_mutation(cpu(index), scope(1), PAGE_SIZE * 5, PAGE_SIZE),
+                Err(UserPinError::Conflict)
+            ));
+        }
+        tracker.release_owned(scope(1), beside).unwrap();
+        tracker.release_owned(scope(2), elsewhere).unwrap();
+        drop(mutation);
+        let pin = tracker
+            .pin_owned(scope(1), range_at(PAGE_SIZE * 4 + 8, 8, UserAccess::READ))
+            .unwrap();
+        tracker.release_owned(scope(1), pin).unwrap();
+    }
+
+    /// `holds_any` and the teardown reservation see a mutation in any CPU's
+    /// slot, and only in its own address space.
+    #[test]
+    fn holds_any_and_teardown_see_a_mutation_in_any_slot() {
+        let tracker = UserPinTracker::<2>::new();
+        for index in 0..crate::cpu::CPU_CAPACITY {
+            let mutation = tracker
+                .begin_mutation(cpu(index), scope(1), PAGE_SIZE * 4, PAGE_SIZE)
+                .unwrap();
+            assert!(tracker.holds_any(scope(1)), "slot {index}");
+            assert!(!tracker.holds_any(scope(2)), "slot {index}");
+            assert!(matches!(
+                tracker.reserve_teardown(scope(1)),
+                Err(UserPinError::Conflict)
+            ));
+            drop(mutation);
+            assert!(!tracker.holds_any(scope(1)), "slot {index}");
+        }
+        let reservation = tracker.reserve_teardown(scope(1)).unwrap();
+        // A teardown of the address space refuses a mutation on every CPU.
+        for index in 0..crate::cpu::CPU_CAPACITY {
+            assert!(matches!(
+                tracker.begin_mutation(cpu(index), scope(1), PAGE_SIZE * 4, PAGE_SIZE),
+                Err(UserPinError::Conflict)
+            ));
+        }
+        drop(reservation);
+    }
+
+    /// Permits dropped in any order each clear only their own CPU's slot.
+    #[test]
+    fn a_permit_clears_only_its_own_slot() {
+        let tracker = UserPinTracker::<2>::new();
+        let permits = [0, 1, 2, 3].map(|index| {
+            tracker
+                .begin_mutation(
+                    cpu(index),
+                    scope(1),
+                    PAGE_SIZE * (4 + 2 * index as u64),
+                    PAGE_SIZE,
+                )
+                .unwrap()
+        });
+        let [zero, one, two, three] = permits;
+        drop(two);
+        // Slot 2 is free; the others still refuse their own range.
+        drop(
+            tracker
+                .begin_mutation(cpu(2), scope(1), PAGE_SIZE * 8, PAGE_SIZE)
+                .unwrap(),
+        );
+        for (index, start) in [(0, 4), (1, 6), (3, 10)] {
+            assert!(
+                matches!(
+                    tracker.begin_mutation(cpu(2), scope(1), PAGE_SIZE * start, PAGE_SIZE),
+                    Err(UserPinError::Conflict)
+                ),
+                "slot {index}"
+            );
+        }
+        drop(zero);
+        drop(three);
+        assert!(tracker.holds_any(scope(1)));
+        drop(one);
+        assert!(!tracker.holds_any(scope(1)));
     }
 
     fn deferred_range(address: u64) -> UserRange {
