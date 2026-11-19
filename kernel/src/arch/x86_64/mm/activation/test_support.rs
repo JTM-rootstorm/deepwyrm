@@ -20,7 +20,29 @@ struct ActiveRootTestAuthority<'a, const RANGE_CAPACITY: usize, const ROLE_CAPAC
     scratch: &'a mut ActiveScratchTarget<LiveActiveScratchIo>,
     /// The publishers' journal storage (Deepwyrm D7: a journal borrows it).
     journal: crate::arch::x86_64::mm::JournalStorage<4, 1>,
+    /// The paging value's fault windows (DW2 §13.16 part e3): a guest
+    /// runtime serves no fault, so they stay empty, but a mapping change
+    /// still takes its proof from closing them.
+    windows: &'a mut user_access::LiveFaultWindows,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
+}
+
+#[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    ActiveRootTestAuthority<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    /// Closes `address_space`'s fault windows (DW2 §13.16 part e3).
+    #[allow(
+        dead_code,
+        reason = "only the F9 and F12 selector runtimes change mappings here"
+    )]
+    fn close_fault_windows(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        charges: &mut impl crate::memory::address_region::WindowCharges,
+    ) -> crate::memory::address_region::WindowsClosed {
+        self.windows.close_address_space(address_space, charges)
+    }
 }
 
 #[cfg(all(feature = "test-support", target_os = "none", target_arch = "x86_64"))]
@@ -1406,6 +1428,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             roles: &mut *self.target.roles,
             scratch: &mut scratch,
             journal: crate::arch::x86_64::mm::JournalStorage::new(),
+            windows: &mut self.fault_windows,
             _not_send_sync: core::marker::PhantomData,
         };
         if let Err(detail) = authority.validate_live_kernel_guard_layout() {

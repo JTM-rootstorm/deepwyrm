@@ -319,8 +319,43 @@ pub(super) struct PagingLock<P> {
     locked: AtomicBool,
     /// Called on every iteration of the spin, as for the runtime authority.
     spin_service: SpinService,
+    /// P's timing (DW2 §13.16 part e3), taken as T's is.
+    timing: PagingTiming,
     value: UnsafeCell<P>,
 }
+
+/// Who took P, for its timing (DW2 §13.16 part e3, the `p-lock` line):
+/// every P beneath a T guard is `Runtime`; with no T guard, a fast serve is
+/// `Fault` and every other holder `Usercopy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PagingSource {
+    Fault = 0,
+    Usercopy = 1,
+    Runtime = 2,
+}
+
+/// P's timing hooks. `now` reads the counter (`None`: no timing); a
+/// release calls `released` with the source, the wait (`None` when taken
+/// at its first try) and the hold, in counter ticks.
+#[derive(Clone, Copy)]
+pub(super) struct PagingTiming {
+    pub(super) now: fn() -> Option<u64>,
+    pub(super) released: fn(PagingSource, Option<u64>, u64),
+}
+
+impl PagingTiming {
+    /// No timing: the lock alone, as host tests see it.
+    pub(super) const NONE: Self = Self {
+        now: untimed_now,
+        released: untimed_release,
+    };
+}
+
+fn untimed_now() -> Option<u64> {
+    None
+}
+
+fn untimed_release(_: PagingSource, _: Option<u64>, _: u64) {}
 
 // SAFETY: `value` is written once before any AP carrier is released, never moved afterward, and
 // every access goes through a `PagingGuard`, which holds `locked` (acquired with Acquire, released
@@ -330,28 +365,53 @@ unsafe impl<P> Sync for PagingLock<P> {}
 
 impl<P> PagingLock<P> {
     pub(super) const fn new(value: P, spin_service: SpinService) -> Self {
+        Self::new_timed(value, spin_service, PagingTiming::NONE)
+    }
+
+    /// As [`Self::new`], with P's timing hooks.
+    pub(super) const fn new_timed(
+        value: P,
+        spin_service: SpinService,
+        timing: PagingTiming,
+    ) -> Self {
         Self {
             locked: AtomicBool::new(false),
             spin_service,
+            timing,
             value: UnsafeCell::new(value),
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the lock's host tests take it directly")
+    )]
     fn acquire(&self) -> PagingGuard<'_, P> {
-        self.acquire_in()
+        self.acquire_in(PagingSource::Runtime)
     }
 
-    fn acquire_in<M>(&self) -> PagingGuard<'_, P, M> {
+    fn acquire_in<M>(&self, source: PagingSource) -> PagingGuard<'_, P, M> {
+        // Stamped only once the first try fails, as for T.
+        let mut ticketed = None;
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            if ticketed.is_none() {
+                ticketed = (self.timing.now)();
+            }
             (self.spin_service)();
             core::hint::spin_loop();
         }
+        let served = (self.timing.now)();
         PagingGuard {
             lock: self,
+            source,
+            served,
+            waited: ticketed
+                .zip(served)
+                .map(|(ticketed, served)| served.saturating_sub(ticketed)),
             _mode: PhantomData,
         }
     }
@@ -369,6 +429,25 @@ impl<P> PagingLock<P> {
     ) -> PagingAccess<'a, P, GuardFreeOnly> {
         PagingAccess {
             lock: self,
+            source: PagingSource::Usercopy,
+            _beneath_runtime_guard: PhantomData,
+            _mode: PhantomData,
+        }
+    }
+
+    /// As [`Self::guard_free_access`], for the fast serve of a page fault
+    /// (DW2 §13.16 part e3): the same guard-free mode, timed as `Fault`.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live fast serve takes it")
+    )]
+    pub(super) fn guard_free_fault_access<'a>(
+        &'a self,
+        _guard_free: GuardFree<'a>,
+    ) -> PagingAccess<'a, P, GuardFreeOnly> {
+        PagingAccess {
+            lock: self,
+            source: PagingSource::Fault,
             _beneath_runtime_guard: PhantomData,
             _mode: PhantomData,
         }
@@ -385,6 +464,7 @@ impl<'g, T: HoldEndCheck> RuntimeAuthorityGuard<'g, T> {
     ) -> (&'a mut T, PagingAccess<'a, P>) {
         let access = PagingAccess {
             lock: paging,
+            source: PagingSource::Runtime,
             _beneath_runtime_guard: PhantomData,
             _mode: PhantomData,
         };
@@ -407,6 +487,7 @@ pub(super) struct GuardFreeOnly;
 /// [`PagingLock::guard_free_access`] (mode [`GuardFreeOnly`]).
 pub(super) struct PagingAccess<'a, P, M = BeneathRuntime> {
     lock: &'a PagingLock<P>,
+    source: PagingSource,
     _beneath_runtime_guard: PhantomData<&'a mut ()>,
     _mode: PhantomData<M>,
 }
@@ -415,12 +496,16 @@ impl<P, M> PagingAccess<'_, P, M> {
     /// Takes P. The guard mutably borrows this access until it drops, so P
     /// is never taken twice on one CPU. It keeps the access's mode.
     pub(super) fn lock(&mut self) -> PagingGuard<'_, P, M> {
-        self.lock.acquire_in()
+        self.lock.acquire_in(self.source)
     }
 }
 
 pub(super) struct PagingGuard<'a, P, M = BeneathRuntime> {
     lock: &'a PagingLock<P>,
+    source: PagingSource,
+    /// When P was taken, and how long it spun, in the timing's ticks.
+    served: Option<u64>,
+    waited: Option<u64>,
     _mode: PhantomData<M>,
 }
 
@@ -433,6 +518,16 @@ pub(super) struct GuardFreeValue<'v, P> {
 
 impl<'v, P> GuardFreeValue<'v, P> {
     pub(super) fn into_inner(self) -> &'v mut P {
+        self.value
+    }
+
+    /// The value, to read, before it is consumed (the fast serve reads its
+    /// fault window before it builds its session, DW2 §13.16 part e3).
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live fast serve reads it")
+    )]
+    pub(super) fn value(&self) -> &P {
         self.value
     }
 }
@@ -465,6 +560,10 @@ impl<P, M> DerefMut for PagingGuard<'_, P, M> {
 
 impl<P, M> Drop for PagingGuard<'_, P, M> {
     fn drop(&mut self) {
+        // Read just before the release store, as T's is.
+        if let (Some(served), Some(released)) = (self.served, (self.lock.timing.now)()) {
+            (self.lock.timing.released)(self.source, self.waited, released.saturating_sub(served));
+        }
         self.lock.locked.store(false, Ordering::Release);
     }
 }
@@ -807,6 +906,85 @@ mod tests {
         assert!(!paging.locked.load(Ordering::Relaxed));
         drop(guard);
         assert_eq!(*handle.lock(), 2);
+    }
+
+    /// A counter for P's timing test: each read is one tick later.
+    static P_CLOCK: AtomicU64 = AtomicU64::new(100);
+    static P_RELEASES: std::sync::Mutex<std::vec::Vec<(PagingSource, Option<u64>, u64)>> =
+        std::sync::Mutex::new(std::vec::Vec::new());
+
+    fn p_clock() -> Option<u64> {
+        Some(P_CLOCK.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn p_released(source: PagingSource, waited: Option<u64>, held: u64) {
+        P_RELEASES.lock().unwrap().push((source, waited, held));
+    }
+
+    /// DW2 §13.16 part e3: P is timed as T is, by who took it: beneath a T
+    /// guard is `Runtime`, guard-free is `Usercopy`, and the fast serve's
+    /// guard-free access is `Fault`. A taking served at its first try has no
+    /// wait; one that spun has one; the hold is read just before release.
+    #[test]
+    fn paging_is_timed_by_its_source_with_its_wait_and_hold() {
+        let lock = RuntimeAuthorityLock::new(1_u32, no_service);
+        let paging = PagingLock::new_timed(
+            10_u32,
+            no_service,
+            PagingTiming {
+                now: p_clock,
+                released: p_released,
+            },
+        );
+        let [mut handle] = lock.handles::<1>();
+        {
+            let mut guard = handle.lock();
+            let (_, mut access) = guard.with_paging(&paging);
+            *access.lock() += 1;
+        }
+        {
+            let mut access = paging.guard_free_access(handle.guard_free());
+            *access.lock() += 1;
+        }
+        {
+            let mut access = paging.guard_free_fault_access(handle.guard_free());
+            *access.lock() += 1;
+        }
+        // Served at once: one read when served, one at release.
+        assert_eq!(
+            *P_RELEASES.lock().unwrap(),
+            [
+                (PagingSource::Runtime, None, 1),
+                (PagingSource::Usercopy, None, 1),
+                (PagingSource::Fault, None, 1),
+            ]
+        );
+        // A taking that spins has a wait.
+        let spinning = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let held = paging.acquire();
+            let spinner = scope.spawn(|| {
+                spinning.store(true, Ordering::Release);
+                *paging.acquire() += 1;
+            });
+            while !spinning.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Six reads so far and one when `held` was served: the next is
+            // the spinner's, made only when its first try fails.
+            while P_CLOCK.load(Ordering::Relaxed) < 108 {
+                std::thread::yield_now();
+            }
+            drop(held);
+            spinner.join().expect("spinning thread");
+        });
+        {
+            let releases = P_RELEASES.lock().unwrap();
+            assert_eq!(releases.len(), 5);
+            assert_eq!(releases[3].1, None);
+            assert!(releases[4].1.is_some_and(|waited| waited >= 1));
+        }
+        assert_eq!(*paging.acquire(), 14);
     }
 
     #[test]

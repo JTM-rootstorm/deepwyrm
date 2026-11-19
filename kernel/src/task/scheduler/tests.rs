@@ -4200,3 +4200,33 @@ fn a_wake_preemption_whose_woken_thread_was_stolen_keeps_the_runner() {
     assert!(!cpu0.scheduler.has_reschedule_request_on(cpu(0)));
     assert_eq!(cpu0.scheduler.check_invariants(), Ok(()));
 }
+
+/// DW2 §13.16 part e3: the fast serve's one question of the scheduler is
+/// answered in one hold: this Thread is this CPU's current (a current
+/// Thread is Running: `running` is the claim), and no reschedule is
+/// requested for this CPU.
+#[test]
+fn a_thread_runs_undisturbed_only_while_current_and_unrequested() {
+    let scheduler = CooperativeScheduler::<4>::new();
+    let mut registry = ObjectRegistry::<16>::new();
+    let running = thread_key(&mut registry);
+    let other = thread_key(&mut registry);
+    assert!(!scheduler.runs_undisturbed_on(cpu(0), running));
+    scheduler
+        .commit(scheduler.reserve(running).unwrap())
+        .unwrap();
+    scheduler.commit(scheduler.reserve(other).unwrap()).unwrap();
+    // Runnable, not yet current.
+    assert!(!scheduler.runs_undisturbed_on(cpu(0), running));
+    scheduler.schedule_next_on(cpu(0)).unwrap();
+    assert!(scheduler.runs_undisturbed_on(cpu(0), running));
+    // Another Thread, or another CPU.
+    assert!(!scheduler.runs_undisturbed_on(cpu(0), other));
+    assert!(!scheduler.runs_undisturbed_on(cpu(1), running));
+    // A quantum expiry requests a reschedule.
+    let quantum = scheduler.prepare_quantum_on(cpu(0), 10).unwrap();
+    assert_eq!(scheduler.publish_quantum_expiry(quantum), Ok(true));
+    assert!(scheduler.has_reschedule_request_on(cpu(0)));
+    assert!(!scheduler.runs_undisturbed_on(cpu(0), running));
+    assert_eq!(scheduler.check_invariants(), Ok(()));
+}

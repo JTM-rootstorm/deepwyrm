@@ -18,7 +18,7 @@ use deepwyrm_abi::{
 
 use crate::device::{DeviceResourceInfoProvider, InterruptInfoProvider};
 use crate::memory::object::MemoryObjectAuthority;
-use crate::object::{FinalRelease, ObjectRegistry};
+use crate::object::{FinalRelease, ObjectId, ObjectRegistry};
 
 use crate::handle::{AcceptedObjectTypes, HandleTable, HandleTableError, ResolvedHandle};
 
@@ -96,6 +96,7 @@ pub(crate) fn object_get_info_v1_with_tasks<
     tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     handle: DwHandle,
     topic: u32,
+    credit: &dyn Fn(ObjectId) -> u64,
 ) -> Result<ObjectInfoResult, DwStatus> {
     object_get_info_v1_impl(
         table,
@@ -105,10 +106,14 @@ pub(crate) fn object_get_info_v1_with_tasks<
         None,
         handle,
         topic,
-        |topic, resolved, registry| task_info(tasks, topic, resolved, registry),
+        |topic, resolved, registry| task_info(tasks, topic, resolved, registry, credit),
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the object-info service keeps each typed authority explicit"
+)]
 pub(crate) fn object_get_info_v1_with_tasks_and_devices<
     const HANDLES: usize,
     const OBJECTS: usize,
@@ -125,6 +130,7 @@ pub(crate) fn object_get_info_v1_with_tasks_and_devices<
     devices: &dyn DeviceResourceInfoProvider,
     handle: DwHandle,
     topic: u32,
+    credit: &dyn Fn(ObjectId) -> u64,
 ) -> Result<ObjectInfoResult, DwStatus> {
     object_get_info_v1_impl(
         table,
@@ -134,7 +140,7 @@ pub(crate) fn object_get_info_v1_with_tasks_and_devices<
         None,
         handle,
         topic,
-        |topic, resolved, registry| task_info(tasks, topic, resolved, registry),
+        |topic, resolved, registry| task_info(tasks, topic, resolved, registry, credit),
     )
 }
 
@@ -159,6 +165,7 @@ pub(crate) fn object_get_info_v1_with_tasks_and_device_objects<
     interrupts: &dyn InterruptInfoProvider,
     handle: DwHandle,
     topic: u32,
+    credit: &dyn Fn(ObjectId) -> u64,
 ) -> Result<ObjectInfoResult, DwStatus> {
     object_get_info_v1_impl(
         table,
@@ -168,7 +175,7 @@ pub(crate) fn object_get_info_v1_with_tasks_and_device_objects<
         Some(interrupts),
         handle,
         topic,
-        |topic, resolved, registry| task_info(tasks, topic, resolved, registry),
+        |topic, resolved, registry| task_info(tasks, topic, resolved, registry, credit),
     )
 }
 
@@ -319,9 +326,10 @@ fn task_info<
     topic: u32,
     resolved: &ResolvedHandle,
     registry: &ObjectRegistry<OBJECTS>,
+    credit: &dyn Fn(ObjectId) -> u64,
 ) -> Result<ObjectInfoResult, DwStatus> {
     if topic == DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 {
-        task_group_memory_info(tasks, resolved, registry)
+        task_group_memory_info(tasks, resolved, registry, credit)
     } else {
         task_state_info(tasks, resolved)
     }
@@ -339,12 +347,21 @@ fn task_group_memory_info<
     tasks: &crate::task::TaskAuthority<GROUPS, PROCESSES, THREADS, HANDLES>,
     resolved: &ResolvedHandle,
     registry: &ObjectRegistry<OBJECTS>,
+    credit: &dyn Fn(ObjectId) -> u64,
 ) -> Result<ObjectInfoResult, DwStatus> {
     if resolved.object_type() != DW_OBJECT_TYPE_TASK_GROUP {
         return Err(DW_STATUS_WRONG_OBJECT_TYPE);
     }
+    // Usage as it would stand with every fault window closed (DW2 §13.16
+    // part e3): `credit` is the window credit each group's kept usage
+    // counts. Admission and the owed rule keep the kept figure.
     let budget = tasks
-        .group_memory_budget(resolved.object_id(), |group| registry.charged_pages(group))
+        .group_memory_budget(resolved.object_id(), |group| {
+            crate::memory::address_region::usage_without_credit(
+                registry.charged_pages(group),
+                credit(group),
+            )
+        })
         .unwrap_or_else(|error| panic!("live TaskGroup handle lost its task payload: {error:?}"));
     Ok(ObjectInfoResult::TaskGroupMemory {
         info: DwTaskGroupMemoryInfoV1 {

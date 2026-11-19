@@ -85,6 +85,13 @@ mod production_pools;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 #[path = "activation/tlb_mailbox.rs"]
 mod tlb_mailbox;
+// The fast serve's decision (DW2 §13.16 part e3), host-compiled under `test`.
+#[cfg(any(
+    test,
+    all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")
+))]
+#[path = "activation/fault_window.rs"]
+mod fault_window;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "activation/user_access.rs"]
 mod user_access;
@@ -617,6 +624,9 @@ pub(crate) struct ActiveDeepPaging<A> {
     /// one session at a time, so the paging lock P serializes its use.
     #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
     journal: &'static mut user_access::LiveJournalStorage,
+    /// One fault window per CPU (DW2 §13.16 part e3), so P serializes them.
+    #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+    fault_windows: user_access::LiveFaultWindows,
 }
 
 /// The live journal's storage: the kernel's one live paging state takes it
@@ -672,6 +682,19 @@ pub(crate) struct ActiveScratchTarget<I> {
     io: I,
     poisoned: bool,
     _not_send_sync: core::marker::PhantomData<*mut ()>,
+}
+
+/// Why a live process session could not be built (DW2 §13.16 part e3): the
+/// fast serve declines on each; every other caller panics as before.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveSessionError {
+    /// This CPU has no installed architecture slot.
+    NoCpuBinding,
+    /// The copied root is not this CPU's current root of the Process.
+    Root(RootBindingError),
+    /// This CPU's scratch target could not be selected.
+    Scratch(LiveActiveTargetError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2505,18 +2528,43 @@ mod live_sessions {
         /// primordial runtime only through [`GuardFreeValue`]'s constructor, and
         /// every other constructor here wraps it in a session with no usercopy
         /// (or is compiled only into evidence or guest builds).
-        #[allow(
-            unsafe_code,
-            reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
-        )]
         fn build_live_session(
             &mut self,
             active_root: address_space::UserCopyRoot,
             process: crate::task::ProcessKey,
         ) -> LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
+            self.try_build_live_session(active_root, process)
+                .unwrap_or_else(|error| match error {
+                    LiveSessionError::NoCpuBinding => {
+                        panic!("usercopy has no current architecture CPU binding")
+                    }
+                    LiveSessionError::Root(error) => {
+                        panic!("process usercopy root is not current on this CPU: {error:?}")
+                    }
+                    LiveSessionError::Scratch(error) => {
+                        panic!("usercopy scratch CPU selection failed: {error:?}")
+                    }
+                })
+        }
+
+        /// [`Self::build_live_session`] returning every mismatch instead of
+        /// panicking, for the fast serve, whose copied root may be stale and
+        /// which then declines (DW2 §13.16 part e3).
+        #[allow(
+            unsafe_code,
+            reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
+        )]
+        fn try_build_live_session(
+            &mut self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> Result<
+            LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+            LiveSessionError,
+        > {
             let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 .and_then(crate::cpu::CpuIndex::new)
-                .unwrap_or_else(|| panic!("usercopy has no current architecture CPU binding"));
+                .ok_or(LiveSessionError::NoCpuBinding)?;
             let observed_root: u64;
             unsafe {
                 core::arch::asm!(
@@ -2528,15 +2576,13 @@ mod live_sessions {
             let (root, identity, address_space) = self
                 .root_bindings
                 .usercopy_root_for_process(&self.root, active_root, cpu, observed_root, process)
-                .unwrap_or_else(|error| {
-                    panic!("process usercopy root is not current on this CPU: {error:?}")
-                });
+                .map_err(LiveSessionError::Root)?;
             let scratch = self
                 .target
                 .current_scratch_target()
-                .unwrap_or_else(|error| panic!("usercopy scratch CPU selection failed: {error:?}"));
+                .map_err(LiveSessionError::Scratch)?;
             let target = &mut self.target;
-            LiveProcessAddressSpace {
+            Ok(LiveProcessAddressSpace {
                 root: root as *const PageTableRoot,
                 primordial_root: &self.root,
                 identity,
@@ -2551,8 +2597,40 @@ mod live_sessions {
                     span: None,
                 },
                 journal: &mut *self.journal,
+                windows: &mut self.fault_windows,
                 _root: core::marker::PhantomData,
-            }
+            })
+        }
+
+        /// Closes every CPU's fault window copied from `address_space`'s
+        /// mapping records, returning their credit through `charges`, for a
+        /// hold that holds P with no session (DW2 §13.16 part e3).
+        pub(crate) fn close_fault_windows(
+            &mut self,
+            address_space: crate::memory::address_region::AddressSpaceKey,
+            charges: &mut impl crate::memory::address_region::WindowCharges,
+        ) -> crate::memory::address_region::WindowsClosed {
+            let closed = self
+                .fault_windows
+                .close_address_space(address_space, charges);
+            crate::arch::x86_64::step_report::windows_changed(0, closed.closed() as u64);
+            closed
+        }
+
+        /// Closes every CPU's fault window, for a hold that holds P with no
+        /// session (DW2 §13.16 part e3). Returns how many it closed.
+        pub(crate) fn close_all_fault_windows(
+            &mut self,
+            charges: &mut impl crate::memory::address_region::WindowCharges,
+        ) -> usize {
+            let closed = self.fault_windows.close_all(charges);
+            crate::arch::x86_64::step_report::windows_changed(0, closed as u64);
+            closed
+        }
+
+        /// P's fault windows, to read.
+        pub(crate) fn fault_windows(&self) -> &user_access::LiveFaultWindows {
+            &self.fault_windows
         }
     }
 
@@ -2572,6 +2650,30 @@ mod live_sessions {
             process: crate::task::ProcessKey,
         ) -> LiveProcessAddressSpace<'v, 'root, RANGE_CAPACITY, ROLE_CAPACITY> {
             self.into_inner().build_live_session(active_root, process)
+        }
+
+        /// CPU slot `cpu`'s fault window, copied (DW2 §13.16 part e3).
+        pub(crate) fn fault_window(
+            &self,
+            cpu: usize,
+        ) -> Option<crate::memory::address_region::FaultWindow<address_space::UserCopyRoot>>
+        {
+            self.value().fault_windows.window(cpu).copied()
+        }
+
+        /// The usercopy session for `process` from a copied root identity,
+        /// or why it cannot be built: the fast serve's, which declines on
+        /// any mismatch rather than panicking (DW2 §13.16 part e3).
+        pub(crate) fn try_usercopy_process_address_space(
+            self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> Result<
+            LiveProcessAddressSpace<'v, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+            LiveSessionError,
+        > {
+            self.into_inner()
+                .try_build_live_session(active_root, process)
         }
     }
 }
@@ -2808,6 +2910,8 @@ impl<H, T: Cr3ActivationTarget<H>> PreparedActivation<H, T> {
             root_bindings: AddressSpaceRootBindings::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             kernel_execution_roots: KernelExecutionRoots::new(),
+            #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
+            fault_windows: user_access::LiveFaultWindows::new(),
             #[cfg(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64"))]
             journal: {
                 #[allow(

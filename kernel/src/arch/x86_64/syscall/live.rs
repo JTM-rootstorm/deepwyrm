@@ -1864,12 +1864,20 @@ unsafe fn native_runtime_user_page_fault<
     // One pass is one hold of T (DW2 §13.13 parts b and c): the serve and,
     // for an outcome that returns, the frame's authorisation and the
     // reschedule read.
-    let (action, served) = loop {
+    let (action, served, fast) = loop {
         poll_timer_return_stop(context);
         // SAFETY: [CARRIER] scoped reborrow of this CPU's carrier; the fault gate has no other
         // Rust frame on this CPU that holds one.
         let runtime = unsafe { &mut *context.cast::<R>() };
-        let pass = runtime.serve_user_page_fault(cr2, error, frame);
+        // The fast serve first, with P alone inside this CPU's fault
+        // window (DW2 §13.16 part e3); `None` is the serve under T.
+        let (pass, fast) = match runtime.serve_user_page_fault_fast(cr2, error, frame) {
+            Some(pass) => {
+                step_report::fault_pass_fast();
+                (pass, true)
+            }
+            None => (runtime.serve_user_page_fault(cr2, error, frame), false),
+        };
         step_report::fault_pass(match pass.outcome() {
             UserPageFaultOutcome::Served => step_report::FaultPass::Served,
             UserPageFaultOutcome::AlreadyPresent => step_report::FaultPass::AlreadyPresent,
@@ -1884,6 +1892,7 @@ unsafe fn native_runtime_user_page_fault<
                 break (
                     action,
                     matches!(pass.outcome(), UserPageFaultOutcome::Served),
+                    fast,
                 );
             }
         }
@@ -1911,7 +1920,7 @@ unsafe fn native_runtime_user_page_fault<
     // The fault's time ends here: its return part holds the authorisation,
     // the reschedule read and T's release.
     if let Some(cpu) = cpu {
-        step_report::fault_returned(cpu, served);
+        step_report::fault_returned(cpu, served, fast);
     }
     // Return as the timer gate does, but without a fresh quantum: a thread
     // that faults often must still expire. Only a switch arms one, for the

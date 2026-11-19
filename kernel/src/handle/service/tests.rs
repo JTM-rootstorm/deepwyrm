@@ -340,6 +340,7 @@ fn e_task_state_query_reuses_inspect_gated_service_lookup() {
         &tasks,
         inspected,
         DW_OBJECT_INFO_TASK_STATE_V1,
+        &|_| 0,
     )
     .unwrap();
     let ObjectInfoResult::TaskState(info) = result else {

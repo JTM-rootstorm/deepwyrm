@@ -472,6 +472,22 @@ where
         }))
     }
 
+    /// Frames committing object page `page` of the on-demand `backing`
+    /// would take (DW2 M6 §8.4), asked of this publisher's role manager:
+    /// the fast serve's cost, under the borrow that found the leaf (DW2
+    /// §13.16 part e3).
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "the live fast serve is its only caller")
+    )]
+    pub(crate) fn on_demand_commit_cost(
+        &self,
+        backing: BackingIdentity,
+        page: u64,
+    ) -> Result<u64, FrameRoleError> {
+        self.roles.on_demand_commit_cost(backing, page)
+    }
+
     /// Commits object page `page` of the on-demand `backing` (DW2 M6 §8.4)
     /// through this publisher's role manager, so a serve that found its
     /// leaf's place commits the frame and writes the leaf under one borrow

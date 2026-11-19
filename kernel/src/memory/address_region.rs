@@ -26,6 +26,22 @@ mod authority;
 mod coherency;
 #[path = "address_region/region.rs"]
 mod region;
+// DW2 §13.16 part e3: fault windows and the proof that none is left.
+#[cfg(deepwyrm_integrated)]
+#[path = "address_region/fault_window.rs"]
+mod fault_window;
+
+#[cfg(deepwyrm_integrated)]
+#[allow(
+    unused_imports,
+    reason = "the live runtime opens, spends and closes windows; host builds use the table through the adapter and tests"
+)]
+pub(crate) use fault_window::{
+    FAULT_WINDOW_FRAMES, FaultWindow, FaultWindows, WindowCharges, WindowOpened, WindowOpening,
+    WindowsClosed, usage_without_credit,
+};
+#[cfg(all(deepwyrm_integrated, test))]
+pub(crate) use fault_window::{test_mapping, test_windows_closed};
 
 #[allow(
     unused_imports,

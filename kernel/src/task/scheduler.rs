@@ -2653,6 +2653,15 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         self.state.lock().reschedule_requested(cpu)
     }
 
+    /// In one hold of the scheduler's lock: `thread` is `cpu`'s current (a
+    /// current Thread is Running: `running` is the claim) and no reschedule
+    /// is requested for `cpu` (DW2 §13.16 part e3, the fast serve's step 2).
+    pub(crate) fn runs_undisturbed_on(&self, cpu: SchedulerCpuId, thread: ThreadKey) -> bool {
+        let state = self.state.lock();
+        state.running[cpu.index()].is_some_and(|claim| claim.thread == thread)
+            && !state.reschedule_requested(cpu)
+    }
+
     pub(crate) fn preemption_snapshot_on(
         &self,
         cpu: SchedulerCpuId,

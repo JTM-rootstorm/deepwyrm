@@ -51,7 +51,7 @@ pub(crate) use journal::{
     table_candidates_for,
 };
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use journal::{PinTrackedError, PinTrackedTarget, TouchedLeaf};
+pub(crate) use journal::{PinTrackedError, PinTrackedTarget, TouchedLeaf, TouchedLeafPlace};
 #[allow(
     unused_imports,
     reason = "the one-shot C1 claim is wired by the later bootstrap integration"

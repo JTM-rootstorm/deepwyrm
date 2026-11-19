@@ -1313,13 +1313,24 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             Some(pages) => {
                 let process = runtime.own.scheduled().process;
                 let thread = runtime.own.scheduled().thread;
-                if crate::syscall::reserve_memory_object_pages(
-                    &mut runtime.core.registry,
-                    &runtime.core.tasks,
-                    process,
-                    pages,
-                    thread,
-                ) {
+                let reserve = |runtime: &mut PrimordialRuntimeCarrier<
+                    '_,
+                    '_,
+                    RANGE_CAPACITY,
+                    ROLE_CAPACITY,
+                >| {
+                    crate::syscall::reserve_memory_object_pages(
+                        &mut runtime.core.registry,
+                        &runtime.core.tasks,
+                        process,
+                        pages,
+                        thread,
+                    )
+                };
+                // A quota refusal closes every fault window and reserves
+                // once more (DW2 §13.16 part e3).
+                if reserve(runtime) || (runtime.close_all_fault_windows() != 0 && reserve(runtime))
+                {
                     true
                 } else if runtime.create_refusal_owed(process, pages) {
                     runtime.take_owed_step(step_report::AdmissionWait::Create);
@@ -1385,6 +1396,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let mut restart = false;
             let (status, released_pin) = match (request, atomic_pin) {
                 (NativeSyscallRequest::MemoryObjectCreate { .. }, None) => {
+                    // The adapter's admission is the one that counts: if
+                    // the quota would refuse it now, every fault window is
+                    // closed first (DW2 §13.16 part e3).
+                    if let Some(pages) = restartable {
+                        let process = runtime.own.scheduled().process;
+                        if !crate::syscall::memory_object_quota_allows(
+                            &runtime.core.registry,
+                            &runtime.core.tasks,
+                            process,
+                            pages,
+                        ) {
+                            runtime.close_all_fault_windows();
+                        }
+                    }
                     let mut access = crate::syscall::DeferredMemoryObjectAccess::new(
                         core::mem::replace(
                             &mut deferred,
@@ -3035,6 +3060,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                                 }),
                         );
                     }
+                    runtime.stop_barrier();
                     runtime.begin_pending_remote_termination();
                     break PendingRemoteProcessTermination {
                         phase: prepared.phase,
@@ -3781,6 +3807,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
     for LivePlatform<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
 {
     type Error = user_access::LiveUserAccessError;
+
+    fn close_fault_windows<C: crate::memory::address_region::WindowCharges>(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        charges: &mut C,
+    ) -> crate::memory::address_region::WindowsClosed {
+        self.active.close_fault_windows(address_space, charges)
+    }
 
     fn allocate_zeroed_backing(
         &mut self,
@@ -4794,6 +4828,16 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 
     /// Marks this CPU as owning a pending remote termination, in the prepare
     /// hold that publishes its Stops (DW2 §10.16 revision 2 item 1).
+    /// The Stop barrier (DW2 §13.16 part e3): a hold that has published a
+    /// Stop to another CPU locks and unlocks P once, beneath T, before it
+    /// reads or changes anything in P's value and before it ends. A fast
+    /// serve reads its Stop mailbox and its scheduler-current under P, so
+    /// once this returns the stopped CPU's fast serve either ended before
+    /// it or sees the Stop, and makes no other until it has taken it.
+    fn stop_barrier(&mut self) {
+        drop(self.paging.lock());
+    }
+
     fn begin_pending_remote_termination(&mut self) {
         assert!(
             !core::mem::replace(&mut self.own.pending_remote_termination, true),
@@ -6082,10 +6126,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             };
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
+                // No window copied from this address space outlives the
+                // change (DW2 §13.16 part e3): closed in each iteration.
+                let closed = user.close_fault_windows(
+                    address_space,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
                 let region = self
                     .core
                     .regions
-                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key, closed)
                     .map_err(|_| ())?;
                 let mut publisher = user
                     .publisher::<PRIMORDIAL_TABLE_CANDIDATES>(
@@ -6203,10 +6256,19 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             let length = mapping.byte_len();
             let mut candidates = [const { None }; PRIMORDIAL_TABLE_CANDIDATES];
             let releases = {
+                // No window copied from this address space outlives the
+                // change (DW2 §13.16 part e3): closed in each iteration.
+                let closed = user.close_fault_windows(
+                    address_space,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
                 let region = self
                     .core
                     .regions
-                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                    .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key, closed)
                     .map_err(|_| ())?;
                 let mut publisher = user
                     .publisher::<PRIMORDIAL_TABLE_CANDIDATES>(
@@ -6476,13 +6538,20 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             .next()
             .copied();
         if let Some(mapping) = mapping {
+            let closed = paging.close_fault_windows(
+                address_space,
+                &mut crate::syscall::RegistryWindowCharges {
+                    registry: &mut self.core.registry,
+                    tasks: &self.core.tasks,
+                },
+            );
             let publisher = paging
                 .retiring_teardown_publisher(process, address_space, proof)
                 .unwrap_or_else(|error| panic!("an owed root's teardown publisher: {error:?}"));
             let region = self
                 .core
                 .regions
-                .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key)
+                .region_mut_for_quiesced_teardown(&self.core.tasks, proof, root_key, closed)
                 .unwrap_or_else(|error| panic!("an owed root's region: {error:?}"));
             let releases = region
                 .remove_mapping_detached(
@@ -6513,6 +6582,34 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         }
     }
 
+    /// Takes P and closes every CPU's fault window copied from
+    /// `address_space`'s mapping records, for a hold that holds T and not P
+    /// (DW2 §13.16 part e3).
+    fn close_fault_windows(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+    ) -> crate::memory::address_region::WindowsClosed {
+        let mut paging = self.paging.lock();
+        paging.close_fault_windows(
+            address_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            },
+        )
+    }
+
+    /// Takes P and closes every fault window, before a quota refusal is
+    /// decided in a hold that holds T and not P (DW2 §13.16 part e3).
+    /// Returns how many it closed.
+    fn close_all_fault_windows(&mut self) -> usize {
+        let mut paging = self.paging.lock();
+        paging.close_all_fault_windows(&mut crate::syscall::RegistryWindowCharges {
+            registry: &mut self.core.registry,
+            tasks: &self.core.tasks,
+        })
+    }
+
     /// `finish_quiesced_process_root_retirement` without its drain: the
     /// releases go to the cleanup queue for the drain that ran this step
     /// (DW2 §10.10 item 4), so no drain calls itself.
@@ -6525,6 +6622,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     ) -> Result<(), ()> {
         self.teardown_child_root_under_initiator(process, address_space)
             .map_err(|_| ())?;
+        let closed = self.close_fault_windows(address_space);
         let root_pin = self
             .core
             .regions
@@ -6534,6 +6632,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 proof,
                 self.core.shared.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .map_err(|_| ())?;
         self.core.cleanup.push_optional(
@@ -6607,6 +6706,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.teardown_child_root_under_initiator(process, address_space)
                 .map_err(|_| ())?;
         }
+        let closed = self.close_fault_windows(address_space);
         let root_pin = self
             .core
             .regions
@@ -6616,6 +6716,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 proof,
                 self.core.shared.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .map_err(|_| ())?;
         if process == self.core.primordial_process {
@@ -7223,6 +7324,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         if self.core.memory.active_lease_count() != 0 {
             return Err(0x7000_000a_u32);
         }
+        let closed = self.close_fault_windows(address_space);
         let root_pin = self
             .core
             .regions
@@ -7232,6 +7334,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 &proof,
                 self.core.shared.execution.blocked_operations(),
                 drained,
+                closed,
             )
             .map_err(|_| 0x7000_000b_u32)?;
         self.core.cleanup.push_optional(
@@ -7930,6 +8033,7 @@ impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSysc
                             }
                         }
                     }
+                    runtime.stop_barrier();
                     // No Stop is published to this CPU until its completion
                     // hold clears this (DW2 §10.16 revision 2 item 1).
                     runtime.begin_pending_remote_termination();
@@ -8524,7 +8628,7 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let cpu = self.cpu;
         self.with_synchronized_runtime_at_safe_point(|runtime| {
             let mut refused = None;
-            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused);
+            let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused, true);
             // A touch refused when owed work could admit it frees owed
             // memory first (§10.10 item 7, §10.12 item 6, DW2 §13.12 part
             // b): a quota refusal the refusing groups' finalizing pages
@@ -8561,6 +8665,66 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             })
         })
         .unwrap_or(crate::syscall::native::FaultPass::retry())
+    }
+
+    /// The fast serve (DW2 §13.16 part e3): with P alone, taken through a
+    /// `GuardFree`, a touch inside this CPU's fault window is served by the
+    /// nine steps of [`super::fault_window::serve_fast`]. It reads nothing
+    /// of T's value: its window, P's value, this CPU's owner-local state,
+    /// the scheduler and the stationary shared authorities. `None` on any
+    /// decline: the gate then takes the serve under T.
+    fn serve_user_page_fault_fast(
+        &mut self,
+        cr2: u64,
+        error: u64,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Option<crate::syscall::native::FaultPass> {
+        use super::fault_window::FastServed;
+        use crate::syscall::native::{FaultPass, FaultReturn, UserPageFaultOutcome};
+        let executing = (
+            self.owned.physically_executing.thread,
+            self.owned.root_switch_epoch,
+        );
+        let served = {
+            let mut access = self
+                .paging
+                .guard_free_fault_access(self.runtime.guard_free());
+            let mut paging = access.lock();
+            let mut fast = LiveFastServe {
+                value: Some(paging.guard_free_value()),
+                session: None,
+                cpu: self.cpu,
+                executing,
+                shared: self.shared,
+                frame,
+                candidates: [const { None }; 3],
+            };
+            super::fault_window::serve_fast(&mut fast, cr2, error)
+        };
+        let outcome = match served {
+            Ok(FastServed::Served) => UserPageFaultOutcome::Served,
+            Ok(FastServed::AlreadyPresent) => UserPageFaultOutcome::AlreadyPresent,
+            Err(decline) => {
+                use super::fault_window::FastDecline;
+                use step_report::WindowDecline;
+                step_report::window_declined(match decline {
+                    FastDecline::Identity => WindowDecline::Identity,
+                    FastDecline::Mapping => WindowDecline::Mapping,
+                    FastDecline::Tables => WindowDecline::Tables,
+                    FastDecline::Credit => WindowDecline::Credit,
+                    FastDecline::Memory => WindowDecline::Memory,
+                    FastDecline::Leaf => WindowDecline::Leaf,
+                    FastDecline::Return => WindowDecline::Return,
+                });
+                return None;
+            }
+        };
+        // Authorised through present leaves in the serve's P hold; no
+        // reschedule was requested when the scheduler was asked under it.
+        Some(FaultPass::new(outcome, || FaultReturn {
+            authorized: Ok(()),
+            reschedule: false,
+        }))
     }
 
     fn terminate_current(this: DivergentCarrier<'_, Self>) -> ! {
@@ -9455,9 +9619,13 @@ pub(super) fn enter(
     // The paging authority's lock, P, lives in its own permanent storage beside the runtime
     // authority's, outside the value T guards, and is reached only beneath a T guard (D1 commit 3).
     let paging: &'static PagingLock<RuntimePaging<'static, RANGE_CAPACITY, ROLE_CAPACITY>> =
-        PRIMORDIAL_PAGING.init(PagingLock::new(
+        PRIMORDIAL_PAGING.init(PagingLock::new_timed(
             active,
             user_access::service_local_tlb_shootdown,
+            super::runtime_authority::PagingTiming {
+                now: paging_timing_now,
+                released: paging_released,
+            },
         ));
     // Permanent storage (S2K-4, reset R2D): the lock and the carrier it guards live in one-shot
     // static storage for the kernel's lifetime, not on the boot stack. Built in place there (S2K
@@ -9994,6 +10162,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         handle: deepwyrm_abi::DwHandle,
         topic: u32,
     ) -> Result<crate::syscall::EncodedObjectInfo, deepwyrm_abi::DwStatus> {
+        // A TaskGroup's usage is reported as it would stand with every
+        // fault window closed (DW2 §13.16 part e3): the windows are read
+        // with P taken here, and none is closed for a read.
+        let credit = if topic == deepwyrm_abi::DW_OBJECT_INFO_TASK_GROUP_MEMORY_V1 {
+            let paging = self.paging.lock();
+            crate::syscall::WindowCredit::of(paging.fault_windows(), &self.core.registry)
+        } else {
+            crate::syscall::WindowCredit::none()
+        };
         crate::syscall::object_get_info_v1_query_with_device_objects(
             &mut self.core.registry,
             &self.core.memory,
@@ -10003,6 +10180,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.scheduled().process,
             handle,
             topic,
+            &|group| credit.toward(group),
         )
     }
 
@@ -10687,11 +10865,18 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// that admission refuses for quota, `refused` is given the two charges
     /// it admitted together, for the caller to ask whether the refusal is
     /// owed (DW2 §13.12 part b); it is left alone otherwise.
+    ///
+    /// A quota refusal first closes every fault window and admits once
+    /// more, so credit is never the reason a touch is refused; and with
+    /// `open_window` (the fault gate's serve, not a fill-in's) a touch that
+    /// leaves its page present opens or tops up this CPU's fault window
+    /// for the rest of the mapping (DW2 §13.16 part e3).
     fn serve_user_page_fault(
         &mut self,
         cr2: u64,
         error: u64,
         refused: &mut Option<FaultCharges>,
+        open_window: bool,
     ) -> crate::syscall::native::UserPageFaultOutcome {
         use crate::memory::frame_roles::FrameRoleError;
         use crate::syscall::native::UserPageFaultOutcome as Outcome;
@@ -10729,6 +10914,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let backing = mapping.backing().backing_identity();
         let page =
             (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE;
+        // The window this touch opens, its identity copied here under T
+        // (DW2 §13.16 part e3).
+        let opening = open_window.then(|| crate::memory::address_region::WindowOpening {
+            thread,
+            process,
+            root_epoch: self.owned.root_switch_epoch,
+            root: self
+                .own
+                .active_root
+                .as_ref()
+                .expect("active root")
+                .usercopy_root(),
+            mapping,
+            object,
+            address,
+        });
         let mut paging = self.paging.lock();
         let mut session = paging.page_table_mutation_session(
             self.own.active_root.as_ref().expect("active root"),
@@ -10747,7 +10948,9 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         let mut empty: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3] =
             [const { None }; 3];
-        let tables = 'found: {
+        // Whether this hold closed every window for a refusal already.
+        let mut windows_closed = false;
+        let tables = 'found: loop {
             let Ok(mut publisher) =
                 session.publisher::<3>(mapping.address_space(), mapping.region(), &mut empty)
             else {
@@ -10763,14 +10966,36 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // Every table exists (DW2 §13.16 part e1): the page alone is
             // admitted, committed through this publisher, and its leaf is
             // written into the place the walk found, with one store.
-            if let Err(outcome) = admit_fault_charges(
+            match admit_fault_charges(
                 cpu,
                 &self.core.registry,
                 &self.core.tasks,
                 ((object, cost), (process.object_id(), 0)),
                 refused,
             ) {
-                return outcome;
+                Ok(()) => {}
+                // Credit is never the reason a touch is refused: every
+                // window is closed, and the touch is walked and admitted
+                // once more (DW2 §13.16 part e3).
+                Err(Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+                    if !windows_closed =>
+                {
+                    drop(place);
+                    drop(publisher);
+                    windows_closed = true;
+                    let closed = session.close_all_fault_windows(
+                        &mut crate::syscall::RegistryWindowCharges {
+                            registry: &mut self.core.registry,
+                            tasks: &self.core.tasks,
+                        },
+                    );
+                    if closed != 0 {
+                        *refused = None;
+                        continue;
+                    }
+                    return Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES);
+                }
+                Err(outcome) => return outcome,
             }
             if cost != 0 {
                 let committed = publisher.commit_on_demand_page(backing, page);
@@ -10794,7 +11019,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             // As below: a present leaf that is not exactly this page's is
             // not a race this serves, and only a page committed in this hold
             // could not have had one.
-            return match publisher.write_touched_leaf(place) {
+            let outcome = match publisher.write_touched_leaf(place) {
                 Ok(published) if published || cost != 0 => {
                     step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
                     Outcome::Served
@@ -10802,18 +11027,51 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 Ok(_) => Outcome::AlreadyPresent,
                 Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Map(
                     crate::arch::x86_64::mm::MapError::FrameMismatch,
-                )) if cost == 0 => Outcome::Unserved,
+                )) if cost == 0 => return Outcome::Unserved,
                 Err(error) => panic!("an on-demand fault could not publish its leaf: {error:?}"),
             };
+            drop(publisher);
+            if let Some(opening) = opening {
+                session.open_fault_window(
+                    cpu,
+                    opening,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
+            }
+            return outcome;
         };
-        // Admit both, together, before taking a frame (§8.4).
-        if let Err(outcome) = admit_fault_charges(
+        // Admit both, together, before taking a frame (§8.4). A quota
+        // refusal closes every window and admits once more (DW2 §13.16
+        // part e3).
+        let mut admitted = admit_fault_charges(
             cpu,
             &self.core.registry,
             &self.core.tasks,
             ((object, cost), (process.object_id(), tables)),
             refused,
-        ) {
+        );
+        if matches!(
+            admitted,
+            Err(Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
+        ) && !windows_closed
+            && session.close_all_fault_windows(&mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            }) != 0
+        {
+            *refused = None;
+            admitted = admit_fault_charges(
+                cpu,
+                &self.core.registry,
+                &self.core.tasks,
+                ((object, cost), (process.object_id(), tables)),
+                refused,
+            );
+        }
+        if let Err(outcome) = admitted {
             return outcome;
         }
         if cost != 0 {
@@ -10890,12 +11148,23 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 built,
             );
         }
-        if published || cost != 0 {
+        let outcome = if published || cost != 0 {
             step_report::fault_stamped(cpu, FaultStamp::ServeEnded);
             Outcome::Served
         } else {
             Outcome::AlreadyPresent
+        };
+        if let Some(opening) = opening {
+            session.open_fault_window(
+                cpu,
+                opening,
+                &mut crate::syscall::RegistryWindowCharges {
+                    registry: &mut self.core.registry,
+                    tasks: &self.core.tasks,
+                },
+            );
         }
+        outcome
     }
 
     /// One hold of a syscall's fill-in phase (DW2 M6 §8.6): serves, as a
@@ -10936,7 +11205,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             step_report::fill_in_served();
             let mut refused = None;
             if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
-                self.serve_user_page_fault(page, error, &mut refused)
+                self.serve_user_page_fault(page, error, &mut refused, false)
             {
                 if !self.serve_refusal_owed(status, refused) {
                     return Err(status);
@@ -11002,9 +11271,47 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.active_root.as_ref().expect("active root"),
             process,
         );
+        let teardown_owed = !self.core.owed_teardown.is_empty();
+        let admit_began = step_report::ticks();
+        // The whole step first. A quota refusal closes every fault window
+        // and admits once more, so credit is never the reason a commit is
+        // refused (DW2 §13.16 part e3).
+        let whole = {
+            let cost = session
+                .on_demand_commit_range_cost(backing, first, count)
+                .map_err(|_| DW_STATUS_BAD_STATE)?;
+            let admitted = if cost == 0 {
+                Ok(())
+            } else {
+                crate::syscall::admit_charged_pages(
+                    &self.core.registry,
+                    &self.core.tasks,
+                    object,
+                    cost,
+                )
+            };
+            match admitted {
+                Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
+                    if session.close_all_fault_windows(
+                        &mut crate::syscall::RegistryWindowCharges {
+                            registry: &mut self.core.registry,
+                            tasks: &self.core.tasks,
+                        },
+                    ) != 0 =>
+                {
+                    crate::syscall::admit_charged_pages(
+                        &self.core.registry,
+                        &self.core.tasks,
+                        object,
+                        cost,
+                    )
+                    .map(|()| cost)
+                }
+                admitted => admitted.map(|()| cost),
+            }
+        };
         let registry = &self.core.registry;
         let tasks = &self.core.tasks;
-        let teardown_owed = !self.core.owed_teardown.is_empty();
         let cost_of = |pages: u64| {
             session
                 .on_demand_commit_range_cost(backing, first, pages)
@@ -11019,8 +11326,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         };
         // The whole step, or else the longest start of it the quota admits,
         // so a commit still fills the quota exactly: at most ten admissions.
-        let admit_began = step_report::ticks();
-        let (admitted, cost, mut result) = match admit(count) {
+        let (admitted, cost, mut result) = match whole {
             Ok(cost) => (count, cost, Ok(())),
             // Owed: owed work could admit the whole step, so nothing is
             // committed and the step is taken again after the owed step.
@@ -11204,6 +11510,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                     self.own.active_root.as_ref().expect("active root"),
                     self.own.scheduled().process,
                 );
+                // No window copied from the target's mapping records
+                // outlives this step's change (DW2 §13.16 part e3).
+                let closed = session.close_fault_windows(
+                    target.address_space,
+                    &mut crate::syscall::RegistryWindowCharges {
+                        registry: &mut self.core.registry,
+                        tasks: &self.core.tasks,
+                    },
+                );
                 if session
                     .select_process_for_return_validation(target.process)
                     .is_err()
@@ -11276,6 +11591,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                             protection,
                             room,
                             held,
+                            closed,
                         );
                         let published = publisher.finish_deferred();
                         shootdown = Self::settle_or_defer_shootdown(
@@ -11337,6 +11653,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
+        // No window copied from the target's mapping records outlives this
+        // step's change (DW2 §13.16 part e3).
+        let closed = session.close_fault_windows(
+            target.address_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            },
+        );
         if session
             .select_process_for_return_validation(target.process)
             .is_err()
@@ -11376,6 +11701,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 address,
                 byte_len,
                 held,
+                closed,
             );
             let published = publisher.finish_deferred();
             let shootdown = Self::settle_or_defer_shootdown(
@@ -11430,6 +11756,15 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             self.own.active_root.as_ref().expect("active root"),
             self.own.scheduled().process,
         );
+        // No window copied from the target's mapping records outlives this
+        // step's change (DW2 §13.16 part e3).
+        let closed = session.close_fault_windows(
+            target.address_space,
+            &mut crate::syscall::RegistryWindowCharges {
+                registry: &mut self.core.registry,
+                tasks: &self.core.tasks,
+            },
+        );
         if session
             .select_process_for_return_validation(target.process)
             .is_err()
@@ -11470,6 +11805,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 byte_len,
                 protections,
                 held,
+                closed,
             );
             let published = publisher.finish_deferred();
             let shootdown = Self::settle_or_defer_shootdown(
@@ -12485,6 +12821,202 @@ type FaultCharges = (
 /// is exhaustion; it leaves the charges in `refused` for the caller to ask
 /// whether the refusal is owed (DW2 §13.12 part b). The object and Process
 /// are live here.
+/// P's timing, as T's is taken (DW2 §13.16 part e3, the `p-lock` line).
+fn paging_timing_now() -> Option<u64> {
+    Some(step_report::ticks())
+}
+
+fn paging_released(source: super::runtime_authority::PagingSource, waited: Option<u64>, held: u64) {
+    step_report::p_lock_released(source as usize, waited, held);
+}
+
+/// The fast serve's paging (DW2 §13.16 part e3): P's value, taken
+/// guard-free, until the session for the window's copied root is built
+/// from it; then that session.
+struct LiveFastServe<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    value: Option<
+        super::runtime_authority::GuardFreeValue<
+            'v,
+            RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+        >,
+    >,
+    session:
+        Option<user_access::LiveProcessAddressSpace<'v, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    cpu: crate::cpu::CpuIndex,
+    /// The Thread this CPU physically executes and its root-switch epoch,
+    /// both owner-local.
+    executing: (Option<ThreadKey>, u64),
+    shared: &'static PrimordialRuntimeShared,
+    frame: &'f mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    /// The publisher's table candidates: none, as the fast serve builds no
+    /// table.
+    candidates: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
+}
+
+/// The fast serve's publisher, for steps 4 to 7 under one borrow.
+struct LiveFastLeaf<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    cpu: usize,
+    publisher: crate::arch::x86_64::mm::X86AddressSpacePublisher<
+        'a,
+        user_access::TrackedActiveTarget<'v>,
+        RANGE_CAPACITY,
+        ROLE_CAPACITY,
+        3,
+        { user_access::LIVE_JOURNAL_ENTRIES },
+        { user_access::LIVE_JOURNAL_INVALIDATIONS },
+    >,
+}
+
+/// The backing and object page a touch at `address` of `mapping` names.
+fn fast_page(
+    mapping: &crate::memory::address_region::Mapping,
+    address: u64,
+) -> (crate::memory::frame_roles::BackingIdentity, u64) {
+    (
+        mapping.backing().backing_identity(),
+        (address - mapping.virtual_start() + mapping.backing().object_offset()) / PAGE_SIZE,
+    )
+}
+
+impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fault_window::FastLeaf
+    for LiveFastLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type Place = crate::arch::x86_64::mm::TouchedLeafPlace<'a>;
+
+    fn find(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<Self::Place> {
+        match self.publisher.find_touched_leaf(mapping, address) {
+            Ok(crate::arch::x86_64::mm::TouchedLeaf::Found(place)) => Some(place),
+            Ok(crate::arch::x86_64::mm::TouchedLeaf::MissingTables(_)) | Err(_) => None,
+        }
+    }
+
+    fn cost(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<u64> {
+        let (backing, page) = fast_page(mapping, address);
+        self.publisher.on_demand_commit_cost(backing, page).ok()
+    }
+
+    fn commit(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<u64> {
+        let (backing, page) = fast_page(mapping, address);
+        self.publisher
+            .commit_on_demand_page(backing, page)
+            .ok()
+            .map(|commit| commit.frames)
+    }
+
+    fn write(&mut self, place: Self::Place) -> Option<bool> {
+        self.publisher.write_touched_leaf(place).ok()
+    }
+
+    fn stamp(&mut self, stamp: super::fault_window::FastStamp) {
+        fast_stamp(self.cpu, stamp);
+    }
+}
+
+/// The fast serve's step-report stamp on `cpu`.
+fn fast_stamp(cpu: usize, stamp: super::fault_window::FastStamp) {
+    use super::fault_window::FastStamp;
+    use step_report::FastFaultStamp;
+    step_report::fast_stamped(
+        cpu,
+        match stamp {
+            FastStamp::Checked => FastFaultStamp::Checked,
+            FastStamp::Committed => FastFaultStamp::Committed,
+            FastStamp::Written => FastFaultStamp::Written,
+        },
+    );
+}
+
+impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    super::fault_window::FastServePaging<super::UserCopyRoot>
+    for LiveFastServe<'v, 'roles, 'f, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type Leaf<'a>
+        = LiveFastLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
+    where
+        Self: 'a;
+
+    fn window(&self) -> Option<crate::memory::address_region::FaultWindow<super::UserCopyRoot>> {
+        match (&self.value, &self.session) {
+            (_, Some(session)) => session.fault_window(self.cpu.index()),
+            (Some(value), None) => value.fault_window(self.cpu.index()),
+            (None, None) => None,
+        }
+    }
+
+    fn executing(&self) -> (Option<ThreadKey>, u64) {
+        self.executing
+    }
+
+    fn open_session(&mut self, root: super::UserCopyRoot, process: ProcessKey) -> bool {
+        let Some(value) = self.value.take() else {
+            return false;
+        };
+        match value.try_usercopy_process_address_space(root, process) {
+            Ok(session) => {
+                self.session = Some(session);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn scheduler_allows(&mut self, thread: ThreadKey) -> bool {
+        self.shared.execution.runs_undisturbed_on(self.cpu, thread)
+            && !crate::arch::x86_64::idle::current_stop_requested()
+            && (self.cpu != crate::cpu::CpuIndex::BOOTSTRAP
+                || self
+                    .shared
+                    .timer_expiries
+                    .lock()
+                    .iter()
+                    .all(Option::is_none))
+    }
+
+    fn leaf(&mut self, mapping: &crate::memory::address_region::Mapping) -> Option<Self::Leaf<'_>> {
+        let session = self.session.as_mut()?;
+        session
+            .publisher::<3>(
+                mapping.address_space(),
+                mapping.region(),
+                &mut self.candidates,
+            )
+            .ok()
+            .map(|publisher| LiveFastLeaf {
+                cpu: self.cpu.index(),
+                publisher,
+            })
+    }
+
+    fn spend(&mut self, frames: u64) {
+        self.session
+            .as_mut()
+            .unwrap_or_else(|| panic!("a fast serve committed without its session"))
+            .spend_fault_window(self.cpu.index(), frames);
+    }
+
+    fn validate_return(&mut self) -> bool {
+        self.session
+            .as_mut()
+            .is_some_and(|session| self.frame.validate_and_sanitize(session).is_ok())
+    }
+
+    fn stamp(&mut self, stamp: super::fault_window::FastStamp) {
+        fast_stamp(self.cpu.index(), stamp);
+    }
+}
+
 fn admit_fault_charges(
     cpu: usize,
     registry: &Registry,
