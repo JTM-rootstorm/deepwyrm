@@ -27,17 +27,19 @@ use crate::memory::frame_roles::{
 mod pin_tracked;
 #[path = "journal/publisher.rs"]
 mod publisher;
+#[path = "journal/touched_leaf.rs"]
+mod touched_leaf;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) use pin_tracked::{PinTrackedError, PinTrackedTarget};
 
 use crate::memory::physical::BASE_PAGE_SIZE;
-#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
-pub(crate) use publisher::TouchedLeaf;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use publisher::TouchedLeafPlace;
 pub(crate) use publisher::{X86AddressSpacePublishError, X86AddressSpacePublisher};
 #[cfg(test)]
 use publisher::{first_mapping_start, mapping_at, next_boundary, next_mapping_start};
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(crate) use touched_leaf::TouchedLeaf;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) use touched_leaf::TouchedLeafPlace;
 
 const ENTRY_COUNT: usize = 512;
 

@@ -1228,6 +1228,114 @@ fn one_walk_writes_the_leaf_each_protection_needs() {
     }
 }
 
+/// The same touch through a writer built directly over `&FrameRoleManager`
+/// (DW2 §15.2), as the shared fault session builds one: find, then write,
+/// with no commit (the page is committed already). The target is
+/// pin-tracked over `pins`.
+fn touch_through_writer(fixture: &mut Fixture, address: u64, pins: &Pins) -> Touch {
+    let mapping = fixture.mapping_at(address);
+    fixture.with_pins(pins, |fixture, target| {
+        let mut writer = super::super::touched_leaf::TouchedLeafWriter::new(
+            fixture.region.address_space_key(),
+            fixture.region.region_key(),
+            &fixture.page_tables,
+            fixture.root,
+            &fixture.roles,
+            target,
+        )
+        .unwrap();
+        match writer.find_touched_leaf(&mapping, address) {
+            Ok(TouchedLeaf::Found(place)) => (Ok(0), Some(writer.write_touched_leaf(place))),
+            Ok(TouchedLeaf::MissingTables(tables)) => (Ok(tables), None),
+            Err(error) => (Err(error), None),
+        }
+    })
+}
+
+/// What a committed page's leaf holds before the touch.
+#[derive(Clone, Copy, Debug)]
+enum LeafBefore {
+    Empty,
+    ThisPage,
+    AnotherFrame,
+}
+
+/// Every table, page 0 committed (and page 1 committed and touched), the
+/// object mapped with `protection`, and page 0's leaf as `before` says.
+fn committed_page(ceiling: Protection, protection: Protection, before: LeafBefore) -> Fixture {
+    let mut fixture = with_tables(Fixture::with_protection(ceiling, protection));
+    fixture.commit(0);
+    match before {
+        LeafBefore::Empty => {}
+        LeafBefore::ThisPage => {
+            fixture.touch(START).unwrap();
+        }
+        LeafBefore::AnotherFrame => {
+            let page_one = fixture.target.entries[&entry_key(&fixture, START + BASE_PAGE_SIZE, 0)];
+            let key = entry_key(&fixture, START, 0);
+            fixture.target.entries.insert(key, page_one);
+        }
+    }
+    fixture
+}
+
+/// DW2 §15.2: for a committed page, the writer reached through the
+/// publisher and a writer built directly over `&FrameRoleManager` give the
+/// same result and leave every page-table entry the same, bit for bit, for
+/// read-only, writable and executable mappings, with the leaf empty, this
+/// page's, or another frame's; each makes one store exactly when it
+/// publishes.
+#[test]
+fn a_writer_over_the_shared_role_manager_writes_what_the_publisher_does() {
+    for (ceiling, protection) in [
+        (Protection::READ_WRITE, Protection::READ),
+        (Protection::READ_WRITE, Protection::READ_WRITE),
+        (Protection::READ_EXECUTE, Protection::READ_EXECUTE),
+    ] {
+        for (before, expected) in [
+            (LeafBefore::Empty, Some(Ok(true))),
+            (LeafBefore::ThisPage, Some(Ok(false))),
+            (
+                LeafBefore::AnotherFrame,
+                Some(Err(X86AddressSpacePublishError::Map(
+                    MapError::FrameMismatch,
+                ))),
+            ),
+        ] {
+            let mut published = committed_page(ceiling, protection, before);
+            let mut direct = committed_page(ceiling, protection, before);
+            assert_eq!(direct.target.entries, published.target.entries);
+            let through_publisher = published.touch_through_find(START, None, &Pins::new());
+            let applied = direct.target.applied.len();
+            let through_writer = touch_through_writer(&mut direct, START, &Pins::new());
+            assert_eq!(
+                through_writer, through_publisher,
+                "{protection:?} {before:?}"
+            );
+            assert_eq!(
+                through_writer,
+                (Ok(0), expected),
+                "{protection:?} {before:?}"
+            );
+            assert_eq!(
+                direct.target.entries, published.target.entries,
+                "{protection:?} {before:?}"
+            );
+            assert_eq!(
+                direct.target.applied.len() - applied,
+                usize::from(through_writer.1 == Some(Ok(true))),
+                "one store exactly when a leaf is published"
+            );
+            assert_eq!(direct.roles.check_invariants(), Ok(()));
+            if matches!(before, LeafBefore::Empty) {
+                let leaf = direct.target.entries[&entry_key(&direct, START, 0)];
+                assert_eq!(leaf & WRITABLE_BIT != 0, protection.writable());
+                assert_eq!(leaf & NO_EXECUTE_BIT == 0, protection.executable());
+            }
+        }
+    }
+}
+
 /// A readable word at `address`, for a user pin.
 fn word(address: u64) -> UserRange {
     UserRange::new(
