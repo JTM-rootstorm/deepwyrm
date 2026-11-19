@@ -348,23 +348,7 @@ where
         })?;
         let entry = super::super::leaf_entry(frame, permissions);
         if leaf != 0 {
-            super::super::decode_leaf::<OwnedPageTableJournalError<T::Error>>(
-                leaf,
-                page.is_user_half(),
-                limit,
-            )
-            .map_err(X86AddressSpacePublishError::Map)?;
-            if leaf & !(super::super::ACCESSED | super::super::DIRTY) != entry {
-                return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch));
-            }
-            // As `validate_present_path`: only through this root's own
-            // tables (§5.3a).
-            if let Some(error) = unauthenticated {
-                return Err(X86AddressSpacePublishError::Journal(
-                    OwnedPageTableJournalError::FrameRole(error),
-                ));
-            }
-            return Ok(false);
+            return present_leaf(leaf, entry, page, limit, unauthenticated);
         }
         // As `map_page`: the policy, and a frame that is no table of the
         // path. (`decode_intermediate` above already required each table
@@ -387,19 +371,59 @@ where
         // a refusal is the journal's error for it. This span is the store's
         // own: it is begun and ended here, apart from the batch path's
         // `span_held`, and is ended only if it was begun.
-        let published = self
-            .target
+        self.target
             .begin_mutation_span(address, BASE_PAGE_SIZE)
-            .and_then(|()| {
-                let stored = self
-                    .target
-                    .apply(&[JournalWrite::new(path[3], index, entry)], &[]);
-                self.target.end_mutation_span();
-                stored
-            });
-        published.map_err(|error| {
-            X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
-        })?;
-        Ok(true)
+            .map_err(|error| {
+                X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
+            })?;
+        // The leaf is read again inside the span, and stored only while it
+        // is still empty (DW2 §15.2). Under a shared hold of P another
+        // CPU's serve of this page may have stored it since the read above;
+        // two spans over one page are never held at once, so this read sees
+        // that store, and storing again would clear the accessed and dirty
+        // bits the other CPU's TLB already holds. A leaf found present is
+        // answered as the read above would have answered it. Under an
+        // exclusive hold nothing else stores a leaf, so this read is 0.
+        let stored = match self.target.read_entry(path[3], index) {
+            Err(error) => Err(X86AddressSpacePublishError::Map(MapError::Access(
+                OwnedPageTableJournalError::Target(error),
+            ))),
+            Ok(0) => self
+                .target
+                .apply(&[JournalWrite::new(path[3], index, entry)], &[])
+                .map(|()| true)
+                .map_err(|error| {
+                    X86AddressSpacePublishError::Journal(OwnedPageTableJournalError::Target(error))
+                }),
+            Ok(leaf) => present_leaf(leaf, entry, page, limit, unauthenticated),
+        };
+        self.target.end_mutation_span();
+        stored
     }
+}
+
+/// What a touch answers for a present `leaf` where this page's leaf would
+/// be `entry` (DW2 §13.16 part e1): the decode's error for a leaf that is
+/// no valid leaf, `FrameMismatch` for one that is not `entry` apart from
+/// the accessed and dirty bits, the path's authentication error if a table
+/// on it is not this root's own (`validate_present_path`, §5.3a), and
+/// otherwise `Ok(false)`: already this page's.
+fn present_leaf<E>(
+    leaf: u64,
+    entry: u64,
+    page: VirtualPage,
+    limit: PhysicalAddressLimit,
+    unauthenticated: Option<FrameRoleError>,
+) -> Result<bool, X86AddressSpacePublishError<E>> {
+    super::super::decode_leaf::<OwnedPageTableJournalError<E>>(leaf, page.is_user_half(), limit)
+        .map_err(X86AddressSpacePublishError::Map)?;
+    if leaf & !(super::super::ACCESSED | super::super::DIRTY) != entry {
+        return Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch));
+    }
+    if let Some(error) = unauthenticated {
+        return Err(X86AddressSpacePublishError::Journal(
+            OwnedPageTableJournalError::FrameRole(error),
+        ));
+    }
+    Ok(false)
 }

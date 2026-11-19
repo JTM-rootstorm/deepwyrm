@@ -1336,6 +1336,68 @@ fn a_writer_over_the_shared_role_manager_writes_what_the_publisher_does() {
     }
 }
 
+/// DW2 §15.2: between a serve's read of an empty leaf and its mutation span,
+/// another CPU's serve of the page stores the leaf (and that CPU's Thread
+/// writes, setting the dirty bit). The read inside the span sees it: the
+/// leaf is not stored again, the result is what the first read would have
+/// answered for that value, and the span is ended.
+#[test]
+fn a_leaf_stored_before_the_span_is_not_stored_again() {
+    const DIRTY_BIT: u64 = 1 << 6;
+    // This page's own entry, as a serve writes it.
+    let this_page = {
+        let mut fixture = with_tables(Fixture::new());
+        fixture.commit(0);
+        fixture.touch(START).unwrap();
+        fixture.target.entries[&entry_key(&fixture, START, 0)]
+    };
+    let page_one = {
+        let fixture = with_tables(Fixture::new());
+        fixture.target.entries[&entry_key(&fixture, START + BASE_PAGE_SIZE, 0)]
+    };
+    for (stored, expected) in [
+        // This page's entry, written to by the other CPU's Thread.
+        (this_page | DIRTY_BIT, Ok(false)),
+        // Another frame's entry.
+        (
+            page_one,
+            Err(X86AddressSpacePublishError::Map(MapError::FrameMismatch)),
+        ),
+        // No valid user leaf: this page's entry without the user bit.
+        (
+            this_page & !USER_BIT,
+            Err(X86AddressSpacePublishError::Map(MapError::InvalidPath)),
+        ),
+    ] {
+        let mut fixture = with_tables(Fixture::new());
+        fixture.commit(0);
+        let key = entry_key(&fixture, START, 0);
+        // Three reads walk the tables, one reads the empty leaf; the fifth,
+        // inside the span, finds what the other serve stored.
+        fixture.target.mutate_on_read = Some((fixture.target.read_count + 5, key, stored));
+        let applied = fixture.target.applied.len();
+        let pins = Pins::new();
+        // `with_pins` asserts that the span was ended.
+        let result = fixture.touch_through_find(START, None, &pins);
+        assert_eq!(result, (Ok(0), Some(expected)), "{stored:#x}");
+        assert_eq!(
+            fixture.target.entries[&key], stored,
+            "the stored leaf stays"
+        );
+        assert_eq!(fixture.target.applied.len(), applied, "no store");
+        // The page's mutation slot is free again.
+        drop(
+            pins.begin_mutation(
+                crate::cpu::CpuIndex::BOOTSTRAP,
+                fixture.region.address_space_key(),
+                START,
+                BASE_PAGE_SIZE,
+            )
+            .unwrap(),
+        );
+    }
+}
+
 /// A readable word at `address`, for a user pin.
 fn word(address: u64) -> UserRange {
     UserRange::new(
