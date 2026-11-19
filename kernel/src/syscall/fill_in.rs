@@ -79,21 +79,21 @@ pub(crate) fn fill_in_range(
     Ok(())
 }
 
+/// What one step safe point of a fill-in runs under its hold.
+pub(crate) trait FillInStep {
+    /// What the hold returns.
+    type Output;
+    /// Runs under `hold`, told whether the quantum ended (`yielding`).
+    fn run(self, hold: &mut impl FillInHold, yielding: bool) -> Self::Output;
+}
+
 /// A fill-in's step safe points.
 pub(crate) trait FillInRuntime {
-    /// The hold a step runs under.
-    type Hold<'a>: FillInHold
-    where
-        Self: 'a;
     /// One step safe point (the live one is
     /// `at_step_safe_point(may_yield, StepCall::FillIn, …)`): `Err(())` on a
-    /// Stop; else `operation` runs under the hold and is told whether the
-    /// quantum ended (`yielding`).
-    fn step<T>(
-        &mut self,
-        may_yield: bool,
-        operation: impl FnOnce(&mut Self::Hold<'_>, bool) -> T,
-    ) -> Result<T, ()>;
+    /// Stop; else `step` runs under the hold and is told whether the
+    /// quantum ended.
+    fn step<S: FillInStep>(&mut self, may_yield: bool, step: S) -> Result<S::Output, ()>;
 }
 
 /// How a fill-in's buffers ended.
@@ -148,20 +148,14 @@ pub(crate) fn fill_in_buffers<R: FillInRuntime>(
             .filter(|_| index == first)
             .unwrap_or(buffer.address & !(page_size - 1));
         while next < end {
-            match runtime.step(stepped, |hold, yielding| {
-                hold.service_timer_expiries();
-                if yielding {
-                    return None;
-                }
-                Some(fill_in_range(
-                    hold,
-                    &mut next,
-                    end,
-                    buffer.write,
-                    step_bytes,
-                    page_size,
-                ))
-            }) {
+            let step = BufferStep {
+                next: &mut next,
+                end,
+                write: buffer.write,
+                step_bytes,
+                page_size,
+            };
+            match runtime.step(stepped, step) {
                 Err(()) => return FillInEnd::Stopped,
                 Ok(None) => return FillInEnd::Parked { index, next },
                 Ok(Some(Err(status))) => return FillInEnd::Failed(status),
@@ -170,6 +164,35 @@ pub(crate) fn fill_in_buffers<R: FillInRuntime>(
         }
     }
     FillInEnd::Done { stepped }
+}
+
+/// One hold of a buffer's fill-in: the bootstrap CPU's timer expiries
+/// first, then, unless the quantum ended (`None`), one step of the range.
+struct BufferStep<'n> {
+    next: &'n mut u64,
+    end: u64,
+    write: bool,
+    step_bytes: u64,
+    page_size: u64,
+}
+
+impl FillInStep for BufferStep<'_> {
+    type Output = Option<Result<(), DwStatus>>;
+
+    fn run(self, hold: &mut impl FillInHold, yielding: bool) -> Self::Output {
+        hold.service_timer_expiries();
+        if yielding {
+            return None;
+        }
+        Some(fill_in_range(
+            hold,
+            self.next,
+            self.end,
+            self.write,
+            self.step_bytes,
+            self.page_size,
+        ))
+    }
 }
 
 /// How one commit step's hold ended (DW2 M6 §8.2, §13.12 part b).

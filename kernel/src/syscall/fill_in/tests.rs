@@ -146,13 +146,7 @@ impl Safepoints {
 }
 
 impl FillInRuntime for Safepoints {
-    type Hold<'a> = Pages;
-
-    fn step<T>(
-        &mut self,
-        may_yield: bool,
-        operation: impl FnOnce(&mut Pages, bool) -> T,
-    ) -> Result<T, ()> {
+    fn step<S: FillInStep>(&mut self, may_yield: bool, step: S) -> Result<S::Output, ()> {
         let point = self.safe_points;
         self.safe_points += 1;
         self.may_yield.push(may_yield);
@@ -162,7 +156,7 @@ impl FillInRuntime for Safepoints {
         }
         let yielding = may_yield && self.yield_at.contains(&point);
         self.hold.log.push(Call::Hold { yielding });
-        Ok(operation(&mut self.hold, yielding))
+        Ok(step.run(&mut self.hold, yielding))
     }
 }
 

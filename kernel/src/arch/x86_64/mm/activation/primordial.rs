@@ -47,7 +47,7 @@ use crate::object::{HandleRef, InternalRef, ObjectRegistry};
 use crate::sync::IrqSpinMutex;
 #[cfg(feature = "test-support")]
 use crate::syscall::FServiceOperationOwner;
-use crate::syscall::fill_in::CommitStep;
+use crate::syscall::fill_in::{CommitStep, FillInEnd};
 use crate::syscall::native::{
     DivergentCarrier, NativeSyscallFrameRuntime, NativeSyscallHandler, NativeSyscallRequest,
     NativeSyscallResult, SyscallControl,
@@ -2458,62 +2458,41 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             next: resume_at,
         } = cursor
         {
-            for (index, buffer) in request.user_buffers().into_iter().enumerate().skip(first) {
-                let Some(buffer) = buffer else {
-                    continue;
-                };
-                if buffer.byte_len == 0 {
-                    continue;
+            let cpu = self.cpu;
+            // A fill-in's serves are not the fault gate's: none is timed, so
+            // none reads the clock (DW2 §13.5).
+            step_report::fault_untimed(cpu.index());
+            match crate::syscall::fill_in::fill_in_buffers(
+                self,
+                request.user_buffers(),
+                first,
+                resume_at,
+                FAMILY_G_STEP_BYTES,
+                PAGE_SIZE,
+            ) {
+                FillInEnd::Stopped => {
+                    step_report::call_ended(cpu.index(), None);
+                    return Some(Err(()));
                 }
-                // A buffer the copy cannot use is the copy's to refuse.
-                let Some(end) = buffer
-                    .address
-                    .checked_add(buffer.byte_len)
-                    .and_then(|end| end.checked_add(PAGE_SIZE - 1))
-                    .map(|end| end & !(PAGE_SIZE - 1))
-                else {
-                    continue;
-                };
-                let cpu = self.cpu;
-                let mut next = match resume_at {
-                    Some(next) if index == first => next,
-                    _ => buffer.address & !(PAGE_SIZE - 1),
-                };
-                while next < end {
-                    match self.at_step_safe_point(stepped, StepCall::FillIn, |runtime, yielding| {
-                        if cpu == crate::cpu::CpuIndex::BOOTSTRAP {
-                            runtime.service_pending_timer_expiries_on_bootstrap();
-                        }
-                        if yielding {
-                            return None;
-                        }
-                        Some(runtime.fill_in_user_range(&mut next, end, buffer.write))
-                    }) {
-                        Err(()) => {
-                            step_report::call_ended(cpu.index(), None);
-                            return Some(Err(()));
-                        }
-                        Ok(None) => {
-                            step_report::call_ended(cpu.index(), None);
-                            let cursor = FillCursor::Buffer {
-                                index,
-                                next: Some(next),
-                            };
-                            return Some(
-                                Ok(self.park_call(ParkedCall::FillIn { request, cursor })),
-                            );
-                        }
-                        Ok(Some(Err(status))) => {
-                            // The fill that failed was its last step.
-                            step_report::call_ended(cpu.index(), Some(StepCall::FillIn));
-                            return Some(self.return_status(status));
-                        }
-                        Ok(Some(Ok(()))) => stepped = true,
-                    }
+                FillInEnd::Parked { index, next } => {
+                    step_report::call_ended(cpu.index(), None);
+                    let cursor = FillCursor::Buffer {
+                        index,
+                        next: Some(next),
+                    };
+                    return Some(Ok(self.park_call(ParkedCall::FillIn { request, cursor })));
+                }
+                FillInEnd::Failed(status) => {
+                    // The fill that failed was its last step.
+                    step_report::call_ended(cpu.index(), Some(StepCall::FillIn));
+                    return Some(self.return_status(status));
+                }
+                // The buffers' last fill, if any, is the fill-in's last step.
+                FillInEnd::Done { stepped: buffers } => {
+                    stepped = buffers;
+                    step_report::call_ended(cpu.index(), stepped.then_some(StepCall::FillIn));
                 }
             }
-            // The buffers' last fill, if any, is the fill-in's last step.
-            step_report::call_ended(self.cpu.index(), stepped.then_some(StepCall::FillIn));
         }
         // `dma_map` maps frames, not leaves: commit its range first (§8.6),
         // but only for a caller whose resource `dma_map` would accept and
@@ -3086,6 +3065,22 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         assert_eq!(result.status, DW_STATUS_SUCCESS);
         assert_eq!(result.control, SyscallControl::TerminateCurrent);
         crate::syscall::native::ExceptionTermination::Terminated
+    }
+}
+
+/// A fill-in's step safe points are the facade's (DW2 §10.8 item 1).
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::fill_in::FillInRuntime
+    for RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    #[inline(always)]
+    fn step<S: crate::syscall::fill_in::FillInStep>(
+        &mut self,
+        may_yield: bool,
+        step: S,
+    ) -> Result<S::Output, ()> {
+        self.at_step_safe_point(may_yield, StepCall::FillIn, |runtime, yielding| {
+            step.run(runtime, yielding)
+        })
     }
 }
 
@@ -11168,59 +11163,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         outcome
     }
 
-    /// One hold of a syscall's fill-in phase (DW2 M6 §8.6): serves, as a
-    /// user touch of the access the syscall will make, every on-demand page
-    /// under `[*next, end)` up to one step's end, publishing its leaf here so
-    /// the copy's page walk finds it. Pages outside on-demand mappings are
-    /// left to the copy, which fails them as before.
-    fn fill_in_user_range(
-        &mut self,
-        next: &mut u64,
-        end: u64,
-        write: bool,
-    ) -> Result<(), deepwyrm_abi::DwStatus> {
-        const USER: u64 = 1 << 2;
-        const WRITE: u64 = 1 << 1;
-        let process = self.own.scheduled().process;
-        // A fill-in's serves are not the fault gate's: none is timed, so
-        // none reads the clock (DW2 §13.5).
-        step_report::fault_untimed(self.cpu().index());
-        let step_end = end.min(next.saturating_add(FAMILY_G_STEP_BYTES));
-        while *next < step_end {
-            let page = *next;
-            *next = page.saturating_add(PAGE_SIZE);
-            let on_demand = match self
-                .core
-                .regions
-                .root_mapping_at(&self.core.tasks, process, page)
-            {
-                Ok(Some(mapping)) => mapping
-                    .object_id()
-                    .is_some_and(|object| self.core.memory.object_is_on_demand(object)),
-                _ => false,
-            };
-            if !on_demand {
-                continue;
-            }
-            let error = USER | if write { WRITE } else { 0 };
-            step_report::fill_in_served();
-            let mut refused = None;
-            if let crate::syscall::native::UserPageFaultOutcome::Exhausted(status) =
-                self.serve_user_page_fault(page, error, &mut refused, false)
-            {
-                if !self.serve_refusal_owed(status, refused) {
-                    return Err(status);
-                }
-                // Owed (DW2 §13.12 part b): the hold takes its owed step,
-                // and this page is served again after the next safe point.
-                *next = page;
-                self.take_owed_step(step_report::AdmissionWait::Commit);
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
     /// One hold of `memory_object_commit` (and of `dma_map`'s fill-in):
     /// commits the pages from `*next` up to one commit step's end. The
     /// step's cost is admitted against the object's creator in this hold,
@@ -11268,137 +11210,32 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         let first = *next / page_size;
         let count = (step_end - *next) / page_size;
         let mut paging = self.paging.lock();
-        let mut session = paging.page_table_mutation_session(
+        let session = paging.page_table_mutation_session(
             self.own.active_root.as_ref().expect("active root"),
             process,
         );
-        let teardown_owed = !self.core.owed_teardown.is_empty();
-        let admit_began = step_report::ticks();
-        // The whole step first. A quota refusal closes every fault window
-        // and admits once more, so credit is never the reason a commit is
-        // refused (DW2 §13.16 part e3).
-        let whole = {
-            let cost = session
-                .on_demand_commit_range_cost(backing, first, count)
-                .map_err(|_| DW_STATUS_BAD_STATE)?;
-            let admitted = if cost == 0 {
-                Ok(())
-            } else {
-                crate::syscall::admit_charged_pages(
-                    &self.core.registry,
-                    &self.core.tasks,
-                    object,
-                    cost,
-                )
-            };
-            match admitted {
-                Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
-                    if session.close_all_fault_windows(
-                        &mut crate::syscall::RegistryWindowCharges {
-                            registry: &mut self.core.registry,
-                            tasks: &self.core.tasks,
-                        },
-                    ) != 0 =>
-                {
-                    crate::syscall::admit_charged_pages(
-                        &self.core.registry,
-                        &self.core.tasks,
-                        object,
-                        cost,
-                    )
-                    .map(|()| cost)
-                }
-                admitted => admitted.map(|()| cost),
-            }
+        let mut hold = LiveCommitStep {
+            session,
+            registry: &mut self.core.registry,
+            tasks: &self.core.tasks,
+            memory: &self.core.memory,
+            owed_teardown: &self.core.owed_teardown,
+            backing,
+            object,
+            first,
+            stamps: [None; 3],
         };
-        let registry = &self.core.registry;
-        let tasks = &self.core.tasks;
-        let cost_of = |pages: u64| {
-            session
-                .on_demand_commit_range_cost(backing, first, pages)
-                .map_err(|_| DW_STATUS_BAD_STATE)
-        };
-        let admit = |pages: u64| -> Result<u64, deepwyrm_abi::DwStatus> {
-            let cost = cost_of(pages)?;
-            if cost != 0 {
-                crate::syscall::admit_charged_pages(registry, tasks, object, cost)?;
-            }
-            Ok(cost)
-        };
-        // The whole step, or else the longest start of it the quota admits,
-        // so a commit still fills the quota exactly: at most ten admissions.
-        let (admitted, cost, mut result) = match whole {
-            Ok(cost) => (count, cost, Ok(())),
-            // Owed: owed work could admit the whole step, so nothing is
-            // committed and the step is taken again after the owed step.
-            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES)
-                if teardown_owed
-                    || crate::syscall::charged_pages_refusal_owed(
-                        registry,
-                        tasks,
-                        object,
-                        cost_of(count)?,
-                    ) =>
-            {
-                drop(session);
-                drop(paging);
-                self.take_owed_step(step_report::AdmissionWait::Commit);
-                return Ok(CommitStep::Owed);
-            }
-            Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => {
-                let (mut fits, mut fits_cost, mut refused) = (0, 0, count);
-                while refused - fits > 1 {
-                    let middle = fits + (refused - fits) / 2;
-                    match admit(middle) {
-                        Ok(cost) => (fits, fits_cost) = (middle, cost),
-                        Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES) => refused = middle,
-                        Err(status) => return Err(status),
-                    }
-                }
-                (fits, fits_cost, Err(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
-            }
-            Err(status) => return Err(status),
-        };
-        let admit_ended = step_report::ticks();
-        let mut frames = 0;
-        for page in first..first + admitted {
-            match session.commit_on_demand_page(backing, page) {
-                Ok(commit) => frames += commit.frames,
-                Err(error) => {
-                    result = Err(match error {
-                        crate::memory::frame_roles::FrameRoleError::Physical(_)
-                        | crate::memory::frame_roles::FrameRoleError::Capacity
-                        | crate::memory::frame_roles::FrameRoleError::InitializationFailed => {
-                            deepwyrm_abi::DW_STATUS_NO_MEMORY
-                        }
-                        _ => DW_STATUS_BAD_STATE,
-                    });
-                    break;
-                }
-            }
-            *next += page_size;
+        let step = crate::syscall::fill_in::commit_step(&mut hold, next, end, count, page_size);
+        if let [Some(admit_began), Some(admit_ended), Some(taken)] = hold.stamps {
+            step_report::commit_step(began, admit_began, admit_ended, taken, step_report::ticks());
         }
-        let taken = step_report::ticks();
-        // What was taken stays committed and charged, even after a failure.
-        debug_assert!(frames <= cost, "a commit step took more than it admitted");
-        if frames != 0 {
-            crate::syscall::record_charged_pages(&mut self.core.registry, object, frames);
-        }
-        step_report::commit_step(began, admit_began, admit_ended, taken, step_report::ticks());
         // P is let go before an owed step, whose drain takes it again.
-        drop(session);
+        drop(hold);
         drop(paging);
-        match result {
-            Ok(()) if *next >= end => Ok(CommitStep::Done),
-            Ok(()) => Ok(CommitStep::More),
-            Err(deepwyrm_abi::DW_STATUS_NO_MEMORY)
-                if self.refusal_owed(deepwyrm_abi::DW_STATUS_NO_MEMORY, |_| false) =>
-            {
-                self.take_owed_step(step_report::AdmissionWait::Commit);
-                Ok(CommitStep::Owed)
-            }
-            Err(status) => Err(status),
+        if let Ok(CommitStep::Owed) = step {
+            self.take_owed_step(step_report::AdmissionWait::Commit);
         }
+        step
     }
 
     /// Takes the hold's owed step for a refusal owed work could admit (DW2
@@ -11426,7 +11263,7 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 !self.core.owed_teardown.is_empty() || quota_owed(self)
             }
             deepwyrm_abi::DW_STATUS_NO_MEMORY => {
-                !self.core.owed_teardown.is_empty() || self.core.memory.finalization_owed()
+                memory_refusal_owed(&self.core.owed_teardown, &self.core.memory)
             }
             _ => false,
         }
@@ -13025,6 +12862,142 @@ fn admit_fault_charges(
             Err(Outcome::Exhausted(deepwyrm_abi::DW_STATUS_NO_RESOURCES))
         }
         Err(_) => Err(Outcome::Unserved),
+    }
+}
+
+/// Whether a frame refusal (`NO_MEMORY`) is owed (DW2 §13.12 part b): any
+/// finalization or teardown is owed.
+fn memory_refusal_owed(
+    owed_teardown: &crate::object::slot_queue::SlotQueue<ProcessKey, REGISTRY_OBJECTS>,
+    memory: &Memory,
+) -> bool {
+    !owed_teardown.is_empty() || memory.finalization_owed()
+}
+
+/// One hold of a fill-in is the carrier's (DW2 M6 §8.6).
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> crate::syscall::fill_in::FillInHold
+    for PrimordialRuntimeCarrier<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn service_timer_expiries(&mut self) {
+        if self.cpu() == crate::cpu::CpuIndex::BOOTSTRAP {
+            self.service_pending_timer_expiries_on_bootstrap();
+        }
+    }
+
+    fn on_demand(&mut self, address: u64) -> bool {
+        let process = self.own.scheduled().process;
+        match self
+            .core
+            .regions
+            .root_mapping_at(&self.core.tasks, process, address)
+        {
+            Ok(Some(mapping)) => mapping
+                .object_id()
+                .is_some_and(|object| self.core.memory.object_is_on_demand(object)),
+            _ => false,
+        }
+    }
+
+    fn serve(&mut self, address: u64, write: bool) -> crate::syscall::fill_in::FillServe {
+        const USER: u64 = 1 << 2;
+        const WRITE: u64 = 1 << 1;
+        let error = USER | if write { WRITE } else { 0 };
+        step_report::fill_in_served();
+        let mut refused = None;
+        let outcome = self.serve_user_page_fault(address, error, &mut refused, false);
+        let owed = matches!(
+            outcome,
+            crate::syscall::native::UserPageFaultOutcome::Exhausted(status)
+                if self.serve_refusal_owed(status, refused)
+        );
+        crate::syscall::fill_in::FillServe { outcome, owed }
+    }
+
+    /// Owed (DW2 §13.12 part b): the hold takes its owed step, and the page
+    /// is served again after the next safe point.
+    fn take_owed_step(&mut self) {
+        PrimordialRuntimeCarrier::take_owed_step(self, step_report::AdmissionWait::Commit);
+    }
+}
+
+/// One hold of a commit step under T and P (DW2 M6 §8.4): the session
+/// beneath P, and the parts of T the step reads and charges.
+struct LiveCommitStep<'s, 'b, 'r, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    session: user_access::PageTableMutationSession<'b, 'r, RANGE_CAPACITY, ROLE_CAPACITY>,
+    registry: &'s mut Registry,
+    tasks: &'s Tasks,
+    memory: &'s Memory,
+    owed_teardown: &'s crate::object::slot_queue::SlotQueue<ProcessKey, REGISTRY_OBJECTS>,
+    backing: crate::memory::frame_roles::BackingIdentity,
+    object: crate::object::ObjectId,
+    /// The step's first object page.
+    first: u64,
+    /// The step report's stamps, by [`crate::syscall::fill_in::CommitPoint`].
+    stamps: [Option<u64>; 3],
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::syscall::fill_in::CommitStepHold
+    for LiveCommitStep<'_, '_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn cost(&mut self, pages: u64) -> Result<u64, deepwyrm_abi::DwStatus> {
+        self.session
+            .on_demand_commit_range_cost(self.backing, self.first, pages)
+            .map_err(|_| DW_STATUS_BAD_STATE)
+    }
+
+    fn admit(&mut self, cost: u64) -> Result<(), deepwyrm_abi::DwStatus> {
+        crate::syscall::admit_charged_pages(self.registry, self.tasks, self.object, cost)
+    }
+
+    fn close_all_windows(&mut self) -> usize {
+        self.session
+            .close_all_fault_windows(&mut crate::syscall::RegistryWindowCharges {
+                registry: &mut *self.registry,
+                tasks: self.tasks,
+            })
+    }
+
+    fn quota_refusal_owed(&mut self, cost: u64) -> bool {
+        !self.owed_teardown.is_empty()
+            || crate::syscall::charged_pages_refusal_owed(
+                self.registry,
+                self.tasks,
+                self.object,
+                cost,
+            )
+    }
+
+    fn commit(&mut self, index: u64) -> Result<u64, crate::syscall::fill_in::CommitRefusal> {
+        match self
+            .session
+            .commit_on_demand_page(self.backing, self.first + index)
+        {
+            Ok(commit) => Ok(commit.frames),
+            Err(
+                crate::memory::frame_roles::FrameRoleError::Physical(_)
+                | crate::memory::frame_roles::FrameRoleError::Capacity
+                | crate::memory::frame_roles::FrameRoleError::InitializationFailed,
+            ) => Err(crate::syscall::fill_in::CommitRefusal::NoMemory),
+            Err(_) => Err(crate::syscall::fill_in::CommitRefusal::BadState),
+        }
+    }
+
+    fn record(&mut self, frames: u64) {
+        crate::syscall::record_charged_pages(&mut *self.registry, self.object, frames);
+    }
+
+    fn memory_refusal_owed(&mut self) -> bool {
+        memory_refusal_owed(self.owed_teardown, self.memory)
+    }
+
+    fn stamp(&mut self, point: crate::syscall::fill_in::CommitPoint) {
+        let slot = match point {
+            crate::syscall::fill_in::CommitPoint::AdmitBegan => 0,
+            crate::syscall::fill_in::CommitPoint::AdmitEnded => 1,
+            crate::syscall::fill_in::CommitPoint::Taken => 2,
+        };
+        self.stamps[slot] = Some(step_report::ticks());
     }
 }
 

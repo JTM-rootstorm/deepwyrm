@@ -8,10 +8,10 @@
 pub(crate) mod native;
 
 #[cfg_attr(
-    not(test),
-    expect(
+    not(all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")),
+    allow(
         dead_code,
-        reason = "the live fill-in and commit step move onto these decisions in the next commit"
+        reason = "only the live facade fills in a syscall's buffers and commits in steps"
     )
 )]
 pub(crate) mod fill_in;
