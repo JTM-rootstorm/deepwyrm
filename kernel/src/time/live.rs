@@ -221,11 +221,6 @@ pub(crate) struct DeadlineRegistrationFailure {
 }
 
 impl DeadlineRegistrationFailure {
-    #[cfg(test)]
-    pub(crate) const fn error(&self) -> LiveTimeError {
-        self.error
-    }
-
     pub(crate) fn into_parts(self) -> (LiveTimeError, BlockWakeKey) {
         (self.error, self.wake)
     }

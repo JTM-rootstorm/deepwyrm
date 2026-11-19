@@ -5917,11 +5917,6 @@ pub(crate) unsafe fn poll_wait_idle_suspend<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
-        // The live detach needs the linked per-CPU stacks and the detached
-        // idle entry, which exist only in the freestanding kernel. A host test
-        // build under the DW1-C evidence cfg has the variant but not those.
-        #[cfg(test)]
-        IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
 
@@ -5965,11 +5960,6 @@ pub(crate) unsafe fn poll_wait_idle_suspend_on<
             .map_err(WaitSuspendError::Switch)?;
             Ok(NativeIdleSuspendPoll::Switch(plan))
         }
-        // The live detach needs the linked per-CPU stacks and the detached
-        // idle entry, which exist only in the freestanding kernel. A host test
-        // build under the DW1-C evidence cfg has the variant but not those.
-        #[cfg(test)]
-        IdleScheduleDecision::Detach(_) => Err(WaitSuspendError::InvalidDecision),
     }
 }
 

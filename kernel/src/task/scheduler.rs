@@ -417,127 +417,6 @@ pub(crate) struct SchedulerMigrationRejection {
     pub(crate) reason: SchedulerMigrationRejectionReason,
 }
 
-/// Fixture identity used to install DW1-C's deterministic scheduler
-/// fixture from the already validated ARM table. This is not affinity ABI.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Dw1cSchedulerActorIdentity {
-    pub(crate) thread: ThreadKey,
-    pub(crate) execution_generation: u64,
-}
-
-/// DW1-C fixture request for one CPU to leave a blocked actor's suspended
-/// continuation on its ordinary detached idle carrier.  The exact execution
-/// generation prevents a late ARM retry from detaching a later run of the
-/// same Thread.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Dw1cContinuationDetachRequest {
-    cpu: SchedulerCpuId,
-    thread: ThreadKey,
-    execution_generation: u64,
-}
-
-#[cfg(test)]
-impl Dw1cContinuationDetachRequest {
-    pub(crate) const fn cpu(self) -> SchedulerCpuId {
-        self.cpu
-    }
-
-    pub(crate) const fn thread(self) -> ThreadKey {
-        self.thread
-    }
-
-    pub(crate) const fn execution_generation(self) -> u64 {
-        self.execution_generation
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Dw1cTerminalGate {
-    NotFixture,
-    AwaitingExpiry,
-    Ready,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct Dw1cSchedulerActor {
-    thread: ThreadKey,
-    arm_generation: u64,
-    arm_block_token: u64,
-    lane_cpu: SchedulerCpuId,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct Dw1cSchedulerFixture {
-    reporter_thread: ThreadKey,
-    reporter_cpu: SchedulerCpuId,
-    actors: [Dw1cSchedulerActor; 8],
-    lane_complete_mask: u64,
-    token8_gate_claim: Option<RunningClaim>,
-    held_token8_expiry: Option<SchedulerQuantumTicket>,
-    token8_expiry_observed: bool,
-    token8_terminal_consumed: bool,
-}
-
-#[cfg(test)]
-impl Dw1cSchedulerFixture {
-    fn actor(&self, thread: ThreadKey) -> Option<(usize, Dw1cSchedulerActor)> {
-        self.actors
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, actor)| actor.thread == thread)
-    }
-
-    fn lane_complete(&self, cpu: SchedulerCpuId) -> bool {
-        self.lane_complete_mask & (1_u64 << cpu.index()) != 0
-    }
-
-    fn restricted_target(&self, thread: ThreadKey) -> Option<SchedulerCpuId> {
-        if thread == self.reporter_thread {
-            return Some(self.reporter_cpu);
-        }
-        self.actor(thread)
-            .and_then(|(_, actor)| (!self.lane_complete(actor.lane_cpu)).then_some(actor.lane_cpu))
-    }
-
-    fn lane_pair_completed(
-        &self,
-        cpu: SchedulerCpuId,
-        outgoing: ThreadKey,
-        outgoing_generation: u64,
-        incoming: ThreadKey,
-        incoming_generation: u64,
-    ) -> bool {
-        // `complete_switch_on` has already authenticated `outgoing` against
-        // the exact suspended execution generation and obtains `incoming`
-        // from the exact current Running claim. A later generation is valid
-        // because either actor may be preempted again before its lane peer
-        // becomes eligible. Retaining the ARM generation as a lower bound,
-        // and requiring the fixed adjacent actor pair, keeps completion tied
-        // to this fixture's post-ARM lane lineage rather than stale snapshots.
-        let Some((outgoing_index, outgoing_actor)) = self.actor(outgoing) else {
-            return false;
-        };
-        let Some((incoming_index, incoming_actor)) = self.actor(incoming) else {
-            return false;
-        };
-        outgoing_index ^ 1 == incoming_index
-            && outgoing_actor.lane_cpu == cpu
-            && incoming_actor.lane_cpu == cpu
-            && outgoing_generation >= outgoing_actor.arm_generation
-            && incoming_generation >= incoming_actor.arm_generation
-    }
-
-    fn token8(&self) -> Dw1cSchedulerActor {
-        self.actors[7]
-    }
-}
-
 impl RunnablePublication {
     pub(crate) const fn target(self) -> SchedulerCpuId {
         self.target
@@ -557,8 +436,6 @@ pub(crate) enum IdleScheduleDecision {
     ContinueIdle,
     ResumeCurrent,
     Switch(ScheduleDecision),
-    #[cfg(test)]
-    Detach(Dw1cContinuationDetachRequest),
 }
 
 #[derive(Debug)]
@@ -689,54 +566,6 @@ pub(crate) struct SchedulerCounters {
     pub(crate) idle_time_ns: u64,
     pub(crate) longest_ready_delay_ns: u64,
     pub(crate) overflow_fault: bool,
-}
-
-/// One DW1-C fixture, whole-scheduler accounting observation. Both
-/// identities are minted while the scheduler lock is held, after every
-/// retained ownership and accounting invariant has been validated. They are
-/// scheduler-snapshot identities for DW1-C records 42 and 44, not actor tokens
-/// or actor execution generations.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Dw1cFinalSchedulerSnapshot {
-    token: u64,
-    generation: u64,
-    max_ready_delay_ns: u64,
-    accounting_mask: u8,
-}
-
-#[cfg(test)]
-impl Dw1cFinalSchedulerSnapshot {
-    pub(crate) const fn token(self) -> u64 {
-        self.token
-    }
-
-    pub(crate) const fn generation(self) -> u64 {
-        self.generation
-    }
-
-    pub(crate) const fn max_ready_delay_ns(self) -> u64 {
-        self.max_ready_delay_ns
-    }
-
-    pub(crate) const fn accounting_mask(self) -> u8 {
-        self.accounting_mask
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn for_test(
-        token: u64,
-        generation: u64,
-        max_ready_delay_ns: u64,
-        accounting_mask: u8,
-    ) -> Self {
-        Self {
-            token,
-            generation,
-            max_ready_delay_ns,
-            accounting_mask,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -893,10 +722,6 @@ struct SchedulerState<const CAPACITY: usize> {
     next_idle_generation: u64,
     next_wake_generation: u64,
     next_completed_switch_generation: u64,
-    #[cfg(test)]
-    next_final_snapshot_token: u64,
-    #[cfg(test)]
-    next_final_snapshot_generation: u64,
     next_quantum_generation: [u64; H2_SCHEDULER_CPU_CAPACITY],
     queue: [Option<QueueEntry>; CAPACITY],
     len: usize,
@@ -921,16 +746,6 @@ struct SchedulerState<const CAPACITY: usize> {
     last_migration: Option<SchedulerMigrationRecord>,
     carrier_admission: CarrierAdmissionState,
     #[cfg(test)]
-    dw1c_fixture: Option<Dw1cSchedulerFixture>,
-    #[cfg(test)]
-    dw1c_continuation_detach: [Option<Dw1cContinuationDetachRequest>; H2_SCHEDULER_CPU_CAPACITY],
-    #[cfg(test)]
-    accounting_underflow_fault: bool,
-    #[cfg(test)]
-    time_regression_fault: bool,
-    #[cfg(test)]
-    terminal_retired: [Option<ThreadKey>; CAPACITY],
-    #[cfg(test)]
     trace: SchedulerTrace,
 }
 
@@ -946,10 +761,6 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             next_idle_generation: 1,
             next_wake_generation: 1,
             next_completed_switch_generation: 1,
-            #[cfg(test)]
-            next_final_snapshot_token: 1,
-            #[cfg(test)]
-            next_final_snapshot_generation: 1,
             next_quantum_generation: [1; H2_SCHEDULER_CPU_CAPACITY],
             queue: [None; CAPACITY],
             len: 0,
@@ -967,16 +778,6 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             preemption_disable_depth: [0; H2_SCHEDULER_CPU_CAPACITY],
             last_migration: None,
             carrier_admission: CarrierAdmissionState::new(),
-            #[cfg(test)]
-            dw1c_fixture: None,
-            #[cfg(test)]
-            dw1c_continuation_detach: [None; H2_SCHEDULER_CPU_CAPACITY],
-            #[cfg(test)]
-            accounting_underflow_fault: false,
-            #[cfg(test)]
-            time_regression_fault: false,
-            #[cfg(test)]
-            terminal_retired: [None; CAPACITY],
             #[cfg(test)]
             trace: SchedulerTrace::new(),
         }
@@ -997,17 +798,8 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         match error {
             SchedulerError::AccountingOverflow | SchedulerError::AccountingUnderflow => {
                 self.accounting.retain_faults_from(attempted);
-                #[cfg(test)]
-                if error == SchedulerError::AccountingUnderflow {
-                    self.accounting_underflow_fault = true;
-                }
             }
-            SchedulerError::TimeRegression => {
-                #[cfg(test)]
-                {
-                    self.time_regression_fault = true;
-                }
-            }
+            SchedulerError::TimeRegression => {}
             _ => panic!("unexpected scheduler telemetry rejection: {error:?}"),
         }
         #[cfg(not(test))]
@@ -1015,10 +807,6 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
     }
 
     fn reject_time_regression(&mut self) -> SchedulerError {
-        #[cfg(test)]
-        {
-            self.time_regression_fault = true;
-        }
         SchedulerError::TimeRegression
     }
 
@@ -1218,29 +1006,16 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         victim: SchedulerCpuId,
         target: SchedulerCpuId,
     ) -> bool {
-        self.entry_migratable_without_external_exclusion(entry, victim, target)
-            && {
-                #[cfg(test)]
-                {
-                    self.dw1c_fixture
-                        .and_then(|fixture| fixture.restricted_target(entry.thread))
-                        .is_none()
-                }
-                #[cfg(not(test))]
-                {
-                    true
-                }
+        self.entry_migratable_without_external_exclusion(entry, victim, target) && {
+            #[cfg(test)]
+            {
+                entry.migration_exclusion.is_none()
             }
-            && {
-                #[cfg(test)]
-                {
-                    entry.migration_exclusion.is_none()
-                }
-                #[cfg(not(test))]
-                {
-                    true
-                }
+            #[cfg(not(test))]
+            {
+                true
             }
+        }
     }
 
     fn entry_migratable_without_external_exclusion(
@@ -1290,13 +1065,6 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
         }
         if let Some(exclusion) = entry.migration_exclusion {
             return Err(exclusion);
-        }
-        if self
-            .dw1c_fixture
-            .and_then(|fixture| fixture.restricted_target(entry.thread))
-            .is_some()
-        {
-            return Err(SchedulerMigrationRejectionReason::NotRevalidatable);
         }
         Ok(())
     }
@@ -1711,25 +1479,9 @@ impl<const CAPACITY: usize> SchedulerState<CAPACITY> {
             if self.quantum[cpu_index].is_some() && self.need_resched[cpu_index].is_some() {
                 return Err(SchedulerError::StaleQuantum);
             }
-            #[cfg(test)]
-            let held_dw1c_expiry = self
-                .dw1c_fixture
-                .and_then(|fixture| fixture.held_token8_expiry)
-                .filter(|ticket| ticket.cpu == cpu);
-            #[cfg(not(test))]
-            let held_dw1c_expiry: Option<SchedulerQuantumTicket> = None;
-            if held_dw1c_expiry.is_some()
-                && (self.quantum[cpu_index].is_some() || self.need_resched[cpu_index].is_some())
-            {
-                return Err(SchedulerError::StaleQuantum);
-            }
-            for ticket in [
-                self.quantum[cpu_index],
-                self.need_resched[cpu_index],
-                held_dw1c_expiry,
-            ]
-            .into_iter()
-            .flatten()
+            for ticket in [self.quantum[cpu_index], self.need_resched[cpu_index]]
+                .into_iter()
+                .flatten()
             {
                 if ticket.domain != self.domain
                     || ticket.cpu != cpu
@@ -1873,256 +1625,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         Self {
             state: IrqSpinMutex::new(SchedulerState::new()),
         }
-    }
-
-    /// Installs the DW1-C deterministic placement fixture after ARM has
-    /// authenticated the exact reporter and actor table. No evidence observer
-    /// is invoked while scheduler authority is held.
-    #[cfg(test)]
-    pub(crate) fn install_dw1c_fixture(
-        &self,
-        reporter: SchedulerExecutionClaim,
-        actors: [Dw1cSchedulerActorIdentity; 8],
-    ) -> Result<(), SchedulerError> {
-        let mut state = self.state.lock();
-        if reporter.domain != state.domain || reporter.generation == 0 {
-            return Err(SchedulerError::ForeignExecutionClaim);
-        }
-        if state.dw1c_fixture.is_some()
-            || state.running[reporter.cpu.index()]
-                != Some(RunningClaim {
-                    thread: reporter.thread,
-                    generation: reporter.generation,
-                })
-            || state.suspended[reporter.cpu.index()].is_some()
-            || state.pending_block[reporter.cpu.index()].is_some()
-        {
-            return Err(SchedulerError::StaleExecutionClaim);
-        }
-        let schedulable = state.schedulable_mask();
-        if schedulable.count_ones() != 4 || schedulable & (1_u64 << reporter.cpu.index()) == 0 {
-            return Err(SchedulerError::CarrierUnavailable);
-        }
-        for (index, actor) in actors.iter().copied().enumerate() {
-            if actor.execution_generation == 0
-                || actors[..index]
-                    .iter()
-                    .any(|prior| prior.thread == actor.thread)
-                || actor.thread == reporter.thread
-            {
-                return Err(SchedulerError::DuplicateThread);
-            }
-            let Some(entry) = state.queue[..state.len]
-                .iter()
-                .flatten()
-                .find(|entry| entry.thread == actor.thread)
-            else {
-                if state.running.iter().flatten().any(|claim| {
-                    claim.thread == actor.thread && claim.generation == actor.execution_generation
-                }) || state.suspended.iter().flatten().any(|claim| {
-                    claim.thread == actor.thread && claim.generation == actor.execution_generation
-                }) {
-                    return Err(SchedulerError::ContinuationOwned);
-                }
-                return Err(SchedulerError::NotScheduled);
-            };
-            if entry.state != SchedulerThreadState::Blocked
-                || entry.block_execution_generation != actor.execution_generation
-                || entry.continuation_cpu.is_some()
-                || entry.continuation_generation != 0
-                || state
-                    .suspended
-                    .iter()
-                    .flatten()
-                    .any(|suspended| suspended.thread == actor.thread)
-            {
-                return Err(SchedulerError::ContinuationOwned);
-            }
-        }
-        let mut other_cpus = [SchedulerCpuId::BOOTSTRAP; 3];
-        let mut other_count = 0;
-        for cpu_index in 0..H2_SCHEDULER_CPU_CAPACITY {
-            let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
-            if schedulable & (1_u64 << cpu_index) != 0 && cpu != reporter.cpu {
-                if other_count >= other_cpus.len() {
-                    return Err(SchedulerError::CarrierUnavailable);
-                }
-                other_cpus[other_count] = cpu;
-                other_count += 1;
-            }
-        }
-        if other_count != other_cpus.len() {
-            return Err(SchedulerError::CarrierUnavailable);
-        }
-        let fixture_actors = core::array::from_fn(|index| Dw1cSchedulerActor {
-            thread: actors[index].thread,
-            arm_generation: actors[index].execution_generation,
-            arm_block_token: state.queue[..state.len]
-                .iter()
-                .flatten()
-                .find(|entry| entry.thread == actors[index].thread)
-                .expect("validated DW1C actor remains queued")
-                .token,
-            lane_cpu: if index < 2 {
-                reporter.cpu
-            } else {
-                other_cpus[(index - 2) / 2]
-            },
-        });
-        state.dw1c_fixture = Some(Dw1cSchedulerFixture {
-            reporter_thread: reporter.thread,
-            reporter_cpu: reporter.cpu,
-            actors: fixture_actors,
-            lane_complete_mask: 0,
-            token8_gate_claim: None,
-            held_token8_expiry: None,
-            token8_expiry_observed: false,
-            token8_terminal_consumed: false,
-        });
-        state.assert_invariants();
-        Ok(())
-    }
-
-    /// Selects the exact carrier that must rescan before the DW1-C fixture can retry
-    /// ARM.  A blocked actor may still own its physically suspended syscall
-    /// continuation after the remaining CPUs become quiescent.  Returning
-    /// `WOULD_BLOCK` alone cannot wake that carrier, so the caller stages one
-    /// ordinary affine idle-wake after dropping runtime authority.
-    #[cfg(test)]
-    pub(crate) fn stage_dw1c_arm_retry_detach(
-        &self,
-        actors: [Dw1cSchedulerActorIdentity; 8],
-    ) -> Option<SchedulerCpuId> {
-        let mut state = self.state.lock();
-        let request = actors.into_iter().find_map(|actor| {
-            let entry = state.queue[..state.len].iter().flatten().find(|entry| {
-                entry.thread == actor.thread
-                    && entry.block_execution_generation == actor.execution_generation
-            })?;
-            let cpu = entry.continuation_cpu?;
-            state.suspended[cpu.index()]
-                .filter(|suspended| {
-                    suspended.thread == actor.thread
-                        && suspended.generation == actor.execution_generation
-                        && suspended.publication == SuspendedPublication::Queued
-                })
-                .map(|_| Dw1cContinuationDetachRequest {
-                    cpu,
-                    thread: actor.thread,
-                    execution_generation: actor.execution_generation,
-                })
-        })?;
-        let slot = &mut state.dw1c_continuation_detach[request.cpu.index()];
-        match *slot {
-            None => *slot = Some(request),
-            Some(existing) if existing == request => {}
-            Some(_) => return None,
-        }
-        state.assert_invariants();
-        Some(request.cpu)
-    }
-
-    /// Returns the exact DW1-C detach request only while the named
-    /// generation still owns this CPU's physically suspended continuation.
-    #[cfg(test)]
-    pub(crate) fn dw1c_continuation_detach_request_on(
-        &self,
-        cpu: SchedulerCpuId,
-        suspended: ThreadKey,
-    ) -> Option<Dw1cContinuationDetachRequest> {
-        let state = self.state.lock();
-        let request = state.dw1c_continuation_detach[cpu.index()]?;
-        let continuation = state.suspended[cpu.index()]?;
-        (request.cpu == cpu
-            && request.thread == suspended
-            && continuation.thread == request.thread
-            && continuation.generation == request.execution_generation
-            && continuation.publication == SuspendedPublication::Queued)
-            .then_some(request)
-    }
-
-    /// Clears only the request that has already completed its physical switch
-    /// to the CPU-private detached idle carrier.
-    #[cfg(test)]
-    pub(crate) fn complete_dw1c_continuation_detach(
-        &self,
-        request: Dw1cContinuationDetachRequest,
-    ) -> Result<(), SchedulerError> {
-        let mut state = self.state.lock();
-        let cpu_index = request.cpu.index();
-        if state.dw1c_continuation_detach[cpu_index] != Some(request)
-            || state.suspended[cpu_index].is_some()
-        {
-            return Err(SchedulerError::StaleExecutionClaim);
-        }
-        state.dw1c_continuation_detach[cpu_index] = None;
-        state.assert_invariants();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dw1c_terminal_gate(&self, thread: ThreadKey) -> Dw1cTerminalGate {
-        let state = self.state.lock();
-        let Some(fixture) = state.dw1c_fixture else {
-            return Dw1cTerminalGate::NotFixture;
-        };
-        if fixture.token8().thread != thread || fixture.token8_terminal_consumed {
-            return Dw1cTerminalGate::NotFixture;
-        }
-        if fixture.held_token8_expiry.is_some() && fixture.token8_expiry_observed {
-            Dw1cTerminalGate::Ready
-        } else {
-            Dw1cTerminalGate::AwaitingExpiry
-        }
-    }
-
-    /// Opens the DW1-C token-8 terminal gate only after the collector has
-    /// accepted the exact scheduler-published expiry. Publication and evidence
-    /// observation intentionally occur on opposite sides of scheduler
-    /// ownership, so holding the ticket alone is not yet a terminal permit.
-    #[cfg(test)]
-    pub(crate) fn acknowledge_dw1c_quantum_observation(
-        &self,
-        ticket: SchedulerQuantumTicket,
-    ) -> Result<(), SchedulerError> {
-        let mut state = self.state.lock();
-        let Some(fixture) = state.dw1c_fixture.as_mut() else {
-            return Ok(());
-        };
-        let Some(held) = fixture.held_token8_expiry else {
-            return Ok(());
-        };
-        if held != ticket {
-            return Ok(());
-        }
-        if fixture.token8_terminal_consumed || fixture.token8_expiry_observed {
-            return Err(SchedulerError::StaleQuantum);
-        }
-        fixture.token8_expiry_observed = true;
-        state.assert_invariants();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dw1c_token2_relay_ready(&self) -> bool {
-        let state = self.state.lock();
-        let Some(fixture) = state.dw1c_fixture else {
-            return false;
-        };
-        let actor = fixture.actors[1];
-        state.queue[..state.len].iter().flatten().any(|entry| {
-            entry.thread == actor.thread
-                && entry.state == SchedulerThreadState::Blocked
-                && entry.token != 0
-                && entry.token != actor.arm_block_token
-                && entry.block_execution_generation != 0
-                && entry.continuation_cpu.is_none()
-                && entry.continuation_generation == 0
-        }) && !state
-            .suspended
-            .iter()
-            .flatten()
-            .any(|suspended| suspended.thread == actor.thread)
     }
 
     pub(crate) fn reserve(
@@ -2548,17 +2050,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
     ) -> Result<Option<SchedulerQuantumTicket>, SchedulerError> {
         let mut state = self.state.lock();
         let claim = state.running[cpu.index()].ok_or(SchedulerError::NotRunning)?;
-        #[cfg(test)]
-        if state.dw1c_fixture.is_some_and(|fixture| {
-            fixture.held_token8_expiry.is_some_and(|ticket| {
-                ticket.cpu == cpu
-                    && ticket.thread == claim.thread
-                    && ticket.execution_generation == claim.generation
-            })
-        }) {
-            state.assert_invariants();
-            return Ok(None);
-        }
         if state.suspended[cpu.index()].is_some()
             || state.pending_block[cpu.index()].is_some()
             || state.need_resched[cpu.index()].is_some()
@@ -2600,36 +2091,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(error);
         }
         state.quantum[cpu_index] = None;
-        #[cfg(test)]
-        let hold_for_dw1c = state.dw1c_fixture.is_some_and(|fixture| {
-            !fixture.token8_terminal_consumed
-                && fixture.token8_gate_claim.is_some_and(|claim| {
-                    ticket.cpu == fixture.token8().lane_cpu
-                        && ticket.thread == claim.thread
-                        && ticket.execution_generation == claim.generation
-                })
-        });
-        #[cfg(test)]
-        if hold_for_dw1c {
-            let fixture = state
-                .dw1c_fixture
-                .as_mut()
-                .expect("DW1C held expiry requires the installed fixture");
-            if fixture.held_token8_expiry.replace(ticket).is_some() {
-                state.assert_invariants();
-                return Err(SchedulerError::StaleQuantum);
-            }
-        } else {
-            match state.need_resched[cpu_index] {
-                None => state.need_resched[cpu_index] = Some(ticket),
-                Some(current) if current == ticket => {}
-                Some(_) => {
-                    state.assert_invariants();
-                    return Err(SchedulerError::StaleQuantum);
-                }
-            }
-        }
-        #[cfg(not(test))]
         match state.need_resched[cpu_index] {
             None => state.need_resched[cpu_index] = Some(ticket),
             Some(current) if current == ticket => {}
@@ -3136,14 +2597,7 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             return Err(SchedulerError::StaleBlockToken);
         };
         let blocked = state.queue[index].expect("validated blocked scheduler entry remains queued");
-        #[cfg(test)]
-        let fixture_target = state
-            .dw1c_fixture
-            .and_then(|fixture| fixture.restricted_target(blocked.thread));
-        #[cfg(not(test))]
-        let fixture_target: Option<SchedulerCpuId> = None;
-        let Some(target) = fixture_target.or_else(|| state.select_placement(blocked, requester))
-        else {
+        let Some(target) = state.select_placement(blocked, requester) else {
             return Err(SchedulerError::CarrierUnavailable);
         };
         let (wake_generation, next_wake_generation) = state.checked_wake_generation()?;
@@ -3216,60 +2670,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             source: requester,
             generation: wake_generation,
         })
-    }
-
-    /// Performs the DW1-C token-6 wake and deliberate migration rejection
-    /// under one scheduler acquisition. The woken generation cannot dispatch
-    /// between Runnable publication and the exact exclusion probe.
-    #[cfg(test)]
-    pub(crate) fn wake_with_migration_rejection_on(
-        &self,
-        requester: SchedulerCpuId,
-        key: BlockWakeKey,
-        reason: SchedulerMigrationRejectionReason,
-    ) -> Result<(SchedulerWakePublication, SchedulerMigrationRejection), SchedulerError> {
-        let mut state = self.state.lock();
-        let publication = Self::wake_on_locked(&mut state, requester, key)?;
-        let Some(index) = state.queue[..state.len]
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.thread == key.thread))
-        else {
-            return Err(SchedulerError::NotScheduled);
-        };
-        let entry = state.queue[index]
-            .as_mut()
-            .expect("located DW1C wake entry remains queued");
-        if entry.state != SchedulerThreadState::Runnable
-            || entry.started_execution_generation != key.execution_generation
-            || entry.migration_exclusion.is_some()
-        {
-            return Err(SchedulerError::StaleExecutionClaim);
-        }
-        entry.migration_exclusion = Some(reason);
-        let candidate = *entry;
-        let victim = candidate.target_cpu;
-        let target = publication.source();
-        let attempt = if victim == target {
-            Err(SchedulerError::StaleExecutionClaim)
-        } else {
-            state
-                .selector_migration_attempt(candidate, victim, target)
-                .err()
-                .filter(|observed| *observed == reason)
-                .map(|observed| SchedulerMigrationRejection {
-                    thread: key.thread,
-                    execution_generation: key.execution_generation,
-                    cpu: target,
-                    reason: observed,
-                })
-                .ok_or(SchedulerError::StaleExecutionClaim)
-        };
-        state.queue[index]
-            .as_mut()
-            .expect("DW1C rejection candidate remains queued")
-            .migration_exclusion = None;
-        state.assert_invariants();
-        Ok((publication, attempt?))
     }
 
     pub(crate) fn wake(&self, key: BlockWakeKey) -> Result<(), SchedulerError> {
@@ -3351,17 +2751,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             || suspended_claim.publication != SuspendedPublication::Queued
         {
             return Err(SchedulerError::ContinuationOwned);
-        }
-        #[cfg(test)]
-        if let Some(request) = state.dw1c_continuation_detach[cpu_index]
-            && request.thread == suspended_claim.thread
-            && request.execution_generation == suspended_claim.generation
-        {
-            state.assert_invariants();
-            return Ok(SchedulerIdleDispatch {
-                decision: IdleScheduleDecision::Detach(request),
-                migration: None,
-            });
         }
         let local_runnable = state.queue[..state.len].iter().any(|entry| {
             entry.is_some_and(|entry| {
@@ -3538,31 +2927,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
             thread: incoming.thread,
             generation: incoming.generation,
         });
-        #[cfg(test)]
-        if let Some(incoming) = incoming_claim
-            && let Some(fixture) = state.dw1c_fixture.as_mut()
-        {
-            if suspended.involuntary_preemption
-                && fixture.lane_pair_completed(
-                    claim.cpu,
-                    claim.thread,
-                    claim.generation,
-                    incoming.thread,
-                    incoming.generation,
-                )
-            {
-                fixture.lane_complete_mask |= 1_u64 << claim.cpu.index();
-            }
-            if fixture.token8_gate_claim.is_none()
-                && fixture.lane_complete(fixture.token8().lane_cpu)
-                && fixture.token8().thread == incoming.thread
-            {
-                fixture.token8_gate_claim = Some(RunningClaim {
-                    thread: incoming.thread,
-                    generation: incoming.generation,
-                });
-            }
-        }
         state.mirror_liveness(claim.cpu, crate::debug::liveness::LivenessEvent::Dispatched);
         state.assert_invariants();
         Ok(SchedulerCompletedSwitch {
@@ -3800,40 +3164,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
         if state.pending_block[cpu_index].is_some_and(|pending| pending.thread == claim.thread) {
             state.pending_block[cpu_index] = None;
         }
-        #[cfg(test)]
-        let held_dw1c_expiry = if let Some(fixture) = state.dw1c_fixture.as_mut() {
-            if fixture.token8().thread == claim.thread && !fixture.token8_terminal_consumed {
-                if !fixture.token8_expiry_observed {
-                    return Err(SchedulerError::QuantumUnavailable);
-                }
-                let ticket = fixture
-                    .held_token8_expiry
-                    .take()
-                    .ok_or(SchedulerError::QuantumUnavailable)?;
-                if fixture.token8_gate_claim
-                    != Some(RunningClaim {
-                        thread: claim.thread,
-                        generation: claim.generation,
-                    })
-                    || ticket.cpu != claim.cpu
-                    || ticket.thread != claim.thread
-                    || ticket.execution_generation != claim.generation
-                {
-                    fixture.held_token8_expiry = Some(ticket);
-                    return Err(SchedulerError::StaleQuantum);
-                }
-                fixture.token8_gate_claim = None;
-                fixture.token8_expiry_observed = false;
-                fixture.token8_terminal_consumed = true;
-                Some(ticket)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        #[cfg(test)]
-        let _ = held_dw1c_expiry;
         let cleared_preemption = state.clear_preemption_on(claim.cpu);
         state.running[cpu_index] = None;
         state.suspended[cpu_index] = Some(SuspendedContinuation {
@@ -4037,138 +3367,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                 .find(|claim| claim.thread == thread)
                 .map(|claim| claim.generation),
         }
-    }
-
-    /// Captures the DW1-C terminal accounting relation under one scheduler
-    /// lock. No payload is returned, and no snapshot identity is consumed,
-    /// unless the complete live state and every sticky diagnostic remain
-    /// sound.
-    #[cfg(test)]
-    pub(crate) fn dw1c_final_snapshot(&self) -> Result<Dw1cFinalSchedulerSnapshot, SchedulerError> {
-        const ACCOUNTING_SOUND_MASK: u8 = 0x3f;
-
-        let mut state = self.state.lock();
-        let mut accounting_mask = 0_u8;
-
-        if state.accounting.cpu.iter().any(|cpu| cpu.overflow_fault) {
-            return Err(SchedulerError::AccountingOverflow);
-        }
-        accounting_mask |= 1 << 0;
-
-        if state.accounting_underflow_fault
-            || (0..H2_SCHEDULER_CPU_CAPACITY).any(|cpu_index| {
-                let cpu = SchedulerCpuId::new(cpu_index).expect("bounded scheduler CPU index");
-                let runnable = state.queue[..state.len]
-                    .iter()
-                    .flatten()
-                    .filter(|entry| {
-                        entry.state == SchedulerThreadState::Runnable && entry.target_cpu == cpu
-                    })
-                    .count() as u64;
-                state.accounting.cpu[cpu_index].current_runnable != runnable
-            })
-        {
-            return Err(SchedulerError::AccountingUnderflow);
-        }
-        if state.time_regression_fault
-            || state.instrumentation_now_ns.iter().flatten().any(|local| {
-                state
-                    .instrumentation_global_now_ns
-                    .is_some_and(|global| *local > global)
-            })
-        {
-            return Err(SchedulerError::TimeRegression);
-        }
-        accounting_mask |= 1 << 1;
-
-        for (index, claim) in state.running.iter().flatten().enumerate() {
-            if state
-                .running
-                .iter()
-                .flatten()
-                .skip(index + 1)
-                .any(|other| other.thread == claim.thread)
-            {
-                return Err(SchedulerError::DuplicateThread);
-            }
-        }
-        accounting_mask |= 1 << 2;
-
-        if state.running.iter().flatten().any(|claim| {
-            state.queue[..state.len]
-                .iter()
-                .flatten()
-                .any(|entry| entry.thread == claim.thread)
-        }) {
-            return Err(SchedulerError::DuplicateThread);
-        }
-        accounting_mask |= 1 << 3;
-
-        for (index, entry) in state.queue[..state.len].iter().flatten().enumerate() {
-            if state.queue[..state.len]
-                .iter()
-                .flatten()
-                .skip(index + 1)
-                .any(|other| other.thread == entry.thread)
-            {
-                return Err(SchedulerError::DuplicateThread);
-            }
-        }
-        accounting_mask |= 1 << 4;
-
-        if state.terminal_retired.iter().flatten().any(|terminal| {
-            state
-                .running
-                .iter()
-                .flatten()
-                .any(|claim| claim.thread == *terminal)
-                || state.queue[..state.len]
-                    .iter()
-                    .flatten()
-                    .any(|entry| entry.thread == *terminal)
-                || state
-                    .suspended
-                    .iter()
-                    .flatten()
-                    .any(|claim| claim.thread == *terminal)
-        }) {
-            return Err(SchedulerError::StaleExecutionClaim);
-        }
-        accounting_mask |= 1 << 5;
-
-        state.check_invariants()?;
-        if accounting_mask != ACCOUNTING_SOUND_MASK {
-            return Err(SchedulerError::StaleExecutionClaim);
-        }
-
-        let token = state.next_final_snapshot_token;
-        let generation = state.next_final_snapshot_generation;
-        let next_token = token
-            .checked_add(1)
-            .filter(|next| *next != 0)
-            .ok_or(SchedulerError::TokenExhausted)?;
-        let next_generation = generation
-            .checked_add(1)
-            .filter(|next| *next != 0)
-            .ok_or(SchedulerError::TokenExhausted)?;
-        if token == 0 || generation == 0 {
-            return Err(SchedulerError::TokenExhausted);
-        }
-        let max_ready_delay_ns = state
-            .accounting
-            .cpu
-            .iter()
-            .map(|cpu| cpu.longest_ready_delay_ns)
-            .max()
-            .unwrap_or(0);
-        state.next_final_snapshot_token = next_token;
-        state.next_final_snapshot_generation = next_generation;
-        Ok(Dw1cFinalSchedulerSnapshot {
-            token,
-            generation,
-            max_ready_delay_ns,
-            accounting_mask,
-        })
     }
 
     #[cfg(test)]
@@ -4501,8 +3699,6 @@ impl<const CAPACITY: usize> CooperativeScheduler<CAPACITY> {
                     cancelled_quantum: None,
                 }),
                 IdleScheduleDecision::Switch(decision) => Ok(decision),
-                #[cfg(test)]
-                IdleScheduleDecision::Detach(_) => Err(SchedulerError::ContinuationOwned),
             };
         }
         self.schedule_next_on(SchedulerCpuId::BOOTSTRAP)
