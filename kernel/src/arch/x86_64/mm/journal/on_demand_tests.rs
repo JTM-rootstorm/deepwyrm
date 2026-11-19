@@ -1232,17 +1232,25 @@ fn one_walk_writes_the_leaf_each_protection_needs() {
 /// (DW2 §15.2), as the shared fault session builds one: find, then write,
 /// with no commit (the page is committed already). The target is
 /// pin-tracked over `pins`.
+#[allow(
+    unsafe_code,
+    reason = "the keys were issued for the root and region this binds"
+)]
 fn touch_through_writer(fixture: &mut Fixture, address: u64, pins: &Pins) -> Touch {
     let mapping = fixture.mapping_at(address);
     fixture.with_pins(pins, |fixture, target| {
-        let mut writer = super::super::touched_leaf::TouchedLeafWriter::new(
-            fixture.region.address_space_key(),
-            fixture.region.region_key(),
-            &fixture.page_tables,
-            fixture.root,
-            &fixture.roles,
-            target,
-        )
+        // SAFETY: the keys were issued for this fixture's root and region, the
+        // target is its tables', and no other writer or publisher runs.
+        let mut writer = unsafe {
+            super::super::touched_leaf::TouchedLeafWriter::new(
+                fixture.region.address_space_key(),
+                fixture.region.region_key(),
+                &fixture.page_tables,
+                fixture.root,
+                &fixture.roles,
+                target,
+            )
+        }
         .unwrap();
         match writer.find_touched_leaf(&mapping, address) {
             Ok(TouchedLeaf::Found(place)) => (Ok(0), Some(writer.write_touched_leaf(place))),

@@ -1118,75 +1118,16 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn walk_leaf(&mut self, virtual_address: u64) -> Result<LiveUserWalk, LiveUserAccessError> {
-        let page = VirtualPage::containing(virtual_address)
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
-        if !page.is_user_half() {
-            return Err(LiveUserAccessError::Permission);
-        }
-        let mut current = self.identity;
-        let mut user = true;
-        let mut writable = true;
-        let mut executable = true;
-        for level in (1..=3).rev() {
-            let entry = self.read_entry(current, page.index(level))?;
-            if entry & PRESENT == 0 || entry & HUGE != 0 {
-                return Err(LiveUserAccessError::MissingOrInvalid);
-            }
-            user &= entry & USER != 0;
-            writable &= entry & WRITABLE != 0;
-            executable &= entry & NO_EXECUTE == 0;
-            let child_level = match level {
-                3 => TableLevel::Pdpt,
-                2 => TableLevel::Pd,
-                1 => TableLevel::Pt,
-                _ => unreachable!(),
-            };
-            let child = self
-                .roles
-                .table_identity(
-                    self.identity.owner(),
-                    child_level,
-                    entry & physical_mask(self.selected_root().capabilities),
-                )
-                .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
-            self.roles
-                .validate_table_child(current, child)
-                .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
-            current = child;
-        }
-        let entry = self.read_entry(current, page.index(0))?;
-        if entry & PRESENT == 0 || entry & HUGE != 0 {
-            return Err(LiveUserAccessError::MissingOrInvalid);
-        }
-        user &= entry & USER != 0;
-        writable &= entry & WRITABLE != 0;
-        executable &= entry & NO_EXECUTE == 0;
-        if !user {
-            return Err(LiveUserAccessError::Permission);
-        }
-        Ok(LiveUserWalk {
-            user,
-            writable,
-            executable,
-            physical: entry & physical_mask(self.selected_root().capabilities),
-        })
-    }
-
-    fn read_entry(
-        &mut self,
-        table: TableIdentity,
-        index: usize,
-    ) -> Result<u64, LiveUserAccessError> {
-        self.target
-            .read_entry(
-                FrameAddress::new(
-                    table.physical_start(),
-                    self.selected_root().physical_limit(),
-                )
-                .map_err(|_| LiveUserAccessError::MissingOrInvalid)?,
-                index,
-            )
-            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+        let root = self.selected_root();
+        let (limit, mask) = (root.physical_limit(), physical_mask(root.capabilities));
+        walk_user_leaf(
+            &*self.roles,
+            &mut self.target,
+            self.identity,
+            limit,
+            mask,
+            virtual_address,
+        )
     }
 
     fn preflight(&mut self, chunk: UserPageChunk) -> Result<(), LiveUserAccessError> {
@@ -1497,6 +1438,192 @@ impl<'borrow, 'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
             )
         }?;
         Ok((publisher, coherency))
+    }
+}
+
+/// Walks a user address to its leaf through `target`, the root identity
+/// `identity` and the role manager, which authenticates every table on the
+/// path as that root owner's, at its level and under its parent: the walk
+/// both live sessions make (D1 commit 9; DW2 §15.2). It reads only: the
+/// target's reads, and the role manager's table identities. `limit` and
+/// `mask` are the root's physical limit and address mask.
+fn walk_user_leaf<
+    T: crate::arch::x86_64::mm::AtomicPageTableTarget,
+    const RANGE_CAPACITY: usize,
+    const ROLE_CAPACITY: usize,
+>(
+    roles: &FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    target: &mut T,
+    identity: TableIdentity,
+    limit: crate::memory::physical::PhysicalAddressLimit,
+    mask: u64,
+    virtual_address: u64,
+) -> Result<LiveUserWalk, LiveUserAccessError> {
+    let mut read_entry = |table: TableIdentity, index: usize| {
+        target
+            .read_entry(
+                FrameAddress::new(table.physical_start(), limit)
+                    .map_err(|_| LiveUserAccessError::MissingOrInvalid)?,
+                index,
+            )
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)
+    };
+    let page = VirtualPage::containing(virtual_address)
+        .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+    if !page.is_user_half() {
+        return Err(LiveUserAccessError::Permission);
+    }
+    let mut current = identity;
+    let mut user = true;
+    let mut writable = true;
+    let mut executable = true;
+    for level in (1..=3).rev() {
+        let entry = read_entry(current, page.index(level))?;
+        if entry & PRESENT == 0 || entry & HUGE != 0 {
+            return Err(LiveUserAccessError::MissingOrInvalid);
+        }
+        user &= entry & USER != 0;
+        writable &= entry & WRITABLE != 0;
+        executable &= entry & NO_EXECUTE == 0;
+        let child_level = match level {
+            3 => TableLevel::Pdpt,
+            2 => TableLevel::Pd,
+            1 => TableLevel::Pt,
+            _ => unreachable!(),
+        };
+        let child = roles
+            .table_identity(identity.owner(), child_level, entry & mask)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        roles
+            .validate_table_child(current, child)
+            .map_err(|_| LiveUserAccessError::MissingOrInvalid)?;
+        current = child;
+    }
+    let entry = read_entry(current, page.index(0))?;
+    if entry & PRESENT == 0 || entry & HUGE != 0 {
+        return Err(LiveUserAccessError::MissingOrInvalid);
+    }
+    user &= entry & USER != 0;
+    writable &= entry & WRITABLE != 0;
+    executable &= entry & NO_EXECUTE == 0;
+    if !user {
+        return Err(LiveUserAccessError::Permission);
+    }
+    Ok(LiveUserWalk {
+        user,
+        writable,
+        executable,
+        physical: entry & mask,
+    })
+}
+
+/// The fast serve's session under a shared hold of P (DW2 §15.2): built by
+/// [`super::ActiveDeepPaging::try_build_shared_fault_session`] from `&P`,
+/// with the checks of the exclusive session's builder. It holds shared
+/// references only, and this CPU's own scratch target, pin-tracked in this
+/// CPU's mutation slot. It has no journal and no method that takes or
+/// returns `&mut` to anything P guards: what it writes is a leaf (one
+/// atomic store, through the writer's span and reread), this CPU's slot of
+/// the pin tracker (under the tracker's lock), and this CPU's scratch leaf
+/// when a table lies outside the direct map.
+pub(crate) struct SharedFaultSession<'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    pub(super) root: &'v PageTableRoot,
+    pub(super) identity: TableIdentity,
+    pub(super) address_space: crate::memory::address_region::AddressSpaceKey,
+    pub(super) roles: &'v FrameRoleManager<RANGE_CAPACITY, ROLE_CAPACITY>,
+    pub(super) windows: &'v LiveFaultWindows,
+    pub(super) target: TrackedActiveTarget<'v>,
+}
+
+impl<'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    SharedFaultSession<'v, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    /// CPU slot `cpu`'s fault window, copied.
+    pub(crate) fn fault_window(
+        &self,
+        cpu: usize,
+    ) -> Option<crate::memory::address_region::FaultWindow<super::UserCopyRoot>> {
+        self.windows.window(cpu).copied()
+    }
+
+    /// The touched-leaf writer for `address_space` and `region`, over this
+    /// session's root, role manager and target. It refuses an address space
+    /// that is not this session's, and makes the publisher constructor's
+    /// checks of the root ([`X86AddressSpacePublisher::new`]'s domain, root,
+    /// level and `validate_table_identity`).
+    ///
+    /// [`X86AddressSpacePublisher::new`]: crate::arch::x86_64::mm::X86AddressSpacePublisher
+    #[allow(
+        unsafe_code,
+        reason = "the shared session binds its own checked root, identity and address space to this CPU's target"
+    )]
+    pub(crate) fn leaf_writer(
+        &mut self,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        region: crate::memory::address_region::RegionKey,
+    ) -> Result<
+        crate::arch::x86_64::mm::TouchedLeafWriter<
+            '_,
+            '_,
+            TrackedActiveTarget<'v>,
+            RANGE_CAPACITY,
+            ROLE_CAPACITY,
+        >,
+        crate::arch::x86_64::mm::X86AddressSpacePublishError<LiveTrackedTargetError>,
+    > {
+        if address_space != self.address_space {
+            return Err(crate::arch::x86_64::mm::X86AddressSpacePublishError::Identity);
+        }
+        // SAFETY: (1) `root`, `identity` and `address_space` came together from one binding of
+        // the root table, through `usercopy_root_for_process` in the shared checks, under the
+        // shared hold this session borrows; `region` is refused by the writer's `check_root`
+        // unless it is of that address space's domain, and each mapping it writes is checked
+        // against `address_space` and `region` by `validate_mapping_batch`. The target is this
+        // CPU's scratch target, which reads and writes physical frames of whatever root it is
+        // handed: here this root's tables, reached from `root`. (2) The session borrows the
+        // shared guard of P for `'v`, so no exclusive holder of P, and so no change of a table
+        // of this root or of a present leaf, runs while the writer lives. (3) Other shared
+        // serves' writers over this root may run on other CPUs; this one's target is pin-tracked
+        // in this CPU's own mutation slot, so its span over a page is refused while another
+        // CPU's overlaps, and it rereads the leaf inside its span before storing.
+        unsafe {
+            crate::arch::x86_64::mm::TouchedLeafWriter::new(
+                address_space,
+                region,
+                self.root,
+                self.identity,
+                self.roles,
+                &mut self.target,
+            )
+        }
+    }
+
+    fn walk_leaf(&mut self, virtual_address: u64) -> Result<LiveUserWalk, LiveUserAccessError> {
+        walk_user_leaf(
+            self.roles,
+            &mut self.target,
+            self.identity,
+            self.root.physical_limit(),
+            physical_mask(self.root.capabilities),
+            virtual_address,
+        )
+    }
+}
+
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    crate::arch::x86_64::syscall::UserReturnMappingValidation
+    for SharedFaultSession<'_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    fn executable_at(&mut self, address: u64) -> bool {
+        self.walk_leaf(address)
+            .is_ok_and(|walk| walk.user && walk.executable)
+    }
+
+    fn writable_byte_below(&mut self, stack_pointer: u64) -> bool {
+        stack_pointer.checked_sub(1).is_some_and(|address| {
+            self.walk_leaf(address)
+                .is_ok_and(|walk| walk.user && walk.writable)
+        })
     }
 }
 

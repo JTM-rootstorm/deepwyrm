@@ -2468,6 +2468,17 @@ impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
 mod live_sessions {
     use super::*;
 
+    /// What [`ActiveDeepPaging::live_session_checks`] produced: the root
+    /// bound to the copied identity, that identity and its address space,
+    /// and this CPU's scratch target and slot.
+    struct LiveSessionChecks<'a> {
+        root: &'a PageTableRoot,
+        identity: TableIdentity,
+        address_space: crate::memory::address_region::AddressSpaceKey,
+        scratch: ActiveScratchTarget<LiveActiveScratchIo>,
+        cpu: crate::cpu::CpuIndex,
+    }
+
     impl<'root, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         ActiveDeepPaging<LiveActivePagingTarget<'root, RANGE_CAPACITY, ROLE_CAPACITY>>
     {
@@ -2535,21 +2546,20 @@ mod live_sessions {
                 })
         }
 
-        /// [`Self::build_live_session`] returning every mismatch instead of
-        /// panicking, for the fast serve, whose copied root may be stale and
-        /// which then declines (DW2 §13.16 part e3).
+        /// The checks every live session is built after (D1 commit 5; DW2
+        /// §15.2), in their order: this CPU's binding, CR3, the copied root
+        /// identity against the live binding, this CPU and the residency
+        /// epoch, then this CPU's scratch target. It reads only, so both the
+        /// exclusive builder and the shared one make it.
         #[allow(
             unsafe_code,
             reason = "the copied active-root identity is checked against current CPU identity and CR3 before raw-VA usercopy"
         )]
-        fn try_build_live_session(
-            &mut self,
+        fn live_session_checks(
+            &self,
             active_root: address_space::UserCopyRoot,
             process: crate::task::ProcessKey,
-        ) -> Result<
-            LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
-            LiveSessionError,
-        > {
+        ) -> Result<LiveSessionChecks<'_>, LiveSessionError> {
             let cpu = crate::arch::x86_64::syscall::current_cpu_index_for_diagnostics()
                 .and_then(crate::cpu::CpuIndex::new)
                 .ok_or(LiveSessionError::NoCpuBinding)?;
@@ -2569,9 +2579,37 @@ mod live_sessions {
                 .target
                 .current_scratch_target()
                 .map_err(LiveSessionError::Scratch)?;
+            Ok(LiveSessionChecks {
+                root,
+                identity,
+                address_space,
+                scratch,
+                cpu,
+            })
+        }
+
+        /// [`Self::build_live_session`] returning every mismatch instead of
+        /// panicking, for the fast serve, whose copied root may be stale and
+        /// which then declines (DW2 §13.16 part e3).
+        fn try_build_live_session(
+            &mut self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> Result<
+            LiveProcessAddressSpace<'_, 'root, RANGE_CAPACITY, ROLE_CAPACITY>,
+            LiveSessionError,
+        > {
+            let LiveSessionChecks {
+                root,
+                identity,
+                address_space,
+                scratch,
+                cpu,
+            } = self.live_session_checks(active_root, process)?;
+            let root = core::ptr::from_ref(root);
             let target = &mut self.target;
             Ok(LiveProcessAddressSpace {
-                root: root as *const PageTableRoot,
+                root,
                 primordial_root: &self.root,
                 identity,
                 address_space,
@@ -2588,6 +2626,44 @@ mod live_sessions {
                 journal: &mut *self.journal,
                 windows: &mut self.fault_windows,
                 _root: core::marker::PhantomData,
+            })
+        }
+
+        /// The fast serve's session under a shared hold of P (DW2 §15.2):
+        /// the checks of [`Self::try_build_live_session`], in its order,
+        /// then shared references to the role manager, the pin tracker and
+        /// the fault windows, the checked root, and this CPU's own scratch
+        /// target, pin-tracked in this CPU's slot as the exclusive
+        /// session's is. No journal and no root bindings: nothing after the
+        /// checks needs the table.
+        pub(crate) fn try_build_shared_fault_session(
+            &self,
+            active_root: address_space::UserCopyRoot,
+            process: crate::task::ProcessKey,
+        ) -> Result<
+            user_access::SharedFaultSession<'_, RANGE_CAPACITY, ROLE_CAPACITY>,
+            LiveSessionError,
+        > {
+            let LiveSessionChecks {
+                root,
+                identity,
+                address_space,
+                scratch,
+                cpu,
+            } = self.live_session_checks(active_root, process)?;
+            Ok(user_access::SharedFaultSession {
+                root,
+                identity,
+                address_space,
+                roles: &*self.target.roles,
+                windows: &self.fault_windows,
+                target: user_access::TrackedActiveTarget {
+                    scratch,
+                    pins: &self.user_pins,
+                    address_space,
+                    span: None,
+                    cpu,
+                },
             })
         }
 

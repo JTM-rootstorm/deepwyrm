@@ -537,6 +537,9 @@ struct RuntimeCarrierFacade<
     )>,
     admission_entered: bool,
     pending_remote_termination: Option<PendingRemoteTermination>,
+    /// Owner-local: whether this CPU's last fast serve took no frame, so
+    /// the next fault tries the shared serve first (DW2 §15.2).
+    shared_serve: super::fault_window::SharedServeFlag,
 }
 
 /// One CPU's quantum-expiry publisher (S2K-6, [CARRIER] gap 2 in
@@ -8501,6 +8504,9 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> crate::syscall::native::FaultPass {
         let cpu = self.cpu;
+        // The serve under T may open, replace or close this CPU's window:
+        // the next fault runs the exclusive fast serve first (DW2 §15.2).
+        self.shared_serve.serve_under_t_ran();
         self.with_synchronized_runtime_at_safe_point(|runtime| {
             let mut refused = None;
             let mut outcome = runtime.serve_user_page_fault(cr2, error, &mut refused, true);
@@ -8546,54 +8552,41 @@ impl<'runtime, 'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     /// `GuardFree`, a touch inside this CPU's fault window is served by the
     /// nine steps of [`super::fault_window::serve_fast`]. It reads nothing
     /// of T's value: its window, P's value, this CPU's owner-local state,
-    /// the scheduler and the stationary shared authorities. `None` on any
-    /// decline: the gate then takes the serve under T.
+    /// the scheduler and the stationary shared authorities. Which serve
+    /// runs is the gate's (DW2 §15.2, [`super::fault_window::serve_gated`]):
+    /// after a fast serve here that took no frame, the shared serve first,
+    /// then on `NotCommitted` the exclusive one in the same fault. `None` on
+    /// any other decline: the gate then takes the serve under T.
     fn serve_user_page_fault_fast(
         &mut self,
         cr2: u64,
         error: u64,
         frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
     ) -> Option<crate::syscall::native::FaultPass> {
-        use super::fault_window::FastServed;
+        use super::fault_window::{FastKind, FastServed};
         use crate::syscall::native::{FaultPass, FaultReturn, UserPageFaultOutcome};
-        let executing = (
-            self.owned.physically_executing.thread,
-            self.owned.root_switch_epoch,
-        );
-        let served = {
-            let mut access = self
-                .paging
-                .guard_free_fault_access(self.runtime.guard_free());
-            let mut paging = access.lock();
-            let mut fast = LiveFastServe {
-                value: Some(paging.guard_free_value()),
-                session: None,
-                cpu: self.cpu,
-                executing,
-                shared: self.shared,
-                frame,
-                candidates: [const { None }; 3],
-            };
-            super::fault_window::serve_fast(&mut fast, cr2, error)
+        let mut flag = self.shared_serve;
+        let (served, kind) = {
+            let mut context = (&mut *self, &mut *frame);
+            super::fault_window::serve_gated(
+                &mut flag,
+                &mut context,
+                |(this, frame)| this.serve_fast_shared(cr2, error, frame),
+                |(this, frame)| this.serve_fast_exclusive(cr2, error, frame),
+            )
         };
+        self.shared_serve = flag;
         let outcome = match served {
             Ok(FastServed::Served) => UserPageFaultOutcome::Served,
             Ok(FastServed::AlreadyPresent) => UserPageFaultOutcome::AlreadyPresent,
             Err(decline) => {
-                use super::fault_window::FastDecline;
-                use step_report::WindowDecline;
-                step_report::window_declined(match decline {
-                    FastDecline::Identity => WindowDecline::Identity,
-                    FastDecline::Mapping => WindowDecline::Mapping,
-                    FastDecline::Tables => WindowDecline::Tables,
-                    FastDecline::Credit => WindowDecline::Credit,
-                    FastDecline::Memory => WindowDecline::Memory,
-                    FastDecline::Leaf => WindowDecline::Leaf,
-                    FastDecline::Return => WindowDecline::Return,
-                });
+                step_report::window_declined(window_decline(decline));
                 return None;
             }
         };
+        if kind == FastKind::Shared {
+            step_report::fast_served_shared(self.cpu.index());
+        }
         // Authorised through present leaves in the serve's P hold; no
         // reschedule was requested when the scheduler was asked under it.
         Some(FaultPass::new(outcome, || FaultReturn {
@@ -9569,6 +9562,7 @@ pub(super) fn enter(
             admission: None,
             admission_entered: false,
             pending_remote_termination: None,
+            shared_serve: super::fault_window::SharedServeFlag::new(),
         });
     // Permanent storage (S2K-4, reset R2D): the facade array lives in one-shot static storage for
     // the kernel's lifetime. [P-FACADE] Its one owner's reference is converted, here and once,
@@ -12470,6 +12464,105 @@ fn paging_released(source: super::runtime_authority::PagingSource, waited: Optio
     step_report::p_lock_released(source as usize, waited, held);
 }
 
+impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    RuntimeCarrierFacade<'_, '_, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    /// The exclusive fast serve (DW2 §13.16 part e3) in one exclusive hold
+    /// of P, and whether it took no frame (DW2 §15.2).
+    fn serve_fast_exclusive(
+        &mut self,
+        cr2: u64,
+        error: u64,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<(super::fault_window::FastServed, bool), super::fault_window::FastDecline> {
+        let executing = (
+            self.owned.physically_executing.thread,
+            self.owned.root_switch_epoch,
+        );
+        let mut access = self
+            .paging
+            .guard_free_fault_access(self.runtime.guard_free());
+        let mut paging = access.lock();
+        let mut fast = LiveFastServe {
+            value: Some(paging.guard_free_value()),
+            session: None,
+            cpu: self.cpu,
+            executing,
+            shared: self.shared,
+            frame,
+            candidates: [const { None }; 3],
+            spent: false,
+        };
+        super::fault_window::serve_fast(&mut fast, cr2, error).map(|served| (served, !fast.spent))
+    }
+
+    /// The shared fast serve (DW2 §15.2) in one shared hold of P: a touch
+    /// of a page already committed, which takes no frame and writes nothing
+    /// P guards. Its `NotCommitted` is counted here; the gate then runs the
+    /// exclusive serve.
+    fn serve_fast_shared(
+        &mut self,
+        cr2: u64,
+        error: u64,
+        frame: &mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+    ) -> Result<super::fault_window::FastServed, super::fault_window::FastDecline> {
+        let executing = (
+            self.owned.physically_executing.thread,
+            self.owned.root_switch_epoch,
+        );
+        let served = {
+            let mut access = self
+                .paging
+                .guard_free_shared_fault_access(self.runtime.guard_free());
+            let paging = access.lock_shared();
+            let mut serve = LiveSharedServe {
+                value: &paging,
+                session: None,
+                cpu: self.cpu,
+                executing,
+                shared: self.shared,
+                frame,
+            };
+            super::fault_window::serve_fast(&mut serve, cr2, error)
+        };
+        if served == Err(super::fault_window::FastDecline::NotCommitted) {
+            step_report::window_declined(step_report::WindowDecline::NotCommitted);
+        }
+        served
+    }
+}
+
+/// A fast serve's decline, as the step report counts it.
+fn window_decline(decline: super::fault_window::FastDecline) -> step_report::WindowDecline {
+    use super::fault_window::FastDecline;
+    use step_report::WindowDecline;
+    match decline {
+        FastDecline::Identity => WindowDecline::Identity,
+        FastDecline::Mapping => WindowDecline::Mapping,
+        FastDecline::Tables => WindowDecline::Tables,
+        FastDecline::Credit => WindowDecline::Credit,
+        FastDecline::Memory => WindowDecline::Memory,
+        FastDecline::Leaf => WindowDecline::Leaf,
+        FastDecline::Return => WindowDecline::Return,
+        FastDecline::NotCommitted => WindowDecline::NotCommitted,
+    }
+}
+
+/// Step 2 of a fast serve, exclusive or shared: the scheduler runs
+/// `thread` undisturbed on `cpu` (its own lock), no Stop is requested
+/// (an atomic mailbox), and on the BSP no timer expiry is pending (the
+/// expiries' own lock).
+fn fast_serve_scheduler_allows(
+    shared: &PrimordialRuntimeShared,
+    cpu: crate::cpu::CpuIndex,
+    thread: ThreadKey,
+) -> bool {
+    shared.execution.runs_undisturbed_on(cpu, thread)
+        && !crate::arch::x86_64::idle::current_stop_requested()
+        && (cpu != crate::cpu::CpuIndex::BOOTSTRAP
+            || shared.timer_expiries.lock().iter().all(Option::is_none))
+}
+
 /// The fast serve's paging (DW2 §13.16 part e3): P's value, taken
 /// guard-free, until the session for the window's copied root is built
 /// from it; then that session.
@@ -12491,6 +12584,9 @@ struct LiveFastServe<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAP
     /// The publisher's table candidates: none, as the fast serve builds no
     /// table.
     candidates: [Option<crate::memory::frame_roles::TableCandidateGrant>; 3],
+    /// A commit took frames, spent from the window (DW2 §15.2: a serve that
+    /// took none lets the next fault try the shared serve first).
+    spent: bool,
 }
 
 /// The fast serve's publisher, for steps 4 to 7 under one borrow.
@@ -12599,15 +12695,7 @@ impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn scheduler_allows(&mut self, thread: ThreadKey) -> bool {
-        self.shared.execution.runs_undisturbed_on(self.cpu, thread)
-            && !crate::arch::x86_64::idle::current_stop_requested()
-            && (self.cpu != crate::cpu::CpuIndex::BOOTSTRAP
-                || self
-                    .shared
-                    .timer_expiries
-                    .lock()
-                    .iter()
-                    .all(Option::is_none))
+        fast_serve_scheduler_allows(self.shared, self.cpu, thread)
     }
 
     fn leaf(&mut self, mapping: &crate::memory::address_region::Mapping) -> Option<Self::Leaf<'_>> {
@@ -12626,10 +12714,138 @@ impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 
     fn spend(&mut self, frames: u64) {
+        self.spent = true;
         self.session
             .as_mut()
             .unwrap_or_else(|| panic!("a fast serve committed without its session"))
             .spend_fault_window(self.cpu.index(), frames);
+    }
+
+    fn validate_return(&mut self) -> bool {
+        self.session
+            .as_mut()
+            .is_some_and(|session| self.frame.validate_and_sanitize(session).is_ok())
+    }
+
+    fn stamp(&mut self, stamp: super::fault_window::FastStamp) {
+        fast_stamp(self.cpu.index(), stamp);
+    }
+}
+
+/// The shared fast serve's paging (DW2 §15.2): P's value through a shared
+/// guard, `&P` only, until the shared session for the window's copied root
+/// is built from it; then that session. It takes no frame.
+struct LiveSharedServe<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    value: &'v RuntimePaging<'roles, RANGE_CAPACITY, ROLE_CAPACITY>,
+    session: Option<user_access::SharedFaultSession<'v, RANGE_CAPACITY, ROLE_CAPACITY>>,
+    cpu: crate::cpu::CpuIndex,
+    /// The Thread this CPU physically executes and its root-switch epoch,
+    /// both owner-local.
+    executing: (Option<ThreadKey>, u64),
+    shared: &'static PrimordialRuntimeShared,
+    frame: &'f mut crate::arch::x86_64::syscall::RawCpl3TimerReturnFrame,
+}
+
+/// The shared fast serve's leaf writer, for steps 4 to 7 under one borrow
+/// of the shared session.
+struct LiveSharedLeaf<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> {
+    cpu: usize,
+    writer: crate::arch::x86_64::mm::TouchedLeafWriter<
+        'a,
+        'a,
+        user_access::TrackedActiveTarget<'v>,
+        RANGE_CAPACITY,
+        ROLE_CAPACITY,
+    >,
+}
+
+impl<'a, 'v, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> super::fault_window::FastLeaf
+    for LiveSharedLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type Place = crate::arch::x86_64::mm::TouchedLeafPlace<'a>;
+
+    fn find(
+        &mut self,
+        mapping: &crate::memory::address_region::Mapping,
+        address: u64,
+    ) -> Option<Self::Place> {
+        match self.writer.find_touched_leaf(mapping, address) {
+            Ok(crate::arch::x86_64::mm::TouchedLeaf::Found(place)) => Some(place),
+            Ok(crate::arch::x86_64::mm::TouchedLeaf::MissingTables(_)) | Err(_) => None,
+        }
+    }
+
+    /// Takes no frame: the page is resolved once, as the write's resolve
+    /// does, and its frame carried in the place for the write. A page with
+    /// a frame is `Done(0)`; an absent one `NotCommitted`; any other error
+    /// `Unaskable`.
+    fn commit_within(
+        &mut self,
+        place: &mut Self::Place,
+        _limit: u64,
+    ) -> super::fault_window::FastCommit {
+        use super::fault_window::FastCommit;
+        match self.writer.resolve_touched_page(place) {
+            Ok(true) => FastCommit::Done(0),
+            Ok(false) => FastCommit::NotCommitted,
+            Err(_) => FastCommit::Unaskable,
+        }
+    }
+
+    fn write(&mut self, place: Self::Place) -> Option<bool> {
+        self.writer.write_touched_leaf(place).ok()
+    }
+
+    fn stamp(&mut self, stamp: super::fault_window::FastStamp) {
+        fast_stamp(self.cpu, stamp);
+    }
+}
+
+impl<'v, 'roles, 'f, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
+    super::fault_window::FastServePaging<super::UserCopyRoot>
+    for LiveSharedServe<'v, 'roles, 'f, RANGE_CAPACITY, ROLE_CAPACITY>
+{
+    type Leaf<'a>
+        = LiveSharedLeaf<'a, 'v, RANGE_CAPACITY, ROLE_CAPACITY>
+    where
+        Self: 'a;
+
+    fn window(&self) -> Option<crate::memory::address_region::FaultWindow<super::UserCopyRoot>> {
+        match &self.session {
+            Some(session) => session.fault_window(self.cpu.index()),
+            None => self.value.fault_windows().window(self.cpu.index()).copied(),
+        }
+    }
+
+    fn executing(&self) -> (Option<ThreadKey>, u64) {
+        self.executing
+    }
+
+    fn open_session(&mut self, root: super::UserCopyRoot, process: ProcessKey) -> bool {
+        match self.value.try_build_shared_fault_session(root, process) {
+            Ok(session) => {
+                self.session = Some(session);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn scheduler_allows(&mut self, thread: ThreadKey) -> bool {
+        fast_serve_scheduler_allows(self.shared, self.cpu, thread)
+    }
+
+    fn leaf(&mut self, mapping: &crate::memory::address_region::Mapping) -> Option<Self::Leaf<'_>> {
+        let cpu = self.cpu.index();
+        self.session
+            .as_mut()?
+            .leaf_writer(mapping.address_space(), mapping.region())
+            .ok()
+            .map(|writer| LiveSharedLeaf { cpu, writer })
+    }
+
+    fn spend(&mut self, _frames: u64) {
+        panic!("a shared fast serve took a frame")
     }
 
     fn validate_return(&mut self) -> bool {

@@ -549,11 +549,8 @@ impl<P> PagingLock<P> {
     /// access mutably borrow the CPU's handle for `'a`, so P is never held
     /// before T; timed as `FaultShared`.
     #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the lock's host tests take it; the shared fast serve is built on it in its own commit"
-        )
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live shared fast serve takes it")
     )]
     pub(super) fn guard_free_shared_fault_access<'a>(
         &'a self,
@@ -694,11 +691,8 @@ impl<P> SharedPagingAccess<'_, P> {
     /// Takes P shared. The guard mutably borrows this access until it
     /// drops, so P is never taken twice on one CPU.
     #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the lock's host tests take it; the shared fast serve is built on it in its own commit"
-        )
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live shared fast serve takes it")
     )]
     pub(super) fn lock_shared(&mut self) -> SharedPagingGuard<'_, P> {
         self.lock.acquire_shared()
@@ -728,9 +722,12 @@ impl<P> Deref for SharedPagingGuard<'_, P> {
         // hold `&P` at the same time; each reaches P's value only through `&P`, and what may be
         // done through it is bounded by the shared fault session (DW2 §15.2,
         // `SharedFaultSession`): every path from it reads, or writes through a structure's own
-        // lock (the pin tracker, the residency state, the scheduler) or an atomic (a page-table
-        // leaf, this CPU's scratch leaf, the step report), and none writes a field of P's value
-        // through a shared reference.
+        // lock (its CPU's slot of the pin tracker; the residency state, the scheduler and the
+        // timer expiries are only read under theirs) or an atomic (this CPU's scratch leaf, the
+        // step report), or stores one page-table leaf by one atomic store, only while that leaf
+        // is empty, inside a mutation span over its page that the pin tracker holds for its CPU
+        // alone and after reading the leaf again inside that span, so two shared serves never
+        // store one leaf; none writes a field of P's value through a shared reference.
         unsafe { &*self.lock.value.get() }
     }
 }

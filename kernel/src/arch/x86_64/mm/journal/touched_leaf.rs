@@ -109,12 +109,34 @@ where
 {
     /// A writer over `roles` and `target` for `root`, after the checks
     /// [`X86AddressSpacePublisher::new`] makes of its root
-    /// ([`check_root`]). The binding of `address_space` and `region` to
-    /// `root`, and of `target` to `root`, is the caller's to attest, as it
-    /// is the publisher's constructor's; inside the journal only the tests
-    /// build one this way.
-    #[cfg(test)]
-    pub(super) fn new(
+    /// ([`check_root`]): the shared fault session's (DW2 §15.2).
+    ///
+    /// # Safety
+    ///
+    /// - `address_space` and `region` are authority-issued identities for
+    ///   the exact address space `root` and `root_identity` represent, and
+    ///   `target` reads and writes the hierarchy rooted at that exact root.
+    /// - For the writer's lifetime no table of that root is added, removed
+    ///   or re-parented and no present leaf is changed or cleared: the
+    ///   caller holds P, shared or exclusive, and every such change needs P
+    ///   exclusive.
+    /// - Other writers over the same root may exist at once on other CPUs.
+    ///   Each stores only an empty leaf, inside a mutation span over that
+    ///   page which its target holds in the pin tracker, and reads the leaf
+    ///   again inside the span before it stores
+    ///   ([`Self::write_touched_leaf`]), so two never store one leaf.
+    ///
+    /// This is not the publisher's contract: a publisher is the only
+    /// mutator of its root for its lifetime; a writer is not.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live shared fault session builds one")
+    )]
+    #[allow(
+        unsafe_code,
+        reason = "the caller attests the root, address-space and target binding and holds P"
+    )]
+    pub(crate) unsafe fn new(
         address_space: AddressSpaceKey,
         region: RegionKey,
         root: &'w PageTableRoot,
@@ -246,6 +268,34 @@ where
             unauthenticated,
             frame: None,
             _writer: core::marker::PhantomData,
+        }))
+    }
+
+    /// Resolves the page `place` was found for as [`Self::write_touched_leaf`]'s
+    /// resolve does (DW2 §15.2), for a serve that takes no frame:
+    /// `page_descriptor` with the mapping's writability, refusing a backing
+    /// that is not on demand. `Ok(true)`: the page has a frame, recorded in
+    /// `place` as a commit through the place records it, so the write
+    /// takes it from there and does not resolve the page again (its
+    /// permissions are the mapping's, as the resolve's are). `Ok(false)`:
+    /// the page is absent, and `place` is unchanged. Any other error is the
+    /// resolve's.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live shared fast serve resolves")
+    )]
+    pub(crate) fn resolve_touched_page(
+        &mut self,
+        place: &mut TouchedLeafPlace<'p>,
+    ) -> Result<bool, X86AddressSpacePublishError<T::Error>> {
+        let address = place.page.address();
+        let descriptor = page_descriptor(self.roles, &place.mapping, address, &mut None)?;
+        if !descriptor.on_demand {
+            return Err(X86AddressSpacePublishError::InvalidMapping);
+        }
+        Ok(descriptor.physical_start.is_some_and(|physical_start| {
+            place.frame = Some(physical_start);
+            true
         }))
     }
 

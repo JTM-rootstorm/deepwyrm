@@ -39,7 +39,7 @@ use publisher::{first_mapping_start, mapping_at, next_boundary, next_mapping_sta
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub(crate) use touched_leaf::TouchedLeaf;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use touched_leaf::TouchedLeafPlace;
+pub(crate) use touched_leaf::{TouchedLeafPlace, TouchedLeafWriter};
 
 const ENTRY_COUNT: usize = 512;
 
