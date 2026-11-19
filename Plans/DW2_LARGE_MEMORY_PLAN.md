@@ -2860,3 +2860,40 @@ No part is most of it. The hold is many small checks, each of which the reviews 
 - Checked on `8786c90` with Wyrmroot `8aaf00e`: fmt, clippy (236 / 86), kernel-check, 1,642 host tests; `dev-boot --check --sdk` plain, `--smp`, `--kvm` twice and `--kvm --smp` twice; `records-dropped=0` and `mismatches=0` in every boot. Lane `m8-one-walk` is merged and retired.
 
 **Step 3 is closed** (option A). M8 goes on to its carried items (§13.8) and its exit.
+
+### 13.19 Step 4: two carried items, designed (2026-11-18; for Mike's decision)
+
+Read at Deepwyrm `4b5c076` and Wyrmroot `8aaf00e`.
+
+**Item 1: an owed backing holds a reservation slot** (§9's row, §13.8).
+
+*What the code does.* The registry has 64 reservation slots (`RESERVATION_THREADS`). A Thread holds one from its create's first hold to its last. When an eager create whose backing is indexed is abandoned (a step failed, the Thread ended, or the adapter rolled back), the slot passes to the owed backing and is held until the owed finalize steps have freed it (`rekey_reservation_to_owed_backing`, `reserve_owed_backing_pages`, `release_owed_backings`). A create whose first hold finds no slot free is not reserved and fails in the adapter with `NO_RESOURCES` (`deferred_first_hold`: `reserve` is false, the quota allows, so `create_refusal_owed` is false). Wyrmroot's jobs end on a refused create.
+
+*What is wrong with that.* The refusal is not the caller's: its quota admits the create, and the slots come back as soon as the owed steps run. It is the one refusal left that owed work would cure (§13.15 said so).
+
+*The design: wait, as §13.12 part b waits.* A create that finds no slot free while at least one slot is held by an owed backing takes the hold's owed step and is taken again at its next step safe point: `FirstHold::Owed`, the path a quota refusal owed work could admit already takes, parked as `ParkedCall::Admission` when its quantum ends.
+- The rule is one host-built function beside `memory_object_refusal_owed` in `syscall/adapters.rs`: `memory_object_slot_owed(registry, tasks, process, pages)` is true when the quota admits the create, no reservation slot is free, and an owed backing holds one. The registry gains `reservation_slot_free()` and `owed_backing_reservations()`.
+- `deferred_first_hold` asks it after `create_refusal_owed`. Nothing else changes: the final hold already holds its slot, and the two abandon paths already have theirs.
+- *Why not a bound for each TaskGroup,* which is what §13.8's row names. A bound on owed backings alone does not hold: the Threads of one group can each start a create while the group is under its bound and abandon them together. A bound that holds must count creates in flight too, which limits how many Threads of a job may be in a create at once: a new limit programs can see, for a case the wait already makes harmless. With the wait, what a job can do to others by abandoning creates is delay them by the owed steps of frames charged to its own quota, and every waiting hold takes one of those steps.
+- *What stays.* Every slot held by Threads' creates in flight and none by an owed backing is still `NO_RESOURCES`; with 64 slots and no more Threads than that it does not happen. Owed backings are freed after owed objects, so the wait is bounded by all owed finalization, as a quota wait is.
+- *Tests (host).* The rule: every slot held by owed backings is owed; 63 owed and one Thread is owed; all 64 by Threads is not; a free slot is not; a quota that refuses is not (the quota's rule decides it). The registry: a slot is free again when an owed backing's reservation ends, and the same create then reserves. The live change is five lines and has no host harness; the boots run it without reaching it, since no boot fills the slots. No guest probe is proposed: filling 64 slots needs 64 abandoned creates in fragmented memory inside one drain.
+
+**Item 2: `dev-boot --check --smp` without KVM fails on a loaded host** (§13.17).
+
+*The kept evidence, decoded.* Eight failed boots, five of the e3 pair and three of `0be5647`. Every one ended with all four CPUs halted two to three minutes before the harness gave up.
+- Two (e3) failed in the shell: `unavailable: memory`. That is wyrmsh's one-second control deadline (`STATUS_TIMEOUT_NS`, `InspectionTimeout`). One more (e3) lost a job between its launch and its `wait`, on the same one-second path (`jobs/launch.rs`).
+- Five (two e3, three main) stalled before the first prompt. Where services exited with a failure, the steps are: uart16550d 26 (its controller closed the control channel while it waited, without a deadline, for its interrupt stage) and 24 (its send on that channel failed); blockmgr 42 and ext4d 42 (the wait for a service to be published ended: closed or its deadline), blockmgr 57 (a connect was answered with something other than CONNECTED) and 61 (a send to the block service failed). Each is a peer going away. The first process to give up is not named: the kernel's `retired` line carries no name, and the userspace console is one of the services that died.
+
+*What that shows and does not.* Without `--kvm` and without `--icount` the guest's clock is the host's wall clock and its four CPUs are four host threads. The three shell failures are a one-second wall-clock deadline expiring in a starved guest: that is read from the code. The five early stalls are consistent with a startup deadline doing the same and one service's exit taking its peers with it, but which deadline is not shown. Nothing in them points at the kernel: no panic, no halted lock, the same shape with and without e3, and none in 13 `--kvm --smp` boots or under `--smp --icount`, where time is the guest's own.
+
+*Three ways to dispose of it.*
+- *a. Take the mode out of routine use.* Four CPUs are checked with `--kvm --smp` (real parallelism) and `--smp --icount` (virtual time). Plain `--smp` stays in the tool and its help says it needs a quiet host. A Wyrmroot text change.
+- *b. Name the first failure.* The kernel's `retired` line gains the process's image name, so the next such boot shows who gave up first; then decide. Small; it does not make the mode reliable.
+- *c. Find the deadline.* Reproduce on a loaded host (Mike's own load; the coordinator starts no load generators) with b in place, and move that deadline or make it virtual. Open-ended: each fix exposes the next wall-clock deadline.
+
+**Recommendation.** Item 1 as designed. Item 2: a and b; c only if a plain `--smp` boot fails on a quiet host.
+
+**Decisions this asks of Mike.**
+1. Approve item 1: the wait in place of §13.8's bound for each TaskGroup.
+2. Item 2: a, b, c, or a combination.
+3. The four items §13.8 leaves to M8's exit can be decided now or after these: the `test-support` build (fix and check it, or delete the feature's guest half); a group at its limit waiting out any dead job's teardown (accept, or narrow); the BSP's timer-arm deferrals and the 2.9 s owed-finalization boot (both close on the exit boots' counters unless they show them).
