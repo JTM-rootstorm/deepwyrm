@@ -2288,7 +2288,7 @@ Each step is designed here before it is built and approved by Mike; steps 2 and 
 0. **Four CPUs under KVM pass the check.** Entry, above: M8 does not measure until `dev-boot --check --kvm --smp` passes every time. Its parts are specified in §13.4.
 1. **Measure a first touch** (§13.5): a guest probe and kernel report lines, on one CPU and with four jobs on four CPUs, in real time. Nothing is changed in this step. Built and measured: §13.11.
 2. **Usage that is not a scan** (§13.6, outline): designed in full once step 1 shows what admission costs. The design: §13.12. Built: §13.15.
-3. **A first touch outside the global lock** (§13.7, outline): designed in full from step 1's split of a fault's time and of the wait for T. The design, which starts with what a fault does not need: §13.13. Parts a to d built: §13.15; part e's design: §13.16.
+3. **A first touch outside the global lock** (§13.7, outline): designed in full from step 1's split of a fault's time and of the wait for T. The design, which starts with what a fault does not need: §13.13. Parts a to d built: §13.15; part e's design: §13.16; part e built: §13.17.
 4. **The carried items** (§13.8), each built with the step it belongs to or by itself.
 
 ### 13.4 Step 0: four CPUs under KVM pass the check
@@ -2335,16 +2335,18 @@ Whichever is built keeps §8.4's rule (what is admitted is what is charged) and 
 
 | Item (§9) | With |
 |---|---|
-| The fault gate, fill-in and commit step have no host tests | The gate: **built** with step 3 part c (§13.15): its decisions are a function tested on the host. The fill-in and the commit step: step 3 part e4 (§13.16) |
+| The fault gate, fill-in and commit step have no host tests | The gate: **built** with step 3 part c (§13.15): its decisions are a function tested on the host. The fill-in and the commit step: **built** with step 3 part e4 (§13.17) |
 | The commit step's 1,600 to 2,000 instructions over the kernel before the index | **Closed** (§13.11): a step's 13.8 µs is 11.5 µs of taking and zeroing 512 frames and 1.9 µs of admission scans, which step 2 removes |
 | The role table reached in 2 MiB pages: its cost on a real TLB | **Closed as not shown** (§13.11): the parts of a first touch that read the role table are 107 to 471 ns each |
 | An owed backing holds a reservation slot; a job can hold all 64 | After step 2 (its counters change the reservations): bound the owed backings one TaskGroup may hold |
 | `halt_forever` in `arch/x86_64/syscall/live.rs` logs nothing (102 sites) | Step 0, item 3: built (§13.10) |
 | A closed object counts against its group's limits until its finalization is done (§13.10) | **Closed**: step 2 part b, built (§13.15) |
 | A group at its limit waits out any dead job's owed teardown before it is refused (§13.15) | Decided with Mike at M8's exit: accept it, or wait only for a teardown whose frames are charged to the refusing group |
-| The kernel does not compile for the target with `test-support` (§13.10) | Decided with Mike at M8's exit: fix and check it, or delete the feature's guest half |
+| The kernel does not compile for the target with `test-support` (§13.10). The guest selector builds `atomic-wait-wake` and `ipc-blocking-smoke` fail on the same call, so part e3's edits to the F9 and F12 test-support runtimes are not compiled by any check (§13.17) | Decided with Mike at M8's exit: fix and check it, or delete the feature's guest half |
 | Consecutive deferrals of the BSP's timer arm | Decided at M8's exit from the `deferred` counter of its four-CPU boots |
 | One boot whose finalization stayed owed for 2.9 s | Not seen since; closed at M8's exit unless a four-CPU KVM boot shows it |
+| `dev-boot --check --smp` without `--kvm` and without `--icount` fails on a loaded host, before and after part e3 (§13.17) | Its own item before M8's exit: decode the failing steps from the kept evidence, reproduce it on a loaded host, and either fix what stalls or run that mode of the check on virtual time. Wyrmroot's `wait` answering `foreign` for a spawned job that has ended is looked at with it |
+| Three jobs at once wait for P (§13.17) | Step 3's next part: designed from the `p-lock` and `faults-fast` lines and §13.7's candidates, and brought to Mike before it is built |
 
 ### 13.9 Decisions this asks of Mike
 
@@ -2612,7 +2614,7 @@ One job's first touch fell from about 15.2 µs on one CPU and 13.8 µs on four (
 
 **Next.** Part e (§13.13) comes back to Mike as its own design: the leaf's publish, a first touch off T, and the host tests of the fill-in and the commit step. It is §13.16.
 
-### 13.16 Step 3 part e: a first touch off the runtime lock: design (2026-11-18; approved by Mike the same day)
+### 13.16 Step 3 part e: a first touch off the runtime lock: design (2026-11-18; approved by Mike the same day; built: §13.17)
 
 Read at Deepwyrm `4c00faf`. The measure to beat is §13.15's: one job touches a page every 2.1 to 2.4 µs, each of three jobs every 7.9 µs, and the three together make fewer pages than one.
 
@@ -2715,3 +2717,77 @@ A decline changes nothing before step 6. The fast serve takes no owed step, drai
 4. Approve part e4 after e3, or by itself if e3 is not built.
 
 **Mike, 2026-11-18: "Approve all four."** Built in order: e1 and e2 in one lane, each its own commit and each timed by itself; e1's security review before its merge; then e3 with its Wyrmroot side and its review; then e4.
+
+### 13.17 Step 3 part e as built and measured (2026-11-18)
+
+Built by Opus workers from §13.16 and the coordinator's briefs; reviewed (the security review included), checked and booted by the coordinator. Every commit is signed.
+
+| | Deepwyrm | Wyrmroot |
+|---|---|---|
+| Part e1 (and e2, built and reverted) | `0be5647` (`41bb6d2`, `9acf9c7`, `9d652e8`, `bf9fea4`) | |
+| Part e3 | `588700a` (`291269d`, `217d283`, `80307cd`, `18715c5`, `4f48de9`, `e3a0550`, `1501583`) | `8aaf00e` (`36f2264`, `3b2105b`) |
+| Part e4 | `bdab2a2` (`9bfe021`, `c88f6ef`) | |
+
+**The numbers.** As in §13.15: KVM on the development host, `touch-loop 64 20`, median nanoseconds a page, one value a boot, the builds of one run booted interleaved. Run 7 waited for a quiet host (a load average under 2).
+
+| Run | Build | One job, one CPU | One job, four CPUs | Three jobs at once, each |
+|---|---|---|---|---|
+| 6 | before part e (`0cfb51b`) | 2,399, 2,383, 2,390, 3,281 | 2,092, 2,042, 2,493, 2,813 | 7,018, 7,076, 7,521, 10,922 |
+| 6 | e1 (`41bb6d2`) | 1,788, 1,775, 1,801, 2,428 | 1,465, 1,457, 1,465, 1,554 | 5,502, 5,304, 5,235, 5,211 |
+| 6 | e1 and e2 (`9acf9c7`) | 1,792, 1,814, 1,888, 1,827 | 1,498, 1,638, 1,518, 1,799 | 5,146, 5,477, 5,670, 5,541 |
+| 6 | e1, e2 and the reservation (`9d652e8`) | 2,492, 1,823, 1,811, 1,806 | 2,057, 1,507, 1,478, 1,822 | 5,365, 5,393, 5,316, 5,209 |
+| 7 | e1 with the reservation, merged (`0be5647`) | 1,813, 1,700, 1,720, 1,701 | 1,514, 1,373, 1,696, 1,691 | 5,258, 4,764, 5,037, 5,054 |
+| 7 | e3 (`1501583`, Wyrmroot `3b2105b`) | 1,293, 1,175, 1,171, 1,177 | 1,316, 1,161, 1,182, 1,164 | 4,528, 4,000, 3,889, 4,496 |
+
+One job's first touch is now about 1.2 µs on one CPU and on four, against 2.4 and 2.1 to 2.4 before part e and 15.2 and 13.8 at step 1. Each of three jobs touches a page every 3.9 to 4.5 µs against 7.9.
+
+**Part e1** (`41bb6d2`, `9d652e8`). `X86AddressSpacePublisher` gains `find_touched_leaf`, `commit_on_demand_page` and `write_touched_leaf` (the design's `touch_leaf`, as its two calls on one walk's result, with the commit between them); the served fault uses them where the tables exist and the journal otherwise.
+- *What the review found.* The first build wrote the leaf without the reservation the journal path takes on its page: against pins, a mutation in progress and a teardown reservation. `9d652e8` adds it; the tables part of a fault is about 180 ns with it and 150 without, against 770 before.
+- *Measured* (run 6): every e1 boot is faster than every boot before it, one job and three. In the kernel a fault on one CPU fell from about 2,070 ns to 1,480 (tables 767 to 150).
+- Checked on `bf9fea4` with Wyrmroot `038d8c2`: fmt, clippy (236 / 86), kernel-check, 1,583 host tests; `dev-boot --check --sdk` plain, `--smp`, `--kvm` twice and `--kvm --smp` three times; `records-dropped=0` and `mismatches=0` in every boot. Security review by reading at `9d652e8`: no Critical, High or Medium finding.
+
+**Part e2** (`9acf9c7`): built as designed, timed by itself and not kept. It was not faster than e1 (run 6): one job on one CPU 1,792 to 1,888 ns a page against 1,775 to 1,801 (and one e1 boot of 2,428), and the kernel's return part 511 to 527 ns against 521 to 526. Reverted in the lane (`bf9fea4`). The serve under T still takes P a second time for the return; the fast serve of e3 validates the return in its one hold of P.
+
+**Part e3** (§13.16). Built as designed, with these differences:
+- *The window* also carries the Thread's Process, copied under T at opening. The table is `FaultWindows<R, CPUS>` in P's value (`memory/address_region/fault_window.rs`); the fast serve's decision is `serve_fast` over the `FastServePaging` and `FastLeaf` traits (`activation/fault_window.rs`).
+- *Fact 3's functions.* Three change a mapping record or retire a root in a production build (`region_mut_for_operation`, `region_mut_for_quiesced_teardown`, `retire_quiesced_root`); `region_mut_for_teardown`, `retire_exited_root` and `region_mut_for_live_process` are built only for tests. All six take a `WindowsClosed` by value and assert its address space.
+- *The barrier.* A Stop is published from two loops of the runtime, not one wrapper; `stop_barrier` (lock and unlock P) follows each, on the only path out of it.
+- *Who opens a window.* Only the gate's serve under T. A fill-in's serve opens none; it closes every window before it returns a quota refusal, as the others do.
+- *Before a quota refusal* at each of the four admission sites (create's first and final hold, the commit step, the serve under T): every window is closed and the request admitted once more, when closing closed anything. The owed rule is asked after that.
+- *Reported usage leaves the credit out.* The design did not say what `object_get_info` reports. As built a program sees an object's committed frames, never the credit: the query takes P, reads the windows and subtracts (`usage_without_credit`). Mike was told on 2026-11-18.
+- *The scheduler's answer* to step 2 is one call, `runs_undisturbed_on(cpu, thread)`: this CPU's running claim is that Thread and no reschedule is requested for the CPU.
+- *The declines.* Seven, not six: `leaf` is a leaf found present with another frame or other permissions. A publisher that refuses the window's root counts as `identity`; a cost that cannot be asked as `credit`.
+- *Report lines.* `faults-fast served= total-us= longest-us= check-us= commit-us= tables-us= return-us=`; `fault-passes` gains `fast=`; `fault-windows opened= closed=`; `fault-declines identity= mapping= tables= credit= memory= leaf= return=` (its own line because one record holds 192 bytes); `p-lock cpu= source=<fault|usercopy|runtime> count= waited= wait-us= held-us=`. A host test holds the two window lines inside a record for counters of up to seventeen digits.
+- *Wyrmroot.* The check requires `faults-fast`, `fault-windows` and `fault-declines` in both boots, prints the fast serve's mean beside the serve under T, and fails when fewer than half of the served fault passes were fast.
+- *Host tests* as §13.16 lists them, the randomised run with a fixed seed.
+
+*Measured* (run 7). Every e3 boot is faster than every boot of `0be5647`, in all three columns.
+- About 98 in 100 first touches take the fast serve (559,845 to 559,931 of 569,254 for one job). In the kernel it is 934 to 1,011 ns: check 178 to 184, commit 336 to 398, tables 141 to 146, return 277 to 282. The serve under T was 1,458 to 1,525 ns on one CPU.
+- The other 2 in 100 are served under T at 2.2 to 2.8 µs each. Nearly all are a window run out of credit (one touch in 64), and that serve opens the next window.
+- *Three jobs are now bound by P.* A fast serve is then 3,239 to 3,435 ns, of which 2,344 to 2,537 is the check, in which P is taken. In one boot the three busy CPUs each took P for a fault 394,000 to 516,000 times, waited in 80 to 99 of 100 of them for 2.2 to 2.8 µs a wait, and held it about 1.0 µs. The three together touch a page every 1.3 to 1.5 µs, still not more than one job's 1.2.
+- Not measured: whether P's order of service matters here (it is a test-and-set lock, not a fair one).
+
+*Security review* (the coordinator, by reading, at `1501583` with Wyrmroot `3b2105b`): no Critical, High or Medium finding. Read against §13.16's list: credit is created and destroyed only under T and P, and spent under P alone; every function that changes a mapping record or retires a root consumes a `WindowsClosed`; an object stays live while a mapping holds it, so closing never meets a dead object; the page-quota admission sites are the four above and each closes before it refuses; the fast serve declines on any stale state and never panics on one; its return validation goes through present leaves only; both barriers follow their publication on the only path.
+
+*Checked* on `1501583` with Wyrmroot `3b2105b`: fmt, clippy (236 / 86), kernel-check, 1,611 host tests; Wyrmroot fmt, clippy, unit and `xtask` tests; `dev-boot --check --sdk` plain, `--icount`, `--smp --icount`, `--kvm` 6 of 6 and `--kvm --smp` 7 of 7; `records-dropped=0` and `mismatches=0` in every boot.
+
+**`--smp` without KVM fails on a loaded host, with and without e3.** While other work loaded the development host (a load average of 4 to 28), `dev-boot --check --smp` without `--kvm` and without `--icount` passed 5 boots of 10 for the e3 pair and 7 of 10 for `0be5647`, booted interleaved. On a quiet host both pass.
+- Every failure of either pair ended with all four CPUs halted. Main's three stalled before the first shell prompt. Of e3's five, two stalled there too and three later: two at the shell's one-second control timeout (`unavailable: memory`), and one with a job gone from system-init (`wait` answered `foreign`).
+- The kernel's lock lines show no starvation: in the boots that passed, the longest wait for T and its longest hold are about 36 ms.
+- The counts are too small to call e3 worse. In the same boots three jobs at once were faster with e3 (37,300 and 38,700 ns a page against 45,800 and 48,400 on a quieter host; about 62,000 against 91,400 and 98,800 under load).
+- *A reading, not proven:* without KVM and without `--icount` the guest's clock is the host's wall clock, so on a starved host userspace deadlines expire and the system winds down idle. The failing steps were not decoded. Evidence: `.tmp/dev-boot/1795044512391245005`, `1795045396912737152`, `1795045622975144886`, `1795045861380830099`, `1795046268701112557`, `1795046734075059653`, `1795046824894682158`, `1795048686357322899`.
+- Scheduled in §13.8.
+
+**Part e4** (`9bfe021`, `c88f6ef`). The fill-in's loops and the commit step's decision are host-built in `kernel/src/syscall/fill_in.rs`, each over a small trait the live runtime implements with the calls that were there:
+- `fill_in_range`, one hold of a fill-in, over `FillInHold` (the timer expiries, whether a page is on demand, the serve, the owed step);
+- `fill_in_buffers`, the buffers over step safe points, over `FillInRuntime`, ending `Stopped`, `Parked { index, next }`, `Failed(status)` or `Done { stepped }`;
+- `commit_step`, over `CommitStepHold` (cost, admission, closing the windows, the two owed questions, the commit, the record); `CommitStep` moved there.
+- *Tests.* 21 over models. §9's three: a spurious fault (a leaf already present is passed over); a table refusal (`NO_MEMORY`, owed and not owed); BSP timer expiries during a long fill-in, checked hold by hold (every hold drains before it serves, a yielding hold drains and serves nothing), and the same fill-in on another CPU. Also: a parked call resumes at the first page no hold served, for each safe point it can park at; the bisection fills the quota exactly in at most ten admissions for a 512-page step; a frame refused mid-step keeps what was taken.
+- *Where the build differs.* `FillInRuntime::step` takes a `FillInStep` value, not a closure over an associated hold type: that form does not compile for the facade.
+- *No behaviour changes, with three notes.* The mark that keeps a fill-in's serves untimed is written once a call or resume, not once a hold; only the fault gate sets it, and no fault enters on that CPU inside the call. A refused commit step asks the step's cost once more before it answers that a teardown is owed. The commit step's report sample ends after the `NO_MEMORY` owed question, with P still held.
+- *What host tests do not reach:* the live implementations of the three traits, `at_step_safe_point`, the mapping of a frame error to `NO_MEMORY` or `BAD_STATE`, and `run_fill_in`'s parking and its `dma_map` loop. They are target-only; the boots run them.
+- Checked on `c88f6ef` with Wyrmroot `8aaf00e`: fmt, clippy (236 / 86), kernel-check, 1,632 host tests; `dev-boot --check --sdk` plain, `--smp`, `--kvm` 6 of 6 and `--kvm --smp` 6 of 6; `records-dropped=0` and `mismatches=0` in every boot. Timed against `588700a` in four interleaved KVM rounds, a commit step of 512 pages takes 12,485 to 13,532 ns with e4 and 12,671 to 13,119 without on one CPU, and 26,147 to 29,259 against 26,431 to 29,093 on four: no difference.
+
+**Lanes.** `m8-touch-leaf`, `m8-fault-window`, `m8-fault-window-check` and `m8-fill-in-tests` are merged and retired.
+
+**Next.** Three jobs at once wait for P, as §13.16 said they might. The candidates are §13.7's (frames ready per CPU, zeroing outside P), to be designed from the `p-lock` and `faults-fast` lines and brought to Mike as a design. Then the carried items of §13.8 and M8's exit.
