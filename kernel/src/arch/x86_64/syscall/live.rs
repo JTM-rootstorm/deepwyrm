@@ -313,10 +313,6 @@ struct NativeSyscallRuntimeEntry<
         + crate::syscall::native::NativeRendezvousRuntime,
 > {
     runtime: core::ptr::NonNull<R>,
-    /// The quantum-expiry publisher to bind when this entry publishes the
-    /// runtime itself; `None` when its caller already
-    /// published both (the primordial runtime).
-    quantum_expiry: Option<core::ptr::NonNull<R::QuantumExpiry>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2894,10 +2890,7 @@ pub(crate) unsafe fn enter_published_native_syscall_runtime<
     stack: KernelStackBounds,
     exception_binding: &crate::arch::x86_64::exceptions::UserExceptionBinding,
 ) -> ! {
-    let entry = NativeSyscallRuntimeEntry {
-        runtime,
-        quantum_expiry: None,
-    };
+    let entry = NativeSyscallRuntimeEntry { runtime };
     // SAFETY: forwarded from this function's `# Safety`; `enter` checks the pointer against the
     // published binding and halts on a mismatch.
     unsafe { entry.enter(state, stack, exception_binding) }
@@ -2925,63 +2918,27 @@ impl<
         // SAFETY: [ENTRY-REF] no record reference is live here; `stack` is the selected Thread's
         // live stack per this function's caller contract.
         unsafe { bind_current_thread_stack(stack) }.unwrap_or_else(|_| halt_forever());
-        // The entry's pointer is the one published (or compared with the published binding): no
-        // reference is created over the carrier here.
+        // The entry's pointer is compared with the published binding: no reference is created
+        // over the carrier here.
         let context = self.runtime.as_ptr();
         let cpu_index = current_cpu_index_for_diagnostics().unwrap_or_else(|| halt_forever());
-        if RUNTIME_STATE
+        let binding = RUNTIME
             .get(cpu_index)
-            .is_some_and(|slot| slot.load(Ordering::Acquire) == RUNTIME_UNBOUND)
+            .filter(|_| {
+                RUNTIME_STATE[cpu_index].load(Ordering::Acquire) == RUNTIME_BOUND
+                    && RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index)
+                        == Some(RuntimeCarrierLifecycle::Executing)
+            })
+            // SAFETY: [PER-CPU-SLOT] the filter observed BOUND with Acquire, so the one-shot
+            // binding is initialized and immutable; it is `Copy`.
+            .map(|storage| unsafe { (*storage.0.get()).assume_init() })
+            .unwrap_or_else(|| halt_forever());
+        if binding.context != context.cast::<()>()
+            || binding.handler as usize != native_runtime_trampoline::<R> as *const () as usize
+            || binding.idle_scheduler_handler as usize
+                != native_runtime_idle_scheduler::<R> as *const () as usize
         {
-            // SAFETY: [CARRIER] the entry's caller keeps the carrier stationary for the kernel's life
-            // (a pin consumed by a never-returning frame, or a pointer published under
-            // `bind_native_runtime_carrier_for_slot`'s contract), and every later use goes through
-            // this pointer; it is owned by this CPU's slot.
-            unsafe {
-                publish_syscall_runtime(
-                    cpu_index,
-                    context.cast::<()>(),
-                    native_runtime_trampoline::<R>,
-                    native_runtime_fresh_thread::<R>,
-                    native_runtime_idle_scheduler::<R>,
-                    native_runtime_user_exception::<R>,
-                    native_runtime_rendezvous_gate::<R>,
-                    native_runtime_rendezvous_reaper::<R>,
-                    self.quantum_expiry
-                        .unwrap_or_else(|| halt_forever())
-                        .as_ptr()
-                        .cast::<()>(),
-                    native_runtime_quantum_expiry::<R::QuantumExpiry>,
-                    native_runtime_prepare_quantum::<R>,
-                    native_runtime_timer_pre_iret::<R>,
-                    native_runtime_user_page_fault::<R>,
-                )
-            }
-            .unwrap_or_else(|_| halt_forever());
-            RUNTIME_CARRIER_LIFECYCLES
-                .bind_parked(cpu_index)
-                .unwrap_or_else(|_| halt_forever());
-            let cpu = crate::cpu::CpuIndex::new(cpu_index).unwrap_or_else(|| halt_forever());
-            release_native_runtime_carrier_for_slot(cpu).unwrap_or_else(|_| halt_forever());
-        } else {
-            let binding = RUNTIME
-                .get(cpu_index)
-                .filter(|_| {
-                    RUNTIME_STATE[cpu_index].load(Ordering::Acquire) == RUNTIME_BOUND
-                        && RUNTIME_CARRIER_LIFECYCLES.lifecycle(cpu_index)
-                            == Some(RuntimeCarrierLifecycle::Executing)
-                })
-                // SAFETY: [PER-CPU-SLOT] the filter observed BOUND with Acquire, so the one-shot
-                // binding is initialized and immutable; it is `Copy`.
-                .map(|storage| unsafe { (*storage.0.get()).assume_init() })
-                .unwrap_or_else(|| halt_forever());
-            if binding.context != context.cast::<()>()
-                || binding.handler as usize != native_runtime_trampoline::<R> as *const () as usize
-                || binding.idle_scheduler_handler as usize
-                    != native_runtime_idle_scheduler::<R> as *const () as usize
-            {
-                halt_forever();
-            }
+            halt_forever();
         }
         // SAFETY: the boundary was validated, `stack` was bound above per the caller's contract,
         // and `state` is a `ValidatedUserReturn`; the primordial caller keeps it on the boot stack,
