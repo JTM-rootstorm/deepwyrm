@@ -318,6 +318,11 @@ mod pin_tracker {
         /// pin overlaps the range, while `cpu` has a mutation in progress,
         /// and while another CPU's mutation in the same address space
         /// overlaps the range.
+        ///
+        /// Inlined into its two callers, the pin-tracked target's span and
+        /// its lone batch, as the one-slot tracker's was: it is on every
+        /// first touch's leaf store (DW2 §15.2).
+        #[inline(always)]
         pub(crate) fn begin_mutation(
             &self,
             cpu: CpuIndex,
@@ -338,9 +343,12 @@ mod pin_tracker {
             };
             let slot = cpu.index();
             let mut state = self.state.lock();
+            // One pass over the slots: this CPU's slot taken, or any
+            // mutation overlapping (only one in the same address space can).
             if state.teardown == Some(address_space)
-                || state.mutations[slot].is_some()
-                || state.mutations().any(|other| other.overlaps(mutation))
+                || state.mutations.iter().enumerate().any(|(index, other)| {
+                    other.is_some_and(|other| index == slot || other.overlaps(mutation))
+                })
                 || state
                     .pins
                     .iter()
