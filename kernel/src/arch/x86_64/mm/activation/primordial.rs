@@ -12552,6 +12552,8 @@ fn window_decline(decline: super::fault_window::FastDecline) -> step_report::Win
 /// `thread` undisturbed on `cpu` (its own lock), no Stop is requested
 /// (an atomic mailbox), and on the BSP no timer expiry is pending (the
 /// expiries' own lock).
+// Inlined into each serve's `scheduler_allows`, so each calls it locally and directly.
+#[inline(always)]
 fn fast_serve_scheduler_allows(
     shared: &PrimordialRuntimeShared,
     cpu: crate::cpu::CpuIndex,
