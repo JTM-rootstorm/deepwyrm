@@ -89,6 +89,8 @@ struct Model {
     tables_missing: bool,
     /// Index nodes a commit of an absent page takes besides the page.
     nodes: u64,
+    /// The commit's cost cannot be asked.
+    cost_unaskable: bool,
     commit_refused: bool,
     write_fails: bool,
     return_refused: bool,
@@ -138,48 +140,52 @@ impl Model {
 }
 
 impl FastLeaf for ModelLeaf<'_> {
-    type Place = u64;
+    /// The mapping and the page's address.
+    type Place = (Mapping, u64);
 
-    fn find(&mut self, _mapping: &Mapping, address: u64) -> Option<u64> {
+    fn find(&mut self, mapping: &Mapping, address: u64) -> Option<(Mapping, u64)> {
         self.model.calls.push("find");
-        (!self.model.tables_missing).then_some(address)
+        (!self.model.tables_missing).then_some((*mapping, address))
     }
 
-    fn cost(&mut self, mapping: &Mapping, address: u64) -> Option<u64> {
-        self.model.calls.push("cost");
-        let nodes = self.model.nodes;
-        let page = Model::page_of(mapping, address);
-        let object = self.model.object_of(mapping);
-        Some(if object.committed.contains(&page) {
-            0
-        } else {
-            1 + nodes
-        })
-    }
-
-    fn commit(&mut self, mapping: &Mapping, address: u64) -> Option<u64> {
-        self.model.calls.push("commit");
-        if self.model.commit_refused {
-            return None;
+    /// As the role manager's commit within a limit: a committed page takes
+    /// nothing whatever the limit; a commit over the limit takes nothing;
+    /// a refused one takes nothing. "commit" is called only when frames
+    /// are taken.
+    fn commit_within(&mut self, place: &mut (Mapping, u64), limit: u64) -> FastCommit {
+        self.model.calls.push("commit_within");
+        if self.model.cost_unaskable {
+            return FastCommit::Unaskable;
         }
         let nodes = self.model.nodes;
-        let page = Model::page_of(mapping, address);
-        let object = self.model.object_of(mapping);
-        assert!(!object.committed.contains(&page));
+        let (mapping, address) = *place;
+        let page = Model::page_of(&mapping, address);
+        if self.model.object_of(&mapping).committed.contains(&page) {
+            return FastCommit::Done(0);
+        }
+        if 1 + nodes > limit {
+            return FastCommit::Over;
+        }
+        if self.model.commit_refused {
+            return FastCommit::Refused;
+        }
+        self.model.calls.push("commit");
+        let object = self.model.object_of(&mapping);
         object.committed.push(page);
         object.frames += 1 + nodes;
-        Some(1 + nodes)
+        FastCommit::Done(1 + nodes)
     }
 
-    fn write(&mut self, place: u64) -> Option<bool> {
+    fn write(&mut self, place: (Mapping, u64)) -> Option<bool> {
         self.model.calls.push("write");
         if self.model.write_fails {
             return None;
         }
-        if self.model.leaves.contains(&place) {
+        let address = place.1;
+        if self.model.leaves.contains(&address) {
             return Some(false);
         }
-        self.model.leaves.push(place);
+        self.model.leaves.push(address);
         Some(true)
     }
 
@@ -273,6 +279,7 @@ fn fixture() -> Fixture {
         publisher_refused: false,
         tables_missing: false,
         nodes: 0,
+        cost_unaskable: false,
         commit_refused: false,
         write_fails: false,
         return_refused: false,
@@ -318,7 +325,7 @@ fn a_touch_inside_the_window_is_served_and_spends_its_frames() {
             "scheduler",
             "leaf",
             "find",
-            "cost",
+            "commit_within",
             "commit",
             "write",
             "spend",
@@ -528,6 +535,76 @@ fn step_6_declines_a_refused_commit() {
     model.assert_charge_invariant();
 }
 
+/// DW2 §13.18 part f1: a commit over the credit is one call that takes
+/// no frame, and leaves the credit and the window as they were; within the
+/// credit the same touch is then served.
+#[test]
+fn a_commit_over_the_credit_takes_no_frame() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    model.nodes = 64;
+    let calls = assert_declined_unchanged(model, START + PAGE, WRITE_FAULT, FastDecline::Credit);
+    assert_eq!(
+        calls,
+        ["session", "scheduler", "leaf", "find", "commit_within"]
+    );
+    assert!(model.objects[0].committed.is_empty());
+    model.nodes = 0;
+    assert_eq!(
+        serve_fast(model, START + PAGE, WRITE_FAULT),
+        Ok(FastServed::Served)
+    );
+    assert_eq!(credit(model), Some(63));
+    model.assert_charge_invariant();
+}
+
+/// A cost that cannot be asked declines as a cost over the credit does.
+#[test]
+fn an_unaskable_cost_declines_as_credit() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    model.cost_unaskable = true;
+    assert_declined_unchanged(model, START + PAGE, WRITE_FAULT, FastDecline::Credit);
+}
+
+/// A committed page takes no frame (`Done(0)`): with its leaf present the
+/// touch is already present; with its leaf empty the leaf is written and
+/// the touch served, the credit unspent either way.
+#[test]
+fn a_commit_of_a_committed_page_takes_nothing_and_the_leaf_decides() {
+    let mut fixture = fixture();
+    let model = &mut fixture.model;
+    // Page 1 committed with its leaf, page 2 committed with none.
+    model.objects[0].committed.extend([1, 2]);
+    model.objects[0].frames = 2;
+    model.leaves.push(START + PAGE);
+    model.weights.add(model.objects[0].id, 2);
+    model.assert_charge_invariant();
+    for limit_spent in [false, true] {
+        if limit_spent {
+            // No credit left: a committed page still takes nothing.
+            let spent = credit(model).unwrap();
+            model.windows.spend(model.cpu, spent);
+            model.weights.subtract(model.objects[0].id, spent);
+            model.assert_charge_invariant();
+        }
+        model.calls.clear();
+        let served = serve_fast(model, START + PAGE, WRITE_FAULT);
+        assert_eq!(served, Ok(FastServed::AlreadyPresent));
+        assert!(!model.calls.contains(&"commit") && !model.calls.contains(&"spend"));
+    }
+    model.calls.clear();
+    assert_eq!(
+        serve_fast(model, START + 2 * PAGE, WRITE_FAULT),
+        Ok(FastServed::Served)
+    );
+    assert!(!model.calls.contains(&"commit") && !model.calls.contains(&"spend"));
+    assert_eq!(model.leaves, [START + PAGE, START + 2 * PAGE]);
+    assert_eq!(credit(model), Some(0));
+    assert_eq!(model.objects[0].frames, 2);
+    model.assert_charge_invariant();
+}
+
 #[test]
 fn steps_7_and_8_decline_after_the_commit_with_the_credit_spent() {
     let mut fixture = fixture();
@@ -616,6 +693,7 @@ fn a_randomised_run_keeps_the_invariant_of_the_charge_after_every_operation() {
         publisher_refused: false,
         tables_missing: false,
         nodes: 0,
+        cost_unaskable: false,
         commit_refused: false,
         write_fails: false,
         return_refused: false,

@@ -512,6 +512,16 @@ impl MemoryObjectRange {
         }
     }
 
+    /// This range with its object offset replaced, for tests of a mapping
+    /// record no map would make.
+    #[cfg(test)]
+    pub(super) const fn with_object_offset_for_test(self, object_offset: u64) -> Self {
+        Self {
+            object_offset,
+            ..self
+        }
+    }
+
     pub(crate) const fn backing_identity(self) -> BackingIdentity {
         self.backing
     }

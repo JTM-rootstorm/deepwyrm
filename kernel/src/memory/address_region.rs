@@ -290,6 +290,16 @@ impl Mapping {
         self.virtual_start + self.byte_len
     }
 
+    /// This mapping record with its backing's object offset replaced, for
+    /// tests of a record no map would make.
+    #[cfg(test)]
+    pub(crate) const fn with_object_offset_for_test(self, object_offset: u64) -> Self {
+        Self {
+            backing: self.backing.with_object_offset_for_test(object_offset),
+            ..self
+        }
+    }
+
     const fn spec(self) -> MappingSpec {
         MappingSpec {
             address_space: self.address_space,
