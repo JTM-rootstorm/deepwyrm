@@ -187,9 +187,22 @@ pub(crate) const P_LOCK_SOURCES: usize = 4;
 const P_LOCK_SOURCE_NAMES: [&str; P_LOCK_SOURCES] =
     ["fault", "usercopy", "runtime", "fault-shared"];
 
+/// The index of the `runtime` source in [`P_LOCK_SOURCE_NAMES`]: P held
+/// exclusively beneath a T guard.
+const P_LOCK_RUNTIME: usize = 2;
+
 /// A P acquisition's figures, per CPU and source: count, how many spun,
 /// wait sum, held sum.
 const P_LOCK_FIGURES: usize = 4;
+
+/// The owners a `runtime` hold of P is filed under (DW2 §15.8): the calls
+/// in steps, in [`NAMES`]' order, then T's drain sources, in
+/// [`SOURCE_NAMES`]' order.
+const P_HELD_BUCKETS: usize = CALLS + SOURCES;
+
+/// A `runtime` hold's figures, pending per CPU and filed per bucket: count,
+/// how many spun, wait sum, held sum, held longest, times in ticks.
+const P_HELD_FIGURES: usize = 5;
 
 /// `ticks` of the TSC at `hz`, in whole microseconds; zero when no rate
 /// was measured. 128-bit, so no product overflows; clamped to `u64::MAX`.
@@ -383,6 +396,13 @@ pub(crate) struct StepTally<const CPUS: usize> {
     streams_ended: AtomicU64,
     /// Per CPU and source, [`P_LOCK_FIGURES`], times in ticks.
     p_lock: [[[AtomicU64; P_LOCK_FIGURES]; P_LOCK_SOURCES]; CPUS],
+    /// Per CPU, the `runtime` holds of P released there and not yet filed
+    /// under their owner, [`P_HELD_FIGURES`] (DW2 §15.8). Written only on
+    /// its own CPU.
+    p_held_pending: [[AtomicU64; P_HELD_FIGURES]; CPUS],
+    /// The filed `runtime` holds by owner, [`P_HELD_BUCKETS`], summed over
+    /// CPUs.
+    p_held: [[AtomicU64; P_HELD_FIGURES]; P_HELD_BUCKETS],
 }
 
 /// The fields of [`StepTally::backing_allocated`]'s packed record. 24 bits
@@ -472,6 +492,8 @@ impl<const CPUS: usize> StepTally<CPUS> {
             streams_ended: AtomicU64::new(0),
             p_lock: [const { [const { [const { AtomicU64::new(0) }; P_LOCK_FIGURES] }; P_LOCK_SOURCES] };
                 CPUS],
+            p_held_pending: [const { [const { AtomicU64::new(0) }; P_HELD_FIGURES] }; CPUS],
+            p_held: [const { [const { AtomicU64::new(0) }; P_HELD_FIGURES] }; P_HELD_BUCKETS],
         }
     }
 
@@ -688,7 +710,10 @@ impl<const CPUS: usize> StepTally<CPUS> {
 
     /// `cpu` released P taken by `source` (an index of
     /// [`P_LOCK_SOURCE_NAMES`]) after holding it `held` ticks; `waited` is
-    /// its spin, `None` when it was taken at its first try.
+    /// its spin, `None` when it was taken at its first try. A `runtime`
+    /// hold is also kept pending on `cpu` until its owner is known (DW2
+    /// §15.8): the timed step that ends next there, or, when no step is
+    /// being timed, T's next release there.
     pub(crate) fn p_lock_released(
         &self,
         cpu: usize,
@@ -707,6 +732,40 @@ impl<const CPUS: usize> StepTally<CPUS> {
             wait_sum.fetch_add(waited, Ordering::Relaxed);
         }
         held_sum.fetch_add(held, Ordering::Relaxed);
+        if source != P_LOCK_RUNTIME {
+            return;
+        }
+        let Some([count, spun, wait_sum, held_sum, held_longest]) = self.p_held_pending.get(cpu)
+        else {
+            return;
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        if let Some(waited) = waited {
+            spun.fetch_add(1, Ordering::Relaxed);
+            wait_sum.fetch_add(waited, Ordering::Relaxed);
+        }
+        held_sum.fetch_add(held, Ordering::Relaxed);
+        held_longest.fetch_max(held, Ordering::Relaxed);
+    }
+
+    /// Files the `runtime` holds pending on `cpu` under `bucket` (an index
+    /// below [`P_HELD_BUCKETS`]), leaving none pending there.
+    fn p_held_filed(&self, cpu: usize, bucket: usize) {
+        let (Some(pending), Some(filed)) = (self.p_held_pending.get(cpu), self.p_held.get(bucket))
+        else {
+            return;
+        };
+        if pending[0].load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let [count, spun, wait_sum, held_sum, held_longest] = pending
+            .each_ref()
+            .map(|figure| figure.swap(0, Ordering::Relaxed));
+        filed[0].fetch_add(count, Ordering::Relaxed);
+        filed[1].fetch_add(spun, Ordering::Relaxed);
+        filed[2].fetch_add(wait_sum, Ordering::Relaxed);
+        filed[3].fetch_add(held_sum, Ordering::Relaxed);
+        filed[4].fetch_max(held_longest, Ordering::Relaxed);
     }
 
     /// `cpu` was served T at `served` (ticks). `ticketed` is when it began
@@ -727,7 +786,17 @@ impl<const CPUS: usize> StepTally<CPUS> {
     /// `cpu` released T at `released` (ticks), draining as `source`: the
     /// hold, if its service was stamped, is one acquisition of the CPU and
     /// source.
+    ///
+    /// The `runtime` holds of P pending on `cpu` (DW2 §15.8): while a step
+    /// is being timed there they stay pending, because a step of a call in
+    /// steps is one T hold whose step ends at the safe point after this
+    /// release, and that `step_ended` files them under its call. With no
+    /// step timed they were held outside any step, and are filed here under
+    /// `source`, whether or not the service was stamped.
     pub(crate) fn t_lock_released(&self, cpu: usize, source: DrainSource, released: u64) {
+        if !self.timing(cpu) {
+            self.p_held_filed(cpu, CALLS + source as usize);
+        }
         let (Some(slot), Some(wait), Some(figures)) = (
             self.t_lock_served.get(cpu),
             self.t_lock_wait.get(cpu),
@@ -886,6 +955,19 @@ impl<const CPUS: usize> StepTally<CPUS> {
                     "p-lock cpu={cpu} source={name} count={count} waited={waited} wait-us={wait} held-us={held}"
                 ));
             }
+        }
+        // The `runtime` holds by owner, summed over CPUs (DW2 §15.8): the
+        // counts sum to the `runtime` lines', less holds still pending.
+        for (name, figures) in NAMES.iter().chain(&SOURCE_NAMES).zip(&self.p_held) {
+            let count = figures[0].load(Ordering::Relaxed);
+            if count == 0 {
+                continue;
+            }
+            let waited = figures[1].load(Ordering::Relaxed);
+            let [_, _, wait, held, held_longest] = figures.each_ref().map(us);
+            line(format_args!(
+                "p-held by={name} count={count} waited={waited} wait-us={wait} held-us={held} held-longest-us={held_longest}"
+            ));
         }
         line(format_args!(
             "commit-steps count={} admit-us={} take-us={} rest-us={}",
@@ -1129,12 +1211,15 @@ impl<const CPUS: usize> StepTally<CPUS> {
         }
     }
 
-    /// The step `cpu` was timing ends at `now`, at a safe point of `call`.
-    /// Nothing is recorded if no step was being timed there.
     /// A call in steps ended on `cpu` at `now` (every exit of its loop):
     /// the step being timed there, if any, is recorded as `last`'s last
     /// step when `last` names one, and the CPU times nothing afterwards
     /// either way, so no slot stays open past the call (§10.19 revision 2).
+    ///
+    /// With `last` `None`, the `runtime` holds of P pending on `cpu` stay
+    /// pending and are filed under the source of T's next release there
+    /// (DW2 §15.8): a step's holds misfiled that way are a small misfiling
+    /// the report accepts.
     pub(crate) fn call_ended(&self, cpu: usize, last: Option<StepCall>, now: u64) {
         match last {
             Some(call) => self.step_ended(cpu, call, now),
@@ -1148,7 +1233,9 @@ impl<const CPUS: usize> StepTally<CPUS> {
 
     /// Runs `step` as one step of `call` on `cpu`, timed with `now`, unless
     /// a step is being timed there already: then it is part of that step's
-    /// hold and is counted in it (step-6 review D4).
+    /// hold and is counted in it (step-6 review D4). The `runtime` holds of
+    /// P it releases are then the outer step's, filed when that step ends;
+    /// timed alone, they are filed under `call` when it ends (DW2 §15.8).
     pub(crate) fn timed_nested<T>(
         &self,
         cpu: usize,
@@ -1173,6 +1260,14 @@ impl<const CPUS: usize> StepTally<CPUS> {
     /// timed there already, of a call in whose hold this one runs, keeps
     /// its start: both are recorded, the outer one including this one's
     /// time (DW2 §10.19 revision 3 item 3).
+    ///
+    /// The `runtime` holds of P pending on `cpu` when this step ends,
+    /// including any the outer step released before this one began, are
+    /// filed under `call` (DW2 §15.8; the outer step's part is a small
+    /// misfiling the report accepts). Those the outer step releases after
+    /// are filed under its own call when it ends. If `now` gives no end,
+    /// nothing is filed here and the holds stay pending for the outer
+    /// step's end, or, with no outer step, T's next release.
     pub(crate) fn timed<T>(
         &self,
         cpu: usize,
@@ -1197,6 +1292,11 @@ impl<const CPUS: usize> StepTally<CPUS> {
         result
     }
 
+    /// The step `cpu` was timing ends at `now`, at a safe point of `call`.
+    /// Nothing is recorded if no step was being timed there. The `runtime`
+    /// holds of P pending on `cpu` are this step's, whether this end comes
+    /// under T or at the safe point after T's release, and are filed under
+    /// `call` (DW2 §15.8).
     pub(crate) fn step_ended(&self, cpu: usize, call: StepCall, now: u64) {
         let Some(slot) = self.started.get(cpu) else {
             return;
@@ -1205,6 +1305,7 @@ impl<const CPUS: usize> StepTally<CPUS> {
         if started == 0 {
             return;
         }
+        self.p_held_filed(cpu, call as usize);
         let held = now.saturating_sub(started - 1).min(u64::MAX >> CALL_BITS);
         self.longest
             .fetch_max((held << CALL_BITS) | call as u64, Ordering::Relaxed);
@@ -2873,20 +2974,339 @@ mod tests {
         tally.t_lock_released(0, DrainSource::Fault, us(1));
         let lines = measure_lines(&tally);
         assert_eq!(
-            lines[9..14],
+            lines[9..15],
             [
                 "t-lock cpu=0 source=fault count=1 waited=0 wait-us=0 wait-longest-us=0 held-us=1 held-longest-us=1",
                 "p-lock cpu=0 source=runtime count=1 waited=0 wait-us=0 held-us=5",
                 "p-lock cpu=0 source=fault-shared count=1 waited=1 wait-us=2 held-us=1",
                 "p-lock cpu=1 source=fault count=2 waited=1 wait-us=3 held-us=3",
                 "p-lock cpu=1 source=usercopy count=1 waited=1 wait-us=0 held-us=4",
+                // CPU 0's runtime hold, filed at its T release (DW2 §15.8).
+                "p-held by=fault count=1 waited=0 wait-us=0 held-us=5 held-longest-us=5",
             ]
         );
-        assert!(lines[14].starts_with("commit-steps "));
+        assert!(lines[15].starts_with("commit-steps "));
+    }
+
+    /// The `p-held` lines of `tally`'s measurement (DW2 §15.8).
+    fn p_held_lines(tally: &StepTally<2>) -> Vec<String> {
+        measure_lines(tally)
+            .into_iter()
+            .filter(|line| line.starts_with("p-held "))
+            .collect()
+    }
+
+    /// P's source index named `name`.
+    fn p_source(name: &str) -> usize {
+        super::P_LOCK_SOURCE_NAMES
+            .iter()
+            .position(|source| *source == name)
+            .unwrap()
+    }
+
+    /// DW2 §15.8: a `runtime` hold released inside a timed step is filed
+    /// under that step's call when the step ends: at the safe point after
+    /// T's release (a call in steps), or under T (a step ended in its hold).
+    #[test]
+    fn a_runtime_hold_inside_a_step_files_under_its_call() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        // A step of a call in steps: one T hold, its step ended at the safe
+        // point after T's release.
+        tally.t_lock_served(0, None, us(0));
+        tally.step_began(0, us(1));
+        tally.p_lock_released(0, runtime, Some(us(2)), us(3));
+        tally.p_lock_released(0, runtime, None, us(7));
+        tally.t_lock_released(0, DrainSource::Syscall, us(20));
+        // Pending until the step ends: nothing is filed at T's release.
+        assert!(p_held_lines(&tally).is_empty());
+        tally.step_ended(0, StepCall::Unmap, us(21));
+        assert_eq!(
+            p_held_lines(&tally),
+            ["p-held by=unmap count=2 waited=1 wait-us=2 held-us=10 held-longest-us=7"]
+        );
+        // A step that ends under T, before T's release.
+        tally.t_lock_served(1, None, us(0));
+        tally.step_began(1, us(1));
+        tally.p_lock_released(1, runtime, None, us(4));
+        tally.step_ended(1, StepCall::Map, us(10));
+        tally.t_lock_released(1, DrainSource::Syscall, us(11));
+        assert_eq!(
+            p_held_lines(&tally),
+            [
+                "p-held by=map count=1 waited=0 wait-us=0 held-us=4 held-longest-us=4",
+                "p-held by=unmap count=2 waited=1 wait-us=2 held-us=10 held-longest-us=7",
+            ]
+        );
+    }
+
+    /// DW2 §15.8: a T release while a step is timed files nothing; a later
+    /// T release with no step timed files only what was released since the
+    /// step's end filed its own.
+    #[test]
+    fn a_t_release_while_a_step_is_timed_files_nothing() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        tally.step_began(0, us(0));
+        tally.p_lock_released(0, runtime, None, us(6));
+        tally.t_lock_released(0, DrainSource::Syscall, us(10));
+        tally.t_lock_released(0, DrainSource::Gate, us(11));
+        assert!(p_held_lines(&tally).is_empty());
+        tally.step_ended(0, StepCall::Commit, us(12));
+        tally.p_lock_released(0, runtime, None, us(1));
+        tally.t_lock_released(0, DrainSource::Syscall, us(20));
+        assert_eq!(
+            p_held_lines(&tally),
+            [
+                "p-held by=commit count=1 waited=0 wait-us=0 held-us=6 held-longest-us=6",
+                "p-held by=syscall count=1 waited=0 wait-us=0 held-us=1 held-longest-us=1",
+            ]
+        );
+    }
+
+    /// DW2 §15.8: a call that ends naming no last step stops the timing
+    /// without filing, so its step's pending holds go to the source of T's
+    /// next release: the small misfiling the report accepts.
+    #[test]
+    fn a_call_ended_without_a_last_step_leaves_its_holds_to_t() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        tally.step_began(1, us(0));
+        tally.p_lock_released(1, runtime, None, us(2));
+        tally.t_lock_released(1, DrainSource::Syscall, us(5));
+        tally.call_ended(1, None, us(6));
+        assert!(p_held_lines(&tally).is_empty());
+        tally.p_lock_released(1, runtime, None, us(3));
+        tally.t_lock_released(1, DrainSource::Fault, us(9));
+        assert_eq!(
+            p_held_lines(&tally),
+            ["p-held by=fault count=2 waited=0 wait-us=0 held-us=5 held-longest-us=3"]
+        );
+    }
+
+    /// DW2 §15.8: a `runtime` hold released with no step timed is filed
+    /// under T's drain source at T's release, whether or not T's service
+    /// was stamped; and a step end with no step timed files nothing.
+    #[test]
+    fn a_runtime_hold_outside_a_step_files_under_t_s_source() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        tally.p_lock_released(1, runtime, None, us(4));
+        tally.step_ended(1, StepCall::Map, us(10));
+        assert!(p_held_lines(&tally).is_empty());
+        // T's service on CPU 1 was not stamped: the hold is still filed.
+        tally.t_lock_released(1, DrainSource::Fault, us(12));
+        tally.p_lock_released(1, runtime, Some(us(1)), us(2));
+        tally.t_lock_served(1, None, us(20));
+        tally.t_lock_released(1, DrainSource::Idle, us(25));
+        assert_eq!(
+            p_held_lines(&tally),
+            [
+                "p-held by=fault count=1 waited=0 wait-us=0 held-us=4 held-longest-us=4",
+                "p-held by=idle count=1 waited=1 wait-us=1 held-us=2 held-longest-us=2",
+            ]
+        );
+    }
+
+    /// DW2 §15.8: only `runtime` holds are filed; the fast serves', the
+    /// usercopies' and the shared serves' never appear in a bucket.
+    #[test]
+    fn holds_from_other_sources_are_never_filed() {
+        let tally = StepTally::<2>::new();
+        tally.step_began(0, us(0));
+        for name in ["fault", "usercopy", "fault-shared"] {
+            tally.p_lock_released(0, p_source(name), Some(us(1)), us(1));
+            tally.p_lock_released(1, p_source(name), None, us(1));
+        }
+        tally.step_ended(0, StepCall::Commit, us(10));
+        tally.t_lock_released(0, DrainSource::Gate, us(11));
+        tally.t_lock_released(1, DrainSource::Gate, us(11));
+        assert!(p_held_lines(&tally).is_empty());
+        assert!(
+            tally
+                .p_held
+                .iter()
+                .flatten()
+                .all(|figure| figure.load(Ordering::Relaxed) == 0)
+        );
+    }
+
+    /// DW2 §15.8: a hold pending on one CPU is filed only by that CPU's
+    /// step end or T release, and a step timed on another CPU does not
+    /// hold back its T release.
+    #[test]
+    fn a_hold_pending_on_one_cpu_is_not_filed_by_another() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        tally.p_lock_released(0, runtime, None, us(3));
+        tally.step_began(1, us(0));
+        tally.t_lock_released(1, DrainSource::Syscall, us(4));
+        tally.step_ended(1, StepCall::Protect, us(5));
+        tally.t_lock_released(1, DrainSource::Syscall, us(6));
+        assert!(p_held_lines(&tally).is_empty());
+        // CPU 0 times a step; CPU 1's T release, with none timed there,
+        // still files CPU 1's hold.
+        tally.p_lock_released(1, runtime, None, us(1));
+        tally.step_began(0, us(7));
+        tally.t_lock_released(1, DrainSource::Idle, us(7));
+        assert_eq!(
+            p_held_lines(&tally),
+            ["p-held by=idle count=1 waited=0 wait-us=0 held-us=1 held-longest-us=1"]
+        );
+        tally.step_ended(0, StepCall::Create, us(9));
+        assert_eq!(
+            p_held_lines(&tally),
+            [
+                "p-held by=create count=1 waited=0 wait-us=0 held-us=3 held-longest-us=3",
+                "p-held by=idle count=1 waited=0 wait-us=0 held-us=1 held-longest-us=1",
+            ]
+        );
+    }
+
+    /// DW2 §15.8: across filings into one bucket the longest hold is kept,
+    /// and the spun count and wait sum add up.
+    #[test]
+    fn the_longest_hold_and_the_waits_are_kept_across_filings() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        for (cpu, waited, held) in [
+            (0, Some(us(4)), us(9)),
+            (1, None, us(2)),
+            (0, Some(us(1)), us(3)),
+        ] {
+            tally.step_began(cpu, us(0));
+            tally.p_lock_released(cpu, runtime, waited, held);
+            tally.step_ended(cpu, StepCall::FillIn, us(50));
+        }
+        assert_eq!(
+            p_held_lines(&tally),
+            ["p-held by=fill count=3 waited=2 wait-us=5 held-us=14 held-longest-us=9"]
+        );
+    }
+
+    /// DW2 §15.8: once every hold is filed, the buckets' counts and held
+    /// sums are the `runtime` figures over all CPUs; a hold still pending
+    /// is in the `runtime` figures and in no bucket.
+    #[test]
+    fn the_buckets_sum_to_the_runtime_figures() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        let calls = [
+            StepCall::Map,
+            StepCall::Unmap,
+            StepCall::Commit,
+            StepCall::Teardown,
+            StepCall::Finalize,
+        ];
+        let sources = [DrainSource::Gate, DrainSource::Fault, DrainSource::Other];
+        for round in 0..12u64 {
+            let cpu = (round % 2) as usize;
+            let waited = (round % 3 == 0).then_some(round * 7);
+            tally.p_lock_released(cpu, runtime, waited, 100 + round * 13);
+            let call = calls[(round % 5) as usize];
+            let source = sources[(round % 3) as usize];
+            match round % 4 {
+                // A step of a call in steps: T released, then the step ends.
+                0 => {
+                    tally.step_began(cpu, 0);
+                    tally.p_lock_released(cpu, runtime, None, 40 + round);
+                    tally.t_lock_released(cpu, source, 1_000);
+                    tally.step_ended(cpu, call, 1_001);
+                }
+                // A step ended under T.
+                2 => {
+                    tally.step_began(cpu, 0);
+                    tally.p_lock_released(cpu, runtime, None, 40 + round);
+                    tally.step_ended(cpu, call, 1_000);
+                    tally.t_lock_released(cpu, source, 2_000);
+                }
+                // No step.
+                _ => tally.t_lock_released(cpu, source, 2_000),
+            }
+        }
+        // One more, left pending.
+        tally.p_lock_released(1, runtime, None, 999);
+        let sum = |figure: usize| -> u64 {
+            tally
+                .p_lock
+                .iter()
+                .map(|sources| sources[runtime][figure].load(Ordering::Relaxed))
+                .sum()
+        };
+        let filed = |figure: usize| -> u64 {
+            tally
+                .p_held
+                .iter()
+                .map(|bucket| bucket[figure].load(Ordering::Relaxed))
+                .sum()
+        };
+        assert_eq!(sum(0), 12 + 6 + 1);
+        assert_eq!(filed(0), sum(0) - 1);
+        assert_eq!(filed(1), sum(1));
+        assert_eq!(filed(2), sum(2));
+        assert_eq!(filed(3), sum(3) - 999);
+        tally.t_lock_released(1, DrainSource::Gate, 3_000);
+        assert_eq!(filed(0), sum(0));
+        assert_eq!(filed(3), sum(3));
+    }
+
+    /// DW2 §15.8: with `timed` nested in a step, what the outer step held
+    /// before the inner one began is filed under the inner call, and what
+    /// it held after, under its own.
+    #[test]
+    fn a_hold_before_a_nested_timed_step_files_under_the_inner_call() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        tally.step_began(0, 1);
+        tally.p_lock_released(0, runtime, None, us(5));
+        tally.timed(0, StepCall::Teardown, clock(&[10, 20]), || {
+            tally.p_lock_released(0, runtime, None, us(1));
+        });
+        tally.p_lock_released(0, runtime, None, us(2));
+        tally.step_ended(0, StepCall::Map, 30);
+        assert_eq!(
+            p_held_lines(&tally),
+            [
+                "p-held by=map count=1 waited=0 wait-us=0 held-us=2 held-longest-us=2",
+                "p-held by=teardown count=2 waited=0 wait-us=0 held-us=6 held-longest-us=5",
+            ]
+        );
+    }
+
+    /// DW2 §15.8: the `p-held` lines follow the `p-lock` lines, before
+    /// `commit-steps`, in bucket order (the calls, then T's sources), with
+    /// none for an empty bucket.
+    #[test]
+    fn the_p_held_lines_follow_the_p_lock_lines_in_bucket_order() {
+        let tally = StepTally::<2>::new();
+        let runtime = p_source("runtime");
+        tally.p_lock_released(0, runtime, None, us(1));
+        tally.t_lock_released(0, DrainSource::Other, 0);
+        tally.step_began(1, 0);
+        tally.p_lock_released(1, runtime, None, us(1));
+        tally.step_ended(1, StepCall::Release, 5);
+        tally.p_lock_released(0, runtime, None, us(1));
+        tally.t_lock_released(0, DrainSource::Gate, 0);
+        let lines = measure_lines(&tally);
+        let first = lines
+            .iter()
+            .position(|line| line.starts_with("p-held "))
+            .unwrap();
+        assert!(lines[first - 1].starts_with("p-lock cpu=1 source=runtime "));
+        assert_eq!(
+            lines[first..first + 3],
+            [
+                "p-held by=release count=1 waited=0 wait-us=0 held-us=1 held-longest-us=1",
+                "p-held by=gate count=1 waited=0 wait-us=0 held-us=1 held-longest-us=1",
+                "p-held by=other count=1 waited=0 wait-us=0 held-us=1 held-longest-us=1",
+            ]
+        );
+        assert!(lines[first + 3].starts_with("commit-steps "));
     }
 
     /// The fault-window lines and the shared serve's two lines (DW2
-    /// §15.2), every value at 17 digits, as the report writes them, fit a
+    /// §15.2), and the `p-held` line of the longest owner's name (§15.8),
+    /// every value at 17 digits, as the report writes them, fit a
     /// diagnostic record's 192 bytes; that bound is enough because a count
     /// cannot reach 10^17 in a boot (at one a nanosecond that is about
     /// three years), and if a field is ever added it is the format that
@@ -2913,6 +3333,16 @@ mod tests {
         {
             slot.store(LARGEST, Ordering::Relaxed);
         }
+        // The `p-held` line of the longest owner's name (DW2 §15.8).
+        let longest_name = super::NAMES
+            .iter()
+            .chain(&super::SOURCE_NAMES)
+            .enumerate()
+            .max_by_key(|(_, name)| name.len())
+            .unwrap();
+        for figure in &tally.p_held[longest_name.0] {
+            figure.store(LARGEST, Ordering::Relaxed);
+        }
         // At 1 MHz a tick is a microsecond, so the times print as stored.
         let lines = measure_lines_at(&tally, 1_000_000);
         let find = |prefix: &str| {
@@ -2928,6 +3358,14 @@ mod tests {
         let shared_declines = find("fault-declines-shared ");
         let ahead = find("fault-ahead ");
         let streams = find("streams ");
+        let held = find("p-held ");
+        assert_eq!(
+            held,
+            std::format!(
+                "p-held by={} count={LARGEST} waited={LARGEST} wait-us={LARGEST} held-us={LARGEST} held-longest-us={LARGEST}",
+                longest_name.1
+            )
+        );
         assert_eq!(
             ahead,
             std::format!("fault-ahead commits={LARGEST} frames={LARGEST} us={LARGEST}")
@@ -2948,7 +3386,15 @@ mod tests {
             shared_declines,
             std::format!("fault-declines-shared not-committed={LARGEST}")
         );
-        for line in [windows, declines, shared, shared_declines, ahead, streams] {
+        for line in [
+            windows,
+            declines,
+            shared,
+            shared_declines,
+            ahead,
+            streams,
+            held,
+        ] {
             assert!(line.len() <= 192, "{} bytes: {line}", line.len());
         }
     }
