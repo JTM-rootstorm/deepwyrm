@@ -109,7 +109,8 @@ fn opening_charges_up_to_64_frames_of_the_pages_after_the_touch() {
         opened,
         WindowOpened {
             opened: true,
-            closed: false
+            closed: false,
+            ahead: false
         }
     );
     assert_eq!(windows.window(0).unwrap().credit(), 64);
@@ -182,7 +183,8 @@ fn the_same_mapping_and_thread_is_topped_up_by_the_difference() {
         opened,
         WindowOpened {
             opened: true,
-            closed: false
+            closed: false,
+            ahead: false
         }
     );
     let window = windows.window(0).unwrap();
@@ -222,7 +224,8 @@ fn another_mapping_or_thread_closes_the_old_window_first() {
         opened,
         WindowOpened {
             opened: true,
-            closed: true
+            closed: true,
+            ahead: false
         }
     );
     // The old object keeps only the frames committed for it.
@@ -375,4 +378,330 @@ fn the_reported_usage_is_the_committed_weight_at_every_step() {
     windows.close_all(&mut weights);
     assert_eq!(reported(&weights, &windows), committed);
     assert_eq!(usize::try_from(weights.weight(counted)).unwrap(), committed);
+}
+
+/// The address of page `n` of the test mapping.
+fn at(n: u64) -> u64 {
+    START + n * PAGE_SIZE
+}
+
+/// A window on CPU 0 over a 200-page mapping, opened at page `first`: the
+/// Thread, Process, object, mapping, the weights and the table.
+struct Stream {
+    thread: ObjectId,
+    process: ObjectId,
+    object: ObjectId,
+    mapping: Mapping,
+    weights: Weights,
+    windows: FaultWindows<u32, 2>,
+    /// Frames committed for the object: each spend and spend ahead.
+    committed: u64,
+}
+
+impl Stream {
+    fn new(pages: u64, first: u64) -> Self {
+        let id = ids(3);
+        let mut stream = Self {
+            thread: id[0],
+            process: id[1],
+            object: id[2],
+            mapping: test_mapping(space(1), START, pages, Protection::READ_WRITE),
+            weights: Weights::new(&[id[2]], 100_000),
+            windows: FaultWindows::new(),
+            committed: 0,
+        };
+        let opened = stream.serve_under_t(first);
+        assert!(
+            opened.opened && !opened.ahead,
+            "a new window is never a stream"
+        );
+        stream
+    }
+
+    fn serve_under_t(&mut self, page: u64) -> WindowOpened {
+        let opened = self.windows.open(
+            0,
+            opening(
+                self.thread,
+                self.process,
+                self.mapping,
+                self.object,
+                at(page),
+            ),
+            &mut self.weights,
+        );
+        self.check();
+        opened
+    }
+
+    fn fast_serves(&mut self, frames: u64) {
+        for _ in 0..frames {
+            self.windows.spend(0, 1);
+            self.committed += 1;
+            self.check();
+        }
+    }
+
+    fn spend_ahead(&mut self, frames: u64, end_page: u64) {
+        self.windows.spend_ahead(0, frames, at(end_page));
+        self.committed += frames;
+        self.check();
+    }
+
+    fn window(&self) -> FaultWindow<u32> {
+        *self.windows.window(0).expect("the window")
+    }
+
+    /// The weight invariant: weight = committed frames + credit.
+    fn check(&self) {
+        let credit = self.windows.window(0).map_or(0, FaultWindow::credit);
+        assert_eq!(self.weights.weight(self.object), self.committed + credit);
+    }
+}
+
+#[test]
+fn sequential_touches_that_spend_the_credit_start_a_stream() {
+    let mut stream = Stream::new(200, 0);
+    assert_eq!(stream.window().credit(), 64);
+    stream.fast_serves(64);
+    let opened = stream.serve_under_t(65);
+    assert!(opened.ahead && opened.opened);
+    let window = stream.window();
+    assert_eq!((window.base(), window.granted()), (at(65), 64));
+    assert_eq!(window.ahead_end(), None);
+}
+
+#[test]
+fn a_table_miss_in_the_middle_of_the_credit_starts_a_stream() {
+    // Five touches, then the sixth page after the open found a table
+    // missing: fewer spent, a nearer address.
+    let mut stream = Stream::new(200, 10);
+    stream.fast_serves(5);
+    assert!(stream.serve_under_t(16).ahead);
+}
+
+#[test]
+fn a_serve_one_page_off_is_no_stream() {
+    for page in [15, 17, 10, 0] {
+        let mut stream = Stream::new(200, 10);
+        stream.fast_serves(5);
+        let opened = stream.serve_under_t(page);
+        assert!(!opened.ahead, "page {page}");
+        let window = stream.window();
+        // It is a credit window, recording this serve.
+        assert_eq!((window.base(), window.ahead_end()), (at(page), None));
+        assert_eq!(window.granted(), window.credit());
+    }
+    assert_eq!(
+        Stream::new(200, 10).windows.take_stream_changes(),
+        StreamChanges::default()
+    );
+}
+
+#[test]
+fn spending_ahead_lowers_the_credit_and_records_the_end() {
+    let mut stream = Stream::new(200, 0);
+    stream.fast_serves(64);
+    assert!(stream.serve_under_t(65).ahead);
+    stream.spend_ahead(64, 130);
+    let window = stream.window();
+    assert_eq!(window.credit(), 0);
+    assert_eq!(window.ahead_end(), Some(at(130)));
+    assert_eq!(window.granted(), 0);
+    assert_eq!(
+        stream.windows.take_stream_changes(),
+        StreamChanges {
+            started: 1,
+            ended: 0
+        }
+    );
+    assert_eq!(
+        stream.windows.take_stream_changes(),
+        StreamChanges::default()
+    );
+}
+
+#[test]
+fn a_serve_at_the_end_continues_and_one_inside_changes_nothing() {
+    let mut stream = Stream::new(400, 0);
+    stream.fast_serves(64);
+    assert!(stream.serve_under_t(65).ahead);
+    stream.spend_ahead(64, 130);
+    // Inside the range (a page table was missing there): the top-up is
+    // made, but nothing about the stream changes.
+    let opened = stream.serve_under_t(100);
+    assert!(!opened.ahead && opened.opened);
+    let window = stream.window();
+    assert_eq!(
+        (window.base(), window.granted(), window.ahead_end()),
+        (at(65), 0, Some(at(130)))
+    );
+    stream.windows.spend(0, window.credit());
+    stream.committed += window.credit();
+    // At the end: it continues.
+    let opened = stream.serve_under_t(130);
+    assert!(opened.ahead);
+    let window = stream.window();
+    assert_eq!(
+        (window.base(), window.credit(), window.ahead_end()),
+        (at(130), 64, Some(at(130)))
+    );
+    stream.spend_ahead(64, 195);
+    assert_eq!(
+        stream.windows.take_stream_changes(),
+        StreamChanges {
+            started: 1,
+            ended: 0
+        }
+    );
+}
+
+#[test]
+fn a_serve_elsewhere_ends_the_stream_and_the_window_is_a_credit_window_again() {
+    let mut stream = Stream::new(400, 0);
+    stream.fast_serves(64);
+    assert!(stream.serve_under_t(65).ahead);
+    stream.spend_ahead(64, 130);
+    // Past the end, the range's own start, and before it.
+    for page in [131, 65, 64] {
+        let mut stream = Stream {
+            windows: FaultWindows {
+                slots: stream.windows.slots,
+                streams: StreamChanges::default(),
+            },
+            weights: Weights {
+                objects: stream.weights.objects.clone(),
+                room: stream.weights.room,
+            },
+            ..stream
+        };
+        let opened = stream.serve_under_t(page);
+        assert!(!opened.ahead, "page {page}");
+        let window = stream.window();
+        assert_eq!(window.ahead_end(), None);
+        assert_eq!((window.base(), window.granted()), (at(page), 64));
+        assert_eq!(stream.windows.take_stream_changes().ended, 1);
+        // A credit window again: its own touches start a stream.
+        stream.fast_serves(3);
+        assert!(stream.serve_under_t(page + 4).ahead);
+    }
+}
+
+#[test]
+fn a_new_or_replaced_window_is_never_a_stream() {
+    let mut stream = Stream::new(400, 0);
+    stream.fast_serves(64);
+    assert!(stream.serve_under_t(65).ahead);
+    stream.spend_ahead(64, 130);
+    stream.windows.take_stream_changes();
+    // Another mapping, at the very page the stream would continue at.
+    let other = test_mapping(space(1), START, 401, Protection::READ_WRITE);
+    let opened = stream.windows.open(
+        0,
+        opening(stream.thread, stream.process, other, stream.object, at(130)),
+        &mut stream.weights,
+    );
+    assert!(opened.opened && opened.closed && !opened.ahead);
+    assert_eq!(stream.window().ahead_end(), None);
+    assert_eq!(
+        stream.windows.take_stream_changes(),
+        StreamChanges {
+            started: 0,
+            ended: 1
+        }
+    );
+    stream.check();
+}
+
+#[test]
+fn closing_a_stream_ends_it() {
+    let mut stream = Stream::new(400, 0);
+    stream.fast_serves(64);
+    assert!(stream.serve_under_t(65).ahead);
+    stream.spend_ahead(10, 76);
+    // A partial commit ahead: the credit left stays charged.
+    assert_eq!(stream.window().credit(), 54);
+    stream.windows.take_stream_changes();
+    assert!(stream.windows.close(0, &mut stream.weights));
+    stream.check();
+    assert_eq!(stream.weights.weight(stream.object), stream.committed);
+    assert_eq!(stream.windows.take_stream_changes().ended, 1);
+
+    // The address space's close and the close of every window, too; a
+    // credit window's close ends nothing.
+    for all in [false, true] {
+        let mut stream = Stream::new(400, 0);
+        stream.fast_serves(64);
+        assert!(stream.serve_under_t(65).ahead);
+        stream.spend_ahead(64, 130);
+        let mut other = Stream::new(400, 0);
+        let closed = if all {
+            stream.windows.close_all(&mut stream.weights)
+        } else {
+            stream
+                .windows
+                .close_address_space(space(1), &mut stream.weights)
+                .closed()
+        };
+        assert_eq!(closed, 1);
+        stream.check();
+        assert_eq!(stream.windows.take_stream_changes().ended, 1);
+        other.windows.close_all(&mut other.weights);
+        assert_eq!(other.windows.take_stream_changes().ended, 0);
+    }
+}
+
+#[test]
+fn the_mappings_last_pages_bound_the_credit_a_stream_gets() {
+    // 100 pages: after a stream starts at page 65 there are 34 pages left.
+    let mut stream = Stream::new(100, 0);
+    stream.fast_serves(64);
+    let opened = stream.serve_under_t(65);
+    assert!(opened.ahead);
+    assert_eq!(stream.window().credit(), 34);
+    stream.spend_ahead(34, 100);
+    // The last page continues the stream with nothing left to commit.
+    let mut stream = Stream::new(100, 0);
+    stream.fast_serves(64);
+    stream.serve_under_t(65);
+    stream.spend_ahead(33, 99);
+    let opened = stream.serve_under_t(99);
+    assert!(opened.ahead && !opened.opened);
+    // The window keeps credit the mapping has no page after this one for:
+    // a commit ahead clips its range to the mapping, not to the credit.
+    assert_eq!(stream.window().credit(), 1);
+    stream.windows.spend(0, 1);
+    stream.committed += 1;
+    // At the very end, a stream that has no credit to commit ahead.
+    let mut stream = Stream::new(66, 0);
+    stream.fast_serves(64);
+    let opened = stream.serve_under_t(65);
+    assert!(opened.ahead && !opened.opened);
+    assert_eq!(stream.window().credit(), 0);
+}
+
+#[test]
+fn the_weight_is_the_committed_frames_and_the_credit_through_a_stream() {
+    // Each step checks weight = committed + credit (`Stream::check`):
+    // open, a full spend ahead, a continuation's top-up, a partial one, a
+    // serve elsewhere and a close.
+    let mut stream = Stream::new(1000, 0);
+    stream.fast_serves(64);
+    stream.serve_under_t(65);
+    assert_eq!(stream.weights.weight(stream.object), 64 + 64);
+    stream.spend_ahead(64, 130);
+    stream.serve_under_t(130);
+    stream.spend_ahead(20, 151);
+    stream.serve_under_t(500);
+    stream.fast_serves(7);
+    assert!(stream.windows.close(0, &mut stream.weights));
+    stream.check();
+    assert_eq!(stream.weights.weight(stream.object), 64 + 64 + 20 + 7);
+}
+
+#[test]
+#[should_panic(expected = "more than its credit")]
+fn spending_ahead_above_the_credit_panics() {
+    let mut stream = Stream::new(400, 0);
+    stream.windows.spend_ahead(0, 65, at(66));
 }
