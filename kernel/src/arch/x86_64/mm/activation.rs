@@ -45,9 +45,6 @@ mod primordial;
 mod handle_capacity;
 // The primordial carrier's move-only root-switch transactions, host-compiled
 // under `test` and generic over `RootSwitchTarget` (S2K-2).
-#[cfg(test)]
-#[path = "activation/primordial_diagnostic.rs"]
-mod primordial_diagnostic;
 #[cfg(any(
     test,
     all(deepwyrm_integrated, target_os = "none", target_arch = "x86_64")

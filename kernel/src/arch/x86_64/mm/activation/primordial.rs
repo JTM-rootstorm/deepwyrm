@@ -7716,50 +7716,6 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
     }
 }
 
-#[cfg(test)]
-const fn primordial_receive_failure_tag(code: u32) -> u32 {
-    match code {
-        0x7100_0011 => 1,
-        0x7100_0012 => 2,
-        0x7100_0013 => 3,
-        0x7100_0014 => 4,
-        0x7100_0015 => 5,
-        0x7100_0016 => 6,
-        0x7100_0017 => 7,
-        0x7100_0018 => 8,
-        0x7100_0019 => 9,
-        0x7100_0002 => 0xa,
-        _ => 0xf,
-    }
-}
-
-#[cfg(test)]
-fn primordial_completion_case(
-    error: crate::boot::primordial::construction::PrimordialCompletionError<u32>,
-    terminal_info: Option<deepwyrm_abi::DwTaskTerminationInfoV1>,
-) -> u32 {
-    use crate::boot::primordial::construction::PrimordialCompletionError;
-
-    // The canonical detail has only sixteen bits, so it cannot
-    // retain both arbitrary u32 values losslessly. Receive failures use ETVV:
-    // T is the exact bounded Channel/wake tag and VV is the most actionable
-    // terminal category (including exact AF01_0002 versus bootstrap-family).
-    // Other completion stages retain their existing stable low-byte detail.
-    match error {
-        PrimordialCompletionError::Receive(code, _) => {
-            0xe000
-                | (primordial_receive_failure_tag(code) << 8)
-                | primordial_terminal_summary(terminal_info)
-        }
-        PrimordialCompletionError::MalformedReady(_) => 0xd200,
-        PrimordialCompletionError::ObserveExit(code) => 0xd300 | (code & 0xff),
-        PrimordialCompletionError::NonzeroExit(code) => 0xd400 | (code & 0xff),
-        PrimordialCompletionError::UnhandledException => 0xd500,
-        PrimordialCompletionError::AuthorizedTermination => 0xd600,
-        PrimordialCompletionError::NotQuiescent(code, _) => 0xd700 | (code & 0xff),
-    }
-}
-
 impl<'roles, const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> NativeSyscallHandler
     for RuntimeCarrierFacade<'_, 'roles, RANGE_CAPACITY, ROLE_CAPACITY>
 {
