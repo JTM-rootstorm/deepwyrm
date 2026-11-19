@@ -8,6 +8,7 @@
 //! fake, so the pin rules are tested without the live target.
 
 use super::{AtomicPageTableTarget, FrameAddress, JournalWrite, VirtualPage, target_seal};
+use crate::cpu::CpuIndex;
 use crate::memory::address_region::AddressSpaceKey;
 use crate::memory::physical::BASE_PAGE_SIZE;
 use crate::memory::usercopy::{UserMutationPermit, UserPinError, UserPinTracker};
@@ -22,6 +23,9 @@ pub(crate) struct PinTrackedTarget<'a, T, const PINS: usize> {
     pub(crate) scratch: T,
     pub(crate) pins: &'a UserPinTracker<PINS>,
     pub(crate) address_space: AddressSpaceKey,
+    /// The CPU this target writes from, whose mutation slot in `pins` its
+    /// reservations take (DW2 §15.2).
+    pub(crate) cpu: CpuIndex,
     /// The span a batched publication holds against pins, as
     /// `[start, end)` with its permit.
     pub(crate) span: Option<(u64, u64, UserMutationPermit<'a, PINS>)>,
@@ -78,7 +82,7 @@ unsafe impl<T: AtomicPageTableTarget, const PINS: usize> AtomicPageTableTarget
             }
             Some(
                 self.pins
-                    .begin_mutation(self.address_space, start, end - start)
+                    .begin_mutation(self.cpu, self.address_space, start, end - start)
                     .map_err(PinTrackedError::Pin)?,
             )
         };
@@ -105,7 +109,7 @@ unsafe impl<T: AtomicPageTableTarget, const PINS: usize> AtomicPageTableTarget
             .ok_or(PinTrackedError::Pin(UserPinError::InvalidMutationRange))?;
         let permit = self
             .pins
-            .begin_mutation(self.address_space, start, byte_len)
+            .begin_mutation(self.cpu, self.address_space, start, byte_len)
             .map_err(PinTrackedError::Pin)?;
         self.span = Some((start, end, permit));
         Ok(())

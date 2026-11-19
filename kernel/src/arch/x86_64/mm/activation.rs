@@ -893,6 +893,16 @@ impl ActiveScratchIo for BootstrapActiveScratchIo {
 impl<I: ActiveScratchIo> journal_target_seal::Sealed for ActiveScratchTarget<I> {}
 
 impl<I: ActiveScratchIo> ActiveScratchTarget<I> {
+    /// The CPU whose scratch slot this target was selected for; every
+    /// access re-attests that it runs there.
+    #[cfg_attr(
+        not(all(target_os = "none", target_arch = "x86_64")),
+        allow(dead_code, reason = "only the live sessions build tracked targets")
+    )]
+    pub(crate) fn cpu(&self) -> crate::cpu::CpuIndex {
+        self.scratch.cpu
+    }
+
     fn require_owning_cpu(&self) -> Result<(), LiveActiveTargetError> {
         if self.io.current_cpu() != Some(self.scratch.cpu) {
             return Err(LiveActiveTargetError::WrongCpu);
@@ -2573,6 +2583,7 @@ mod live_sessions {
                     pins: &self.user_pins,
                     address_space,
                     span: None,
+                    cpu,
                 },
                 journal: &mut *self.journal,
                 windows: &mut self.fault_windows,

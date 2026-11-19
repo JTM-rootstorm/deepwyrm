@@ -3696,12 +3696,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize>
                 .unwrap_or_else(|error| {
                     panic!("primordial teardown scratch CPU failed: {error:?}")
                 });
+            let cpu = scratch.cpu();
             let target = &mut self.active.target;
             let mut tracked = user_access::TrackedActiveTarget {
                 scratch,
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
                 span: None,
+                cpu,
             };
             // SAFETY: [P-PUBLISHER] `region` is the primordial root region, whose address space is
             // `active.root`; `target.roles` and `tracked` serialize that root, and no other
@@ -3847,12 +3849,14 @@ impl<const RANGE_CAPACITY: usize, const ROLE_CAPACITY: usize> PrimordialPlatform
                 .target
                 .current_scratch_target()
                 .map_err(|_| user_access::LiveUserAccessError::MissingOrInvalid)?;
+            let cpu = scratch.cpu();
             let target = &mut self.active.target;
             let mut tracked = user_access::TrackedActiveTarget {
                 scratch,
                 pins: &self.active.user_pins,
                 address_space: region.address_space_key(),
                 span: None,
+                cpu,
             };
             // SAFETY: [P-PUBLISHER] `region` is the primordial root region, whose address space is
             // `active.root`; `target.roles` and `tracked` serialize that root, and no other

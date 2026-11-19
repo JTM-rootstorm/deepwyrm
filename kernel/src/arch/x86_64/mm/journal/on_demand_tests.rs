@@ -369,6 +369,7 @@ impl Fixture {
             pins,
             address_space: self.region.address_space_key(),
             span: None,
+            cpu: crate::cpu::CpuIndex::BOOTSTRAP,
         };
         let result = touch(self, &mut tracked);
         assert!(tracked.span.is_none(), "a touch left a mutation span held");
@@ -1252,6 +1253,7 @@ fn hold_pin<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
 fn hold_mutation<'p>(fixture: &Fixture, pins: &'p Pins) -> Box<dyn Held + 'p> {
     Box::new(
         pins.begin_mutation(
+            crate::cpu::CpuIndex::BOOTSTRAP,
             fixture.region.address_space_key(),
             START + 3 * BASE_PAGE_SIZE,
             BASE_PAGE_SIZE,
@@ -1322,7 +1324,15 @@ fn one_store_releases_its_page_after_writing() {
         (Ok(0), Some(Ok(true)))
     );
     let space = fixture.region.address_space_key();
-    drop(pins.begin_mutation(space, START, BASE_PAGE_SIZE).unwrap());
+    drop(
+        pins.begin_mutation(
+            crate::cpu::CpuIndex::BOOTSTRAP,
+            space,
+            START,
+            BASE_PAGE_SIZE,
+        )
+        .unwrap(),
+    );
     let pin = pins.pin_owned(space, word(START + 8)).unwrap();
     pins.release_owned(space, pin).unwrap();
 }
